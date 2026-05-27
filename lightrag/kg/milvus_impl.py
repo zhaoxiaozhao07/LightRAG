@@ -3,7 +3,7 @@ import os
 from typing import Any, final, Optional, Dict
 from dataclasses import dataclass, fields
 import numpy as np
-from lightrag.utils import logger, compute_mdhash_id
+from lightrag.utils import logger, compute_mdhash_id, performance_timing_log
 from ..base import BaseVectorStorage
 from ..constants import DEFAULT_MAX_FILE_PATH_LENGTH
 from ..kg.shared_storage import get_data_init_lock
@@ -1459,13 +1459,25 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         if not data:
             return
 
-        # Ensure collection is loaded before upserting
-        self._ensure_collection_loaded()
-
         import time
+
+        total_start = time.perf_counter()
+        record_count = len(data)
+
+        # Ensure collection is loaded before upserting
+        load_start = time.perf_counter()
+        self._ensure_collection_loaded()
+        performance_timing_log(
+            "[%s] MilvusVectorDBStorage.upsert[%s] collection load completed in %.4fs records=%s",
+            self.workspace,
+            self.namespace,
+            time.perf_counter() - load_start,
+            record_count,
+        )
 
         current_time = int(time.time())
 
+        build_start = time.perf_counter()
         list_data: list[dict[str, Any]] = [
             {
                 "id": k,
@@ -1479,19 +1491,62 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             contents[i : i + self._max_batch_size]
             for i in range(0, len(contents), self._max_batch_size)
         ]
+        performance_timing_log(
+            "[%s] MilvusVectorDBStorage.upsert[%s] payload build completed in %.4fs records=%s batches=%s max_batch_size=%s",
+            self.workspace,
+            self.namespace,
+            time.perf_counter() - build_start,
+            record_count,
+            len(batches),
+            self._max_batch_size,
+        )
 
+        embedding_start = time.perf_counter()
         embedding_tasks = [
             self.embedding_func(batch, context="document") for batch in batches
         ]
         embeddings_list = await asyncio.gather(*embedding_tasks)
+        performance_timing_log(
+            "[%s] MilvusVectorDBStorage.upsert[%s] embedding generation completed in %.4fs batches=%s records=%s",
+            self.workspace,
+            self.namespace,
+            time.perf_counter() - embedding_start,
+            len(batches),
+            record_count,
+        )
 
+        vector_start = time.perf_counter()
         embeddings = np.concatenate(embeddings_list)
         for i, d in enumerate(list_data):
             d["vector"] = embeddings[i]
-        results = self._client.upsert(
-            collection_name=self.final_namespace, data=list_data
+        performance_timing_log(
+            "[%s] MilvusVectorDBStorage.upsert[%s] vector attach completed in %.4fs records=%s",
+            self.workspace,
+            self.namespace,
+            time.perf_counter() - vector_start,
+            record_count,
         )
-        return results
+
+        client_start = time.perf_counter()
+        client = self._client
+        if client is None:
+            raise RuntimeError("Milvus client is not initialized")
+        client.upsert(collection_name=self.final_namespace, data=list_data)
+        performance_timing_log(
+            "[%s] MilvusVectorDBStorage.upsert[%s] client upsert completed in %.4fs records=%s",
+            self.workspace,
+            self.namespace,
+            time.perf_counter() - client_start,
+            record_count,
+        )
+        performance_timing_log(
+            "[%s] MilvusVectorDBStorage.upsert[%s] completed in %.4fs records=%s",
+            self.workspace,
+            self.namespace,
+            time.perf_counter() - total_start,
+            record_count,
+        )
+        return None
 
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None

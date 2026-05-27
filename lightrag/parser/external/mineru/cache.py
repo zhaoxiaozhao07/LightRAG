@@ -149,6 +149,13 @@ def _current_endpoint_signature() -> str:
     return ""
 
 
+def mineru_local_server_url_from_env() -> str:
+    return (
+        os.getenv("MINERU_LOCAL_SERVER_URL", "").strip()
+        or os.getenv("MINERU_VLM_URL", "").strip()
+    ).rstrip("/")
+
+
 def local_page_bounds(page_ranges: str) -> tuple[int, int]:
     raw = page_ranges.strip()
     if not raw:
@@ -192,6 +199,7 @@ class MinerUParserOptions:
     local_backend: str
     local_parse_method: str
     local_image_analysis: bool
+    local_server_url: str
     local_start_page_id: int
     local_end_page_id: int
 
@@ -240,6 +248,7 @@ class MinerUParserOptions:
             local_image_analysis=_env_bool(
                 "MINERU_LOCAL_IMAGE_ANALYSIS", DEFAULT_MINERU_LOCAL_IMAGE_ANALYSIS
             ),
+            local_server_url=mineru_local_server_url_from_env(),
             local_start_page_id=local_start,
             local_end_page_id=local_end,
         )
@@ -260,6 +269,7 @@ def mineru_options_signature(
     local_backend: str = DEFAULT_MINERU_LOCAL_BACKEND,
     local_parse_method: str = DEFAULT_MINERU_LOCAL_PARSE_METHOD,
     local_image_analysis: bool = DEFAULT_MINERU_LOCAL_IMAGE_ANALYSIS,
+    local_server_url: str = "",
     local_start_page_id: int = DEFAULT_MINERU_LOCAL_START_PAGE_ID,
     local_end_page_id: int = DEFAULT_MINERU_LOCAL_END_PAGE_ID,
 ) -> str:
@@ -288,6 +298,7 @@ def mineru_options_signature(
                 "local_parse_method": str(local_parse_method or "").strip()
                 or DEFAULT_MINERU_LOCAL_PARSE_METHOD,
                 "local_image_analysis": bool(local_image_analysis),
+                "local_server_url": str(local_server_url or "").strip().rstrip("/"),
                 "local_start_page_id": int(local_start_page_id),
                 "local_end_page_id": int(local_end_page_id),
             }

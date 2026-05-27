@@ -173,6 +173,7 @@ class MinerURawClient:
         self.local_backend = options.local_backend
         self.local_parse_method = options.local_parse_method
         self.local_image_analysis = options.local_image_analysis
+        self.local_server_url = options.local_server_url
         self.local_start_page_id = options.local_start_page_id
         self.local_end_page_id = options.local_end_page_id
 
@@ -338,7 +339,7 @@ class MinerURawClient:
             )
 
     def _local_form_data(self) -> dict[str, str]:
-        return {
+        data = {
             "lang_list": self.language,
             "backend": self.local_backend,
             "parse_method": self.local_parse_method,
@@ -355,6 +356,9 @@ class MinerURawClient:
             "start_page_id": str(self.local_start_page_id),
             "end_page_id": str(self.local_end_page_id),
         }
+        if self.local_server_url:
+            data["server_url"] = self.local_server_url
+        return data
 
     async def _download_local(
         self,

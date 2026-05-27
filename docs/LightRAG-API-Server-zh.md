@@ -1120,6 +1120,8 @@ notes.[-R].md
 
 ## API 端点
 
+如果需要把文档上传、MinerU 解析、知识图谱构建、结构化检索和最终问答串成可执行链路，请优先参考 [LightRAG API：MinerU 文档入库、知识图谱构建与问答串联指南](./LightRAG-API-MinerU-Workflow-zh.md)。该指南配套 `scripts/run_lightrag_api_workflow.py` smoke 脚本，可用 `uv run` 直接验证 API 层完整流程。
+
 所有支持的后端（`lollms`、`ollama`、`openai` / OpenAI-compatible、`azure_openai`、`bedrock` 和 `gemini`）都暴露相同的 LightRAG REST API。当 API 服务器运行时，访问：
 
 - Swagger UI：http://localhost:9621/docs

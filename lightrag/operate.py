@@ -159,6 +159,446 @@ def _truncate_vdb_content(content: str, global_config: dict, content_label: str)
     return truncated_content
 
 
+class _VDBUpsertBatcher:
+    """Small async batcher that lets merge tasks batch VDB writes without releasing locks."""
+
+    def __init__(
+        self,
+        vector_db: BaseVectorStorage | None,
+        operation_name: str,
+        record_label: str,
+        global_config: dict,
+        pipeline_status: dict | None = None,
+        pipeline_status_lock=None,
+        retry_delay: float = 0.1,
+        timeout_seconds: float | None = None,
+        success_log_threshold_seconds: float = 5.0,
+        flush_interval_seconds: float = 0.01,
+    ) -> None:
+        configured_batch_size = global_config.get("embedding_batch_num", 10)
+        try:
+            batch_size = int(configured_batch_size)
+        except (TypeError, ValueError):
+            batch_size = 10
+
+        self.vector_db = vector_db
+        self.operation_name = operation_name
+        self.record_label = record_label
+        self.pipeline_status = pipeline_status
+        self.pipeline_status_lock = pipeline_status_lock
+        self.retry_delay = retry_delay
+        self.timeout_seconds = timeout_seconds
+        self.success_log_threshold_seconds = success_log_threshold_seconds
+        self.flush_interval_seconds = flush_interval_seconds
+        self.batch_size = max(batch_size, 1)
+        self._lock = asyncio.Lock()
+        self._pending: list[
+            tuple[
+                dict[str, dict[str, Any]],
+                list[str],
+                asyncio.Future[None],
+            ]
+        ] = []
+        self._flush_task: asyncio.Task | None = None
+
+    async def submit(
+        self,
+        data: dict[str, dict[str, Any]],
+        delete_ids: list[str] | None = None,
+    ) -> None:
+        if self.vector_db is None or not data:
+            return
+
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        async with self._lock:
+            self._pending.append((data, list(delete_ids or []), future))
+            if self._flush_task is None or self._flush_task.done():
+                self._flush_task = asyncio.create_task(self._delayed_flush())
+
+        await future
+
+    async def _delayed_flush(self) -> None:
+        await asyncio.sleep(self.flush_interval_seconds)
+        await self._flush_pending()
+
+    async def _flush_pending(self) -> None:
+        while True:
+            async with self._lock:
+                if not self._pending:
+                    self._flush_task = None
+                    return
+                batch = self._pending[: self.batch_size]
+                del self._pending[: self.batch_size]
+
+            payload: dict[str, dict[str, Any]] = {}
+            delete_ids: list[str] = []
+            futures: list[asyncio.Future[None]] = []
+            for item_payload, item_delete_ids, item_future in batch:
+                payload.update(item_payload)
+                delete_ids.extend(item_delete_ids)
+                futures.append(item_future)
+
+            try:
+                vector_db = self.vector_db
+                if vector_db is None:
+                    for future in futures:
+                        if not future.done():
+                            future.set_result(None)
+                    continue
+                assert vector_db is not None
+                upsert_vector_db: BaseVectorStorage = vector_db
+
+                if delete_ids:
+                    unique_delete_ids = list(dict.fromkeys(delete_ids))
+                    try:
+                        await vector_db.delete(unique_delete_ids)
+                    except Exception as e:
+                        logger.debug(
+                            "Could not delete %d stale vector records before %s: %s",
+                            len(unique_delete_ids),
+                            self.operation_name,
+                            e,
+                        )
+
+                status_message = (
+                    f"Batching {self.operation_name}: {len(payload)} "
+                    f"{self.record_label}"
+                )
+                logger.info(status_message)
+                if (
+                    self.pipeline_status is not None
+                    and self.pipeline_status_lock is not None
+                ):
+                    async with self.pipeline_status_lock:
+                        self.pipeline_status["latest_message"] = status_message
+                        self.pipeline_status["history_messages"].append(status_message)
+
+                await safe_vdb_operation_with_exception(
+                    operation=lambda payload=payload, vector_db=upsert_vector_db: vector_db.upsert(
+                        payload
+                    ),
+                    operation_name=self.operation_name,
+                    entity_name=f"{len(payload)} {self.record_label}",
+                    max_retries=3,
+                    retry_delay=self.retry_delay,
+                    timeout_seconds=self.timeout_seconds,
+                    log_start=False,
+                    success_log_threshold_seconds=self.success_log_threshold_seconds,
+                )
+            except Exception as e:
+                for future in futures:
+                    if not future.done():
+                        future.set_exception(e)
+            else:
+                for future in futures:
+                    if not future.done():
+                        future.set_result(None)
+
+
+def _format_stage_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "n/a"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    total_seconds = int(round(seconds))
+    minutes, secs = divmod(total_seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m{secs:02d}s"
+
+
+def _should_append_progress_event(count: int, total: int) -> bool:
+    if total <= 0:
+        return False
+    if count in (1, total):
+        return True
+    interval = max(total // 20, 1)
+    return count % interval == 0
+
+
+async def _update_pipeline_status_message(
+    pipeline_status: dict | None,
+    pipeline_status_lock,
+    message: str,
+    *,
+    append_history: bool = True,
+    extra_updates: dict[str, Any] | None = None,
+) -> None:
+    if pipeline_status is None or pipeline_status_lock is None:
+        return
+
+    async with pipeline_status_lock:
+        pipeline_status["latest_message"] = message
+        if extra_updates:
+            pipeline_status.update(extra_updates)
+        if append_history:
+            pipeline_status.setdefault("history_messages", []).append(message)
+
+
+class _MergeStageProgress:
+    """Publish lightweight progress snapshots for long concurrent merge phases."""
+
+    def __init__(
+        self,
+        stage_name: str,
+        record_label: str,
+        total: int,
+        doc_id: str | None,
+        pipeline_status: dict | None,
+        pipeline_status_lock,
+    ) -> None:
+        self.stage_name = stage_name
+        self.record_label = record_label
+        self.total = total
+        self.doc_id = doc_id or "<unknown>"
+        self.pipeline_status = pipeline_status
+        self.pipeline_status_lock = pipeline_status_lock
+        self.started_at = time.perf_counter()
+        self.started = 0
+        self.completed = 0
+        self.failed = 0
+        self.cancelled = 0
+        self._lock = asyncio.Lock()
+
+    def _snapshot_locked(
+        self, state: str, detail: str | None
+    ) -> tuple[str, dict[str, Any]]:
+        elapsed = time.perf_counter() - self.started_at
+        finished = self.completed + self.failed + self.cancelled
+        active = max(self.started - finished, 0)
+        percent = (finished / self.total * 100) if self.total else 100.0
+        eta_seconds = None
+        if finished > 0 and finished < self.total:
+            eta_seconds = elapsed / finished * (self.total - finished)
+
+        message = (
+            f"{self.stage_name} progress for {self.doc_id}: "
+            f"{finished}/{self.total} {self.record_label} ({percent:.1f}%), "
+            f"started {self.started}/{self.total}, active {active}, "
+            f"elapsed {_format_stage_duration(elapsed)}"
+        )
+        if eta_seconds is not None:
+            message += f", eta {_format_stage_duration(eta_seconds)}"
+        if detail:
+            message += f"; {state}: {detail}"
+
+        snapshot: dict[str, Any] = {
+            "doc_id": self.doc_id,
+            "stage": self.stage_name,
+            "record_label": self.record_label,
+            "total": self.total,
+            "started": self.started,
+            "completed": self.completed,
+            "failed": self.failed,
+            "cancelled": self.cancelled,
+            "active": active,
+            "finished": finished,
+            "percent": round(percent, 1),
+            "elapsed_seconds": round(elapsed, 3),
+            "eta_seconds": round(eta_seconds, 3)
+            if eta_seconds is not None
+            else None,
+            "state": state,
+            "detail": detail,
+        }
+        return message, snapshot
+
+    async def _publish_locked(
+        self,
+        state: str,
+        detail: str | None,
+        *,
+        append_history: bool,
+    ) -> None:
+        message, snapshot = self._snapshot_locked(state, detail)
+        if append_history:
+            logger.info(message)
+        else:
+            logger.debug(message)
+        await _update_pipeline_status_message(
+            self.pipeline_status,
+            self.pipeline_status_lock,
+            message,
+            append_history=append_history,
+            extra_updates={"merge_progress": snapshot},
+        )
+
+    async def _publish(
+        self,
+        state: str,
+        detail: str | None,
+        *,
+        append_history: bool,
+    ) -> None:
+        async with self._lock:
+            await self._publish_locked(
+                state,
+                detail,
+                append_history=append_history,
+            )
+
+    async def _republish_after_cancelled_publication(
+        self,
+        state: str,
+        detail: str | None,
+        *,
+        append_history: bool,
+    ) -> None:
+        try:
+            async with self._lock:
+                await self._publish_locked(
+                    state,
+                    detail,
+                    append_history=append_history,
+                )
+        except asyncio.CancelledError:
+            logger.debug(
+                "Progress publication cancelled again for %s %s",
+                self.stage_name,
+                state,
+            )
+
+    async def start(self, detail: str | None = None) -> None:
+        counted = False
+        try:
+            async with self._lock:
+                self.started += 1
+                counted = True
+                append_history = _should_append_progress_event(
+                    self.started, self.total
+                )
+                await self._publish_locked(
+                    "started",
+                    detail,
+                    append_history=append_history,
+                )
+        except asyncio.CancelledError:
+            if counted:
+                async with self._lock:
+                    self.cancelled += 1
+                    await self._publish_locked(
+                        "cancelled",
+                        detail,
+                        append_history=True,
+                    )
+            raise
+
+    async def note(self, detail: str) -> None:
+        await self._publish("working", detail, append_history=False)
+
+    async def finish(self, detail: str | None = None) -> None:
+        counted = False
+        append_history = True
+        try:
+            async with self._lock:
+                self.completed += 1
+                counted = True
+                finished = self.completed + self.failed + self.cancelled
+                append_history = _should_append_progress_event(finished, self.total)
+                await self._publish_locked(
+                    "completed",
+                    detail,
+                    append_history=append_history,
+                )
+        except asyncio.CancelledError:
+            if not counted:
+                raise
+            await self._republish_after_cancelled_publication(
+                "completed",
+                detail,
+                append_history=append_history,
+            )
+
+    async def fail(self, detail: str | None = None) -> None:
+        counted = False
+        try:
+            async with self._lock:
+                self.failed += 1
+                counted = True
+                await self._publish_locked(
+                    "failed",
+                    detail,
+                    append_history=True,
+                )
+        except asyncio.CancelledError:
+            if not counted:
+                raise
+            await self._republish_after_cancelled_publication(
+                "failed",
+                detail,
+                append_history=True,
+            )
+
+    async def cancel(self, detail: str | None = None) -> None:
+        counted = False
+        try:
+            async with self._lock:
+                self.cancelled += 1
+                counted = True
+                await self._publish_locked(
+                    "cancelled",
+                    detail,
+                    append_history=True,
+                )
+        except asyncio.CancelledError:
+            if not counted:
+                raise
+            await self._republish_after_cancelled_publication(
+                "cancelled",
+                detail,
+                append_history=True,
+            )
+
+
+def _format_merge_stage_timing_summary(stage_timings: dict[str, dict[str, Any]]) -> str:
+    return ", ".join(
+        f"{timing['label']}={_format_stage_duration(timing.get('seconds'))}"
+        for timing in stage_timings.values()
+    )
+
+
+async def _record_merge_stage_timing(
+    stage_timings: dict[str, dict[str, Any]],
+    stage_key: str,
+    stage_label: str,
+    started_at: float,
+    pipeline_status: dict | None,
+    pipeline_status_lock,
+    doc_id: str | None,
+    *,
+    extra: dict[str, Any] | None = None,
+    skipped: bool = False,
+) -> None:
+    elapsed = time.perf_counter() - started_at
+    timing = {
+        "label": stage_label,
+        "seconds": round(elapsed, 3),
+        "skipped": skipped,
+    }
+    if extra:
+        timing.update(extra)
+    stage_timings[stage_key] = timing
+
+    status = "skipped" if skipped else "completed"
+    message = (
+        f"{stage_label} {status} for {doc_id or '<unknown>'} "
+        f"in {_format_stage_duration(elapsed)}"
+    )
+    if extra:
+        extra_summary = ", ".join(f"{key}={value}" for key, value in extra.items())
+        message += f" ({extra_summary})"
+    logger.info(message)
+    performance_timing_log("[merge_nodes_and_edges] %s", message)
+    await _update_pipeline_status_message(
+        pipeline_status,
+        pipeline_status_lock,
+        message,
+        append_history=True,
+        extra_updates={"merge_stage_timings": dict(stage_timings)},
+    )
+
+
 _MM_DISPLAY_NAME_PATTERN = re.compile(
     r"^\[(?:Image|Table|Equation) Name\](.+)$",
     flags=re.MULTILINE,
@@ -1908,6 +2348,7 @@ async def _merge_nodes_then_upsert(
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
+    entity_vdb_batcher: _VDBUpsertBatcher | None = None,
 ):
     """Get existing nodes from knowledge graph use name,if exists, merge data, else create, then upsert."""
     timing_start = time.perf_counter()
@@ -2211,13 +2652,16 @@ async def _merge_nodes_then_upsert(
                     "file_path": file_path,
                 }
             }
-            await safe_vdb_operation_with_exception(
-                operation=lambda payload=data_for_vdb: entity_vdb.upsert(payload),
-                operation_name="entity_upsert",
-                entity_name=entity_name,
-                max_retries=3,
-                retry_delay=0.1,
-            )
+            if entity_vdb_batcher is not None:
+                await entity_vdb_batcher.submit(data_for_vdb)
+            else:
+                await safe_vdb_operation_with_exception(
+                    operation=lambda payload=data_for_vdb: entity_vdb.upsert(payload),
+                    operation_name="entity_upsert",
+                    entity_name=entity_name,
+                    max_retries=3,
+                    retry_delay=0.1,
+                )
         return node_data
     finally:
         performance_timing_log(
@@ -2241,6 +2685,9 @@ async def _merge_edges_then_upsert(
     added_entities: list = None,  # New parameter to track entities added during edge processing
     relation_chunks_storage: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
+    entity_vdb_batcher: _VDBUpsertBatcher | None = None,
+    relationships_vdb_batcher: _VDBUpsertBatcher | None = None,
+    relation_progress: _MergeStageProgress | None = None,
 ):
     timing_start = time.perf_counter()
     timing_relation = f"`{src_id}`~`{tgt_id}`"
@@ -2583,18 +3030,21 @@ async def _merge_edges_then_upsert(
                             "file_path": file_path,
                         }
                     }
-                    await safe_vdb_operation_with_exception(
-                        operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
-                        operation_name="added_entity_upsert",
-                        entity_name=f"{need_insert_id} [relation:{relation_key}]",
-                        max_retries=3,
-                        retry_delay=0.1,
-                        timeout_seconds=_get_relationship_vdb_timeout_seconds(
-                            global_config
-                        ),
-                        log_start=False,
-                        success_log_threshold_seconds=5.0,
-                    )
+                    if entity_vdb_batcher is not None:
+                        await entity_vdb_batcher.submit(vdb_data)
+                    else:
+                        await safe_vdb_operation_with_exception(
+                            operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
+                            operation_name="added_entity_upsert",
+                            entity_name=f"{need_insert_id} [relation:{relation_key}]",
+                            max_retries=3,
+                            retry_delay=0.1,
+                            timeout_seconds=_get_relationship_vdb_timeout_seconds(
+                                global_config
+                            ),
+                            log_start=False,
+                            success_log_threshold_seconds=5.0,
+                        )
 
                 # Track entities added during edge processing
                 if added_entities is not None:
@@ -2698,18 +3148,23 @@ async def _merge_edges_then_upsert(
                                 ),
                             }
                         }
-                    await safe_vdb_operation_with_exception(
-                        operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
-                        operation_name="existing_entity_update",
-                        entity_name=f"{need_insert_id} [relation:{relation_key}]",
-                        max_retries=3,
-                        retry_delay=0.1,
-                        timeout_seconds=_get_relationship_vdb_timeout_seconds(
-                            global_config
-                        ),
-                        log_start=False,
-                        success_log_threshold_seconds=5.0,
-                    )
+                        if entity_vdb_batcher is not None:
+                            await entity_vdb_batcher.submit(vdb_data)
+                        else:
+                            await safe_vdb_operation_with_exception(
+                                operation=lambda payload=vdb_data: entity_vdb.upsert(
+                                    payload
+                                ),
+                                operation_name="existing_entity_update",
+                                entity_name=f"{need_insert_id} [relation:{relation_key}]",
+                                max_retries=3,
+                                retry_delay=0.1,
+                                timeout_seconds=_get_relationship_vdb_timeout_seconds(
+                                    global_config
+                                ),
+                                log_start=False,
+                                success_log_threshold_seconds=5.0,
+                            )
 
                 # 6. Log once at the end if any update occurred
                 if updated:
@@ -2717,7 +3172,11 @@ async def _merge_edges_then_upsert(
                         f"Chunks appended from relation: `{need_insert_id}`"
                     )
                     logger.info(status_message)
-                    if pipeline_status is not None and pipeline_status_lock is not None:
+                    if relation_progress is not None:
+                        await relation_progress.note(
+                            f"chunks appended to entity `{need_insert_id}` from `{relation_key}`"
+                        )
+                    elif pipeline_status is not None and pipeline_status_lock is not None:
                         async with pipeline_status_lock:
                             pipeline_status["latest_message"] = status_message
                             pipeline_status["history_messages"].append(status_message)
@@ -2764,12 +3223,6 @@ async def _merge_edges_then_upsert(
         if relationships_vdb is not None:
             rel_vdb_id = compute_mdhash_id(src_id + tgt_id, prefix="rel-")
             rel_vdb_id_reverse = compute_mdhash_id(tgt_id + src_id, prefix="rel-")
-            try:
-                await relationships_vdb.delete([rel_vdb_id, rel_vdb_id_reverse])
-            except Exception as e:
-                logger.debug(
-                    f"Could not delete old relationship vector records {rel_vdb_id}, {rel_vdb_id_reverse}: {e}"
-                )
             rel_content = _truncate_vdb_content(
                 f"{keywords}\t{src_id}\n{tgt_id}\n{description}",
                 global_config,
@@ -2787,21 +3240,33 @@ async def _merge_edges_then_upsert(
                     "file_path": file_path,
                 }
             }
-            relation_status_message = f"Upserting relation VDB: `{relation_key}`"
-            logger.info(relation_status_message)
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    pipeline_status["latest_message"] = relation_status_message
-            await safe_vdb_operation_with_exception(
-                operation=lambda payload=vdb_data: relationships_vdb.upsert(payload),
-                operation_name="relationship_upsert",
-                entity_name=relation_key,
-                max_retries=3,
-                retry_delay=0.2,
-                timeout_seconds=_get_relationship_vdb_timeout_seconds(global_config),
-                log_start=False,
-                success_log_threshold_seconds=5.0,
-            )
+            if relationships_vdb_batcher is not None:
+                await relationships_vdb_batcher.submit(
+                    vdb_data,
+                    delete_ids=[rel_vdb_id, rel_vdb_id_reverse],
+                )
+            else:
+                try:
+                    await relationships_vdb.delete([rel_vdb_id, rel_vdb_id_reverse])
+                except Exception as e:
+                    logger.debug(
+                        f"Could not delete old relationship vector records {rel_vdb_id}, {rel_vdb_id_reverse}: {e}"
+                    )
+                relation_status_message = f"Upserting relation VDB: `{relation_key}`"
+                logger.info(relation_status_message)
+                if pipeline_status is not None and pipeline_status_lock is not None:
+                    async with pipeline_status_lock:
+                        pipeline_status["latest_message"] = relation_status_message
+                await safe_vdb_operation_with_exception(
+                    operation=lambda payload=vdb_data: relationships_vdb.upsert(payload),
+                    operation_name="relationship_upsert",
+                    entity_name=relation_key,
+                    max_retries=3,
+                    retry_delay=0.2,
+                    timeout_seconds=_get_relationship_vdb_timeout_seconds(global_config),
+                    log_start=False,
+                    success_log_threshold_seconds=5.0,
+                )
 
         return edge_data
     finally:
@@ -2856,6 +3321,9 @@ async def merge_nodes_and_edges(
         file_path: File path for logging
     """
 
+    merge_total_start = time.perf_counter()
+    stage_timings: dict[str, dict[str, Any]] = {}
+
     # Check for cancellation at the start of merge
     if pipeline_status is not None and pipeline_status_lock is not None:
         async with pipeline_status_lock:
@@ -2863,6 +3331,7 @@ async def merge_nodes_and_edges(
                 raise PipelineCancelledException("User cancelled during merge phase")
 
     # Collect all nodes and edges from all chunks
+    collect_start = time.perf_counter()
     all_nodes = defaultdict(list)
     all_edges = defaultdict(list)
 
@@ -2880,6 +3349,21 @@ async def merge_nodes_and_edges(
     total_entities_count = len(all_nodes)
     total_relations_count = len(all_edges)
 
+    await _record_merge_stage_timing(
+        stage_timings,
+        "collect",
+        "Collect merge inputs",
+        collect_start,
+        pipeline_status,
+        pipeline_status_lock,
+        doc_id,
+        extra={
+            "chunks": len(chunk_results),
+            "entities": total_entities_count,
+            "relations": total_relations_count,
+        },
+    )
+
     log_message = f"Merging stage {current_file_number}/{total_files}: {file_path}"
     logger.info(log_message)
     async with pipeline_status_lock:
@@ -2889,8 +3373,47 @@ async def merge_nodes_and_edges(
     # Get max async tasks limit from global_config for semaphore control
     graph_max_async = global_config.get("llm_model_max_async", 4) * 2
     semaphore = asyncio.Semaphore(graph_max_async)
+    relation_vdb_timeout = _get_relationship_vdb_timeout_seconds(global_config)
+    phase1_entity_vdb_batcher = _VDBUpsertBatcher(
+        entity_vdb,
+        "entity_batch_upsert",
+        "entities",
+        global_config,
+        pipeline_status,
+        pipeline_status_lock,
+        retry_delay=0.1,
+    )
+    phase2_entity_vdb_batcher = _VDBUpsertBatcher(
+        entity_vdb,
+        "relation_entity_batch_upsert",
+        "relation-linked entities",
+        global_config,
+        pipeline_status,
+        pipeline_status_lock,
+        retry_delay=0.1,
+        timeout_seconds=relation_vdb_timeout,
+    )
+    phase2_relationships_vdb_batcher = _VDBUpsertBatcher(
+        relationships_vdb,
+        "relationship_batch_upsert",
+        "relationships",
+        global_config,
+        pipeline_status,
+        pipeline_status_lock,
+        retry_delay=0.2,
+        timeout_seconds=relation_vdb_timeout,
+    )
 
     # ===== Phase 1: Process all entities concurrently =====
+    phase1_start = time.perf_counter()
+    phase1_progress = _MergeStageProgress(
+        "Phase 1 entity merge",
+        "entities",
+        total_entities_count,
+        doc_id,
+        pipeline_status,
+        pipeline_status_lock,
+    )
     log_message = f"Phase 1: Processing {total_entities_count} entities from {doc_id} (async: {graph_max_async})"
     logger.info(log_message)
     async with pipeline_status_lock:
@@ -2907,12 +3430,16 @@ async def merge_nodes_and_edges(
                             "User cancelled during entity merge"
                         )
 
-            workspace = global_config.get("workspace", "")
-            namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
-            async with get_storage_keyed_lock(
-                [entity_name], namespace=namespace, enable_logging=False
-            ):
-                try:
+            progress_started = False
+            try:
+                await phase1_progress.start(f"`{entity_name}`")
+                progress_started = True
+
+                workspace = global_config.get("workspace", "")
+                namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
+                async with get_storage_keyed_lock(
+                    [entity_name], namespace=namespace, enable_logging=False
+                ):
                     logger.debug(f"Processing entity {entity_name}")
                     entity_data = await _merge_nodes_then_upsert(
                         entity_name,
@@ -2924,33 +3451,36 @@ async def merge_nodes_and_edges(
                         pipeline_status_lock,
                         llm_response_cache,
                         entity_chunks_storage,
+                        phase1_entity_vdb_batcher,
                     )
 
+                    await phase1_progress.finish(f"`{entity_name}`")
                     return entity_data
 
-                except Exception as e:
-                    error_msg = f"Error processing entity `{entity_name}`: {e}"
-                    logger.error(error_msg)
+            except asyncio.CancelledError:
+                if progress_started:
+                    await phase1_progress.cancel(f"`{entity_name}`")
+                raise
+            except Exception as e:
+                if progress_started:
+                    await phase1_progress.fail(f"`{entity_name}`: {e}")
+                error_msg = f"Error processing entity `{entity_name}`: {e}"
+                logger.error(error_msg)
 
-                    # Try to update pipeline status, but don't let status update failure affect main exception
-                    try:
-                        if (
-                            pipeline_status is not None
-                            and pipeline_status_lock is not None
-                        ):
-                            async with pipeline_status_lock:
-                                pipeline_status["latest_message"] = error_msg
-                                pipeline_status["history_messages"].append(error_msg)
-                    except Exception as status_error:
-                        logger.error(
-                            f"Failed to update pipeline status: {status_error}"
-                        )
+                # Try to update pipeline status, but don't let status update failure affect main exception
+                try:
+                    if pipeline_status is not None and pipeline_status_lock is not None:
+                        async with pipeline_status_lock:
+                            pipeline_status["latest_message"] = error_msg
+                            pipeline_status["history_messages"].append(error_msg)
+                except Exception as status_error:
+                    logger.error(f"Failed to update pipeline status: {status_error}")
 
-                    # Re-raise the original exception with a prefix
-                    prefixed_exception = create_prefixed_exception(
-                        e, f"`{entity_name}`"
-                    )
-                    raise prefixed_exception from e
+                # Re-raise the original exception with a prefix
+                prefixed_exception = create_prefixed_exception(
+                    e, f"`{entity_name}`"
+                )
+                raise prefixed_exception from e
 
     # Create entity processing tasks
     entity_tasks = []
@@ -2995,7 +3525,28 @@ async def merge_nodes_and_edges(
 
         await asyncio.sleep(0)
 
+    await _record_merge_stage_timing(
+        stage_timings,
+        "phase1_entities",
+        "Phase 1 entity merge",
+        phase1_start,
+        pipeline_status,
+        pipeline_status_lock,
+        doc_id,
+        extra={"processed": len(processed_entities), "total": total_entities_count},
+        skipped=not bool(entity_tasks),
+    )
+
     # ===== Phase 2: Process all relationships concurrently =====
+    phase2_start = time.perf_counter()
+    phase2_progress = _MergeStageProgress(
+        "Phase 2 relation merge",
+        "relations",
+        total_relations_count,
+        doc_id,
+        pipeline_status,
+        pipeline_status_lock,
+    )
     log_message = f"Phase 2: Processing {total_relations_count} relations from {doc_id} (async: {graph_max_async})"
     logger.info(log_message)
     async with pipeline_status_lock:
@@ -3016,13 +3567,16 @@ async def merge_nodes_and_edges(
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
             sorted_edge_key = sorted([edge_key[0], edge_key[1]])
             edge_label = _format_relation_edge_label(edge_key)
+            progress_started = False
+            try:
+                await phase2_progress.start(f"`{edge_label}`")
+                progress_started = True
 
-            async with get_storage_keyed_lock(
-                sorted_edge_key,
-                namespace=namespace,
-                enable_logging=False,
-            ):
-                try:
+                async with get_storage_keyed_lock(
+                    sorted_edge_key,
+                    namespace=namespace,
+                    enable_logging=False,
+                ):
                     added_entities = []  # Track entities added during edge processing
 
                     edge_data = await _merge_edges_then_upsert(
@@ -3039,34 +3593,40 @@ async def merge_nodes_and_edges(
                         added_entities,  # Pass list to collect added entities
                         relation_chunks_storage,
                         entity_chunks_storage,  # Add entity_chunks_storage parameter
+                        phase2_entity_vdb_batcher,
+                        phase2_relationships_vdb_batcher,
+                        phase2_progress,
                     )
 
                     if edge_data is None:
+                        await phase2_progress.finish(f"`{edge_label}` skipped")
                         return None, []
 
+                    await phase2_progress.finish(f"`{edge_label}`")
                     return edge_data, added_entities
 
-                except Exception as e:
-                    error_msg = f"Error processing relation `{edge_label}`: {e}"
-                    logger.error(error_msg)
+            except asyncio.CancelledError:
+                if progress_started:
+                    await phase2_progress.cancel(f"`{edge_label}`")
+                raise
+            except Exception as e:
+                if progress_started:
+                    await phase2_progress.fail(f"`{edge_label}`: {e}")
+                error_msg = f"Error processing relation `{edge_label}`: {e}"
+                logger.error(error_msg)
 
-                    # Try to update pipeline status, but don't let status update failure affect main exception
-                    try:
-                        if (
-                            pipeline_status is not None
-                            and pipeline_status_lock is not None
-                        ):
-                            async with pipeline_status_lock:
-                                pipeline_status["latest_message"] = error_msg
-                                pipeline_status["history_messages"].append(error_msg)
-                    except Exception as status_error:
-                        logger.error(
-                            f"Failed to update pipeline status: {status_error}"
-                        )
+                # Try to update pipeline status, but don't let status update failure affect main exception
+                try:
+                    if pipeline_status is not None and pipeline_status_lock is not None:
+                        async with pipeline_status_lock:
+                            pipeline_status["latest_message"] = error_msg
+                            pipeline_status["history_messages"].append(error_msg)
+                except Exception as status_error:
+                    logger.error(f"Failed to update pipeline status: {status_error}")
 
-                    # Re-raise the original exception with a prefix
-                    prefixed_exception = create_prefixed_exception(e, f"{edge_label}")
-                    raise prefixed_exception from e
+                # Re-raise the original exception with a prefix
+                prefixed_exception = create_prefixed_exception(e, f"{edge_label}")
+                raise prefixed_exception from e
 
     # Create relationship processing tasks
     edge_tasks = []
@@ -3143,7 +3703,25 @@ async def merge_nodes_and_edges(
         )
         await asyncio.sleep(0)
 
+    await _record_merge_stage_timing(
+        stage_timings,
+        "phase2_relations",
+        "Phase 2 relation merge",
+        phase2_start,
+        pipeline_status,
+        pipeline_status_lock,
+        doc_id,
+        extra={
+            "processed": len(processed_edges),
+            "added_entities": len(all_added_entities),
+            "total": total_relations_count,
+        },
+        skipped=not bool(edge_tasks),
+    )
+
     # ===== Phase 3: Update full_entities and full_relations storage =====
+    phase3_start = time.perf_counter()
+    phase3_error: str | None = None
     if full_entities_storage and full_relations_storage and doc_id:
         try:
             # Merge all entities: original entities + entities added during edge processing
@@ -3206,16 +3784,43 @@ async def merge_nodes_and_edges(
             )
 
         except Exception as e:
+            phase3_error = str(e)
             logger.error(
                 f"Failed to update entity-relation index for document {doc_id}: {e}"
             )
             # Don't raise exception to avoid affecting main flow
+    await _record_merge_stage_timing(
+        stage_timings,
+        "phase3_indexes",
+        "Phase 3 final index update",
+        phase3_start,
+        pipeline_status,
+        pipeline_status_lock,
+        doc_id,
+        extra={
+            "entities": len(processed_entities) + len(all_added_entities),
+            "relations": len(processed_edges),
+            **({"error": phase3_error} if phase3_error else {}),
+        },
+        skipped=not bool(full_entities_storage and full_relations_storage and doc_id),
+    )
 
-    log_message = f"Completed merging: {len(processed_entities)} entities, {len(all_added_entities)} extra entities, {len(processed_edges)} relations"
+    total_elapsed = time.perf_counter() - merge_total_start
+    stage_timings["total"] = {
+        "label": "Total merge",
+        "seconds": round(total_elapsed, 3),
+        "skipped": False,
+    }
+    log_message = (
+        f"Completed merging: {len(processed_entities)} entities, "
+        f"{len(all_added_entities)} extra entities, {len(processed_edges)} relations; "
+        f"timings: {_format_merge_stage_timing_summary(stage_timings)}"
+    )
     logger.info(log_message)
     async with pipeline_status_lock:
         pipeline_status["latest_message"] = log_message
         pipeline_status["history_messages"].append(log_message)
+        pipeline_status["merge_stage_timings"] = dict(stage_timings)
 
 
 async def extract_entities(
