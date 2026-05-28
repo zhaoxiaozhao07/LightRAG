@@ -13,14 +13,21 @@ from lightrag.api.document_lifecycle_service import (
     DocumentSourceInput,
     build_text_source,
 )
+from lightrag.api.index_build_service import (
+    IndexBuildPlan,
+    IndexBuildService,
+)
 from lightrag.api.job_service import JobService
 from lightrag.api.kb_service import KnowledgeBaseNotFoundError
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry
 from lightrag.api.metadata_store import (
+    ActiveDocumentBuildJobError,
     ActiveDocumentParseJobError,
     ArtifactRecord,
+    DocumentNotParsedError,
     DocumentRecord,
     IdempotencyKeyConflictError,
+    InvalidJobTransitionError,
     JobRecord,
     MetadataRecordNotFoundError,
 )
@@ -40,8 +47,18 @@ _RESERVED_DOCUMENT_METADATA_KEYS = {
     "auto_parse",
     "batch_id",
     "blocks_path",
+    "build_skipped",
+    "build_skip_reason",
+    "build_started_at",
+    "current_build_job_id",
     "current_parse_job_id",
+    "force_embedding",
+    "force_extract",
+    "force_rechunk",
     "force_reparse",
+    "last_built_at",
+    "last_build_job_id",
+    "last_failed_build_job_id",
     "last_failed_parse_job_id",
     "last_failed_parser_hash",
     "last_parse_job_id",
@@ -51,6 +68,8 @@ _RESERVED_DOCUMENT_METADATA_KEYS = {
     "parse_stage_skipped",
     "parse_started_at",
     "parser_engine",
+    "pending_build_job_id",
+    "pending_index_hash",
     "pending_lightrag_doc_id",
     "pending_parse_batch_id",
     "pending_parse_job_id",
@@ -151,6 +170,63 @@ class BatchParseDocumentsRequest(BaseModel):
         if len(set(value)) != len(value):
             raise ValueError("Duplicate document_ids are not allowed")
         return value
+
+
+class BuildKGRequest(BaseModel):
+    force_rechunk: bool = False
+    force_extract: bool = False
+    force_embedding: bool = False
+    idempotency_key: Optional[str] = None
+
+
+class BatchBuildKGRequest(BaseModel):
+    document_ids: list[str] = Field(
+        min_length=1, max_length=_MAX_KB_BATCH_PARSE_DOCUMENTS
+    )
+    force_rechunk: bool = False
+    force_extract: bool = False
+    force_embedding: bool = False
+    idempotency_key: Optional[str] = None
+
+    @field_validator("document_ids", mode="after")
+    @classmethod
+    def reject_duplicate_document_ids(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("Duplicate document_ids are not allowed")
+        return value
+
+
+class ReindexRequest(BaseModel):
+    force_rechunk: bool = True
+    force_extract: bool = True
+    force_embedding: bool = True
+    idempotency_key: Optional[str] = None
+
+
+class BatchReindexRequest(BaseModel):
+    document_ids: list[str] = Field(
+        min_length=1, max_length=_MAX_KB_BATCH_PARSE_DOCUMENTS
+    )
+    force_rechunk: bool = True
+    force_extract: bool = True
+    force_embedding: bool = True
+    idempotency_key: Optional[str] = None
+
+    @field_validator("document_ids", mode="after")
+    @classmethod
+    def reject_duplicate_document_ids(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("Duplicate document_ids are not allowed")
+        return value
+
+
+class JobCancelResponse(BaseModel):
+    job: "JobResponse"
+    cancelled: bool
+
+
+class JobRetryRequest(BaseModel):
+    idempotency_key: Optional[str] = None
 
 
 class PatchDocumentRequest(BaseModel):
@@ -451,11 +527,122 @@ def _batch_parse_failure_message(failed_items: int, total_items: int) -> str:
     return f"{failed_items} of {total_items} documents failed to parse"
 
 
+def _build_plan_payload(plan: IndexBuildPlan) -> dict[str, Any]:
+    return {
+        "document_id": plan.document.id,
+        "lightrag_doc_id": plan.document.lightrag_doc_id,
+        "parser_hash": plan.parser_hash,
+        "index_hash": plan.index_hash,
+        "sidecar_uri": plan.sidecar_uri,
+        "blocks_path": plan.blocks_path,
+        "process_options": plan.process_options,
+        "force_rechunk": plan.force_rechunk,
+        "force_extract": plan.force_extract,
+        "force_embedding": plan.force_embedding,
+        "skipped": plan.skipped,
+        "skip_reason": plan.skip_reason,
+    }
+
+
+async def _execute_build_plan(
+    *,
+    index_service: IndexBuildService,
+    kb_id: str,
+    job_id: str,
+    plan: IndexBuildPlan,
+    rag: Any,
+) -> dict[str, Any]:
+    try:
+        if not plan.skipped:
+            await index_service.mark_building(kb_id, plan.document.id, job_id=job_id)
+        run_result = await index_service.run_build(rag, plan)
+        result = await index_service.complete_build(
+            kb_id,
+            plan.document.id,
+            job_id=job_id,
+            plan=plan,
+            run_result=run_result,
+        )
+        return {
+            "document_id": result.id,
+            "status": "succeeded",
+            "skipped": bool(plan.skipped or run_result.get("skipped")),
+            "skip_reason": plan.skip_reason if plan.skipped else None,
+            "index_hash": plan.index_hash,
+            "chunks_count": result.chunks_count,
+            "entity_count": result.entity_count,
+            "relation_count": result.relation_count,
+        }
+    except Exception as exc:  # noqa: BLE001 — surface and persist
+        logger.error(
+            "Failed to build KG for document '%s' (KB '%s'): %s",
+            plan.document.id,
+            kb_id,
+            exc,
+        )
+        try:
+            await index_service.fail_build(
+                kb_id,
+                plan.document.id,
+                job_id=job_id,
+                error_code="build_failed",
+                error_message=str(exc),
+            )
+        except Exception as transition_exc:
+            logger.error(
+                "Failed to mark build job '%s' failed: %s",
+                job_id,
+                transition_exc,
+            )
+        return {
+            "document_id": plan.document.id,
+            "status": "failed",
+            "error_code": "build_failed",
+            "error_message": str(exc),
+        }
+
+
+def _batch_build_job_result(
+    *,
+    batch_id: str,
+    total_items: int,
+    completed_items: int,
+    failed_items: int,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if failed_items == 0:
+        outcome = "succeeded"
+    elif completed_items == 0:
+        outcome = "failed"
+    else:
+        outcome = "partial_failure"
+    return {
+        "batch_id": batch_id,
+        "total_items": total_items,
+        "completed_items": completed_items,
+        "failed_items": failed_items,
+        "summary": {
+            "outcome": outcome,
+            "requested_items": total_items,
+            "completed_items": completed_items,
+            "failed_items": failed_items,
+        },
+        "items": items,
+    }
+
+
+def _batch_build_failure_message(failed_items: int, total_items: int) -> str:
+    if failed_items == total_items:
+        return "No documents indexed successfully"
+    return f"{failed_items} of {total_items} documents failed to build"
+
+
 def create_kb_document_routes(
     document_service: DocumentLifecycleService,
     job_service: JobService,
     api_key: Optional[str] = None,
     registry: LightRAGInstanceRegistry | None = None,
+    index_service: IndexBuildService | None = None,
 ):
     router = APIRouter(prefix="/kbs", tags=["knowledge-base-documents"])
     combined_auth = get_combined_auth_dependency(api_key)
@@ -1016,6 +1203,609 @@ def create_kb_document_routes(
         except Exception as exc:
             logger.error("Failed to start parse for KB '%s': %s", kb_id, exc)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    async def _start_single_build_job(
+        *,
+        kb_id: str,
+        document_id: str,
+        force_rechunk: bool,
+        force_extract: bool,
+        force_embedding: bool,
+        idempotency_key: Optional[str],
+        background_tasks: BackgroundTasks,
+    ) -> JobResponse:
+        if registry is None or index_service is None:
+            raise HTTPException(
+                status_code=503,
+                detail="KB index build service is not configured",
+            )
+        active_registry = registry
+        active_index_service = index_service
+        rag = await active_registry.get(kb_id)
+        plan = await active_index_service.create_build_plan(
+            kb_id,
+            document_id,
+            rag=rag,
+            force_rechunk=force_rechunk,
+            force_extract=force_extract,
+            force_embedding=force_embedding,
+        )
+        job, created_job = await job_service.create_build_job_once(
+            kb_id,
+            document_id=document_id,
+            parser_hash=plan.parser_hash,
+            index_hash=plan.index_hash,
+            source_hash=plan.document.source_hash,
+            lightrag_doc_id=plan.document.lightrag_doc_id or "",
+            sidecar_uri=plan.sidecar_uri,
+            blocks_path=plan.blocks_path,
+            process_options=plan.process_options,
+            force_rechunk=force_rechunk,
+            force_extract=force_extract,
+            force_embedding=force_embedding,
+            idempotency_key=idempotency_key,
+        )
+        if not created_job:
+            return JobResponse.from_record(job)
+
+        if plan.skipped:
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="running",
+                progress=0.5,
+            )
+            try:
+                run_result = await active_index_service.run_build(rag, plan)
+                document = await active_index_service.complete_build(
+                    kb_id,
+                    document_id,
+                    job_id=job.id,
+                    plan=plan,
+                    run_result=run_result,
+                )
+            except Exception as exc:  # noqa: BLE001
+                await job_service.transition_job(
+                    kb_id,
+                    job.id,
+                    status="failed",
+                    progress=1.0,
+                    failed_items=1,
+                    error_code="build_failed",
+                    error_message=str(exc),
+                )
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+            final_job = await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="succeeded",
+                progress=1.0,
+                completed_items=1,
+                result={
+                    "document_id": document.id,
+                    "skipped": True,
+                    "skip_reason": plan.skip_reason,
+                    "index_hash": plan.index_hash,
+                    "chunks_count": document.chunks_count,
+                    "entity_count": document.entity_count,
+                    "relation_count": document.relation_count,
+                },
+            )
+            return JobResponse.from_record(final_job)
+
+        try:
+            await active_index_service.claim_build_queued(kb_id, job_id=job.id, plan=plan)
+        except ActiveDocumentBuildJobError as exc:
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                failed_items=1,
+                error_code="build_job_active",
+                error_message=str(exc),
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_code": "build_job_active",
+                    "document_id": exc.document_id,
+                    "existing_job_id": exc.existing_job_id,
+                    "message": str(exc),
+                },
+            ) from exc
+
+        async def _build_task() -> None:
+            try:
+                await job_service.transition_job(
+                    kb_id, job.id, status="running", progress=0.1
+                )
+                inner_rag = await active_registry.get(kb_id)
+                item = await _execute_build_plan(
+                    index_service=active_index_service,
+                    kb_id=kb_id,
+                    job_id=job.id,
+                    plan=plan,
+                    rag=inner_rag,
+                )
+                if item["status"] == "succeeded":
+                    await job_service.transition_job(
+                        kb_id,
+                        job.id,
+                        status="succeeded",
+                        progress=1.0,
+                        completed_items=1,
+                        result={
+                            "document_id": item["document_id"],
+                            "skipped": item["skipped"],
+                            "skip_reason": item.get("skip_reason"),
+                            "index_hash": item["index_hash"],
+                            "chunks_count": item.get("chunks_count"),
+                            "entity_count": item.get("entity_count"),
+                            "relation_count": item.get("relation_count"),
+                        },
+                    )
+                else:
+                    await job_service.transition_job(
+                        kb_id,
+                        job.id,
+                        status="failed",
+                        progress=1.0,
+                        failed_items=1,
+                        error_code=item["error_code"],
+                        error_message=item["error_message"],
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to build KG for document '%s' (KB '%s'): %s",
+                    document_id,
+                    kb_id,
+                    exc,
+                )
+                try:
+                    await active_index_service.fail_build(
+                        kb_id,
+                        document_id,
+                        job_id=job.id,
+                        error_code="build_failed",
+                        error_message=str(exc),
+                    )
+                    await job_service.transition_job(
+                        kb_id,
+                        job.id,
+                        status="failed",
+                        progress=1.0,
+                        failed_items=1,
+                        error_code="build_failed",
+                        error_message=str(exc),
+                    )
+                except Exception as transition_exc:
+                    logger.error(
+                        "Failed to mark build job '%s' failed: %s",
+                        job.id,
+                        transition_exc,
+                    )
+
+        background_tasks.add_task(_build_task)
+        return JobResponse.from_record(job)
+
+    @router.post(
+        "/{kb_id}/documents/{document_id}:build-kg",
+        response_model=JobResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Build the knowledge graph and index for one parsed document",
+    )
+    async def build_document_kg(
+        kb_id: str,
+        document_id: str,
+        background_tasks: BackgroundTasks,
+        request: BuildKGRequest = Body(default_factory=BuildKGRequest),
+    ):
+        try:
+            return await _start_single_build_job(
+                kb_id=kb_id,
+                document_id=document_id,
+                force_rechunk=request.force_rechunk,
+                force_extract=request.force_extract,
+                force_embedding=request.force_embedding,
+                idempotency_key=request.idempotency_key,
+                background_tasks=background_tasks,
+            )
+        except HTTPException:
+            raise
+        except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except DocumentNotParsedError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_code": "document_not_parsed",
+                    "document_id": exc.document_id,
+                    "current_status": exc.current_status,
+                    "message": str(exc),
+                },
+            ) from exc
+        except IdempotencyKeyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error(
+                "Failed to start build_kg for KB '%s' doc '%s': %s",
+                kb_id,
+                document_id,
+                exc,
+            )
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.post(
+        "/{kb_id}/documents/{document_id}:reindex",
+        response_model=JobResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Reindex one document by forcing chunk/extract/embedding stages",
+    )
+    async def reindex_document(
+        kb_id: str,
+        document_id: str,
+        background_tasks: BackgroundTasks,
+        request: ReindexRequest = Body(default_factory=ReindexRequest),
+    ):
+        try:
+            return await _start_single_build_job(
+                kb_id=kb_id,
+                document_id=document_id,
+                force_rechunk=request.force_rechunk,
+                force_extract=request.force_extract,
+                force_embedding=request.force_embedding,
+                idempotency_key=request.idempotency_key,
+                background_tasks=background_tasks,
+            )
+        except HTTPException:
+            raise
+        except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except DocumentNotParsedError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_code": "document_not_parsed",
+                    "document_id": exc.document_id,
+                    "current_status": exc.current_status,
+                    "message": str(exc),
+                },
+            ) from exc
+        except IdempotencyKeyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error(
+                "Failed to start reindex for KB '%s' doc '%s': %s",
+                kb_id,
+                document_id,
+                exc,
+            )
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    async def _start_batch_build_job(
+        *,
+        kb_id: str,
+        request_ids: list[str],
+        force_rechunk: bool,
+        force_extract: bool,
+        force_embedding: bool,
+        idempotency_key: Optional[str],
+        background_tasks: BackgroundTasks,
+    ) -> DocumentBatchResponse:
+        if registry is None or index_service is None:
+            raise HTTPException(
+                status_code=503,
+                detail="KB index build service is not configured",
+            )
+        active_registry = registry
+        active_index_service = index_service
+        rag = await active_registry.get(kb_id)
+        batch_plan = await active_index_service.create_batch_build_plan(
+            kb_id,
+            request_ids,
+            rag=rag,
+            force_rechunk=force_rechunk,
+            force_extract=force_extract,
+            force_embedding=force_embedding,
+        )
+        job, created_job = await job_service.create_batch_build_job_once(
+            kb_id,
+            batch_id=batch_plan.batch_id,
+            document_ids=request_ids,
+            total_items=len(request_ids),
+            plan_items=[_build_plan_payload(plan) for plan in batch_plan.plans],
+            planning_failures=batch_plan.failures,
+            force_rechunk=force_rechunk,
+            force_extract=force_extract,
+            force_embedding=force_embedding,
+            idempotency_key=idempotency_key,
+        )
+        if not created_job:
+            existing_document_ids = job.payload.get("document_ids")
+            existing_document_id_values = (
+                [
+                    document_id
+                    for document_id in existing_document_ids
+                    if isinstance(document_id, str)
+                ]
+                if isinstance(existing_document_ids, list)
+                else []
+            )
+            existing_documents = await document_service.get_documents_by_ids(
+                kb_id, existing_document_id_values
+            )
+            return DocumentBatchResponse(
+                job_id=job.id,
+                batch_id=job.batch_id or "",
+                documents=[
+                    DocumentResponse.from_record(item) for item in existing_documents
+                ],
+            )
+
+        skipped_plans = [plan for plan in batch_plan.plans if plan.skipped]
+        active_plans = [plan for plan in batch_plan.plans if not plan.skipped]
+        queued_documents, claim_failures = await active_index_service.claim_batch_build_queued(
+            kb_id, job_id=job.id, plans=active_plans
+        )
+        queued_document_ids = {document.id for document in queued_documents}
+        execution_plans = [
+            plan for plan in active_plans if plan.document.id in queued_document_ids
+        ]
+
+        async def _batch_build_task() -> None:
+            item_results: list[dict[str, Any]] = [
+                *batch_plan.failures,
+                *claim_failures,
+            ]
+            completed_items = 0
+            failed_items = len(item_results)
+            try:
+                await job_service.transition_job(
+                    kb_id,
+                    job.id,
+                    status="running",
+                    progress=0.0,
+                    failed_items=failed_items,
+                    result=_batch_build_job_result(
+                        batch_id=job.batch_id or batch_plan.batch_id,
+                        total_items=len(request_ids),
+                        completed_items=completed_items,
+                        failed_items=failed_items,
+                        items=item_results,
+                    ),
+                )
+                inner_rag = (
+                    await active_registry.get(kb_id)
+                    if (execution_plans or skipped_plans)
+                    else None
+                )
+                for plan in [*skipped_plans, *execution_plans]:
+                    if inner_rag is None:
+                        raise RuntimeError(
+                            "KB index build service did not return a LightRAG instance"
+                        )
+                    item = await _execute_build_plan(
+                        index_service=active_index_service,
+                        kb_id=kb_id,
+                        job_id=job.id,
+                        plan=plan,
+                        rag=inner_rag,
+                    )
+                    item_results.append(item)
+                    if item["status"] == "succeeded":
+                        completed_items += 1
+                    else:
+                        failed_items += 1
+
+                final_result = _batch_build_job_result(
+                    batch_id=job.batch_id or batch_plan.batch_id,
+                    total_items=len(request_ids),
+                    completed_items=completed_items,
+                    failed_items=failed_items,
+                    items=item_results,
+                )
+                final_status = "succeeded" if failed_items == 0 else "failed"
+                await job_service.transition_job(
+                    kb_id,
+                    job.id,
+                    status=final_status,
+                    progress=1.0,
+                    completed_items=completed_items,
+                    failed_items=failed_items,
+                    result=final_result,
+                    error_code=None if failed_items == 0 else "partial_build_failed",
+                    error_message=None
+                    if failed_items == 0
+                    else _batch_build_failure_message(failed_items, len(request_ids)),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to run batch build job '%s' for KB '%s': %s",
+                    job.id,
+                    kb_id,
+                    exc,
+                )
+                processed_ids = {item["document_id"] for item in item_results}
+                for plan in execution_plans:
+                    if plan.document.id in processed_ids:
+                        continue
+                    item_results.append(
+                        {
+                            "document_id": plan.document.id,
+                            "status": "failed",
+                            "error_code": "build_failed",
+                            "error_message": str(exc),
+                        }
+                    )
+                    failed_items += 1
+                    try:
+                        await active_index_service.fail_build(
+                            kb_id,
+                            plan.document.id,
+                            job_id=job.id,
+                            error_code="build_failed",
+                            error_message=str(exc),
+                        )
+                    except Exception as transition_exc:
+                        logger.error(
+                            "Failed to mark build job '%s' failed for batch: %s",
+                            job.id,
+                            transition_exc,
+                        )
+                await job_service.transition_job(
+                    kb_id,
+                    job.id,
+                    status="failed",
+                    progress=1.0,
+                    completed_items=completed_items,
+                    failed_items=failed_items,
+                    result=_batch_build_job_result(
+                        batch_id=job.batch_id or batch_plan.batch_id,
+                        total_items=len(request_ids),
+                        completed_items=completed_items,
+                        failed_items=failed_items,
+                        items=item_results,
+                    ),
+                    error_code="batch_build_failed",
+                    error_message=str(exc),
+                )
+
+        background_tasks.add_task(_batch_build_task)
+
+        # Return queued + skipped (skipped processed within task) + planning-known docs
+        all_known_ids = list(queued_document_ids) + [
+            plan.document.id for plan in skipped_plans
+        ]
+        seen: set[str] = set()
+        ordered_ids = []
+        for document_id in all_known_ids:
+            if document_id in seen:
+                continue
+            seen.add(document_id)
+            ordered_ids.append(document_id)
+        documents = await document_service.get_documents_by_ids(kb_id, ordered_ids)
+        return DocumentBatchResponse(
+            job_id=job.id,
+            batch_id=job.batch_id or batch_plan.batch_id,
+            documents=[DocumentResponse.from_record(item) for item in documents],
+        )
+
+    @router.post(
+        "/{kb_id}/documents:batch-build-kg",
+        response_model=DocumentBatchResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Build the knowledge graph and index for multiple parsed documents",
+    )
+    async def batch_build_documents(
+        kb_id: str,
+        background_tasks: BackgroundTasks,
+        request: BatchBuildKGRequest,
+    ):
+        try:
+            return await _start_batch_build_job(
+                kb_id=kb_id,
+                request_ids=request.document_ids,
+                force_rechunk=request.force_rechunk,
+                force_extract=request.force_extract,
+                force_embedding=request.force_embedding,
+                idempotency_key=request.idempotency_key,
+                background_tasks=background_tasks,
+            )
+        except HTTPException:
+            raise
+        except KnowledgeBaseNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except IdempotencyKeyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error(
+                "Failed to start batch build_kg for KB '%s': %s", kb_id, exc
+            )
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.post(
+        "/{kb_id}/documents:batch-reindex",
+        response_model=DocumentBatchResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Reindex multiple documents by forcing chunk/extract/embedding stages",
+    )
+    async def batch_reindex_documents(
+        kb_id: str,
+        background_tasks: BackgroundTasks,
+        request: BatchReindexRequest,
+    ):
+        try:
+            return await _start_batch_build_job(
+                kb_id=kb_id,
+                request_ids=request.document_ids,
+                force_rechunk=request.force_rechunk,
+                force_extract=request.force_extract,
+                force_embedding=request.force_embedding,
+                idempotency_key=request.idempotency_key,
+                background_tasks=background_tasks,
+            )
+        except HTTPException:
+            raise
+        except KnowledgeBaseNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except IdempotencyKeyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error("Failed to start batch reindex for KB '%s': %s", kb_id, exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.post(
+        "/{kb_id}/jobs/{job_id}:cancel",
+        response_model=JobResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Cancel a queued or running job",
+    )
+    async def cancel_job(kb_id: str, job_id: str):
+        try:
+            job, _changed = await job_service.cancel_job(kb_id, job_id)
+            return JobResponse.from_record(job)
+        except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InvalidJobTransitionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post(
+        "/{kb_id}/jobs/{job_id}:retry",
+        response_model=JobResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Retry a failed or cancelled job",
+    )
+    async def retry_job(
+        kb_id: str,
+        job_id: str,
+        request: JobRetryRequest = Body(default_factory=JobRetryRequest),
+    ):
+        try:
+            job = await job_service.retry_job(
+                kb_id, job_id, new_idempotency_key=request.idempotency_key
+            )
+            return JobResponse.from_record(job)
+        except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InvalidJobTransitionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.get(
         "/{kb_id}/documents/{document_id}/artifacts",

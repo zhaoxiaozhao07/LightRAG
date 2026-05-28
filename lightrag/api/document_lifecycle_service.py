@@ -114,6 +114,14 @@ class DocumentLifecycleService:
         self._metadata_store = metadata_store
         self._source_root = Path(source_root)
 
+    @property
+    def metadata_store(self) -> SQLiteMetadataStore:
+        return self._metadata_store
+
+    @property
+    def kb_service(self) -> KnowledgeBaseService:
+        return self._kb_service
+
     async def create_source_batch(
         self,
         kb_id: str,

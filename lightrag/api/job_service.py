@@ -366,6 +366,143 @@ class JobService:
             error_message=error_message,
         )
 
+    async def cancel_job(
+        self, kb_id: str, job_id: str
+    ) -> tuple[JobRecord, bool]:
+        record = await self._kb_service.get(kb_id)
+        existing = await self._metadata_store.get_job(record.id, job_id)
+        if existing.status in {"succeeded", "cancelled"}:
+            return existing, False
+        if existing.status == "queued":
+            updated = await self._metadata_store.transition_job(
+                record.id,
+                job_id,
+                status="cancelled",
+                error_code="cancelled_by_user",
+                error_message="Job cancelled before execution",
+            )
+            return updated, True
+        if existing.status in {"running", "retrying"}:
+            updated = await self._metadata_store.transition_job(
+                record.id, job_id, status="cancelling"
+            )
+            return updated, True
+        if existing.status == "cancelling":
+            return existing, False
+        if existing.status == "failed":
+            return existing, False
+        return existing, False
+
+    async def retry_job(
+        self,
+        kb_id: str,
+        job_id: str,
+        *,
+        new_idempotency_key: str | None = None,
+    ) -> JobRecord:
+        record = await self._kb_service.get(kb_id)
+        return await self._metadata_store.reset_job_for_retry(
+            record.id, job_id, new_idempotency_key=new_idempotency_key
+        )
+
+    async def create_build_job_once(
+        self,
+        kb_id: str,
+        *,
+        document_id: str,
+        parser_hash: str,
+        index_hash: str,
+        source_hash: str,
+        lightrag_doc_id: str,
+        sidecar_uri: str | None,
+        blocks_path: str | None,
+        process_options: str,
+        force_rechunk: bool = False,
+        force_extract: bool = False,
+        force_embedding: bool = False,
+        idempotency_key: str | None = None,
+    ) -> tuple[JobRecord, bool]:
+        record = await self._kb_service.get(kb_id)
+        now = utc_now_iso()
+        payload = {
+            "document_id": document_id,
+            "parser_hash": parser_hash,
+            "index_hash": index_hash,
+            "source_hash": source_hash,
+            "lightrag_doc_id": lightrag_doc_id,
+            "sidecar_uri": sidecar_uri,
+            "blocks_path": blocks_path,
+            "process_options": process_options,
+            "force_rechunk": force_rechunk,
+            "force_extract": force_extract,
+            "force_embedding": force_embedding,
+        }
+        payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
+        job = JobRecord(
+            id=generate_track_id("job_build"),
+            kb_id=record.id,
+            workspace=record.workspace,
+            batch_id=None,
+            document_id=document_id,
+            job_type="build_kg",
+            status="queued",
+            stage="building",
+            progress=0.0,
+            total_items=1,
+            completed_items=0,
+            failed_items=0,
+            idempotency_key=idempotency_key,
+            config_version_id=record.active_config_version_id,
+            config_hash=index_hash,
+            retry_count=0,
+            max_retries=3,
+            payload=payload,
+            result=None,
+            error_code=None,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+            queued_at=now,
+            started_at=None,
+            finished_at=None,
+            cancelled_at=None,
+        )
+        return await self._metadata_store.create_job_once(job)
+
+    async def create_batch_build_job_once(
+        self,
+        kb_id: str,
+        *,
+        batch_id: str,
+        document_ids: Sequence[str],
+        total_items: int,
+        plan_items: Sequence[dict[str, Any]],
+        planning_failures: Sequence[dict[str, Any]],
+        force_rechunk: bool = False,
+        force_extract: bool = False,
+        force_embedding: bool = False,
+        idempotency_key: str | None = None,
+    ) -> tuple[JobRecord, bool]:
+        payload = {
+            "document_ids": list(document_ids),
+            "items": list(plan_items),
+            "planning_failures": list(planning_failures),
+            "force_rechunk": force_rechunk,
+            "force_extract": force_extract,
+            "force_embedding": force_embedding,
+        }
+        payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
+        return await self.create_job_once(
+            kb_id,
+            job_type="build_kg",
+            batch_id=batch_id,
+            document_id=None,
+            stage="building",
+            total_items=total_items,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+
 
 def _idempotency_fingerprint(payload: dict[str, Any]) -> str:
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")

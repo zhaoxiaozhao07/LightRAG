@@ -972,6 +972,64 @@ class SQLiteMetadataStore:
 
         return await self._write(write)
 
+    async def reset_job_for_retry(
+        self,
+        kb_id: str,
+        job_id: str,
+        *,
+        new_idempotency_key: str | None,
+    ) -> JobRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> JobRecord:
+            current_row = conn.execute(
+                "SELECT * FROM jobs WHERE kb_id = ? AND id = ?",
+                (kb_id, job_id),
+            ).fetchone()
+            if current_row is None:
+                raise MetadataRecordNotFoundError(f"Job '{job_id}' not found")
+            current = JobRecord.from_row(current_row)
+            if current.status not in {"failed", "cancelled"}:
+                raise InvalidJobTransitionError(
+                    f"Cannot retry job '{job_id}' from {current.status}"
+                )
+            if current.retry_count >= current.max_retries:
+                raise InvalidJobTransitionError(
+                    f"Job '{job_id}' has reached max_retries={current.max_retries}"
+                )
+            now = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'queued', stage = ?, progress = 0.0,
+                    completed_items = 0, failed_items = 0,
+                    result_json = NULL, error_code = NULL, error_message = NULL,
+                    retry_count = retry_count + 1,
+                    idempotency_key = ?,
+                    updated_at = ?, queued_at = ?,
+                    started_at = NULL, finished_at = NULL, cancelled_at = NULL
+                WHERE kb_id = ? AND id = ?
+                """,
+                (
+                    current.stage,
+                    new_idempotency_key,
+                    now,
+                    now,
+                    kb_id,
+                    job_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE kb_id = ? AND id = ?",
+                (kb_id, job_id),
+            ).fetchone()
+            if row is None:
+                raise MetadataRecordNotFoundError(f"Job '{job_id}' not found")
+            return JobRecord.from_row(row)
+
+        return await self._write(write)
+
+
     async def _ensure_initialized(self) -> None:
         if not self._initialized:
             await self.initialize()
@@ -1340,6 +1398,41 @@ class SQLiteMetadataStore:
             clear_error=True,
         )
 
+    def _claim_document_build_queued(
+        self,
+        conn: sqlite3.Connection,
+        kb_id: str,
+        document_id: str,
+        *,
+        metadata_patch: dict[str, Any],
+        require_parsed: bool,
+    ) -> DocumentRecord:
+        current_row = conn.execute(
+            """
+            SELECT * FROM documents
+            WHERE kb_id = ? AND id = ? AND deleted_at IS NULL
+            """,
+            (kb_id, document_id),
+        ).fetchone()
+        if current_row is None:
+            raise MetadataRecordNotFoundError(f"Document '{document_id}' not found")
+        status = current_row["status"]
+        if status in {"build_queued", "building"}:
+            raise ActiveDocumentBuildJobError(
+                document_id,
+                _active_build_job_id_from_row(current_row),
+            )
+        if require_parsed and status not in {"parsed", "ready", "build_failed"}:
+            raise DocumentNotParsedError(document_id, str(status))
+        return self._update_document_parse_state(
+            conn,
+            kb_id,
+            document_id,
+            status="build_queued",
+            metadata_patch=metadata_patch,
+            clear_error=True,
+        )
+
     def _update_document_parse_state(
         self,
         conn: sqlite3.Connection,
@@ -1403,13 +1496,13 @@ class SQLiteMetadataStore:
 
 def _allowed_next_job_statuses(current: str) -> set[str]:
     transitions = {
-        "queued": {"running", "cancelled", "failed"},
+        "queued": {"running", "cancelling", "cancelled", "failed"},
         "running": {"succeeded", "failed", "cancelling"},
         "cancelling": {"cancelled", "failed"},
         "retrying": {"queued", "running", "failed"},
         "succeeded": set(),
-        "failed": {"retrying"},
-        "cancelled": {"retrying"},
+        "failed": {"retrying", "queued"},
+        "cancelled": {"retrying", "queued"},
     }
     return transitions.get(current, set())
 
@@ -1425,5 +1518,16 @@ def _active_parse_job_id_from_row(row: sqlite3.Row) -> str:
         return str(job_id) if job_id else "unknown"
     if row["status"] == "parsing":
         job_id = metadata.get("current_parse_job_id")
+        return str(job_id) if job_id else "unknown"
+    return "unknown"
+
+
+def _active_build_job_id_from_row(row: sqlite3.Row) -> str:
+    metadata = _loads_json_object(row["metadata_json"])
+    if row["status"] == "build_queued":
+        job_id = metadata.get("pending_build_job_id")
+        return str(job_id) if job_id else "unknown"
+    if row["status"] == "building":
+        job_id = metadata.get("current_build_job_id")
         return str(job_id) if job_id else "unknown"
     return "unknown"

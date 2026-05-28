@@ -60,6 +60,7 @@ from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
 from lightrag.api.document_lifecycle_service import DocumentLifecycleService
+from lightrag.api.index_build_service import IndexBuildService
 from lightrag.api.job_service import JobService
 from lightrag.api.kb_service import KnowledgeBaseRecord, KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
@@ -872,6 +873,7 @@ def create_app(args):
         kb_service, metadata_store, Path(args.input_dir)
     )
     job_service = JobService(kb_service, metadata_store)
+    index_build_service = IndexBuildService(document_lifecycle_service)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -2105,7 +2107,11 @@ def create_app(args):
     app.include_router(create_kb_routes(kb_service, kb_registry, api_key, job_service))
     app.include_router(
         create_kb_document_routes(
-            document_lifecycle_service, job_service, api_key, registry=kb_registry
+            document_lifecycle_service,
+            job_service,
+            api_key,
+            registry=kb_registry,
+            index_service=index_build_service,
         )
     )
     app.include_router(create_document_routes(rag, doc_manager, api_key))
