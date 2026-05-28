@@ -2691,7 +2691,8 @@ class _PipelineMixin:
                     "update_time": int(time.time()),
                 },
             )
-            await archive_docx_source_after_full_docs_sync(str(p))
+            if content_data.get("archive_source_after_parse", True):
+                await archive_docx_source_after_full_docs_sync(str(p))
             logger.info(
                 f"[parse_native] pending_parse completed for {file_path} "
                 f"via parser/docx"
@@ -2774,12 +2775,13 @@ class _PipelineMixin:
         )
         raw_dir = raw_dir_for_parsed_dir(parsed_dir)
 
-        force_reparse = os.getenv("LIGHTRAG_FORCE_REPARSE_MINERU", "").lower() in {
+        env_force_reparse = os.getenv("LIGHTRAG_FORCE_REPARSE_MINERU", "").lower() in {
             "1",
             "true",
             "yes",
             "on",
         }
+        force_reparse = bool(content_data.get("force_reparse")) or env_force_reparse
 
         parse_stage_skipped = False
         if not force_reparse and is_bundle_valid(raw_dir, source_file_path):
@@ -2792,8 +2794,7 @@ class _PipelineMixin:
         else:
             if force_reparse and raw_dir.exists():
                 logger.info(
-                    "[parse_mineru] LIGHTRAG_FORCE_REPARSE_MINERU set; "
-                    "discarding bundle at %s",
+                    "[parse_mineru] force reparse requested; discarding bundle at %s",
                     raw_dir,
                 )
             raw_dir.mkdir(parents=True, exist_ok=True)
@@ -2832,7 +2833,8 @@ class _PipelineMixin:
                 "update_time": int(time.time()),
             },
         )
-        await archive_docx_source_after_full_docs_sync(str(source_file_path))
+        if content_data.get("archive_source_after_parse", True):
+            await archive_docx_source_after_full_docs_sync(str(source_file_path))
         return {
             "doc_id": doc_id,
             "file_path": file_path,
@@ -2888,12 +2890,13 @@ class _PipelineMixin:
         )
         raw_dir = raw_dir_for_parsed_dir(parsed_dir)
 
-        force_reparse = os.getenv("LIGHTRAG_FORCE_REPARSE_DOCLING", "").lower() in {
+        env_force_reparse = os.getenv("LIGHTRAG_FORCE_REPARSE_DOCLING", "").lower() in {
             "1",
             "true",
             "yes",
             "on",
         }
+        force_reparse = bool(content_data.get("force_reparse")) or env_force_reparse
 
         parse_stage_skipped = False
         if not force_reparse and is_bundle_valid(raw_dir, source_file_path):
@@ -2904,8 +2907,7 @@ class _PipelineMixin:
         else:
             if force_reparse and raw_dir.exists():
                 logger.info(
-                    "[parse_docling] LIGHTRAG_FORCE_REPARSE_DOCLING set; "
-                    "discarding bundle at %s",
+                    "[parse_docling] force reparse requested; discarding bundle at %s",
                     raw_dir,
                 )
             # ``download_into`` mkdir's the raw_dir itself; we only need to
@@ -2951,7 +2953,8 @@ class _PipelineMixin:
                 "update_time": int(time.time()),
             },
         )
-        await archive_docx_source_after_full_docs_sync(str(source_file_path))
+        if content_data.get("archive_source_after_parse", True):
+            await archive_docx_source_after_full_docs_sync(str(source_file_path))
         return {
             "doc_id": doc_id,
             "file_path": file_path,

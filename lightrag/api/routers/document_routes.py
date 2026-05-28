@@ -84,6 +84,48 @@ temp_prefix = "__tmp__"
 UNKNOWN_FILE_SOURCE = "unknown_source"
 LEGACY_EMPTY_FILE_PATH_SENTINELS = {"", "no-file-path"}
 ARCHIVED_FILE_SUFFIX_RE = re.compile(r"_(?:\d{3}|\d{10,})$")
+SUPPORTED_DOCUMENT_EXTENSIONS = (
+    ".txt",
+    ".md",
+    ".mdx",  # MDX (Markdown + JSX)
+    ".pdf",
+    ".docx",
+    ".pptx",
+    ".xlsx",
+    ".rtf",  # Rich Text Format
+    ".odt",  # OpenDocument Text
+    ".tex",  # LaTeX
+    ".epub",  # Electronic Publication
+    ".html",  # HyperText Markup Language
+    ".htm",  # HyperText Markup Language
+    ".csv",  # Comma-Separated Values
+    ".json",  # JavaScript Object Notation
+    ".xml",  # eXtensible Markup Language
+    ".yaml",  # YAML Ain't Markup Language
+    ".yml",  # YAML
+    ".log",  # Log files
+    ".conf",  # Configuration files
+    ".ini",  # Initialization files
+    ".properties",  # Java properties files
+    ".sql",  # SQL scripts
+    ".bat",  # Batch files
+    ".sh",  # Shell scripts
+    ".c",  # C source code
+    ".h",  # C header
+    ".cpp",  # C++ source code
+    ".hpp",  # C++ header
+    ".py",  # Python source code
+    ".java",  # Java source code
+    ".js",  # JavaScript source code
+    ".ts",  # TypeScript source code
+    ".swift",  # Swift source code
+    ".go",  # Go source code
+    ".rb",  # Ruby source code
+    ".php",  # PHP source code
+    ".css",  # Cascading Style Sheets
+    ".scss",  # Sassy CSS
+    ".less",  # LESS CSS
+)
 
 
 def normalize_file_path(file_path: str | None) -> str:
@@ -816,48 +858,7 @@ class DocumentManager:
         self,
         input_dir: str,
         workspace: str = "",  # New parameter for workspace isolation
-        supported_extensions: tuple = (
-            ".txt",
-            ".md",
-            ".mdx",  # MDX (Markdown + JSX)
-            ".pdf",
-            ".docx",
-            ".pptx",
-            ".xlsx",
-            ".rtf",  # Rich Text Format
-            ".odt",  # OpenDocument Text
-            ".tex",  # LaTeX
-            ".epub",  # Electronic Publication
-            ".html",  # HyperText Markup Language
-            ".htm",  # HyperText Markup Language
-            ".csv",  # Comma-Separated Values
-            ".json",  # JavaScript Object Notation
-            ".xml",  # eXtensible Markup Language
-            ".yaml",  # YAML Ain't Markup Language
-            ".yml",  # YAML
-            ".log",  # Log files
-            ".conf",  # Configuration files
-            ".ini",  # Initialization files
-            ".properties",  # Java properties files
-            ".sql",  # SQL scripts
-            ".bat",  # Batch files
-            ".sh",  # Shell scripts
-            ".c",  # C source code
-            ".h",  # C header
-            ".cpp",  # C++ source code
-            ".hpp",  # C++ header
-            ".py",  # Python source code
-            ".java",  # Java source code
-            ".js",  # JavaScript source code
-            ".ts",  # TypeScript source code
-            ".swift",  # Swift source code
-            ".go",  # Go source code
-            ".rb",  # Ruby source code
-            ".php",  # PHP source code
-            ".css",  # Cascading Style Sheets
-            ".scss",  # Sassy CSS
-            ".less",  # LESS CSS
-        ),
+        supported_extensions: tuple = SUPPORTED_DOCUMENT_EXTENSIONS,
     ):
         # Store the base input directory and workspace
         self.base_input_dir = Path(input_dir)

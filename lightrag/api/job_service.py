@@ -1,0 +1,372 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Sequence
+from typing import Any
+
+from lightrag.api.kb_service import KnowledgeBaseService, utc_now_iso
+from lightrag.api.metadata_store import (
+    JobRecord,
+    MetadataJobStatus,
+    SQLiteMetadataStore,
+)
+from lightrag.utils import generate_track_id
+
+_RUNNING_JOB_STATUSES = ("queued", "running", "retrying", "cancelling")
+
+
+class JobService:
+    def __init__(
+        self,
+        kb_service: KnowledgeBaseService,
+        metadata_store: SQLiteMetadataStore,
+    ):
+        self._kb_service = kb_service
+        self._metadata_store = metadata_store
+
+    async def create_job(
+        self,
+        kb_id: str,
+        *,
+        job_type: str,
+        document_id: str | None = None,
+        batch_id: str | None = None,
+        stage: str | None = None,
+        total_items: int = 1,
+        payload: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+    ) -> JobRecord:
+        record = await self._kb_service.get(kb_id)
+        now = utc_now_iso()
+        job = JobRecord(
+            id=generate_track_id(f"job_{job_type}"),
+            kb_id=record.id,
+            workspace=record.workspace,
+            batch_id=batch_id,
+            document_id=document_id,
+            job_type=job_type,
+            status="queued",
+            stage=stage,
+            progress=0.0,
+            total_items=total_items,
+            completed_items=0,
+            failed_items=0,
+            idempotency_key=idempotency_key,
+            config_version_id=record.active_config_version_id,
+            config_hash=None,
+            retry_count=0,
+            max_retries=3,
+            payload=payload or {},
+            result=None,
+            error_code=None,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+            queued_at=now,
+            started_at=None,
+            finished_at=None,
+            cancelled_at=None,
+        )
+        return await self._metadata_store.create_job(job)
+
+    async def create_job_once(
+        self,
+        kb_id: str,
+        *,
+        job_type: str,
+        document_id: str | None = None,
+        batch_id: str | None = None,
+        stage: str | None = None,
+        total_items: int = 1,
+        payload: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+    ) -> tuple[JobRecord, bool]:
+        record = await self._kb_service.get(kb_id)
+        now = utc_now_iso()
+        job_payload = payload or {}
+        job = JobRecord(
+            id=generate_track_id(f"job_{job_type}"),
+            kb_id=record.id,
+            workspace=record.workspace,
+            batch_id=batch_id,
+            document_id=document_id,
+            job_type=job_type,
+            status="queued",
+            stage=stage,
+            progress=0.0,
+            total_items=total_items,
+            completed_items=0,
+            failed_items=0,
+            idempotency_key=idempotency_key,
+            config_version_id=record.active_config_version_id,
+            config_hash=None,
+            retry_count=0,
+            max_retries=3,
+            payload=job_payload,
+            result=None,
+            error_code=None,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+            queued_at=now,
+            started_at=None,
+            finished_at=None,
+            cancelled_at=None,
+        )
+        return await self._metadata_store.create_job_once(job)
+
+    async def create_parse_job(
+        self,
+        kb_id: str,
+        *,
+        document_id: str,
+        parser_hash: str,
+        lightrag_doc_id: str,
+        parser_engine: str,
+        process_options: str,
+        source_uri: str,
+        source_hash: str,
+        force_reparse: bool = False,
+        auto_index: bool = False,
+        idempotency_key: str | None = None,
+    ) -> JobRecord:
+        record = await self._kb_service.get(kb_id)
+        now = utc_now_iso()
+        payload = {
+            "document_id": document_id,
+            "source_uri": source_uri,
+            "source_hash": source_hash,
+            "parser_engine": parser_engine,
+            "process_options": process_options,
+            "parser_hash": parser_hash,
+            "lightrag_doc_id": lightrag_doc_id,
+            "force_reparse": force_reparse,
+            "auto_index": auto_index,
+        }
+        payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
+        job = JobRecord(
+            id=generate_track_id("job_parse"),
+            kb_id=record.id,
+            workspace=record.workspace,
+            batch_id=None,
+            document_id=document_id,
+            job_type="parse",
+            status="queued",
+            stage="parsing",
+            progress=0.0,
+            total_items=1,
+            completed_items=0,
+            failed_items=0,
+            idempotency_key=idempotency_key,
+            config_version_id=record.active_config_version_id,
+            config_hash=parser_hash,
+            retry_count=0,
+            max_retries=3,
+            payload=payload,
+            result=None,
+            error_code=None,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+            queued_at=now,
+            started_at=None,
+            finished_at=None,
+            cancelled_at=None,
+        )
+        return await self._metadata_store.create_job(job)
+
+    async def create_parse_job_once(
+        self,
+        kb_id: str,
+        *,
+        document_id: str,
+        parser_hash: str,
+        lightrag_doc_id: str,
+        parser_engine: str,
+        process_options: str,
+        source_uri: str,
+        source_hash: str,
+        force_reparse: bool = False,
+        auto_index: bool = False,
+        idempotency_key: str | None = None,
+    ) -> tuple[JobRecord, bool]:
+        record = await self._kb_service.get(kb_id)
+        now = utc_now_iso()
+        payload = {
+            "document_id": document_id,
+            "source_uri": source_uri,
+            "source_hash": source_hash,
+            "parser_engine": parser_engine,
+            "process_options": process_options,
+            "parser_hash": parser_hash,
+            "lightrag_doc_id": lightrag_doc_id,
+            "force_reparse": force_reparse,
+            "auto_index": auto_index,
+        }
+        payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
+        job = JobRecord(
+            id=generate_track_id("job_parse"),
+            kb_id=record.id,
+            workspace=record.workspace,
+            batch_id=None,
+            document_id=document_id,
+            job_type="parse",
+            status="queued",
+            stage="parsing",
+            progress=0.0,
+            total_items=1,
+            completed_items=0,
+            failed_items=0,
+            idempotency_key=idempotency_key,
+            config_version_id=record.active_config_version_id,
+            config_hash=parser_hash,
+            retry_count=0,
+            max_retries=3,
+            payload=payload,
+            result=None,
+            error_code=None,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+            queued_at=now,
+            started_at=None,
+            finished_at=None,
+            cancelled_at=None,
+        )
+        return await self._metadata_store.create_job_once(job)
+
+    async def create_batch_parse_job(
+        self,
+        kb_id: str,
+        *,
+        batch_id: str,
+        document_ids: Sequence[str],
+        total_items: int,
+        plan_items: Sequence[dict[str, Any]],
+        planning_failures: Sequence[dict[str, Any]],
+        force_reparse: bool = False,
+        auto_index: bool = False,
+        idempotency_key: str | None = None,
+    ) -> JobRecord:
+        payload = {
+            "document_ids": list(document_ids),
+            "items": list(plan_items),
+            "planning_failures": list(planning_failures),
+            "force_reparse": force_reparse,
+            "auto_index": auto_index,
+        }
+        payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
+        return await self.create_job(
+            kb_id,
+            job_type="parse",
+            batch_id=batch_id,
+            document_id=None,
+            stage="parsing",
+            total_items=total_items,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+
+    async def create_batch_parse_job_once(
+        self,
+        kb_id: str,
+        *,
+        batch_id: str,
+        document_ids: Sequence[str],
+        total_items: int,
+        plan_items: Sequence[dict[str, Any]],
+        planning_failures: Sequence[dict[str, Any]],
+        force_reparse: bool = False,
+        auto_index: bool = False,
+        idempotency_key: str | None = None,
+    ) -> tuple[JobRecord, bool]:
+        payload = {
+            "document_ids": list(document_ids),
+            "items": list(plan_items),
+            "planning_failures": list(planning_failures),
+            "force_reparse": force_reparse,
+            "auto_index": auto_index,
+        }
+        payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
+        return await self.create_job_once(
+            kb_id,
+            job_type="parse",
+            batch_id=batch_id,
+            document_id=None,
+            stage="parsing",
+            total_items=total_items,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+
+    async def list_jobs(
+        self,
+        kb_id: str,
+        *,
+        statuses: Sequence[str] | None = None,
+        document_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[JobRecord], int]:
+        record = await self._kb_service.get(kb_id)
+        return await self._metadata_store.list_jobs(
+            record.id,
+            statuses=statuses,
+            document_id=document_id,
+            limit=limit,
+            offset=offset,
+        )
+
+    async def list_running_jobs(
+        self, kb_id: str, *, limit: int = 20
+    ) -> list[JobRecord]:
+        jobs, _total = await self.list_jobs(
+            kb_id, statuses=_RUNNING_JOB_STATUSES, limit=limit, offset=0
+        )
+        return jobs
+
+    async def get_job(self, kb_id: str, job_id: str) -> JobRecord:
+        record = await self._kb_service.get(kb_id)
+        return await self._metadata_store.get_job(record.id, job_id)
+
+    async def get_job_by_idempotency_key(
+        self, kb_id: str, idempotency_key: str, *, job_type: str | None = None
+    ) -> JobRecord | None:
+        record = await self._kb_service.get(kb_id)
+        return await self._metadata_store.get_job_by_idempotency_key(
+            record.id, idempotency_key, job_type=job_type
+        )
+
+    async def transition_job(
+        self,
+        kb_id: str,
+        job_id: str,
+        *,
+        status: MetadataJobStatus,
+        stage: str | None = None,
+        progress: float | None = None,
+        completed_items: int | None = None,
+        failed_items: int | None = None,
+        result: dict[str, Any] | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> JobRecord:
+        record = await self._kb_service.get(kb_id)
+        return await self._metadata_store.transition_job(
+            record.id,
+            job_id,
+            status=status,
+            stage=stage,
+            progress=progress,
+            completed_items=completed_items,
+            failed_items=failed_items,
+            result=result,
+            error_code=error_code,
+            error_message=error_message,
+        )
+
+
+def _idempotency_fingerprint(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"

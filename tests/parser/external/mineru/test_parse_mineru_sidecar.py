@@ -350,14 +350,22 @@ def test_parse_mineru_cache_hit_skips_download(
             )
             assert counters["calls"] == 1, "cache hit must not re-download"
 
-            # Third call with force-reparse: cache invalidated.
+            # Third call with request-level force-reparse: cache invalidated.
+            await rag.parse_mineru(
+                doc_id=doc_id,
+                file_path="demo.pdf",
+                content_data={"force_reparse": True},
+            )
+            assert counters["calls"] == 2
+
+            # Env-level force-reparse remains supported.
             monkeypatch.setenv("LIGHTRAG_FORCE_REPARSE_MINERU", "true")
             await rag.parse_mineru(
                 doc_id=doc_id,
                 file_path="demo.pdf",
                 content_data={},
             )
-            assert counters["calls"] == 2
+            assert counters["calls"] == 3
         finally:
             await rag.finalize_storages()
 

@@ -387,13 +387,20 @@ def test_parse_docling_cache_hit_skips_download(
             )
             assert counters["calls"] == 1, "cache hit must not re-download"
 
+            await rag.parse_docling(
+                doc_id=doc_id,
+                file_path="demo.pdf",
+                content_data={"force_reparse": True},
+            )
+            assert counters["calls"] == 2
+
             monkeypatch.setenv("LIGHTRAG_FORCE_REPARSE_DOCLING", "true")
             await rag.parse_docling(
                 doc_id=doc_id,
                 file_path="demo.pdf",
                 content_data={},
             )
-            assert counters["calls"] == 2
+            assert counters["calls"] == 3
         finally:
             await rag.finalize_storages()
 

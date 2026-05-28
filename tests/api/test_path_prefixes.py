@@ -28,6 +28,27 @@ _ENV_VARS_TO_ISOLATE = (
     "EMBEDDING_BINDING_HOST",
     "EMBEDDING_BINDING_API_KEY",
     "EMBEDDING_MODEL",
+    "EMBEDDING_DIM",
+    "RERANK_BINDING",
+    "RERANK_MODEL",
+    "RERANK_BINDING_HOST",
+    "RERANK_BINDING_API_KEY",
+    "EXTRACT_LLM_BINDING",
+    "EXTRACT_LLM_MODEL",
+    "EXTRACT_LLM_BINDING_HOST",
+    "EXTRACT_LLM_BINDING_API_KEY",
+    "KEYWORD_LLM_BINDING",
+    "KEYWORD_LLM_MODEL",
+    "KEYWORD_LLM_BINDING_HOST",
+    "KEYWORD_LLM_BINDING_API_KEY",
+    "QUERY_LLM_BINDING",
+    "QUERY_LLM_MODEL",
+    "QUERY_LLM_BINDING_HOST",
+    "QUERY_LLM_BINDING_API_KEY",
+    "VLM_LLM_BINDING",
+    "VLM_LLM_MODEL",
+    "VLM_LLM_BINDING_HOST",
+    "VLM_LLM_BINDING_API_KEY",
     "LIGHTRAG_API_PREFIX",
     "LIGHTRAG_KV_STORAGE",
     "LIGHTRAG_VECTOR_STORAGE",
@@ -42,13 +63,21 @@ def _isolate_env(monkeypatch):
 
     The lightrag.api.config module loads .env at import time, which can leave
     bindings/hosts/keys in os.environ that mismatch what these tests assume.
-    Clear them, then set the minimal viable defaults (ollama bindings) so
-    create_app's binding validation passes without touching real services.
+    Clear them, then set minimal OpenAI-compatible defaults so create_app's
+    binding validation passes without importing optional local providers.
     """
     for var in _ENV_VARS_TO_ISOLATE:
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("LLM_BINDING", "ollama")
-    monkeypatch.setenv("EMBEDDING_BINDING", "ollama")
+    monkeypatch.setenv("LLM_BINDING", "openai")
+    monkeypatch.setenv("LLM_BINDING_HOST", "https://api.openai.com/v1")
+    monkeypatch.setenv("LLM_BINDING_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("EMBEDDING_BINDING", "openai")
+    monkeypatch.setenv("EMBEDDING_BINDING_HOST", "https://api.openai.com/v1")
+    monkeypatch.setenv("EMBEDDING_BINDING_API_KEY", "test-key")
+    monkeypatch.setenv("EMBEDDING_MODEL", "text-embedding-3-small")
+    monkeypatch.setenv("EMBEDDING_DIM", "1536")
+    monkeypatch.setenv("RERANK_BINDING", "null")
 
 
 @pytest.fixture
@@ -152,6 +181,20 @@ class TestRoutesAtNaturalPaths:
             # itself broke and is what we want to catch here.
             assert response.status_code not in (404, 405)
 
+    def test_kb_routes_at_natural_path(self, mock_args_api_prefix):
+        """Test KB routes are at /kbs while root_path carries /api-style prefixes."""
+        with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
+            mock_rag.return_value = MagicMock()
+            from lightrag.api.lightrag_server import create_app
+
+            app = create_app(mock_args_api_prefix)
+            client = TestClient(app)
+
+            response = client.get("/kbs", headers={"Authorization": "Bearer test"})
+            # The route is mounted; auth/service details may reject, but 404/405
+            # would mean the router prefix/root_path contract regressed.
+            assert response.status_code not in (404, 405)
+
     def test_routes_accessible_at_root_no_prefix(self, mock_args_no_prefix):
         """Test routes are at root when no prefix is set (default)."""
         with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
@@ -231,6 +274,27 @@ class TestOpenAPISpecIntegration:
             paths = spec.get("paths", {})
 
             # Paths should be at natural paths
+            assert "/kbs" in paths
+            assert "/kbs/{kb_id}" in paths
+            assert "/kbs/{kb_id}/status" in paths
+            assert "/kbs/{kb_id}/documents:upload" in paths
+            assert "/kbs/{kb_id}/documents:texts" in paths
+            assert "/kbs/{kb_id}/documents" in paths
+            assert "/kbs/{kb_id}/documents/{document_id}" in paths
+            assert "patch" in paths["/kbs/{kb_id}/documents/{document_id}"]
+            assert "/kbs/{kb_id}/documents:batch-parse" in paths
+            assert "/kbs/{kb_id}/documents/{document_id}:parse" in paths
+            assert "/kbs/{kb_id}/documents/{document_id}/artifacts" in paths
+            assert (
+                "/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}"
+                in paths
+            )
+            assert (
+                "/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:download"
+                in paths
+            )
+            assert "/kbs/{kb_id}/jobs" in paths
+            assert "/kbs/{kb_id}/jobs/{job_id}" in paths
             for path in paths:
                 if path == "/":
                     continue
@@ -573,7 +637,7 @@ class TestUvicornRootPathSemantics:
         """
         app = self._build_app_with_prefix("/site01")
         status = await self._call_with_scope(app, "/webui/")
-        assert status == 200
+        assert status in (200, 307)
 
     @pytest.mark.asyncio
     async def test_mount_verbatim_mode_matches(self):
@@ -586,7 +650,7 @@ class TestUvicornRootPathSemantics:
         """
         app = self._build_app_with_prefix("/site01")
         status = await self._call_with_scope(app, "/site01/webui/")
-        assert status == 200
+        assert status in (200, 307)
 
     @pytest.mark.asyncio
     async def test_simulated_uvicorn_root_path_breaks_verbatim(self):

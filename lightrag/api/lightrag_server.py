@@ -59,6 +59,13 @@ from lightrag.parser.external.mineru.cache import MinerUParserOptions
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.document_lifecycle_service import DocumentLifecycleService
+from lightrag.api.job_service import JobService
+from lightrag.api.kb_service import KnowledgeBaseRecord, KnowledgeBaseService
+from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
+from lightrag.api.metadata_store import SQLiteMetadataStore
+from lightrag.api.routers.kb_document_routes import create_kb_document_routes
+from lightrag.api.routers.kb_routes import create_kb_routes
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -855,6 +862,16 @@ def create_app(args):
 
     # Initialize document manager with workspace support for data isolation
     doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
+    kb_service = KnowledgeBaseService(
+        Path(args.working_dir) / "metadata" / "knowledge_bases.json"
+    )
+    metadata_store = SQLiteMetadataStore(
+        Path(args.working_dir) / "metadata" / "metadata.sqlite3"
+    )
+    document_lifecycle_service = DocumentLifecycleService(
+        kb_service, metadata_store, Path(args.input_dir)
+    )
+    job_service = JobService(kb_service, metadata_store)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -863,6 +880,9 @@ def create_app(args):
         app.state.background_tasks = set()
 
         try:
+            await kb_service.initialize()
+            await metadata_store.initialize()
+
             # Initialize database connections
             # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
             await rag.initialize_storages()
@@ -876,6 +896,7 @@ def create_app(args):
 
         finally:
             # Clean up database connections
+            await kb_registry.shutdown()
             await rag.finalize_storages()
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
@@ -1983,81 +2004,110 @@ def create_app(args):
 
     # Initialize RAG with unified configuration
     try:
-        rag = LightRAG(
-            working_dir=args.working_dir,
-            workspace=args.workspace,
-            llm_model_func=create_llm_model_func(args.llm_binding),
-            llm_model_name=args.llm_model,
-            llm_model_max_async=args.max_async,
-            summary_max_tokens=args.summary_max_tokens,
-            summary_context_size=args.summary_context_size,
-            chunk_token_size=int(args.chunk_size),
-            chunk_overlap_token_size=int(args.chunk_overlap_size),
-            llm_model_kwargs=create_llm_model_kwargs(
-                args.llm_binding, args, llm_timeout
-            ),
-            embedding_func=embedding_func,
-            default_llm_timeout=llm_timeout,
-            default_embedding_timeout=embedding_timeout,
-            kv_storage=args.kv_storage,
-            graph_storage=args.graph_storage,
-            vector_storage=args.vector_storage,
-            doc_status_storage=args.doc_status_storage,
-            vector_db_storage_cls_kwargs={
-                "cosine_better_than_threshold": args.cosine_threshold
-            },
-            enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
-            enable_llm_cache=args.enable_llm_cache,
-            vlm_process_enable=args.vlm_process_enable,
-            rerank_model_func=rerank_model_func,
-            rerank_model_max_async=args.rerank_max_async,
-            default_rerank_timeout=args.rerank_timeout,
-            max_parallel_insert=args.max_parallel_insert,
-            max_graph_nodes=args.max_graph_nodes,
-            addon_params=addon_params,
-            ollama_server_infos=ollama_server_infos,
-            role_llm_configs={
-                spec.name: RoleLLMConfig(
-                    func=role_llm_configs[spec.name]["func"],
-                    kwargs=role_llm_configs[spec.name]["kwargs"],
-                    max_async=role_llm_configs[spec.name]["max_async"],
-                    timeout=role_llm_configs[spec.name]["timeout"],
-                    metadata={
-                        "base_binding": args.llm_binding,
-                        "binding": role_llm_configs[spec.name]["binding"],
-                        "model": role_llm_configs[spec.name]["model"],
-                        "host": role_llm_configs[spec.name]["host"],
-                        "api_key": role_llm_configs[spec.name]["api_key"],
-                        "provider_options": role_llm_configs[spec.name][
-                            "provider_options"
-                        ],
-                        "bedrock_aws_options": role_llm_configs[spec.name][
-                            "bedrock_aws_options"
-                        ],
-                        "is_cross_provider": role_llm_configs[spec.name][
-                            "is_cross_provider"
-                        ],
-                    },
+        def build_lightrag_for_workspace(workspace: str) -> LightRAG:
+            rag_instance = LightRAG(
+                working_dir=args.working_dir,
+                workspace=workspace,
+                llm_model_func=create_llm_model_func(args.llm_binding),
+                llm_model_name=args.llm_model,
+                llm_model_max_async=args.max_async,
+                summary_max_tokens=args.summary_max_tokens,
+                summary_context_size=args.summary_context_size,
+                chunk_token_size=int(args.chunk_size),
+                chunk_overlap_token_size=int(args.chunk_overlap_size),
+                llm_model_kwargs=create_llm_model_kwargs(
+                    args.llm_binding, args, llm_timeout
+                ),
+                embedding_func=embedding_func,
+                default_llm_timeout=llm_timeout,
+                default_embedding_timeout=embedding_timeout,
+                kv_storage=args.kv_storage,
+                graph_storage=args.graph_storage,
+                vector_storage=args.vector_storage,
+                doc_status_storage=args.doc_status_storage,
+                vector_db_storage_cls_kwargs={
+                    "cosine_better_than_threshold": args.cosine_threshold
+                },
+                enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
+                enable_llm_cache=args.enable_llm_cache,
+                vlm_process_enable=args.vlm_process_enable,
+                rerank_model_func=rerank_model_func,
+                rerank_model_max_async=args.rerank_max_async,
+                default_rerank_timeout=args.rerank_timeout,
+                max_parallel_insert=args.max_parallel_insert,
+                max_graph_nodes=args.max_graph_nodes,
+                addon_params=addon_params,
+                ollama_server_infos=ollama_server_infos,
+                role_llm_configs={
+                    spec.name: RoleLLMConfig(
+                        func=role_llm_configs[spec.name]["func"],
+                        kwargs=role_llm_configs[spec.name]["kwargs"],
+                        max_async=role_llm_configs[spec.name]["max_async"],
+                        timeout=role_llm_configs[spec.name]["timeout"],
+                        metadata={
+                            "base_binding": args.llm_binding,
+                            "binding": role_llm_configs[spec.name]["binding"],
+                            "model": role_llm_configs[spec.name]["model"],
+                            "host": role_llm_configs[spec.name]["host"],
+                            "api_key": role_llm_configs[spec.name]["api_key"],
+                            "provider_options": role_llm_configs[spec.name][
+                                "provider_options"
+                            ],
+                            "bedrock_aws_options": role_llm_configs[spec.name][
+                                "bedrock_aws_options"
+                            ],
+                            "is_cross_provider": role_llm_configs[spec.name][
+                                "is_cross_provider"
+                            ],
+                        },
+                    )
+                    for spec in ROLES
+                },
+            )
+            rag_instance.register_role_llm_builder(
+                lambda role, meta: (
+                    create_role_llm_func(role, meta),
+                    create_role_llm_model_kwargs(role, meta),
                 )
-                for spec in ROLES
-            },
-        )
+            )
+            return rag_instance
+
+        rag = build_lightrag_for_workspace(args.workspace)
     except Exception as e:
         logger.error(f"Failed to initialize LightRAG: {e}")
         raise
 
     _log_role_provider_options(rag)
 
-    rag.register_role_llm_builder(
-        lambda role, meta: (
-            create_role_llm_func(role, meta),
-            create_role_llm_model_kwargs(role, meta),
-        )
+    async def build_kb_lightrag(record: KnowledgeBaseRecord) -> LightRAG:
+        rag_instance = build_lightrag_for_workspace(record.workspace)
+        await rag_instance.initialize_storages()
+        await rag_instance.check_and_migrate_data()
+        return rag_instance
+
+    async def finalize_kb_lightrag(rag_instance: LightRAGLike) -> None:
+        await rag_instance.finalize_storages()
+
+    kb_registry = LightRAGInstanceRegistry(
+        kb_service,
+        builder=build_kb_lightrag,
+        finalizer=finalize_kb_lightrag,
     )
+    app.state.kb_service = kb_service
+    app.state.lightrag_registry = kb_registry
+    app.state.metadata_store = metadata_store
+    app.state.document_lifecycle_service = document_lifecycle_service
+    app.state.job_service = job_service
 
     # Add routes
     # root_path is set on the app for reverse proxy support;
     # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
+    app.include_router(create_kb_routes(kb_service, kb_registry, api_key, job_service))
+    app.include_router(
+        create_kb_document_routes(
+            document_lifecycle_service, job_service, api_key, registry=kb_registry
+        )
+    )
     app.include_router(create_document_routes(rag, doc_manager, api_key))
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
