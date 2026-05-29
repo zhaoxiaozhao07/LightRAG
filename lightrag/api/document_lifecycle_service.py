@@ -87,6 +87,7 @@ class DocumentBatchResult:
     job: JobRecord
     batch_id: str
     documents: list[DocumentRecord]
+    created: bool = True
 
 
 @dataclass(slots=True)
@@ -309,6 +310,7 @@ class DocumentLifecycleService:
                 job=created_job,
                 batch_id=created_job.batch_id or batch_id,
                 documents=created_documents,
+                created=created,
             )
         except Exception:
             self._cleanup_saved_sources(saved_paths, saved_dirs)

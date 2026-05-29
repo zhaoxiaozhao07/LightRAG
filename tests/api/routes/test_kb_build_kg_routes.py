@@ -589,7 +589,45 @@ def test_reindex_forces_rebuild_even_when_index_hash_matches(tmp_path):
     assert len(rag.enqueue_calls) == 2
 
 
-def test_reindex_deletes_old_index_so_pipeline_actually_reextracts(tmp_path):
+def test_reindex_jobs_use_reindex_job_type(tmp_path):
+    """:reindex / :batch-reindex must produce job_type='reindex' (the documented
+    contract + the worker's 'reindex' executor key), not 'build_kg'. :build-kg
+    stays 'build_kg'."""
+    client, *_ = _build_client(tmp_path)
+    _create_kb(client, "kb_jt")
+    doc_a = _upload_and_parse(client, "kb_jt", filename="a.pdf")
+    doc_b = _upload_and_parse(client, "kb_jt", filename="b.pdf")
+
+    # :build-kg keeps job_type=build_kg.
+    build = client.post(
+        f"/kbs/kb_jt/documents/{doc_a}:build-kg", json={}, headers=_HEADERS
+    )
+    assert build.status_code == 200, build.text
+    assert build.json()["job_type"] == "build_kg"
+
+    # Single :reindex -> job_type=reindex.
+    reindex = client.post(
+        f"/kbs/kb_jt/documents/{doc_a}:reindex", json={}, headers=_HEADERS
+    )
+    assert reindex.status_code == 200, reindex.text
+    assert reindex.json()["job_type"] == "reindex"
+
+    # Batch :batch-reindex -> aggregate job_type=reindex.
+    batch = client.post(
+        "/kbs/kb_jt/documents:batch-reindex",
+        json={"document_ids": [doc_a, doc_b]},
+        headers=_HEADERS,
+    )
+    assert batch.status_code == 200, batch.text
+    batch_job = client.get(
+        f"/kbs/kb_jt/jobs/{batch.json()['job_id']}", headers=_HEADERS
+    ).json()
+    assert batch_job["job_type"] == "reindex"
+
+    # Filtering jobs by job_type=reindex now returns them (contract honored).
+    listed = client.get("/kbs/kb_jt/jobs?status=succeeded", headers=_HEADERS).json()
+    reindex_jobs = [j for j in listed["jobs"] if j["job_type"] == "reindex"]
+    assert len(reindex_jobs) >= 2
     """Regression: a forced reindex of an already-built document must clear the
     old LightRAG doc first, otherwise the engine's enqueue dedup (filter_keys +
     filename/content-hash) silently drops the re-enqueue and reindex becomes a
@@ -824,15 +862,17 @@ def test_active_build_conflict_returns_409(tmp_path):
 
 
 def test_cancel_queued_job_marks_cancelled(tmp_path):
-    client, *_, _ = _build_client(tmp_path)
+    client, kb_service, _document_service, job_service, _probe = _build_client(tmp_path)
     _create_kb(client, "kb_cancel")
-    upload = client.post(
-        "/kbs/kb_cancel/documents:upload?auto_parse=true",
-        files=[("files", ("a.pdf", b"raw-bytes", "application/pdf"))],
-        headers=_HEADERS,
-    )
-    assert upload.status_code == 200
-    job_id = upload.json()["job_id"]
+
+    # Seed a queued job directly (a queued job awaiting a worker), then cancel.
+    async def _seed_queued() -> str:
+        job = await job_service.create_job(
+            "kb_cancel", job_type="parse", stage="parsing"
+        )
+        return job.id
+
+    job_id = asyncio.run(_seed_queued())
 
     cancel = client.post(
         f"/kbs/kb_cancel/jobs/{job_id}:cancel", headers=_HEADERS
@@ -1589,5 +1629,73 @@ def test_durable_delete_executor_redrives_queued_job(tmp_path):
         ).status_code
         == 404
     )
+
+
+def test_upload_auto_parse_actually_parses_in_process(tmp_path):
+    """Regression: multi-file upload with auto_parse=true must actually run the
+    parser in-process (not just enqueue an aggregate job that nothing executes).
+    The aggregate parse job reaches succeeded and each doc reaches 'parsed'."""
+    client, *_ = _build_client(tmp_path)
+    _create_kb(client, "kb_auto_parse")
+
+    response = client.post(
+        "/kbs/kb_auto_parse/documents:upload?auto_parse=true&parser_engine=mineru&process_options=iF",
+        files=[
+            ("files", ("a.pdf", b"a-bytes", "application/pdf")),
+            ("files", ("b.pdf", b"b-bytes", "application/pdf")),
+        ],
+        headers=_HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    job_id = payload["job_id"]
+    document_ids = [doc["id"] for doc in payload["documents"]]
+
+    # TestClient runs background tasks before returning, so the aggregate parse
+    # job has already executed to a terminal state.
+    job = client.get(f"/kbs/kb_auto_parse/jobs/{job_id}", headers=_HEADERS).json()
+    assert job["job_type"] == "parse"
+    assert job["status"] == "succeeded", job
+    assert job["completed_items"] == 2
+    item_docs = {item["document_id"] for item in job["result"]["items"]}
+    assert item_docs == set(document_ids)
+
+    for document_id in document_ids:
+        detail = client.get(
+            f"/kbs/kb_auto_parse/documents/{document_id}", headers=_HEADERS
+        ).json()
+        assert detail["status"] == "parsed"
+
+
+def test_texts_auto_parse_auto_index_reaches_ready(tmp_path):
+    """Regression: documents:texts with auto_parse=true&auto_index=true chains
+    parse + build in-process so each text doc reaches 'ready'."""
+    client, *_ = _build_client(tmp_path)
+    _create_kb(client, "kb_texts_ready")
+
+    response = client.post(
+        "/kbs/kb_texts_ready/documents:texts?auto_parse=true&auto_index=true",
+        json={
+            "documents": [
+                {"text": "hello world", "source_name": "note.md"},
+            ],
+            "auto_parse": True,
+            "auto_index": True,
+            "parser_engine": "docling",
+            "process_options": "iF",
+        },
+        headers=_HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    job = client.get(
+        f"/kbs/kb_texts_ready/jobs/{payload['job_id']}", headers=_HEADERS
+    ).json()
+    assert job["status"] == "succeeded", job
+    document_id = payload["documents"][0]["id"]
+    detail = client.get(
+        f"/kbs/kb_texts_ready/documents/{document_id}", headers=_HEADERS
+    ).json()
+    assert detail["status"] == "ready"
 
 

@@ -741,6 +741,192 @@ async def _execute_parse_plan(
         }
 
 
+async def _run_auto_parse_batch(
+    *,
+    document_service: DocumentLifecycleService,
+    job_service: JobService,
+    registry: LightRAGInstanceRegistry,
+    index_service: "IndexBuildService | None",
+    kb_id: str,
+    job: JobRecord,
+    document_ids: list[str],
+    auto_index: bool,
+) -> None:
+    """Background executor for multi-file ``upload`` / ``texts`` ``auto_parse``.
+
+    ``create_source_batch`` has already created the documents in
+    ``parse_queued`` and the aggregate ``parse`` job in ``queued``; this task
+    parses each document (and, when ``auto_index`` is set and an index service
+    is configured, chains the KG build to ``ready``), then aggregates per-item
+    results into the single aggregate job. Mirrors ``documents:batch-parse`` but
+    skips re-claiming (the docs are already claimed at creation).
+    """
+    item_results: list[dict[str, Any]] = []
+    completed_items = 0
+    failed_items = 0
+    try:
+        await job_service.transition_job(
+            kb_id,
+            job.id,
+            status="running",
+            progress=0.0,
+            result=_batch_parse_job_result(
+                batch_id=job.batch_id or "",
+                total_items=len(document_ids),
+                completed_items=0,
+                failed_items=0,
+                items=[],
+            ),
+        )
+        rag = await registry.get(kb_id) if document_ids else None
+        for document_id in document_ids:
+            if rag is None:
+                raise RuntimeError(
+                    "KB parse service did not return a LightRAG instance"
+                )
+            try:
+                plan = await document_service.create_parse_plan(kb_id, document_id)
+            except Exception as exc:  # noqa: BLE001 — per-item planning failure
+                item_results.append(
+                    {
+                        "document_id": document_id,
+                        "status": "failed",
+                        "error_code": "parse_failed",
+                        "error_message": str(exc),
+                    }
+                )
+                failed_items += 1
+                continue
+            item = await _execute_parse_plan(
+                document_service=document_service,
+                kb_id=kb_id,
+                job_id=job.id,
+                plan=plan,
+                rag=rag,
+                job_service=job_service,
+            )
+            # Optionally chain the index build so the doc reaches ``ready``.
+            if (
+                item["status"] == "succeeded"
+                and auto_index
+                and index_service is not None
+            ):
+                try:
+                    build_plan = await index_service.create_build_plan(
+                        kb_id, document_id, rag=rag
+                    )
+                    if not build_plan.skipped:
+                        await index_service.claim_build_queued(
+                            kb_id, job_id=job.id, plan=build_plan
+                        )
+                    build_item = await _execute_build_plan(
+                        index_service=index_service,
+                        kb_id=kb_id,
+                        job_id=job.id,
+                        plan=build_plan,
+                        rag=rag,
+                        job_service=job_service,
+                    )
+                    item["build_result"] = build_item
+                    if build_item["status"] not in {"succeeded", "cancelled"}:
+                        item["status"] = "failed"
+                        item["error_code"] = build_item.get("error_code")
+                        item["error_message"] = build_item.get("error_message")
+                except Exception as exc:  # noqa: BLE001
+                    item["status"] = "failed"
+                    item["error_code"] = "build_failed"
+                    item["error_message"] = str(exc)
+            item_results.append(item)
+            if item["status"] == "succeeded":
+                completed_items += 1
+            else:
+                failed_items += 1
+
+        final_status = "succeeded" if failed_items == 0 else "failed"
+        await job_service.transition_job(
+            kb_id,
+            job.id,
+            status=final_status,
+            progress=1.0,
+            completed_items=completed_items,
+            failed_items=failed_items,
+            result=_batch_parse_job_result(
+                batch_id=job.batch_id or "",
+                total_items=len(document_ids),
+                completed_items=completed_items,
+                failed_items=failed_items,
+                items=item_results,
+            ),
+            error_code=None if failed_items == 0 else "partial_parse_failed",
+            error_message=None
+            if failed_items == 0
+            else _batch_parse_failure_message(failed_items, len(document_ids)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Failed to run auto-parse job '%s' for KB '%s': %s",
+            job.id,
+            kb_id,
+            exc,
+        )
+        processed_ids = {item["document_id"] for item in item_results}
+        for document_id in document_ids:
+            if document_id in processed_ids:
+                continue
+            try:
+                fallback_plan = await document_service.create_parse_plan(
+                    kb_id, document_id
+                )
+                await document_service.fail_parse(
+                    kb_id,
+                    document_id,
+                    job_id=job.id,
+                    plan=fallback_plan,
+                    error_code="parse_failed",
+                    error_message=str(exc),
+                )
+            except Exception as transition_exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to mark document '%s' failed for auto-parse job '%s': %s",
+                    document_id,
+                    job.id,
+                    transition_exc,
+                )
+            item_results.append(
+                {
+                    "document_id": document_id,
+                    "status": "failed",
+                    "error_code": "parse_failed",
+                    "error_message": str(exc),
+                }
+            )
+            failed_items += 1
+        try:
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                completed_items=completed_items,
+                failed_items=failed_items,
+                result=_batch_parse_job_result(
+                    batch_id=job.batch_id or "",
+                    total_items=len(document_ids),
+                    completed_items=completed_items,
+                    failed_items=failed_items,
+                    items=item_results,
+                ),
+                error_code="batch_parse_failed",
+                error_message=str(exc),
+            )
+        except InvalidJobTransitionError:
+            logger.warning(
+                "Auto-parse job '%s' for KB '%s' was already terminal",
+                job.id,
+                kb_id,
+            )
+
+
 def _batch_parse_job_result(
     *,
     batch_id: str,
@@ -1174,6 +1360,31 @@ def create_kb_document_routes(
     router = APIRouter(prefix="/kbs", tags=["knowledge-base-documents"])
     combined_auth = get_combined_auth_dependency(api_key)
 
+    def _schedule_auto_parse(
+        background_tasks: BackgroundTasks,
+        *,
+        kb_id: str,
+        job: JobRecord,
+        documents: list[DocumentRecord],
+        auto_index: bool,
+    ) -> None:
+        """Schedule the in-process auto-parse executor for a freshly-created
+        multi-file upload / texts batch (job_type=parse, document_id=None)."""
+        if registry is None:
+            return
+        document_ids = [document.id for document in documents]
+        background_tasks.add_task(
+            _run_auto_parse_batch,
+            document_service=document_service,
+            job_service=job_service,
+            registry=registry,
+            index_service=index_service,
+            kb_id=kb_id,
+            job=job,
+            document_ids=document_ids,
+            auto_index=auto_index,
+        )
+
     @router.post(
         "/{kb_id}/documents:upload",
         response_model=DocumentBatchResponse,
@@ -1182,6 +1393,7 @@ def create_kb_document_routes(
     )
     async def upload_documents(
         kb_id: str,
+        background_tasks: BackgroundTasks,
         files: list[UploadFile] = File(...),
         auto_parse: bool = False,
         auto_index: bool = False,
@@ -1232,6 +1444,14 @@ def create_kb_document_routes(
                 process_options=process_options,
                 idempotency_key=idempotency_key,
             )
+            if auto_parse and result.created and registry is not None:
+                _schedule_auto_parse(
+                    background_tasks,
+                    kb_id=kb_id,
+                    job=result.job,
+                    documents=result.documents,
+                    auto_index=auto_index,
+                )
             return DocumentBatchResponse(
                 job_id=result.job.id,
                 batch_id=result.batch_id,
@@ -1259,7 +1479,11 @@ def create_kb_document_routes(
         dependencies=[Depends(combined_auth)],
         summary="Import text documents to a knowledge base metadata stage",
     )
-    async def import_text_documents(kb_id: str, request: TextDocumentsRequest):
+    async def import_text_documents(
+        kb_id: str,
+        background_tasks: BackgroundTasks,
+        request: TextDocumentsRequest,
+    ):
         try:
             _validate_text_document_sizes(request.documents)
             sources = [
@@ -1279,6 +1503,14 @@ def create_kb_document_routes(
                 process_options=request.process_options,
                 idempotency_key=request.idempotency_key,
             )
+            if request.auto_parse and result.created and registry is not None:
+                _schedule_auto_parse(
+                    background_tasks,
+                    kb_id=kb_id,
+                    job=result.job,
+                    documents=result.documents,
+                    auto_index=request.auto_index,
+                )
             return DocumentBatchResponse(
                 job_id=result.job.id,
                 batch_id=result.batch_id,
@@ -3135,6 +3367,7 @@ def create_kb_document_routes(
         force_embedding: bool,
         idempotency_key: Optional[str],
         background_tasks: BackgroundTasks,
+        job_type: str = "build_kg",
     ) -> JobResponse:
         if registry is None or index_service is None:
             raise HTTPException(
@@ -3165,6 +3398,7 @@ def create_kb_document_routes(
             force_rechunk=force_rechunk,
             force_extract=force_extract,
             force_embedding=force_embedding,
+            job_type=job_type,
             idempotency_key=idempotency_key,
         )
         if not created_job:
@@ -3395,6 +3629,7 @@ def create_kb_document_routes(
                 force_embedding=request.force_embedding,
                 idempotency_key=request.idempotency_key,
                 background_tasks=background_tasks,
+                job_type="reindex",
             )
         except HTTPException:
             raise
@@ -3434,6 +3669,7 @@ def create_kb_document_routes(
         force_embedding: bool,
         idempotency_key: Optional[str],
         background_tasks: BackgroundTasks,
+        job_type: str = "build_kg",
     ) -> DocumentBatchResponse:
         if registry is None or index_service is None:
             raise HTTPException(
@@ -3461,6 +3697,7 @@ def create_kb_document_routes(
             force_rechunk=force_rechunk,
             force_extract=force_extract,
             force_embedding=force_embedding,
+            job_type=job_type,
             idempotency_key=idempotency_key,
         )
         if not created_job:
@@ -3692,6 +3929,7 @@ def create_kb_document_routes(
                 force_embedding=request.force_embedding,
                 idempotency_key=request.idempotency_key,
                 background_tasks=background_tasks,
+                job_type="reindex",
             )
         except HTTPException:
             raise

@@ -122,7 +122,8 @@ files: [a.pdf, b.docx]
 约束：
 - 单请求最多 32 个文件，单文件和单请求总字节数均不得超过 `MAX_UPLOAD_SIZE`，未配置或非正数时 `413`。
 - 文件扩展名必须在 `SUPPORTED_DOCUMENT_EXTENSIONS` 列表中。
-- `auto_parse=true` 会创建 `parse` 队列任务；`auto_parse=false` 仅落 metadata，job 立即标记 `succeeded`。
+- `auto_parse=true` 会创建一个 `job_type=parse` 的聚合任务（`document_id=null`、`batch_id` 非空、payload 携带 `document_ids` 列表），并在后台**实际逐个执行解析**（每个文档 `parse_queued → parsing → parsed`），结果聚合进该 job 的 `result.items[]`；同时 `auto_index=true` 会在每个文档解析成功后串联 KG 构建到 `ready`（需路由注入 `IndexBuildService`）。`auto_parse=false` 仅落 metadata，job 立即标记 `succeeded`。
+- 注意：该聚合 parse/build 任务由创建请求的 in-process 后台任务执行;它**不会**被 durable worker 认领（worker 仅认领 `document_id IS NOT NULL` 的单文档任务），因此服务在执行中途重启不会自动续跑该聚合任务，需重新发起。
 - 同名文件会写入独立的 `<workspace>/<document_id>/<filename>` 目录，使用独占创建 (`O_EXCL`)。
 
 返回 `DocumentBatchResponse`：
@@ -159,6 +160,7 @@ Content-Type: application/json
 - 单文档文本上限 1 MB，单 metadata JSON 上限 64 KB。
 - 单请求最多 100 个文本。
 - `idempotency_key` 在 `(kb_id, job_type)` 维度唯一；指纹一致直接返回原 batch；指纹不一致返回 `409`。
+- `auto_parse=true` 与多文件 `:upload` 一致：创建 `job_type=parse` 聚合任务并在后台逐个解析；`auto_index=true` 解析成功后串联 KG 构建到 `ready`（需注入 `IndexBuildService`）。该聚合任务由 in-process 后台任务执行，不被 durable worker 认领。
 
 ### 2.3 批量增量同步
 
@@ -447,7 +449,7 @@ GET /kbs/{kb_id}/jobs/{job_id}
 | 字段 | 说明 |
 |---|---|
 | `id` | 任务 ID |
-| `job_type` | `upload` / `parse` / `build_kg` / `reindex` / `delete` / `replace` / `sync` / `clear_kb`（批量解析/构建/删除复用聚合 `parse`/`build_kg`/`delete` job 并带 `batch_id`） |
+| `job_type` | `upload` / `parse` / `build_kg` / `reindex` / `delete` / `replace` / `sync` / `clear_kb`。`:reindex` / `:batch-reindex` 产出 `job_type=reindex`（与 `:build-kg` 的 `build_kg` 区分）；批量解析/构建/删除复用聚合 `parse` / `build_kg` / `reindex` / `delete` job（`document_id=null` + `batch_id`），`:rebuild` 复用聚合 `build_kg`。 |
 | `status` | `queued` / `running` / `succeeded` / `failed` / `cancelling` / `cancelled` / `retrying` |
 | `stage` | 当前阶段：`uploading` / `parsing` / `building` / `deleting` 等 |
 | `progress` | 0.0 ~ 1.0 |
@@ -497,7 +499,8 @@ Content-Type: application/json
 - **自动消费 `:retry`**：重试把任务重置回 `queued` 后，worker 在下一轮轮询中认领并重跑，客户端无需再次发起业务请求。
 - **重启续跑**：进程重启时，孤儿恢复会保留这些可恢复类型的 `queued` 任务（不再标 `failed`）交给 worker 继续执行；仍处于 `running` 的中途任务无法安全恢复，照旧标 `failed`，其文档同步重置为 `*_failed`，客户端 `:retry` 后即可被 worker 自动重跑。单文档 `delete` 续跑时若孤儿恢复已把文档从 `deleting` 重置为 `delete_failed`，worker 会重新 claim 回 `deleting` 再执行（`_claim_document_deleting` 接受 `delete_failed`）。
 - **不抢占新任务**：worker 只认领 `queued_at` 早于宽限窗口（`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`，默认 5s）的任务；新建任务由其 in-process 背景任务在毫秒级转入 `running`，因此不会被 worker 抢跑，避免重复执行。
-- **暂不可恢复的类型**：`replace`、批量 `sync`、批量 `delete`（`document_id=null`）、`upload` 等依赖请求级上传字节或一次性上下文的任务未纳入 worker 自动恢复；它们重启后仍标 `failed`，需要重新发起请求。
+- **仅认领单文档任务**：worker 的认领条件为 `status='queued' AND document_id IS NOT NULL AND job_type IN (...)`。聚合任务（多文件 `upload` 的 auto_parse、`batch-parse`/`batch-build`/`batch-reindex`/`batch-delete`、`sync`，均 `document_id=null`、payload 携带 `document_ids` 列表）**不会**被认领（单文档执行器无法重建它们,否则会误标 `worker_invalid_payload`），由创建请求的 in-process 任务负责;孤儿恢复也会把这类聚合 queued 任务直接标 `failed`，不会留为永不被认领的僵尸。
+- **暂不可恢复的类型**：`replace`、批量 `sync`、批量 `delete`（`document_id=null`）、`upload`/`texts` 的 auto_parse 聚合任务等依赖请求级上传字节或一次性上下文的任务未纳入 worker 自动恢复；它们重启后仍标 `failed`，需要重新发起请求。
 - 可调环境变量：`LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS`（默认 1.0s）、`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`（默认 5.0s）。
 
 ### 5.6 等待任务终态

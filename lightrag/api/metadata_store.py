@@ -1649,9 +1649,14 @@ class SQLiteMetadataStore:
             now = utc_now_iso()
             for row in rows:
                 # Leave resumable queued jobs for the durable worker to pick up.
+                # Only SINGLE-document jobs are resumable: the worker claims by
+                # job_type AND document_id IS NOT NULL, so an aggregate job
+                # (document_id NULL — e.g. batch-delete) left queued here would
+                # never be claimed. Fail those so they don't leak as zombies.
                 if (
                     row["status"] == "queued"
                     and row["job_type"] in resumable
+                    and row["document_id"] is not None
                 ):
                     continue
                 conn.execute(
@@ -1731,13 +1736,24 @@ class SQLiteMetadataStore:
         flips to ``running`` within milliseconds) are not stolen mid-creation;
         only jobs that have sat ``queued`` beyond the window — retried jobs and
         jobs whose owner crashed/restarted — are claimed.
+
+        Only single-document jobs (``document_id IS NOT NULL``) are eligible.
+        Aggregate jobs — multi-file ``upload``, ``batch-parse`` / ``batch-build``
+        / ``batch-delete`` and ``sync`` — carry ``document_id = NULL`` and a
+        ``document_ids`` list in their payload; the single-document executors
+        cannot re-drive them (they would fail with ``worker_invalid_payload``),
+        so they are excluded here and remain the owner task's / a future
+        batch-aware worker's responsibility.
         """
         await self._ensure_initialized()
         if not job_types:
             return None
         placeholders = ",".join("?" for _ in job_types)
         params: list[Any] = list(job_types)
-        where = f"status = 'queued' AND job_type IN ({placeholders})"
+        where = (
+            f"status = 'queued' AND document_id IS NOT NULL "
+            f"AND job_type IN ({placeholders})"
+        )
         if max_queued_at is not None:
             where += " AND queued_at <= ?"
             params.append(max_queued_at)

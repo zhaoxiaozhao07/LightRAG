@@ -132,7 +132,12 @@ class BuilderProbe:
         return None
 
 
-def _build_client(tmp_path: Path, *, probe: BuilderProbe | None = None):
+def _build_client(
+    tmp_path: Path,
+    *,
+    probe: BuilderProbe | None = None,
+    wire_document_registry: bool = True,
+):
     kb_service = KnowledgeBaseService(tmp_path / "metadata" / "knowledge_bases.json")
     metadata_store = SQLiteMetadataStore(tmp_path / "metadata" / "metadata.sqlite3")
     document_service = DocumentLifecycleService(
@@ -147,9 +152,15 @@ def _build_client(tmp_path: Path, *, probe: BuilderProbe | None = None):
             kb_service, registry, api_key=_API_KEY, job_service=job_service
         )
     )
+    # wire_document_registry=False mimics "no parse worker wired": auto_parse
+    # uploads still persist metadata + a queued parse job but do not execute,
+    # so tests can assert the queued snapshot deterministically.
     app.include_router(
         create_kb_document_routes(
-            document_service, job_service, api_key=_API_KEY, registry=registry
+            document_service,
+            job_service,
+            api_key=_API_KEY,
+            registry=registry if wire_document_registry else None,
         )
     )
     return TestClient(app), kb_service, metadata_store, document_service, job_service
@@ -197,8 +208,10 @@ def _upload_and_parse_document(
 def test_upload_persists_documents_jobs_and_running_status(tmp_path):
     initialize_share_data()
     try:
+        # No parse worker wired: auto_parse persists metadata + a queued parse
+        # job without executing, so the queued/running snapshot is stable.
         client, _kb_service, _store, _document_service, _job_service = _build_client(
-            tmp_path
+            tmp_path, wire_document_registry=False
         )
         kb = _create_kb(client, "kb_upload")
 
@@ -1695,13 +1708,38 @@ def test_parse_document_rejects_existing_active_parse_job(tmp_path):
     )
     _create_kb(client, "kb_parse_active")
     upload = client.post(
-        "/kbs/kb_parse_active/documents:upload?auto_parse=true",
+        "/kbs/kb_parse_active/documents:upload",
         files=[("files", ("paper.pdf", b"pdf", "application/pdf"))],
         headers=_HEADERS,
     )
     assert upload.status_code == 200
-    active_job_id = upload.json()["job_id"]
     document_id = upload.json()["documents"][0]["id"]
+
+    # Deterministically seed an active parse claim (doc -> parse_queued with a
+    # pending job) without running the parser, so the second :parse hits 409.
+    async def _seed_active_parse() -> str:
+        plan = await _document_service.create_parse_plan(
+            "kb_parse_active",
+            document_id,
+            parser_engine="mineru",
+            process_options="iF",
+        )
+        job, _created = await _job_service.create_parse_job_once(
+            "kb_parse_active",
+            document_id=document_id,
+            parser_hash=plan.parser_hash,
+            lightrag_doc_id=plan.lightrag_doc_id,
+            parser_engine=plan.parser_engine,
+            process_options=plan.process_options,
+            source_uri=str(plan.source_path),
+            source_hash=plan.document.source_hash,
+        )
+        await _document_service.mark_parse_queued(
+            "kb_parse_active", document_id, job=job, plan=plan
+        )
+        return job.id
+
+    active_job_id = asyncio.run(_seed_active_parse())
 
     response = client.post(
         f"/kbs/kb_parse_active/documents/{document_id}:parse",
@@ -1729,6 +1767,7 @@ def test_parse_document_rejects_existing_active_parse_job(tmp_path):
     assert failed_jobs.status_code == 200
     assert failed_jobs.json()["total"] == 1
     assert failed_jobs.json()["jobs"][0]["error_code"] == "parse_job_active"
+    # The second :parse was rejected before building any LightRAG instance.
     assert probe.instances == []
 
 

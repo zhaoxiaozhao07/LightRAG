@@ -444,6 +444,7 @@ class JobService:
         force_rechunk: bool = False,
         force_extract: bool = False,
         force_embedding: bool = False,
+        job_type: str = "build_kg",
         idempotency_key: str | None = None,
     ) -> tuple[JobRecord, bool]:
         record = await self._kb_service.get(kb_id)
@@ -468,7 +469,7 @@ class JobService:
             workspace=record.workspace,
             batch_id=None,
             document_id=document_id,
-            job_type="build_kg",
+            job_type=job_type,
             status="queued",
             stage="building",
             progress=0.0,
@@ -505,6 +506,7 @@ class JobService:
         force_rechunk: bool = False,
         force_extract: bool = False,
         force_embedding: bool = False,
+        job_type: str = "build_kg",
         idempotency_key: str | None = None,
     ) -> tuple[JobRecord, bool]:
         payload = {
@@ -518,7 +520,7 @@ class JobService:
         payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
         return await self.create_job_once(
             kb_id,
-            job_type="build_kg",
+            job_type=job_type,
             batch_id=batch_id,
             document_id=None,
             stage="building",
