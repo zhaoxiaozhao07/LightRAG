@@ -222,6 +222,7 @@ def build_parse_executor(
             job_id=job.id,
             plan=plan,
             rag=rag,
+            job_service=job_service,
         )
         if item["status"] == "succeeded":
             await job_service.transition_job(
@@ -237,6 +238,15 @@ def build_parse_executor(
                     "artifact_count": item["artifact_count"],
                     "resumed_by_worker": True,
                 },
+            )
+        elif item["status"] == "cancelled":
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="cancelled",
+                progress=1.0,
+                error_code="cancelled_by_user",
+                error_message=item.get("error_message"),
             )
         else:
             await job_service.transition_job(
@@ -294,6 +304,7 @@ def build_build_kg_executor(
             job_id=job.id,
             plan=plan,
             rag=rag,
+            job_service=job_service,
         )
         if item["status"] == "succeeded":
             await job_service.transition_job(
@@ -310,6 +321,96 @@ def build_build_kg_executor(
                     "chunks_count": item.get("chunks_count"),
                     "entity_count": item.get("entity_count"),
                     "relation_count": item.get("relation_count"),
+                    "resumed_by_worker": True,
+                },
+            )
+        elif item["status"] == "cancelled":
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="cancelled",
+                progress=1.0,
+                error_code="cancelled_by_user",
+                error_message=item.get("error_message"),
+            )
+        else:
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                failed_items=1,
+                error_code=item["error_code"],
+                error_message=item["error_message"],
+            )
+
+    return _run
+
+
+def build_delete_executor(
+    *,
+    document_service: Any,
+    registry: Any,
+    job_service: JobService,
+) -> JobExecutor:
+    """Executor that re-drives a single-document ``delete`` job.
+
+    Delete only needs the document id + delete options (all persisted on the
+    job payload), so it is safe to resume after a crash — unlike replace/sync
+    which need the request's uploaded bytes. On restart, orphan recovery resets
+    the document ``deleting -> delete_failed``; this executor re-claims it back
+    into ``deleting`` (``_claim_document_deleting`` accepts ``delete_failed``)
+    and re-runs the same delete used by the route. Batch delete jobs
+    (``document_id=None``) are not auto-resumed and are skipped here.
+    """
+    from lightrag.api.routers.kb_document_routes import _execute_delete_document_impl
+
+    async def _run(job: JobRecord) -> None:
+        kb_id = job.kb_id
+        payload = job.payload or {}
+        document_id = job.document_id or payload.get("document_id")
+        if not document_id:
+            # Batch delete (document_id=None) is not auto-resumable.
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                failed_items=1,
+                error_code="worker_invalid_payload",
+                error_message="delete job has no single document_id to resume",
+            )
+            return
+        delete_source_file = bool(payload.get("delete_source_file", False))
+        delete_artifacts = bool(payload.get("delete_artifacts", False))
+        delete_llm_cache = bool(payload.get("delete_llm_cache", False))
+        document = await document_service.claim_delete(
+            kb_id,
+            document_id,
+            job=job,
+            delete_source_file=delete_source_file,
+            delete_artifacts=delete_artifacts,
+        )
+        item = await _execute_delete_document_impl(
+            document_service=document_service,
+            kb_id=kb_id,
+            job_id=job.id,
+            document=document,
+            active_registry=registry,
+            delete_source_file=delete_source_file,
+            delete_artifacts=delete_artifacts,
+            delete_llm_cache=delete_llm_cache,
+        )
+        if item["status"] == "succeeded":
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="succeeded",
+                progress=1.0,
+                completed_items=1,
+                result={
+                    "document_id": item["document_id"],
+                    "lightrag_doc_id": item.get("lightrag_doc_id"),
                     "resumed_by_worker": True,
                 },
             )

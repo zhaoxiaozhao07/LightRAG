@@ -153,6 +153,7 @@ class FakeRAG:
         self.enqueue_calls: list[dict] = []
         self.delete_calls: list[tuple[str, bool]] = []
         self.process_calls: int = 0
+        self.parse_calls: list[str] = []
 
     async def finalize_storages(self) -> None:
         return None
@@ -175,6 +176,7 @@ class FakeRAG:
         return await self._parse("docling", doc_id, file_path, content_data)
 
     async def _parse(self, engine, doc_id, file_path, content_data):
+        self.parse_calls.append(doc_id)
         source_path = Path(file_path)
         parsed_dir = source_path.parent / "__parsed__" / f"{source_path.name}.parsed"
         parsed_dir.mkdir(parents=True, exist_ok=True)
@@ -1341,3 +1343,251 @@ def test_durable_build_executor_redrives_queued_job(tmp_path):
     assert job["result"]["resumed_by_worker"] is True
     detail = client.get(f"/kbs/kb_bexec/documents/{document_id}", headers=_HEADERS).json()
     assert detail["status"] == "ready"
+
+
+def test_build_executor_honors_cancelling_checkpoint(tmp_path):
+    """A running build job flipped to 'cancelling' must stop at the executor's
+    entry checkpoint: the pipeline is NOT invoked, the job goes to 'cancelled',
+    and the document is released to 'build_failed' (retryable)."""
+    client, kb_service, document_service, job_service, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_build_cancel")
+    index_service = IndexBuildService(document_service)
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+    document_id = _upload_and_parse(client, "kb_build_cancel")
+
+    async def _drive() -> tuple[str, object]:
+        document = await document_service.get_document("kb_build_cancel", document_id)
+        rag = await registry.get("kb_build_cancel")
+        plan = await index_service.create_build_plan(
+            "kb_build_cancel", document_id, rag=rag
+        )
+        job, _created = await job_service.create_build_job_once(
+            "kb_build_cancel",
+            document_id=document_id,
+            parser_hash=plan.parser_hash,
+            index_hash=plan.index_hash,
+            source_hash=document.source_hash,
+            lightrag_doc_id=document.lightrag_doc_id,
+            sidecar_uri=plan.sidecar_uri,
+            blocks_path=plan.blocks_path,
+            process_options=plan.process_options,
+        )
+        await index_service.claim_build_queued(
+            "kb_build_cancel", job_id=job.id, plan=plan
+        )
+        # Simulate :cancel on a running job: running -> cancelling.
+        await document_service.metadata_store.transition_job(
+            "kb_build_cancel", job.id, status="running", progress=0.1
+        )
+        await document_service.metadata_store.transition_job(
+            "kb_build_cancel", job.id, status="cancelling"
+        )
+        item = await _kb_document_routes._execute_build_plan(
+            index_service=index_service,
+            kb_id="kb_build_cancel",
+            job_id=job.id,
+            plan=plan,
+            rag=rag,
+            job_service=job_service,
+        )
+        return job.id, item
+
+    try:
+        job_id, item = asyncio.run(_drive())
+    finally:
+        asyncio.run(registry.shutdown())
+
+    assert item["status"] == "cancelled"
+    rag = probe.instances[0]
+    # Checkpoint fired BEFORE any pipeline call.
+    assert rag.enqueue_calls == []
+    assert rag.process_calls == 0
+    detail = client.get(
+        f"/kbs/kb_build_cancel/documents/{document_id}", headers=_HEADERS
+    ).json()
+    assert detail["status"] == "build_failed"
+
+
+def test_parse_executor_honors_cancelling_checkpoint(tmp_path):
+    """A running parse job flipped to 'cancelling' stops at the checkpoint:
+    parser NOT invoked, document released to 'parse_failed' (retryable)."""
+    client, kb_service, document_service, job_service, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_parse_cancel")
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+
+    upload = client.post(
+        "/kbs/kb_parse_cancel/documents:upload",
+        files=[("files", ("paper.pdf", b"pdf-bytes", "application/pdf"))],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200
+    document_id = upload.json()["documents"][0]["id"]
+
+    async def _drive() -> tuple[str, object, object]:
+        document = await document_service.get_document("kb_parse_cancel", document_id)
+        plan = await document_service.create_parse_plan(
+            "kb_parse_cancel", document_id, parser_engine="mineru", process_options="iF"
+        )
+        job, _created = await job_service.create_parse_job_once(
+            "kb_parse_cancel",
+            document_id=document_id,
+            parser_hash=plan.parser_hash,
+            lightrag_doc_id=document.lightrag_doc_id,
+            parser_engine=plan.parser_engine,
+            process_options=plan.process_options,
+            source_uri=str(plan.source_path),
+            source_hash=document.source_hash,
+        )
+        await document_service.mark_parse_queued(
+            "kb_parse_cancel", document_id, job=job, plan=plan
+        )
+        await document_service.metadata_store.transition_job(
+            "kb_parse_cancel", job.id, status="running", progress=0.1
+        )
+        await document_service.metadata_store.transition_job(
+            "kb_parse_cancel", job.id, status="cancelling"
+        )
+        rag = await registry.get("kb_parse_cancel")
+        item = await _kb_document_routes._execute_parse_plan(
+            document_service=document_service,
+            kb_id="kb_parse_cancel",
+            job_id=job.id,
+            plan=plan,
+            rag=rag,
+            job_service=job_service,
+        )
+        return job.id, item, rag
+
+    try:
+        job_id, item, rag = asyncio.run(_drive())
+    finally:
+        asyncio.run(registry.shutdown())
+
+    assert item["status"] == "cancelled"
+    assert rag.parse_calls == []  # parser never invoked
+    detail = client.get(
+        f"/kbs/kb_parse_cancel/documents/{document_id}", headers=_HEADERS
+    ).json()
+    assert detail["status"] == "parse_failed"
+
+
+def test_delete_with_rebuild_kb_strategy_reindexes_survivors(tmp_path):
+    """strategy='rebuild_kb' deletes the target then force-reindexes the
+    remaining buildable documents (conservative shared-graph repair). The
+    surviving doc is re-enqueued and the delete job records a rebuild summary."""
+    client, kb_service, document_service, job_service, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_del_rebuild")
+    doc_a = _upload_and_parse(client, "kb_del_rebuild", filename="a.pdf")
+    doc_b = _upload_and_parse(client, "kb_del_rebuild", filename="b.pdf")
+    for document_id in (doc_a, doc_b):
+        built = client.post(
+            f"/kbs/kb_del_rebuild/documents/{document_id}:build-kg",
+            json={},
+            headers=_HEADERS,
+        )
+        assert built.status_code == 200, built.text
+    rag = probe.instances[0]
+    assert len(rag.enqueue_calls) == 2  # both docs initially built
+
+    delete = client.delete(
+        f"/kbs/kb_del_rebuild/documents/{doc_a}?strategy=rebuild_kb",
+        headers=_HEADERS,
+    )
+    assert delete.status_code == 200, delete.text
+    job = client.get(
+        f"/kbs/kb_del_rebuild/jobs/{delete.json()['id']}", headers=_HEADERS
+    ).json()
+    assert job["status"] == "succeeded", job
+    rebuild = job["result"]["rebuild"]
+    assert rebuild["strategy"] == "rebuild_kb"
+    # doc_a is deleted; only the survivor doc_b is a rebuild candidate.
+    assert rebuild["rebuilt_documents"] == 1
+    assert rebuild["failed_documents"] == 0
+    assert rebuild["total_candidates"] == 1
+    # Survivor was force re-enqueued: deleted (doc_a) + 2 initial builds + 1 rebuild.
+    assert len(rag.enqueue_calls) == 3
+    assert rag.enqueue_calls[-1]["ids"] != []
+    # doc_a is gone, doc_b still ready.
+    assert (
+        client.get(
+            f"/kbs/kb_del_rebuild/documents/{doc_a}", headers=_HEADERS
+        ).status_code
+        == 404
+    )
+    survivor = client.get(
+        f"/kbs/kb_del_rebuild/documents/{doc_b}", headers=_HEADERS
+    ).json()
+    assert survivor["status"] == "ready"
+
+
+def test_durable_delete_executor_redrives_queued_job(tmp_path):
+    """Exercise the REAL build_delete_executor (durable worker): a queued delete
+    job for a document is re-driven to completion from persisted payload, even
+    after orphan recovery reset the doc to delete_failed."""
+    from lightrag.api.job_worker import build_delete_executor
+
+    client, kb_service, document_service, job_service, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_delexec")
+    metadata_store = document_service.metadata_store
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+    document_id = _upload_and_parse(client, "kb_delexec")
+    built = client.post(
+        f"/kbs/kb_delexec/documents/{document_id}:build-kg", json={}, headers=_HEADERS
+    )
+    assert built.status_code == 200, built.text
+
+    async def _drive() -> tuple[str, str]:
+        document = await document_service.get_document("kb_delexec", document_id)
+        lightrag_doc_id = document.lightrag_doc_id
+        job, _created = await job_service.create_delete_job_once(
+            "kb_delexec",
+            document_id=document_id,
+            lightrag_doc_id=lightrag_doc_id,
+            delete_source_file=False,
+            delete_artifacts=False,
+            delete_llm_cache=False,
+        )
+        # Simulate a crash mid-delete + restart recovery: the doc was claimed
+        # into 'deleting' then reset to 'delete_failed', job left queued.
+        await metadata_store.claim_document_deleting(
+            "kb_delexec", document_id, metadata_patch={"pending_delete_job_id": job.id}
+        )
+        await document_service.fail_delete(
+            "kb_delexec",
+            document_id,
+            job_id=job.id,
+            error_code="worker_orphaned",
+            error_message="crash",
+        )
+        executor = build_delete_executor(
+            document_service=document_service,
+            registry=registry,
+            job_service=job_service,
+        )
+        claimed = await metadata_store.claim_next_worker_job(
+            job_types=["delete"], max_queued_at=None
+        )
+        assert claimed is not None and claimed.id == job.id
+        await executor(claimed)
+        return job.id, lightrag_doc_id
+
+    try:
+        job_id, lightrag_doc_id = asyncio.run(_drive())
+    finally:
+        asyncio.run(registry.shutdown())
+
+    job = client.get(f"/kbs/kb_delexec/jobs/{job_id}", headers=_HEADERS).json()
+    assert job["status"] == "succeeded", job
+    assert job["result"]["resumed_by_worker"] is True
+    # The old LightRAG doc was actually deleted via the engine. The delete ran
+    # through this test's own registry instance (the last one the probe built).
+    assert probe.instances[-1].delete_calls == [(lightrag_doc_id, False)]
+    # Document is soft-deleted (404 on fetch).
+    assert (
+        client.get(
+            f"/kbs/kb_delexec/documents/{document_id}", headers=_HEADERS
+        ).status_code
+        == 404
+    )
+
+

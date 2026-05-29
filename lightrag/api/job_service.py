@@ -536,6 +536,8 @@ class JobService:
         delete_source_file: bool = False,
         delete_artifacts: bool = False,
         delete_llm_cache: bool = False,
+        delete_graph_orphans: bool = True,
+        strategy: str = "safe",
         idempotency_key: str | None = None,
     ) -> tuple[JobRecord, bool]:
         payload = {
@@ -544,6 +546,8 @@ class JobService:
             "delete_source_file": delete_source_file,
             "delete_artifacts": delete_artifacts,
             "delete_llm_cache": delete_llm_cache,
+            "delete_graph_orphans": delete_graph_orphans,
+            "strategy": strategy,
         }
         payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
         return await self.create_job_once(
@@ -617,6 +621,8 @@ class JobService:
         delete_source_file: bool = False,
         delete_artifacts: bool = False,
         delete_llm_cache: bool = False,
+        delete_graph_orphans: bool = True,
+        strategy: str = "safe",
         idempotency_key: str | None = None,
     ) -> tuple[JobRecord, bool]:
         payload = {
@@ -624,6 +630,8 @@ class JobService:
             "delete_source_file": delete_source_file,
             "delete_artifacts": delete_artifacts,
             "delete_llm_cache": delete_llm_cache,
+            "delete_graph_orphans": delete_graph_orphans,
+            "strategy": strategy,
         }
         payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
         return await self.create_job_once(

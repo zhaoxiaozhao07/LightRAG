@@ -2197,6 +2197,7 @@ def create_app(args):
         from lightrag.api.job_worker import (
             JobWorker,
             build_build_kg_executor,
+            build_delete_executor,
             build_parse_executor,
         )
 
@@ -2211,12 +2212,18 @@ def create_app(args):
             registry=kb_registry,
             job_service=job_service,
         )
+        delete_executor = build_delete_executor(
+            document_service=document_lifecycle_service,
+            registry=kb_registry,
+            job_service=job_service,
+        )
         job_worker = JobWorker(
             job_service,
             executors={
                 "parse": parse_executor,
                 "build_kg": build_executor,
                 "reindex": build_executor,
+                "delete": delete_executor,
             },
             poll_interval_seconds=get_env_value(
                 "LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS", 1.0, float

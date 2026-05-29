@@ -80,8 +80,12 @@ def create_kb_graph_routes(
         try:
             rag = cast(Any, await registry.get(kb_id))
             if q:
+                # Fetch a bounded full match set so ``total`` reflects ALL
+                # matching labels, not just ``limit + offset`` (otherwise paging
+                # through a large filtered set reports a truncated total and the
+                # client cannot tell there are more pages).
                 labels = await rag.chunk_entity_relation_graph.search_labels(
-                    q, limit + offset
+                    q, _MAX_GRAPH_STATUS_NODES
                 )
             else:
                 labels = await rag.get_graph_labels()

@@ -626,21 +626,27 @@ class DocumentLifecycleService:
     ) -> DocumentDeleteFileResult:
         record = await self._kb_service.get(kb_id)
         workspace_dir = (self._source_root / record.workspace).resolve(strict=False)
+        # Canonical document directory: <source_root>/<workspace>/<document_id>.
+        # Anchoring here (rather than trusting source_uri.parent) ensures both
+        # source and artifact cleanup are contained to THIS document's dir, so a
+        # crafted source_uri that lives inside the workspace but outside the doc
+        # dir cannot escape the per-document boundary.
+        document_dir = (workspace_dir / document.id).resolve(strict=False)
         result = DocumentDeleteFileResult()
         artifacts, _total = await self._metadata_store.list_document_artifacts(
             record.id, document.id, limit=200
         )
         source_path: Path | None = None
-        document_dir: Path | None = None
         if delete_source_file or delete_artifacts:
             try:
-                source_path = _safe_workspace_path(workspace_dir, document.source_uri)
-                document_dir = source_path.parent.resolve(strict=False)
+                source_path = _safe_document_path(
+                    workspace_dir, document_dir, document.source_uri
+                )
             except ValueError as exc:
                 result.errors.append(f"source: {exc}")
                 return result
 
-        if delete_artifacts and document_dir is not None:
+        if delete_artifacts:
             for artifact in artifacts:
                 try:
                     artifact_path = _safe_document_path(

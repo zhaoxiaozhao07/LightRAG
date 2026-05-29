@@ -6,7 +6,7 @@ import io
 import json
 import zipfile
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Literal, Optional, cast
 
 from fastapi import (
     APIRouter,
@@ -308,6 +308,8 @@ class BatchDeleteDocumentsRequest(BaseModel):
     delete_source_file: bool = False
     delete_artifacts: bool = False
     delete_llm_cache: bool = False
+    delete_graph_orphans: bool = True
+    strategy: Literal["safe", "rebuild_doc_scope", "rebuild_kb"] = "safe"
     idempotency_key: Optional[str] = None
 
     @field_validator("document_ids", mode="after")
@@ -593,6 +595,89 @@ def _parse_plan_payload(plan: Any) -> dict[str, Any]:
     }
 
 
+async def _job_is_cancelling(
+    job_service: "JobService | None", kb_id: str, job_id: str
+) -> bool:
+    """Cooperative-cancellation checkpoint.
+
+    A running job whose status has been flipped to ``cancelling`` by the
+    ``:cancel`` endpoint should stop at the next safe boundary. In-process
+    background tasks (and the durable worker) call this before starting the
+    expensive parse/build stage; if it returns True the executor releases the
+    document claim and reports a ``cancelled`` item instead of running.
+    """
+    if job_service is None:
+        return False
+    try:
+        job = await job_service.get_job(kb_id, job_id)
+    except Exception:  # noqa: BLE001 — never let a status probe break execution
+        return False
+    return job.status == "cancelling"
+
+
+async def _cancel_parse_item(
+    document_service: DocumentLifecycleService,
+    *,
+    kb_id: str,
+    job_id: str,
+    plan: Any,
+) -> dict[str, Any]:
+    """Release a parse claim when cancelled at a checkpoint (doc -> parse_failed,
+    recoverable via :retry)."""
+    try:
+        await document_service.fail_parse(
+            kb_id,
+            plan.document.id,
+            job_id=job_id,
+            plan=plan,
+            error_code="cancelled_by_user",
+            error_message="Parse cancelled before execution",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Failed to release parse claim for cancelled doc '%s': %s",
+            plan.document.id,
+            exc,
+        )
+    return {
+        "document_id": plan.document.id,
+        "status": "cancelled",
+        "error_code": "cancelled_by_user",
+        "error_message": "Parse cancelled before execution",
+    }
+
+
+async def _cancel_build_item(
+    index_service: IndexBuildService,
+    *,
+    kb_id: str,
+    job_id: str,
+    plan: IndexBuildPlan,
+) -> dict[str, Any]:
+    """Release a build claim when cancelled at a checkpoint (doc -> build_failed,
+    recoverable via :retry)."""
+    try:
+        await index_service.fail_build(
+            kb_id,
+            plan.document.id,
+            job_id=job_id,
+            error_code="cancelled_by_user",
+            error_message="Build cancelled before execution",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Failed to release build claim for cancelled doc '%s': %s",
+            plan.document.id,
+            exc,
+        )
+    return {
+        "document_id": plan.document.id,
+        "status": "cancelled",
+        "error_code": "cancelled_by_user",
+        "error_message": "Build cancelled before execution",
+    }
+
+
 async def _execute_parse_plan(
     *,
     document_service: DocumentLifecycleService,
@@ -600,8 +685,13 @@ async def _execute_parse_plan(
     job_id: str,
     plan: Any,
     rag: Any,
+    job_service: "JobService | None" = None,
 ) -> dict[str, Any]:
     try:
+        if await _job_is_cancelling(job_service, kb_id, job_id):
+            return await _cancel_parse_item(
+                document_service, kb_id=kb_id, job_id=job_id, plan=plan
+            )
         await document_service.mark_parse_running(
             kb_id, plan.document.id, job_id=job_id
         )
@@ -710,8 +800,13 @@ async def _execute_build_plan(
     job_id: str,
     plan: IndexBuildPlan,
     rag: Any,
+    job_service: "JobService | None" = None,
 ) -> dict[str, Any]:
     try:
+        if await _job_is_cancelling(job_service, kb_id, job_id):
+            return await _cancel_build_item(
+                index_service, kb_id=kb_id, job_id=job_id, plan=plan
+            )
         if not plan.skipped:
             await index_service.mark_building(kb_id, plan.document.id, job_id=job_id)
         run_result = await index_service.run_build(rag, plan)
@@ -757,6 +852,90 @@ async def _execute_build_plan(
             "document_id": plan.document.id,
             "status": "failed",
             "error_code": "build_failed",
+            "error_message": str(exc),
+        }
+
+
+async def _execute_delete_document_impl(
+    *,
+    document_service: DocumentLifecycleService,
+    kb_id: str,
+    job_id: str,
+    document: DocumentRecord,
+    active_registry: LightRAGInstanceRegistry,
+    delete_source_file: bool,
+    delete_artifacts: bool,
+    delete_llm_cache: bool,
+) -> dict[str, Any]:
+    try:
+        lightrag_result = None
+        if document.lightrag_doc_id:
+            rag = cast(Any, await active_registry.get(kb_id))
+            lightrag_result = await rag.adelete_by_doc_id(
+                document.lightrag_doc_id,
+                delete_llm_cache=delete_llm_cache,
+            )
+            if getattr(lightrag_result, "status", None) not in {
+                "success",
+                "not_found",
+            }:
+                raise RuntimeError(
+                    getattr(lightrag_result, "message", None)
+                    or f"LightRAG deletion failed for {document.lightrag_doc_id}"
+                )
+        file_result = await document_service.cleanup_document_files(
+            kb_id,
+            document,
+            delete_source_file=delete_source_file,
+            delete_artifacts=delete_artifacts,
+        )
+        if file_result.errors:
+            raise RuntimeError("; ".join(file_result.errors))
+        await document_service.complete_delete(
+            kb_id,
+            document.id,
+            job_id=job_id,
+            lightrag_result=_deletion_result_payload(lightrag_result),
+            file_result=file_result,
+        )
+        return {
+            "document_id": document.id,
+            "status": "succeeded",
+            "lightrag_doc_id": document.lightrag_doc_id,
+            "lightrag_delete_result": _deletion_result_payload(lightrag_result),
+            "file_delete_result": {
+                "deleted_source": file_result.deleted_source,
+                "deleted_artifacts": file_result.deleted_artifacts,
+                "skipped": file_result.skipped,
+                "errors": file_result.errors,
+            },
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Failed to delete document '%s' for KB '%s': %s",
+            document.id,
+            kb_id,
+            exc,
+        )
+        try:
+            await document_service.fail_delete(
+                kb_id,
+                document.id,
+                job_id=job_id,
+                error_code="delete_failed",
+                error_message=str(exc),
+            )
+        except Exception as transition_exc:
+            logger.error(
+                "Failed to mark document '%s' failed for delete job '%s': %s",
+                document.id,
+                job_id,
+                transition_exc,
+            )
+        return {
+            "document_id": document.id,
+            "status": "failed",
+            "error_code": "delete_failed",
             "error_message": str(exc),
         }
 
@@ -852,6 +1031,108 @@ def _delete_failure_message(failed_items: int, total_items: int) -> str:
     if failed_items == total_items:
         return "No documents deleted successfully"
     return f"{failed_items} of {total_items} documents failed to delete"
+
+
+def _validate_delete_strategy(
+    *,
+    strategy: str,
+    delete_graph_orphans: bool,
+    index_service: "IndexBuildService | None",
+) -> None:
+    """Validate shared-graph delete options up front.
+
+    - ``delete_graph_orphans=False`` is rejected: the engine's
+      ``adelete_by_doc_id`` always prunes entities/relations that lose their
+      last source (source-attribution); opting out is not yet supported, so we
+      fail loudly rather than silently ignore the flag.
+    - ``strategy="rebuild_kb"`` requires a configured ``IndexBuildService`` to
+      run the post-delete conservative rebuild.
+    """
+    if not delete_graph_orphans:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "delete_graph_orphans=false is not supported: the engine always "
+                "prunes graph entities/relations that lose their last source."
+            ),
+        )
+    if strategy == "rebuild_kb" and index_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="strategy=rebuild_kb requires the KB index build service",
+        )
+
+
+async def _run_conservative_kb_rebuild(
+    *,
+    document_service: DocumentLifecycleService,
+    index_service: IndexBuildService,
+    registry: LightRAGInstanceRegistry,
+    kb_id: str,
+) -> dict[str, Any]:
+    """Force-reindex every remaining buildable document in the KB.
+
+    Used by ``strategy="rebuild_kb"`` after a delete: deleting a document can
+    leave shared graph entities/relations whose summaries were partly derived
+    from the removed source. A conservative full reindex of the survivors
+    re-derives the KG from the remaining chunks. Runs inline within the delete
+    job (no separate job) and returns a summary recorded on the delete result.
+    """
+    rag = await registry.get(kb_id)
+    document_ids: list[str] = []
+    for status in ("parsed", "ready", "build_failed"):
+        offset = 0
+        page_size = 200
+        while True:
+            documents, total = await document_service.list_documents(
+                kb_id, status=status, limit=page_size, offset=offset
+            )
+            document_ids.extend(doc.id for doc in documents)
+            offset += page_size
+            if offset >= total or not documents:
+                break
+    document_ids = list(dict.fromkeys(document_ids))
+    rebuilt = 0
+    failed = 0
+    for document_id in document_ids:
+        try:
+            plan = await index_service.create_build_plan(
+                kb_id,
+                document_id,
+                rag=rag,
+                force_rechunk=True,
+                force_extract=True,
+                force_embedding=True,
+            )
+            if not plan.skipped:
+                await index_service.claim_build_queued(
+                    kb_id, job_id=f"rebuild_kb::{document_id}", plan=plan
+                )
+            item = await _execute_build_plan(
+                index_service=index_service,
+                kb_id=kb_id,
+                job_id=f"rebuild_kb::{document_id}",
+                plan=plan,
+                rag=rag,
+            )
+            if item["status"] == "succeeded":
+                rebuilt += 1
+            else:
+                failed += 1
+        except Exception as exc:  # noqa: BLE001 — isolate per-doc rebuild failures
+            failed += 1
+            logger.error(
+                "Conservative rebuild of doc '%s' (KB '%s') failed: %s",
+                document_id,
+                kb_id,
+                exc,
+            )
+    return {
+        "strategy": "rebuild_kb",
+        "rebuilt_documents": rebuilt,
+        "failed_documents": failed,
+        "total_candidates": len(document_ids),
+    }
 
 
 def _active_job_error_code(
@@ -2117,79 +2398,18 @@ def create_kb_document_routes(
         delete_artifacts: bool,
         delete_llm_cache: bool,
     ) -> dict[str, Any]:
-        try:
-            lightrag_result = None
-            if document.lightrag_doc_id:
-                rag = cast(Any, await active_registry.get(kb_id))
-                lightrag_result = await rag.adelete_by_doc_id(
-                    document.lightrag_doc_id,
-                    delete_llm_cache=delete_llm_cache,
-                )
-                if getattr(lightrag_result, "status", None) not in {
-                    "success",
-                    "not_found",
-                }:
-                    raise RuntimeError(
-                        getattr(lightrag_result, "message", None)
-                        or f"LightRAG deletion failed for {document.lightrag_doc_id}"
-                    )
-            file_result = await document_service.cleanup_document_files(
-                kb_id,
-                document,
-                delete_source_file=delete_source_file,
-                delete_artifacts=delete_artifacts,
-            )
-            if file_result.errors:
-                raise RuntimeError("; ".join(file_result.errors))
-            await document_service.complete_delete(
-                kb_id,
-                document.id,
-                job_id=job_id,
-                lightrag_result=_deletion_result_payload(lightrag_result),
-                file_result=file_result,
-            )
-            return {
-                "document_id": document.id,
-                "status": "succeeded",
-                "lightrag_doc_id": document.lightrag_doc_id,
-                "lightrag_delete_result": _deletion_result_payload(lightrag_result),
-                "file_delete_result": file_result.__dict__
-                if hasattr(file_result, "__dict__")
-                else {
-                    "deleted_source": file_result.deleted_source,
-                    "deleted_artifacts": file_result.deleted_artifacts,
-                    "skipped": file_result.skipped,
-                    "errors": file_result.errors,
-                },
-            }
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "Failed to delete document '%s' for KB '%s': %s",
-                document.id,
-                kb_id,
-                exc,
-            )
-            try:
-                await document_service.fail_delete(
-                    kb_id,
-                    document.id,
-                    job_id=job_id,
-                    error_code="delete_failed",
-                    error_message=str(exc),
-                )
-            except Exception as transition_exc:
-                logger.error(
-                    "Failed to mark document '%s' failed for delete job '%s': %s",
-                    document.id,
-                    job_id,
-                    transition_exc,
-                )
-            return {
-                "document_id": document.id,
-                "status": "failed",
-                "error_code": "delete_failed",
-                "error_message": str(exc),
-            }
+        # Delegates to the module-level executor so the durable job worker can
+        # reuse the same delete logic when re-driving a queued delete job.
+        return await _execute_delete_document_impl(
+            document_service=document_service,
+            kb_id=kb_id,
+            job_id=job_id,
+            document=document,
+            active_registry=active_registry,
+            delete_source_file=delete_source_file,
+            delete_artifacts=delete_artifacts,
+            delete_llm_cache=delete_llm_cache,
+        )
 
     @router.delete(
         "/{kb_id}/documents/{document_id}",
@@ -2204,12 +2424,19 @@ def create_kb_document_routes(
         delete_source_file: bool = False,
         delete_artifacts: bool = False,
         delete_llm_cache: bool = False,
+        delete_graph_orphans: bool = True,
+        strategy: Literal["safe", "rebuild_doc_scope", "rebuild_kb"] = "safe",
         idempotency_key: Optional[str] = None,
     ):
         if registry is None:
             raise HTTPException(
                 status_code=503, detail="KB delete service is not configured"
             )
+        _validate_delete_strategy(
+            strategy=strategy,
+            delete_graph_orphans=delete_graph_orphans,
+            index_service=index_service,
+        )
         active_registry = registry
         try:
             if idempotency_key is not None:
@@ -2239,6 +2466,8 @@ def create_kb_document_routes(
                 delete_source_file=delete_source_file,
                 delete_artifacts=delete_artifacts,
                 delete_llm_cache=delete_llm_cache,
+                delete_graph_orphans=delete_graph_orphans,
+                strategy=strategy,
                 idempotency_key=idempotency_key,
             )
             if not created_job:
@@ -2287,18 +2516,29 @@ def create_kb_document_routes(
                         delete_llm_cache=delete_llm_cache,
                     )
                     if item["status"] == "succeeded":
+                        rebuild_summary = None
+                        if strategy == "rebuild_kb" and index_service is not None:
+                            rebuild_summary = await _run_conservative_kb_rebuild(
+                                document_service=document_service,
+                                index_service=index_service,
+                                registry=active_registry,
+                                kb_id=kb_id,
+                            )
+                        result_payload = _delete_job_result(
+                            total_items=1,
+                            completed_items=1,
+                            failed_items=0,
+                            items=[item],
+                        )
+                        if rebuild_summary is not None:
+                            result_payload["rebuild"] = rebuild_summary
                         await job_service.transition_job(
                             kb_id,
                             job.id,
                             status="succeeded",
                             progress=1.0,
                             completed_items=1,
-                            result=_delete_job_result(
-                                total_items=1,
-                                completed_items=1,
-                                failed_items=0,
-                                items=[item],
-                            ),
+                            result=result_payload,
                         )
                     else:
                         await job_service.transition_job(
@@ -2359,6 +2599,11 @@ def create_kb_document_routes(
             raise HTTPException(
                 status_code=503, detail="KB delete service is not configured"
             )
+        _validate_delete_strategy(
+            strategy=request.strategy,
+            delete_graph_orphans=request.delete_graph_orphans,
+            index_service=index_service,
+        )
         active_registry = registry
         try:
             batch_id = generate_track_id("batch")
@@ -2369,6 +2614,8 @@ def create_kb_document_routes(
                 delete_source_file=request.delete_source_file,
                 delete_artifacts=request.delete_artifacts,
                 delete_llm_cache=request.delete_llm_cache,
+                delete_graph_orphans=request.delete_graph_orphans,
+                strategy=request.strategy,
                 idempotency_key=request.idempotency_key,
             )
             if not created_job:
@@ -2422,6 +2669,17 @@ def create_kb_document_routes(
                         failed_items=failed_items,
                         items=item_results,
                     )
+                    if (
+                        request.strategy == "rebuild_kb"
+                        and completed_items > 0
+                        and index_service is not None
+                    ):
+                        final_result["rebuild"] = await _run_conservative_kb_rebuild(
+                            document_service=document_service,
+                            index_service=index_service,
+                            registry=active_registry,
+                            kb_id=kb_id,
+                        )
                     await job_service.transition_job(
                         kb_id,
                         job.id,
@@ -2785,8 +3043,18 @@ def create_kb_document_routes(
                         job_id=job.id,
                         plan=plan,
                         rag=rag,
+                        job_service=job_service,
                     )
-                    if item["status"] == "succeeded":
+                    if item["status"] == "cancelled":
+                        await job_service.transition_job(
+                            kb_id,
+                            job.id,
+                            status="cancelled",
+                            progress=1.0,
+                            error_code="cancelled_by_user",
+                            error_message=item.get("error_message"),
+                        )
+                    elif item["status"] == "succeeded":
                         await job_service.transition_job(
                             kb_id,
                             job.id,
@@ -2983,8 +3251,18 @@ def create_kb_document_routes(
                     job_id=job.id,
                     plan=plan,
                     rag=inner_rag,
+                    job_service=job_service,
                 )
-                if item["status"] == "succeeded":
+                if item["status"] == "cancelled":
+                    await job_service.transition_job(
+                        kb_id,
+                        job.id,
+                        status="cancelled",
+                        progress=1.0,
+                        error_code="cancelled_by_user",
+                        error_message=item.get("error_message"),
+                    )
+                elif item["status"] == "succeeded":
                     await job_service.transition_job(
                         kb_id,
                         job.id,

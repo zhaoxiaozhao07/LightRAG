@@ -217,13 +217,15 @@ POST /kbs/{kb_id}/documents/{document_id}:enable
 ### 2.7 文档删除
 
 ```http
-DELETE /kbs/{kb_id}/documents/{document_id}?delete_source_file=false&delete_artifacts=false&delete_llm_cache=false&idempotency_key=delete-001
+DELETE /kbs/{kb_id}/documents/{document_id}?delete_source_file=false&delete_artifacts=false&delete_llm_cache=false&delete_graph_orphans=true&strategy=safe&idempotency_key=delete-001
 ```
 
 行为：
 - 创建 `delete` job，并将文档原子 claim 到 `deleting`；已有 `parse_queued/parsing`、`build_queued/building`、`deleting` 或 `replacing` 时返回 `409`。
 - 若文档已有 `lightrag_doc_id`，后台任务调用 `LightRAG.adelete_by_doc_id`；底层返回 `success` 或 `not_found` 都视为删除成功，适配尚未入库或已被清理的文档。
-- `delete_source_file=true` / `delete_artifacts=true` 时仅允许删除 `INPUT_DIR/<workspace>/<document_id>/...` 内的 source/artifact 文件或目录，路径逃逸会使 job 失败并保留文档为 `delete_failed`。
+- **共享图谱删除策略 `strategy`**（`safe` / `rebuild_doc_scope` / `rebuild_kb`，默认 `safe`）：`safe` 与 `rebuild_doc_scope` 复用 `adelete_by_doc_id` 内建的 source-attribution（按剩余来源判定）+ 共享实体保守重建，仅清除失去最后来源的实体/关系；`rebuild_kb` 在删除成功后对 KB 内剩余可构建文档执行一次保守全量 force-reindex（重派生可能受删除影响的共享图谱），结果记录在 job `result.rebuild`。`rebuild_kb` 需路由注入 `IndexBuildService`，否则返回 `503`。
+- **`delete_graph_orphans`**（默认 `true`）：引擎始终修剪失去最后来源的孤立实体/关系；显式传 `false` 暂不支持，返回 `400`。
+- `delete_source_file=true` / `delete_artifacts=true` 时仅允许删除 `INPUT_DIR/<workspace>/<document_id>/...` 内的 source/artifact 文件或目录（source 与 artifact 均锚定到规范化的 `<workspace>/<document_id>` 目录做 containment 校验），路径逃逸会使 job 失败并保留文档为 `delete_failed`。
 - 成功后文档软删除为 `deleted` 并写入 `deleted_at`，列表和详情默认不再返回该文档，artifact metadata 同步清理。
 
 批量删除：
@@ -463,7 +465,7 @@ POST /kbs/{kb_id}/jobs/{job_id}:cancel
 
 状态转换规则：
 - `queued` → `cancelled`，`error_code=cancelled_by_user`。
-- `running` / `retrying` → `cancelling`；当前执行器是 in-process background task，只有任务体显式检查取消状态时才会停止，尚未提供 durable worker 级强制中断。
+- `running` / `retrying` → `cancelling`。parse / build_kg / reindex 执行器在进入昂贵阶段（解析 / chunk-抽取-嵌入）前会检查 `cancelling` 协作式取消检查点：命中则不调用 parser/pipeline，job 转 `cancelled`，文档释放回 `parse_failed` / `build_failed`（可经 `:retry` 重跑）。已越过检查点、正在执行单次长 await 的任务仍会跑完该阶段，尚无 await 内强制中断。
 - `succeeded` / `failed` / `cancelled` 视为 no-op，原样返回当前 job。
 - `cancelling` 视为 no-op。
 
@@ -491,11 +493,11 @@ Content-Type: application/json
 > 通过环境变量 `LIGHTRAG_KB_JOB_WORKER=true` 启用。默认关闭，关闭时行为与历史一致（仅 in-process 背景任务，重启后遗留任务一律标 `failed`）。
 
 启用后：
-- 服务启动会拉起一个后台轮询 worker，原子认领（`queued → running` 单赢 CAS）以下可从持久化状态重建的任务类型并执行到终态：`parse`、`build_kg`、`reindex`（均为单文档任务）。
+- 服务启动会拉起一个后台轮询 worker，原子认领（`queued → running` 单赢 CAS）以下可从持久化状态重建的任务类型并执行到终态：`parse`、`build_kg`、`reindex`、单文档 `delete`（均为单文档任务；`delete` 只需持久化的文档 id + 删除选项即可重建）。
 - **自动消费 `:retry`**：重试把任务重置回 `queued` 后，worker 在下一轮轮询中认领并重跑，客户端无需再次发起业务请求。
-- **重启续跑**：进程重启时，孤儿恢复会保留这些可恢复类型的 `queued` 任务（不再标 `failed`）交给 worker 继续执行；仍处于 `running` 的中途任务无法安全恢复，照旧标 `failed`，其文档同步重置为 `*_failed`，客户端 `:retry` 后即可被 worker 自动重跑。
+- **重启续跑**：进程重启时，孤儿恢复会保留这些可恢复类型的 `queued` 任务（不再标 `failed`）交给 worker 继续执行；仍处于 `running` 的中途任务无法安全恢复，照旧标 `failed`，其文档同步重置为 `*_failed`，客户端 `:retry` 后即可被 worker 自动重跑。单文档 `delete` 续跑时若孤儿恢复已把文档从 `deleting` 重置为 `delete_failed`，worker 会重新 claim 回 `deleting` 再执行（`_claim_document_deleting` 接受 `delete_failed`）。
 - **不抢占新任务**：worker 只认领 `queued_at` 早于宽限窗口（`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`，默认 5s）的任务；新建任务由其 in-process 背景任务在毫秒级转入 `running`，因此不会被 worker 抢跑，避免重复执行。
-- **暂不可恢复的类型**：`replace`、批量 `sync`、`delete`、`upload` 等依赖请求级上传字节或一次性上下文的任务未纳入 worker 自动恢复；它们重启后仍标 `failed`，需要重新发起请求。
+- **暂不可恢复的类型**：`replace`、批量 `sync`、批量 `delete`（`document_id=null`）、`upload` 等依赖请求级上传字节或一次性上下文的任务未纳入 worker 自动恢复；它们重启后仍标 `failed`，需要重新发起请求。
 - 可调环境变量：`LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS`（默认 1.0s）、`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`（默认 5.0s）。
 
 ### 5.6 等待任务终态
@@ -795,5 +797,6 @@ cancelled --> retrying --> queued
 | 409 | document_not_parsed | 文档尚未完成解析，无法触发构建 |
 | 409 | IdempotencyKeyConflict | 同幂等键不同请求指纹 |
 | 409 | InvalidJobTransitionError | 任务状态不允许该转换 |
+| 400 | - | `delete_graph_orphans=false` 暂不支持 |
 | 413 | - | 上传体积超出 `MAX_UPLOAD_SIZE` 或文本超限 |
-| 503 | - | 注册表 / 构建服务未配置 |
+| 503 | - | 注册表 / 构建服务未配置（含 `strategy=rebuild_kb` 缺少 IndexBuildService） |

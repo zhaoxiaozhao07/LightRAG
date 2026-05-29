@@ -250,3 +250,67 @@ async def test_recovery_leaves_resumable_queued_jobs(tmp_path: Path):
     assert survivor.status == "queued"
     failed_running = await store.get_job("kb_r", "running_parse")
     assert failed_running.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_recovery_leaves_resumable_delete_queued(tmp_path: Path):
+    """When 'delete' is a resumable type (single-doc delete needs only the
+    persisted payload), a queued delete job survives restart recovery."""
+    store = await _make_store(tmp_path)
+    await store.create_job(_job("kb_d", "queued_delete", job_type="delete"))
+    await store.create_job(_job("kb_d", "queued_upload", job_type="upload"))
+
+    recovered = await store.recover_orphan_jobs(
+        resumable_job_types={"parse", "build_kg", "reindex", "delete"}
+    )
+    recovered_ids = {job.id for job in recovered}
+    # delete is kept queued for the worker; upload (needs request bytes) fails.
+    assert "queued_delete" not in recovered_ids
+    assert "queued_upload" in recovered_ids
+
+    survivor = await store.get_job("kb_d", "queued_delete")
+    assert survivor.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_worker_run_loop_consumes_then_stops(tmp_path: Path):
+    """Drive the real background loop: start() schedules _run_loop, which drains
+    a queued job to completion, then stop() signals the loop and awaits it."""
+    import asyncio
+
+    store = await _make_store(tmp_path)
+    kb_service = KnowledgeBaseService(tmp_path / "kb.json")
+    await kb_service.initialize()
+    await kb_service.create(kb_id="kb_loop", name="Loop")
+    record = await kb_service.get("kb_loop")
+    job_service = JobService(kb_service, store)
+    await store.create_job(_job(record.id, "loop_job", job_type="parse"))
+
+    done = asyncio.Event()
+
+    async def fake_executor(job: JobRecord) -> None:
+        await job_service.transition_job(
+            job.kb_id, job.id, status="succeeded", progress=1.0, completed_items=1
+        )
+        done.set()
+
+    worker = JobWorker(
+        job_service,
+        executors={"parse": fake_executor},
+        poll_interval_seconds=0.05,
+        claim_grace_seconds=0.0,
+    )
+    worker.start()
+    # start() is idempotent — a second call must not spawn a second loop.
+    worker.start()
+    try:
+        await asyncio.wait_for(done.wait(), timeout=5.0)
+    finally:
+        await worker.stop()
+
+    final = await job_service.get_job("kb_loop", "loop_job")
+    assert final.status == "succeeded"
+    # After stop(), the loop task is cleared and nothing else is claimable.
+    assert await worker.poll_once() is None
+
+

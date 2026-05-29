@@ -2029,3 +2029,44 @@ def test_download_directory_artifact_rejects_when_over_size_cap(tmp_path, monkey
     )
     assert response.status_code == 413
     assert "maximum download size" in response.json()["detail"].lower()
+
+
+def test_delete_rejects_unsupported_graph_orphans_option(tmp_path):
+    """delete_graph_orphans=false is not supported and must be rejected up front
+    (the engine always prunes orphaned entities/relations)."""
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_orphans")
+    document_id, _artifacts = _upload_and_parse_document(client, "kb_orphans")
+
+    single = client.delete(
+        f"/kbs/kb_orphans/documents/{document_id}?delete_graph_orphans=false",
+        headers=_HEADERS,
+    )
+    assert single.status_code == 400
+    assert "delete_graph_orphans" in single.json()["detail"]
+
+    batch = client.post(
+        "/kbs/kb_orphans/documents:batch-delete",
+        json={"document_ids": [document_id], "delete_graph_orphans": False},
+        headers=_HEADERS,
+    )
+    assert batch.status_code == 400
+
+
+def test_delete_rebuild_kb_strategy_requires_index_service(tmp_path):
+    """strategy=rebuild_kb without a configured IndexBuildService returns 503
+    (the doc-routes test harness wires no index_service)."""
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_rebuild_503")
+    document_id, _artifacts = _upload_and_parse_document(client, "kb_rebuild_503")
+
+    response = client.delete(
+        f"/kbs/kb_rebuild_503/documents/{document_id}?strategy=rebuild_kb",
+        headers=_HEADERS,
+    )
+    assert response.status_code == 503
+
