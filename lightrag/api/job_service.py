@@ -366,9 +366,29 @@ class JobService:
             error_message=error_message,
         )
 
-    async def recover_orphan_jobs(self) -> list[JobRecord]:
-        """Mark queued/running/cancelling/retrying jobs as failed at startup."""
-        return await self._metadata_store.recover_orphan_jobs()
+    async def recover_orphan_jobs(
+        self, *, resumable_job_types: set[str] | None = None
+    ) -> list[JobRecord]:
+        """Mark queued/running/cancelling/retrying jobs as failed at startup.
+
+        When ``resumable_job_types`` is given (durable worker enabled), queued
+        jobs of those types are left in place for the worker to consume.
+        """
+        return await self._metadata_store.recover_orphan_jobs(
+            resumable_job_types=resumable_job_types
+        )
+
+    async def claim_next_worker_job(
+        self,
+        *,
+        job_types: Sequence[str],
+        max_queued_at: str | None = None,
+    ) -> JobRecord | None:
+        """Atomically claim the oldest eligible queued job for a durable worker."""
+        return await self._metadata_store.claim_next_worker_job(
+            job_types=job_types,
+            max_queued_at=max_queued_at,
+        )
 
     async def cancel_job(
         self, kb_id: str, job_id: str

@@ -287,6 +287,20 @@ class BatchReindexRequest(BaseModel):
         return value
 
 
+class RebuildKBRequest(BaseModel):
+    """Whole-KB conservative rebuild request.
+
+    Enumerates every buildable document in the KB and force-reindexes it.
+    ``force_*`` default to ``True`` (full rebuild); callers may relax them to
+    let the ``index_hash`` skip path apply per document.
+    """
+
+    force_rechunk: bool = True
+    force_extract: bool = True
+    force_embedding: bool = True
+    idempotency_key: Optional[str] = None
+
+
 class BatchDeleteDocumentsRequest(BaseModel):
     document_ids: list[str] = Field(
         min_length=1, max_length=_MAX_KB_BATCH_PARSE_DOCUMENTS
@@ -3411,6 +3425,70 @@ def create_kb_document_routes(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             logger.error("Failed to start batch reindex for KB '%s': %s", kb_id, exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.post(
+        "/{kb_id}:rebuild",
+        response_model=DocumentBatchResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Rebuild the whole KB index by reindexing every buildable document",
+    )
+    async def rebuild_kb(
+        kb_id: str,
+        background_tasks: BackgroundTasks,
+        request: RebuildKBRequest = Body(default_factory=RebuildKBRequest),
+    ):
+        """Conservative whole-KB rebuild.
+
+        Enumerates every document currently in a buildable state
+        (``parsed`` / ``ready`` / ``build_failed``) and runs the same batch
+        build path used by ``:batch-reindex``, defaulting all ``force_*`` flags
+        to ``True``. Returns an empty document list (no-op job) when the KB has
+        no buildable documents.
+        """
+        try:
+            buildable_statuses = ("parsed", "ready", "build_failed")
+            document_ids: list[str] = []
+            for status in buildable_statuses:
+                offset = 0
+                page_size = 200
+                while True:
+                    documents, total = await document_service.list_documents(
+                        kb_id, status=status, limit=page_size, offset=offset
+                    )
+                    document_ids.extend(doc.id for doc in documents)
+                    offset += page_size
+                    if offset >= total or not documents:
+                        break
+            # Preserve discovery order while removing accidental duplicates.
+            document_ids = list(dict.fromkeys(document_ids))
+            if not document_ids:
+                # Nothing to rebuild — surface an explicit no-op rather than a
+                # confusing 400 from the batch-plan min-length guard.
+                return DocumentBatchResponse(
+                    job_id="",
+                    batch_id="",
+                    documents=[],
+                )
+            return await _start_batch_build_job(
+                kb_id=kb_id,
+                request_ids=document_ids,
+                force_rechunk=request.force_rechunk,
+                force_extract=request.force_extract,
+                force_embedding=request.force_embedding,
+                idempotency_key=request.idempotency_key,
+                background_tasks=background_tasks,
+            )
+        except HTTPException:
+            raise
+        except KnowledgeBaseNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except IdempotencyKeyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error("Failed to rebuild KB '%s': %s", kb_id, exc)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @router.post(

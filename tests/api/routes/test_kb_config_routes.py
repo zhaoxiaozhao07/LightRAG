@@ -310,6 +310,70 @@ def test_active_config_runtime_helpers_apply_supported_fields():
     assert compute_index_hash(rag) == expected_hashes["index_hash"]
 
 
+def test_active_config_applies_extraction_runtime_fields():
+    active = _config_version(
+        {
+            "extraction_config": {
+                "language": "Chinese",
+                "entity_types": ["Chemical", "Solvent", "Chemical"],
+                "max_gleaning": 2,
+                "max_extraction_records": 80,
+                "max_extraction_entities": 40,
+                "force_llm_summary_on_merge": 6,
+            },
+        }
+    )
+
+    updated = apply_active_config_to_lightrag_kwargs({}, active)
+
+    addon = updated["addon_params"]
+    assert addon["language"] == "Chinese"
+    # Duplicate entity types are de-duplicated while order is preserved.
+    assert addon["entity_types"] == ["Chemical", "Solvent"]
+    assert "- Chemical" in addon["entity_types_guidance"]
+    assert "- Solvent" in addon["entity_types_guidance"]
+    assert updated["entity_extract_max_gleaning"] == 2
+    assert updated["entity_extract_max_records"] == 80
+    assert updated["entity_extract_max_entities"] == 40
+    assert updated["force_llm_summary_on_merge"] == 6
+
+
+def test_active_config_explicit_guidance_takes_precedence_and_merges_addon():
+    active = _config_version(
+        {
+            "extraction_config": {
+                "entity_types": ["Ignored"],
+                "entity_types_guidance": "Custom guidance only.",
+            },
+        }
+    )
+
+    updated = apply_active_config_to_lightrag_kwargs(
+        {"addon_params": {"language": "English", "chunker": {"keep": True}}},
+        active,
+    )
+
+    addon = updated["addon_params"]
+    assert addon["entity_types_guidance"] == "Custom guidance only."
+    # Explicit guidance wins, so no entity_types list is injected.
+    assert "entity_types" not in addon
+    # Pre-existing addon keys are preserved through the merge.
+    assert addon["language"] == "English"
+    assert addon["chunker"] == {"keep": True}
+
+
+def test_extraction_config_changes_require_reindex_via_index_hash():
+    base = {"chunk_config": {"chunk_size": 512}}
+    changed = {
+        "chunk_config": {"chunk_size": 512},
+        "extraction_config": {"entity_types": ["Chemical"]},
+    }
+    assert (
+        ConfigVersionService._derive_hashes(base)["index_hash"]
+        != ConfigVersionService._derive_hashes(changed)["index_hash"]
+    )
+
+
 def test_active_index_hash_ignores_unsupported_runtime_sections():
     base_config = {
         "chunk_config": {"chunk_size": 512},
@@ -517,3 +581,100 @@ def test_config_version_get_404(tmp_path):
         "/kbs/kb_404/configs/cfg_missing", headers=_HEADERS
     )
     assert response.status_code == 404
+
+
+def test_config_diff_parser_only_change_requires_reparse(tmp_path):
+    """Changing ONLY parser_config flips requires_reparse (and the implied
+    requires_reindex) without requiring a vector rebuild."""
+    client, *_ = _build_client(tmp_path)
+    _create_kb(client, "kb_parser_diff")
+    base = client.post(
+        "/kbs/kb_parser_diff/configs",
+        json={"config": _BASE_CONFIG},
+        headers=_HEADERS,
+    )
+    client.post(
+        f"/kbs/kb_parser_diff/configs/{base.json()['id']}:activate", headers=_HEADERS
+    )
+
+    target = client.post(
+        "/kbs/kb_parser_diff/configs",
+        json={"config": {**_BASE_CONFIG, "parser_config": {"engine": "docling"}}},
+        headers=_HEADERS,
+    )
+    diff = client.post(
+        f"/kbs/kb_parser_diff/configs/{target.json()['id']}:diff", headers=_HEADERS
+    )
+    assert diff.status_code == 200
+    body = diff.json()
+    assert body["requires_reparse"] is True
+    assert body["requires_reindex"] is True
+    assert body["requires_vector_rebuild"] is False
+    assert "parser_hash_changed" in body["reasons"]
+    assert "embedding_changed" not in body["reasons"]
+
+
+def test_config_diff_query_only_change_requires_no_rebuild(tmp_path):
+    """Changing ONLY query_config (top_k) needs no reparse/reindex/vector
+    rebuild — it only affects query-time defaults."""
+    client, *_ = _build_client(tmp_path)
+    _create_kb(client, "kb_query_diff")
+    base = client.post(
+        "/kbs/kb_query_diff/configs",
+        json={"config": _BASE_CONFIG},
+        headers=_HEADERS,
+    )
+    client.post(
+        f"/kbs/kb_query_diff/configs/{base.json()['id']}:activate", headers=_HEADERS
+    )
+
+    target = client.post(
+        "/kbs/kb_query_diff/configs",
+        json={"config": {**_BASE_CONFIG, "query_config": {"top_k": 80}}},
+        headers=_HEADERS,
+    )
+    diff = client.post(
+        f"/kbs/kb_query_diff/configs/{target.json()['id']}:diff", headers=_HEADERS
+    )
+    assert diff.status_code == 200
+    body = diff.json()
+    assert body["requires_reparse"] is False
+    assert body["requires_reindex"] is False
+    assert body["requires_vector_rebuild"] is False
+    assert body["reasons"] == ["query_hash_changed"]
+
+
+def test_activate_skips_discard_while_destructive_lock_held(tmp_path):
+    """Activation must still persist active_config_version_id + activated_at
+    even when a destructive job holds the lock; the registry discard is
+    silently skipped (cached instance left intact for the destructive job)."""
+    import asyncio
+
+    kb_service = KnowledgeBaseService(tmp_path / "metadata" / "kb.json")
+    metadata_store = SQLiteMetadataStore(tmp_path / "metadata" / "metadata.sqlite3")
+    probe = BuilderProbe()
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+    config_service = ConfigVersionService(kb_service, metadata_store, registry)
+
+    async def _exercise() -> None:
+        await kb_service.initialize()
+        await kb_service.create(kb_id="kb_lock", name="Lock")
+        rag = await registry.get("kb_lock")
+        assert registry.is_loaded("kb_lock")
+        version = await config_service.create("kb_lock", config=_BASE_CONFIG)
+
+        async with registry.destructive_lock("kb_lock"):
+            activated = await config_service.activate("kb_lock", version.id)
+            # The write side-effects still happened ...
+            assert activated.activated_at is not None
+            refreshed = await kb_service.get("kb_lock")
+            assert refreshed.active_config_version_id == version.id
+            # ... but discard was skipped: the instance is still cached and
+            # was NOT finalized while the destructive lock was held.
+            assert registry.is_loaded("kb_lock")
+            assert rag.finalized is False
+
+    try:
+        asyncio.run(_exercise())
+    finally:
+        asyncio.run(registry.shutdown())

@@ -156,6 +156,21 @@ class QueryParam:
     containing citation information for the retrieved content.
     """
 
+    ids: list[str] | None = None
+    """Optional allow-list of document ids (``full_doc_id``) to restrict retrieval.
+
+    When ``None`` (default), retrieval is unrestricted and behaves exactly as
+    before. When set, every retrieved text chunk — whether sourced from naive
+    vector search, entity-derived units, or relation-derived units — is filtered
+    so only chunks whose owning document is in this list contribute to the
+    answer. An empty list means "no document is in scope" and yields no chunks.
+
+    This is the engine-level hook the KB API layer uses to enforce per-document
+    ``filters.doc_ids`` scoping and to exclude ``enabled=False`` / ``archived``
+    documents from retrieval. Cross-KB isolation is still guaranteed separately
+    by ``workspace`` partitioning.
+    """
+
 
 @dataclass
 class StorageNameSpace(ABC):

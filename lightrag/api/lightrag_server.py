@@ -73,6 +73,7 @@ from lightrag.api.kb_service import KnowledgeBaseRecord, KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
 from lightrag.api.metadata_store import SQLiteMetadataStore
 from lightrag.api.routers.kb_document_routes import create_kb_document_routes
+from lightrag.api.routers.kb_graph_routes import create_kb_graph_routes
 from lightrag.api.routers.kb_query_routes import create_kb_query_routes
 from lightrag.api.routers.kb_routes import create_kb_routes
 
@@ -893,9 +894,15 @@ def create_app(args):
             await metadata_store.initialize()
 
             # Recover orphan jobs left in queued/running/cancelling/retrying
-            # by a previous process — in-process workers cannot resume after
-            # a crash, so the user must retry through the cancel/retry API.
-            recovered = await job_service.recover_orphan_jobs()
+            # by a previous process. When the durable job worker is enabled,
+            # queued jobs of resumable types are LEFT queued for the worker to
+            # consume; everything else (and all mid-flight running jobs) is
+            # failed so the user can retry through the cancel/retry API.
+            worker = getattr(app.state, "job_worker", None)
+            resumable_types = worker.resumable_job_types if worker else None
+            recovered = await job_service.recover_orphan_jobs(
+                resumable_job_types=resumable_types
+            )
             if recovered:
                 ASCIIColors.yellow(
                     f"\nRecovered {len(recovered)} orphan job(s) from previous process; marked as failed.\n"
@@ -908,12 +915,21 @@ def create_app(args):
             # Data migration regardless of storage implementation
             await rag.check_and_migrate_data()
 
+            if worker is not None:
+                worker.start()
+                ASCIIColors.green(
+                    f"\nDurable job worker enabled (types={','.join(sorted(worker.resumable_job_types))}).\n"
+                )
+
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
             yield
 
         finally:
             # Clean up database connections
+            worker = getattr(app.state, "job_worker", None)
+            if worker is not None:
+                await worker.stop()
             await kb_registry.shutdown()
             await rag.finalize_storages()
 
@@ -2172,6 +2188,45 @@ def create_app(args):
     app.state.config_version_service = config_version_service
     app.state.kb_deletion_service = kb_deletion_service
 
+    # Optional durable job worker: re-drives queued single-document
+    # parse / build_kg / reindex jobs (retry consumption + restart resume).
+    # Opt-in; when disabled the system keeps the original in-process-only
+    # behaviour and orphan recovery fails every transient job.
+    job_worker = None
+    if get_env_value("LIGHTRAG_KB_JOB_WORKER", False, bool):
+        from lightrag.api.job_worker import (
+            JobWorker,
+            build_build_kg_executor,
+            build_parse_executor,
+        )
+
+        parse_executor = build_parse_executor(
+            document_service=document_lifecycle_service,
+            registry=kb_registry,
+            job_service=job_service,
+        )
+        build_executor = build_build_kg_executor(
+            document_service=document_lifecycle_service,
+            index_service=index_build_service,
+            registry=kb_registry,
+            job_service=job_service,
+        )
+        job_worker = JobWorker(
+            job_service,
+            executors={
+                "parse": parse_executor,
+                "build_kg": build_executor,
+                "reindex": build_executor,
+            },
+            poll_interval_seconds=get_env_value(
+                "LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS", 1.0, float
+            ),
+            claim_grace_seconds=get_env_value(
+                "LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS", 5.0, float
+            ),
+        )
+    app.state.job_worker = job_worker
+
     # Add routes
     # root_path is set on the app for reverse proxy support;
     # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
@@ -2197,6 +2252,12 @@ def create_app(args):
     app.include_router(
         create_kb_query_routes(
             document_lifecycle_service,
+            kb_registry,
+            api_key=api_key,
+        )
+    )
+    app.include_router(
+        create_kb_graph_routes(
             kb_registry,
             api_key=api_key,
         )

@@ -460,3 +460,62 @@ def test_missing_kb_returns_404(tmp_path):
     assert client.get("/kbs/missing", headers=_HEADERS).status_code == 404
     assert client.get("/kbs/missing/status", headers=_HEADERS).status_code == 404
     assert client.delete("/kbs/missing", headers=_HEADERS).status_code == 404
+
+
+def _build_client_with_jobs(tmp_path: Path):
+    service = KnowledgeBaseService(tmp_path / "metadata" / "knowledge_bases.json")
+    metadata_store = SQLiteMetadataStore(tmp_path / "metadata" / "metadata.sqlite3")
+    job_service = JobService(service, metadata_store)
+    probe = BuilderProbe()
+    registry = LightRAGInstanceRegistry(service, probe.build, probe.finalize)
+    app = FastAPI()
+    app.include_router(
+        create_kb_routes(service, registry, api_key=_API_KEY, job_service=job_service)
+    )
+    return TestClient(app), service, job_service
+
+
+def test_status_reports_running_jobs_from_job_service(tmp_path):
+    """The /status endpoint surfaces queued/running jobs read from the SQLite
+    JobService (the populated path, not just the empty default)."""
+    initialize_share_data()
+    try:
+        client, _service, job_service = _build_client_with_jobs(tmp_path)
+        create = client.post(
+            "/kbs", json={"id": "kb_running", "name": "Running"}, headers=_HEADERS
+        )
+        assert create.status_code == 200
+
+        queued = asyncio.run(
+            job_service.create_job("kb_running", job_type="parse", stage="parsing")
+        )
+
+        status_response = client.get("/kbs/kb_running/status", headers=_HEADERS)
+        assert status_response.status_code == 200
+        running_jobs = status_response.json()["running_jobs"]
+        assert len(running_jobs) == 1
+        assert running_jobs[0]["id"] == queued.id
+        assert running_jobs[0]["status"] == "queued"
+        assert running_jobs[0]["job_type"] == "parse"
+    finally:
+        finalize_share_data()
+
+
+def test_patch_status_deleted_is_rejected(tmp_path):
+    """PATCH must not allow setting status directly to 'deleted' — the
+    mutable-status enum excludes it, so the request is rejected (422)."""
+    client, _service, _registry, _probe = _build_client(tmp_path)
+    create = client.post(
+        "/kbs", json={"id": "kb_no_delete_status", "name": "NoDelete"}, headers=_HEADERS
+    )
+    assert create.status_code == 200
+
+    response = client.patch(
+        "/kbs/kb_no_delete_status", json={"status": "deleted"}, headers=_HEADERS
+    )
+    assert response.status_code == 422
+
+    # The KB remains active and retrievable (not soft-deleted via PATCH).
+    detail = client.get("/kbs/kb_no_delete_status", headers=_HEADERS)
+    assert detail.status_code == 200
+    assert detail.json()["status"] != "deleted"

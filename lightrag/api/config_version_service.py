@@ -130,12 +130,103 @@ def _active_query_runtime_config(config: dict[str, Any] | None) -> dict[str, Any
     return runtime
 
 
+def _entity_types_to_guidance(entity_types: list[str]) -> str:
+    """Render a list of entity types into extraction-prompt guidance text.
+
+    Mirrors the shape of ``PROMPTS['default_entity_types_guidance']`` so a KB
+    can constrain extraction to a domain-specific type set without authoring a
+    full prompt file.
+    """
+    lines = [
+        "Classify each entity using one of the following types. "
+        "If no type fits, use `Other`.",
+        "",
+    ]
+    lines.extend(f"- {entity_type}" for entity_type in entity_types)
+    return "\n".join(lines)
+
+
+def _active_extraction_runtime_config(
+    config: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    """Resolve the ``extraction_config`` section into runtime-applicable parts.
+
+    Returns a dict with two sub-maps:
+
+    - ``addon``: keys overlaid onto ``LightRAG.addon_params`` (``language``,
+      ``entity_types_guidance``, ``entity_type_prompt_file``).
+    - ``kwargs``: direct LightRAG constructor kwargs for extraction caps
+      (``entity_extract_max_gleaning`` etc.).
+
+    Only fields with stable LightRAG runtime equivalents are mapped; unknown
+    keys stay persisted for diff/audit but do not affect the built instance.
+    """
+    extraction_config = _raw_config_section(config, "extraction_config")
+    addon: dict[str, Any] = {}
+    kwargs: dict[str, Any] = {}
+    if not extraction_config:
+        return {"addon": addon, "kwargs": kwargs}
+
+    language = extraction_config.get("language")
+    if language is not None:
+        if not isinstance(language, str) or not language.strip():
+            raise ValueError("extraction_config.language must be a non-empty string")
+        addon["language"] = language.strip()
+
+    guidance = extraction_config.get("entity_types_guidance")
+    entity_types = extraction_config.get("entity_types")
+    if guidance is not None:
+        if not isinstance(guidance, str) or not guidance.strip():
+            raise ValueError(
+                "extraction_config.entity_types_guidance must be a non-empty string"
+            )
+        addon["entity_types_guidance"] = guidance
+    elif entity_types is not None:
+        if not isinstance(entity_types, (list, tuple)) or not all(
+            isinstance(item, str) and item.strip() for item in entity_types
+        ):
+            raise ValueError(
+                "extraction_config.entity_types must be a list of non-empty strings"
+            )
+        if entity_types:
+            normalized_types = list(dict.fromkeys(t.strip() for t in entity_types))
+            addon["entity_types"] = normalized_types
+            addon["entity_types_guidance"] = _entity_types_to_guidance(
+                normalized_types
+            )
+
+    prompt_file = extraction_config.get("entity_type_prompt_file")
+    if prompt_file is not None:
+        if not isinstance(prompt_file, str) or not prompt_file.strip():
+            raise ValueError(
+                "extraction_config.entity_type_prompt_file must be a non-empty string"
+            )
+        addon["entity_type_prompt_file"] = prompt_file.strip()
+
+    for source_key, target_key, allow_zero in (
+        ("max_gleaning", "entity_extract_max_gleaning", True),
+        ("max_extraction_records", "entity_extract_max_records", False),
+        ("max_extraction_entities", "entity_extract_max_entities", False),
+        ("force_llm_summary_on_merge", "force_llm_summary_on_merge", True),
+    ):
+        raw = extraction_config.get(source_key)
+        if raw is None:
+            continue
+        value = _non_negative_int(raw) if allow_zero else _positive_int(raw)
+        if value is not None:
+            kwargs[target_key] = value
+
+    return {"addon": addon, "kwargs": kwargs}
+
+
 def _active_index_runtime_hash(config: dict[str, Any] | None) -> str:
+    extraction = _active_extraction_runtime_config(config)
     return _section_hash(
         "index",
         {
             "chunk": _active_chunk_runtime_config(config),
             "embedding": _active_embedding_runtime_config(config),
+            "extraction": {**extraction["addon"], **extraction["kwargs"]},
         },
     )
 
@@ -192,6 +283,13 @@ def apply_active_config_to_lightrag_kwargs(
                 embedding_updates[target_key] = embedding_runtime[source_key]
         if embedding_updates:
             kwargs["embedding_func"] = replace(embedding_func, **embedding_updates)
+
+    extraction_runtime = _active_extraction_runtime_config(active_config_version.config)
+    if extraction_runtime["addon"]:
+        merged_addon = dict(kwargs.get("addon_params") or {})
+        merged_addon.update(extraction_runtime["addon"])
+        kwargs["addon_params"] = merged_addon
+    kwargs.update(extraction_runtime["kwargs"])
 
     return kwargs
 

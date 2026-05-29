@@ -551,3 +551,135 @@ def test_kb_query_short_query_rejected(tmp_path):
         headers=_HEADERS,
     )
     assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Per-document retrieval scoping (enabled/archived + filters.doc_ids → ids)
+# ---------------------------------------------------------------------------
+
+
+def _doc_record(
+    doc_id: str,
+    *,
+    lightrag_doc_id: str | None,
+    enabled: bool = True,
+    archived: bool = False,
+):
+    from lightrag.api.metadata_store import DocumentRecord
+
+    return DocumentRecord(
+        id=doc_id,
+        kb_id="kb_scope",
+        workspace="kb_scope_ws",
+        lightrag_doc_id=lightrag_doc_id,
+        source_type="upload",
+        source_name=f"{doc_id}.txt",
+        source_uri=f"/tmp/{doc_id}.txt",
+        source_hash="sha256:x",
+        content_type="text/plain",
+        size_bytes=1,
+        parser_hash=None,
+        index_hash=None,
+        status="ready",
+        enabled=enabled,
+        archived=archived,
+        chunks_count=None,
+        entity_count=None,
+        relation_count=None,
+        error_code=None,
+        error_message=None,
+        metadata={},
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z",
+        deleted_at=None,
+    )
+
+
+class _FakeDocService:
+    def __init__(self, documents):
+        self._documents = documents
+
+    async def list_documents(self, kb_id, *, limit=50, offset=0, **kwargs):
+        total = len(self._documents)
+        return self._documents[offset : offset + limit], total
+
+
+def test_resolve_doc_scope_all_enabled_returns_none():
+    from lightrag.api.routers.kb_query_routes import _resolve_doc_id_scope
+
+    docs = [
+        _doc_record("doc_a", lightrag_doc_id="lr-a"),
+        _doc_record("doc_b", lightrag_doc_id="lr-b"),
+    ]
+    scope = asyncio.run(
+        _resolve_doc_id_scope(_FakeDocService(docs), "kb_scope", None)
+    )
+    assert scope is None  # unrestricted, full recall
+
+
+def test_resolve_doc_scope_excludes_disabled_and_archived():
+    from lightrag.api.routers.kb_query_routes import _resolve_doc_id_scope
+
+    docs = [
+        _doc_record("doc_a", lightrag_doc_id="lr-a"),
+        _doc_record("doc_b", lightrag_doc_id="lr-b", enabled=False),
+        _doc_record("doc_c", lightrag_doc_id="lr-c", archived=True),
+    ]
+    scope = asyncio.run(
+        _resolve_doc_id_scope(_FakeDocService(docs), "kb_scope", None)
+    )
+    assert scope == ["lr-a"]
+
+
+def test_resolve_doc_scope_intersects_doc_ids_with_retrievable():
+    from lightrag.api.routers.kb_query_routes import _resolve_doc_id_scope
+
+    docs = [
+        _doc_record("doc_a", lightrag_doc_id="lr-a"),
+        _doc_record("doc_b", lightrag_doc_id="lr-b", enabled=False),
+        _doc_record("doc_c", lightrag_doc_id="lr-c"),
+    ]
+    # Requesting a disabled doc drops it; only retrievable requested docs remain.
+    scope = asyncio.run(
+        _resolve_doc_id_scope(
+            _FakeDocService(docs), "kb_scope", ["doc_a", "doc_b"]
+        )
+    )
+    assert scope == ["lr-a"]
+
+
+def test_resolve_doc_scope_unindexed_docs_have_no_lightrag_id():
+    from lightrag.api.routers.kb_query_routes import _resolve_doc_id_scope
+
+    docs = [
+        _doc_record("doc_a", lightrag_doc_id="lr-a"),
+        _doc_record("doc_b", lightrag_doc_id=None, enabled=False),
+    ]
+    scope = asyncio.run(
+        _resolve_doc_id_scope(_FakeDocService(docs), "kb_scope", None)
+    )
+    assert scope == ["lr-a"]
+
+
+# ---------------------------------------------------------------------------
+# Engine-level chunk filter helpers (operate.py)
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_doc_scope_helpers():
+    from lightrag.operate import _chunk_in_doc_scope, _normalize_doc_id_allowlist
+
+    # None ids => no scoping
+    assert _normalize_doc_id_allowlist(QueryParam(ids=None)) is None
+    assert _chunk_in_doc_scope({"full_doc_id": "lr-a"}, None) is True
+
+    allow = _normalize_doc_id_allowlist(QueryParam(ids=["lr-a", "lr-b"]))
+    assert allow == {"lr-a", "lr-b"}
+    assert _chunk_in_doc_scope({"full_doc_id": "lr-a"}, allow) is True
+    assert _chunk_in_doc_scope({"full_doc_id": "lr-z"}, allow) is False
+    # Records without full_doc_id are excluded when filtering is active.
+    assert _chunk_in_doc_scope({"content": "x"}, allow) is False
+    # Empty allow-list => nothing is in scope.
+    empty = _normalize_doc_id_allowlist(QueryParam(ids=[]))
+    assert empty == set()
+    assert _chunk_in_doc_scope({"full_doc_id": "lr-a"}, empty) is False

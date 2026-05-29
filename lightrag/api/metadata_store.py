@@ -1612,6 +1612,7 @@ class SQLiteMetadataStore:
         *,
         error_code: str = "worker_orphaned",
         error_message: str = "Job worker crashed before completion; please retry",
+        resumable_job_types: set[str] | None = None,
     ) -> list[JobRecord]:
         """Mark queued / running / cancelling / retrying jobs as failed.
 
@@ -1622,8 +1623,20 @@ class SQLiteMetadataStore:
         parse_queued / parsing / build_queued / building are also reset to
         the corresponding ``*_failed`` state so the active-claim guard
         stops treating them as having an in-flight job.
+
+        When a durable :class:`~lightrag.api.job_worker.JobWorker` is enabled,
+        ``resumable_job_types`` lists job types the worker can re-drive from
+        persisted state (e.g. ``{"parse", "build_kg", "reindex"}``). Jobs of
+        those types that are still ``queued`` (created but never started, or
+        reset by ``:retry``) are LEFT queued so the worker consumes them
+        instead of failing them. Jobs that were already ``running`` (their
+        in-process task died mid-flight) are still failed — they cannot be
+        safely resumed — and the document reset below makes their next retry
+        re-claimable. Default ``None`` preserves the original "fail
+        everything transient" behaviour.
         """
         await self._ensure_initialized()
+        resumable = set(resumable_job_types or set())
 
         def write(conn: sqlite3.Connection) -> list[JobRecord]:
             rows = conn.execute(
@@ -1635,6 +1648,12 @@ class SQLiteMetadataStore:
             updated: list[JobRecord] = []
             now = utc_now_iso()
             for row in rows:
+                # Leave resumable queued jobs for the durable worker to pick up.
+                if (
+                    row["status"] == "queued"
+                    and row["job_type"] in resumable
+                ):
+                    continue
                 conn.execute(
                     """
                     UPDATE jobs
@@ -1686,6 +1705,71 @@ class SQLiteMetadataStore:
                 (error_code, error_message, now),
             )
             return updated
+
+        return await self._write(write)
+
+    async def claim_next_worker_job(
+        self,
+        *,
+        job_types: Sequence[str],
+        max_queued_at: str | None = None,
+    ) -> JobRecord | None:
+        """Atomically claim the oldest eligible ``queued`` job for a worker.
+
+        Selects the oldest ``queued`` job whose ``job_type`` is in
+        ``job_types`` and (when ``max_queued_at`` is given) whose ``queued_at``
+        is at or before that timestamp, then transitions it to ``running`` in
+        the SAME serialized write transaction. Because :meth:`_write`
+        serializes all writers, exactly one caller can win the
+        ``queued → running`` transition for a given job — a concurrent
+        in-process background task attempting the same transition will then
+        see ``running`` and abort. Returns the claimed :class:`JobRecord`, or
+        ``None`` when no eligible job exists.
+
+        ``max_queued_at`` implements a grace window: callers pass "now minus
+        a few seconds" so freshly-created jobs (which their in-process task
+        flips to ``running`` within milliseconds) are not stolen mid-creation;
+        only jobs that have sat ``queued`` beyond the window — retried jobs and
+        jobs whose owner crashed/restarted — are claimed.
+        """
+        await self._ensure_initialized()
+        if not job_types:
+            return None
+        placeholders = ",".join("?" for _ in job_types)
+        params: list[Any] = list(job_types)
+        where = f"status = 'queued' AND job_type IN ({placeholders})"
+        if max_queued_at is not None:
+            where += " AND queued_at <= ?"
+            params.append(max_queued_at)
+
+        def write(conn: sqlite3.Connection) -> JobRecord | None:
+            row = conn.execute(
+                f"""
+                SELECT * FROM jobs
+                WHERE {where}
+                ORDER BY queued_at ASC, id ASC
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+            if row is None:
+                return None
+            now = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'running', progress = ?, updated_at = ?,
+                    started_at = COALESCE(started_at, ?)
+                WHERE id = ? AND status = 'queued'
+                """,
+                (max(float(row["progress"] or 0.0), 0.1), now, now, row["id"]),
+            )
+            refreshed = conn.execute(
+                "SELECT * FROM jobs WHERE id = ?", (row["id"],)
+            ).fetchone()
+            if refreshed is None:
+                return None
+            return JobRecord.from_row(refreshed)
 
         return await self._write(write)
 

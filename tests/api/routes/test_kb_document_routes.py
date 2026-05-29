@@ -1934,3 +1934,98 @@ def test_missing_kb_document_routes_return_404(tmp_path):
         headers=_HEADERS,
     )
     assert upload.status_code == 404
+
+
+def test_text_import_rejects_oversized_metadata(tmp_path):
+    """A single text document whose metadata JSON exceeds the 64KB cap is
+    rejected by request validation (422)."""
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_big_meta")
+    big_metadata = {"blob": "x" * (64 * 1024 + 10)}
+
+    response = client.post(
+        "/kbs/kb_big_meta/documents:texts",
+        json={
+            "documents": [
+                {"text": "hello", "source_name": "n.md", "metadata": big_metadata}
+            ]
+        },
+        headers=_HEADERS,
+    )
+    assert response.status_code == 422
+    assert "metadata too large" in response.text.lower()
+
+
+def test_text_import_rejects_too_many_documents(tmp_path):
+    """More than 100 text documents in one request is rejected (422)."""
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_many_texts")
+    documents = [
+        {"text": f"doc {i}", "source_name": f"n{i}.md"} for i in range(101)
+    ]
+
+    response = client.post(
+        "/kbs/kb_many_texts/documents:texts",
+        json={"documents": documents},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 422
+
+
+def test_list_documents_status_filter(tmp_path):
+    """GET /documents?status=... filters by exact document status."""
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_status_filter")
+    # Two uploaded (unparsed) docs and one parsed doc.
+    client.post(
+        "/kbs/kb_status_filter/documents:upload",
+        files=[("files", ("a.pdf", b"a", "application/pdf"))],
+        headers=_HEADERS,
+    )
+    parsed_id, _artifacts = _upload_and_parse_document(
+        client, "kb_status_filter", filename="b.pdf", content=b"b"
+    )
+
+    parsed = client.get(
+        "/kbs/kb_status_filter/documents?status=parsed", headers=_HEADERS
+    )
+    assert parsed.status_code == 200
+    parsed_payload = parsed.json()
+    assert parsed_payload["total"] == 1
+    assert parsed_payload["documents"][0]["id"] == parsed_id
+    assert parsed_payload["documents"][0]["status"] == "parsed"
+
+    uploaded = client.get(
+        "/kbs/kb_status_filter/documents?status=uploaded", headers=_HEADERS
+    )
+    assert uploaded.status_code == 200
+    assert uploaded.json()["total"] == 1
+    assert all(
+        doc["status"] == "uploaded" for doc in uploaded.json()["documents"]
+    )
+
+
+def test_download_directory_artifact_rejects_when_over_size_cap(tmp_path, monkeypatch):
+    """A directory artifact whose uncompressed size exceeds the cap returns
+    413 before any zip bytes are streamed."""
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_zip_cap")
+    document_id, artifacts = _upload_and_parse_document(client, "kb_zip_cap")
+    # Force the cap to 1 byte so the (small) sidecar directory trips it.
+    monkeypatch.setattr(_kb_document_routes, "_MAX_DIRECTORY_ARTIFACT_BYTES", 1)
+
+    sidecar = artifacts["sidecar"]
+    response = client.get(
+        f"/kbs/kb_zip_cap/documents/{document_id}/artifacts/{sidecar['id']}:download",
+        headers=_HEADERS,
+    )
+    assert response.status_code == 413
+    assert "maximum download size" in response.json()["detail"].lower()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
 from collections.abc import Callable
@@ -38,9 +39,17 @@ _HEADERS = {"X-API-Key": _API_KEY}
 class FakeDocStatus:
     def __init__(self):
         self.rows: dict[str, dict] = {}
+        # Cumulative count of how many times each doc id has been (re)stamped
+        # as processed. Unlike ``rows`` (which a delete removes), this only ever
+        # grows, so a test can prove a forced reindex actually re-ran the
+        # pipeline for an already-built doc instead of being deduped away.
+        self.stamp_counts: dict[str, int] = {}
 
     async def get_by_ids(self, ids):
         return [self.rows.get(item_id) for item_id in ids]
+
+    def discard(self, doc_id: str) -> None:
+        self.rows.pop(doc_id, None)
 
     def stamp_processed(
         self,
@@ -56,6 +65,7 @@ class FakeDocStatus:
             "entity_count": entity_count,
             "relation_count": relation_count,
         }
+        self.stamp_counts[doc_id] = self.stamp_counts.get(doc_id, 0) + 1
 
 
 class FakeDeletionResult:
@@ -149,6 +159,10 @@ class FakeRAG:
 
     async def adelete_by_doc_id(self, doc_id, *, delete_llm_cache=False):
         self.delete_calls.append((doc_id, delete_llm_cache))
+        # Mirror the real engine: deleting a doc removes its doc_status row so a
+        # subsequent enqueue of the same id is processed afresh rather than
+        # deduped away.
+        self.doc_status.discard(doc_id)
         return FakeDeletionResult(doc_id, delete_llm_cache)
 
     async def parse_native(self, doc_id, file_path, content_data):
@@ -201,6 +215,12 @@ class FakeRAG:
             doc_record_id = doc_id
             if doc_id in self.build_should_fail_for:
                 raise RuntimeError(f"index pipeline exploded for {doc_id}")
+            # Model LightRAG's enqueue dedup: a doc id already present in
+            # doc_status is treated as a duplicate and silently dropped (NOT
+            # re-extracted). A faithful fake is what makes the "reindex is a
+            # no-op without delete-before-reenqueue" bug observable.
+            if doc_id in self.doc_status.rows:
+                continue
             self.doc_status.stamp_processed(doc_record_id)
         return track_id
 
@@ -567,7 +587,54 @@ def test_reindex_forces_rebuild_even_when_index_hash_matches(tmp_path):
     assert len(rag.enqueue_calls) == 2
 
 
-def test_batch_reindex_forces_rebuild_for_ready_documents(tmp_path):
+def test_reindex_deletes_old_index_so_pipeline_actually_reextracts(tmp_path):
+    """Regression: a forced reindex of an already-built document must clear the
+    old LightRAG doc first, otherwise the engine's enqueue dedup (filter_keys +
+    filename/content-hash) silently drops the re-enqueue and reindex becomes a
+    no-op. We assert the doc is deleted-before-reenqueue AND that the pipeline
+    actually re-stamps doc_status a second time (stamp_counts == 2)."""
+    client, *_, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_reindex_real")
+    document_id = _upload_and_parse(client, "kb_reindex_real")
+
+    built = client.post(
+        f"/kbs/kb_reindex_real/documents/{document_id}:build-kg",
+        json={},
+        headers=_HEADERS,
+    )
+    assert built.status_code == 200, built.text
+    rag = probe.instances[0]
+    detail = client.get(
+        f"/kbs/kb_reindex_real/documents/{document_id}", headers=_HEADERS
+    ).json()
+    lightrag_doc_id = detail["lightrag_doc_id"]
+    assert rag.doc_status.stamp_counts[lightrag_doc_id] == 1
+    assert rag.delete_calls == []
+
+    response = client.post(
+        f"/kbs/kb_reindex_real/documents/{document_id}:reindex",
+        json={},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    job_id = response.json()["id"]
+    final = client.get(
+        f"/kbs/kb_reindex_real/jobs/{job_id}", headers=_HEADERS
+    ).json()
+    assert final["status"] == "succeeded"
+    assert final["result"]["skipped"] is False
+    # Old index cleared before re-enqueue ...
+    assert rag.delete_calls == [(lightrag_doc_id, False)]
+    # ... and the pipeline genuinely re-processed the doc (would stay 1 if the
+    # enqueue had been deduped away).
+    assert rag.doc_status.stamp_counts[lightrag_doc_id] == 2
+    assert len(rag.enqueue_calls) == 2
+    # The rebuilt doc is still queryable/ready with fresh stats.
+    after = client.get(
+        f"/kbs/kb_reindex_real/documents/{document_id}", headers=_HEADERS
+    ).json()
+    assert after["status"] == "ready"
+    assert after["chunks_count"] == 5
     client, *_, probe = _build_client(tmp_path)
     _create_kb(client, "kb_batch_reindex")
     doc_a = _upload_and_parse(client, "kb_batch_reindex", filename="a.pdf")
@@ -936,3 +1003,341 @@ def test_wait_for_job_returns_408_on_timeout(tmp_path):
     detail = response.json()["detail"]
     assert detail["error_code"] == "wait_timeout"
     assert detail["current_status"] == "running"
+
+
+def test_rebuild_kb_reindexes_all_buildable_documents(tmp_path):
+    client, *_, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_rebuild")
+    doc_a = _upload_and_parse(client, "kb_rebuild", filename="a.pdf")
+    doc_b = _upload_and_parse(client, "kb_rebuild", filename="b.pdf")
+
+    # Build both to ready first.
+    for document_id in (doc_a, doc_b):
+        built = client.post(
+            f"/kbs/kb_rebuild/documents/{document_id}:build-kg",
+            json={},
+            headers=_HEADERS,
+        )
+        assert built.status_code == 200, built.text
+    rag = probe.instances[0]
+    assert len(rag.enqueue_calls) == 2
+
+    # Whole-KB rebuild enumerates every buildable doc and force-reindexes.
+    response = client.post("/kbs/kb_rebuild:rebuild", json={}, headers=_HEADERS)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    returned_ids = {doc["id"] for doc in body["documents"]}
+    assert returned_ids == {doc_a, doc_b}
+
+    job = client.get(
+        f"/kbs/kb_rebuild/jobs/{body['job_id']}", headers=_HEADERS
+    ).json()
+    assert job["status"] == "succeeded"
+    assert job["completed_items"] == 2
+    assert job["failed_items"] == 0
+    items = {item["document_id"]: item for item in job["result"]["items"]}
+    assert set(items) == {doc_a, doc_b}
+    # Force rebuild bypasses the hash skip — both re-enqueued.
+    assert all(item["skipped"] is False for item in items.values())
+    assert len(rag.enqueue_calls) == 4
+
+
+def test_rebuild_kb_with_no_documents_is_noop(tmp_path):
+    client, *_ = _build_client(tmp_path)
+    _create_kb(client, "kb_empty_rebuild")
+    response = client.post(
+        "/kbs/kb_empty_rebuild:rebuild", json={}, headers=_HEADERS
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["documents"] == []
+    assert body["job_id"] == ""
+
+
+def test_rebuild_kb_unknown_kb_returns_404(tmp_path):
+    client, *_ = _build_client(tmp_path)
+    response = client.post("/kbs/kb_missing:rebuild", json={}, headers=_HEADERS)
+    assert response.status_code == 404
+
+
+def _seed_failed_build_job(
+    kb_service,
+    document_service,
+    *,
+    kb_id: str,
+    document_id: str,
+    retry_count: int = 0,
+    max_retries: int = 3,
+    idempotency_key: str | None = "seed-key",
+) -> str:
+    """Create a build_kg job and drive it to ``failed`` directly via the store."""
+    from lightrag.api.kb_service import utc_now_iso
+    from lightrag.api.metadata_store import JobRecord
+    from lightrag.utils import generate_track_id
+
+    async def _setup() -> str:
+        record = await kb_service.get(kb_id)
+        now = utc_now_iso()
+        job = JobRecord(
+            id=generate_track_id("job_build"),
+            kb_id=record.id,
+            workspace=record.workspace,
+            batch_id=None,
+            document_id=document_id,
+            job_type="build_kg",
+            status="queued",
+            stage="building",
+            progress=0.0,
+            total_items=1,
+            completed_items=0,
+            failed_items=0,
+            idempotency_key=idempotency_key,
+            config_version_id=None,
+            config_hash=None,
+            retry_count=retry_count,
+            max_retries=max_retries,
+            payload={"document_id": document_id},
+            result=None,
+            error_code=None,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+            queued_at=now,
+            started_at=None,
+            finished_at=None,
+            cancelled_at=None,
+        )
+        created = await document_service.metadata_store.create_job(job)
+        await document_service.metadata_store.transition_job(
+            record.id,
+            created.id,
+            status="failed",
+            progress=1.0,
+            failed_items=1,
+            error_code="build_failed",
+            error_message="boom",
+        )
+        return created.id
+
+    return asyncio.run(_setup())
+
+
+def test_cancel_running_job_transitions_to_cancelling(tmp_path):
+    """A running job cannot be hard-stopped in-process, so :cancel flips it to
+    the advisory 'cancelling' state (not straight to 'cancelled')."""
+    client, kb_service, document_service, _job_service, _probe = _build_client(tmp_path)
+    _create_kb(client, "kb_cancel_running")
+    document_id = _upload_and_parse(client, "kb_cancel_running")
+
+    async def _seed_running() -> str:
+        from lightrag.api.kb_service import utc_now_iso
+        from lightrag.api.metadata_store import JobRecord
+        from lightrag.utils import generate_track_id
+
+        record = await kb_service.get("kb_cancel_running")
+        now = utc_now_iso()
+        job = JobRecord(
+            id=generate_track_id("job_build"),
+            kb_id=record.id,
+            workspace=record.workspace,
+            batch_id=None,
+            document_id=document_id,
+            job_type="build_kg",
+            status="queued",
+            stage="building",
+            progress=0.0,
+            total_items=1,
+            completed_items=0,
+            failed_items=0,
+            idempotency_key=None,
+            config_version_id=None,
+            config_hash=None,
+            retry_count=0,
+            max_retries=3,
+            payload={"document_id": document_id},
+            result=None,
+            error_code=None,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+            queued_at=now,
+            started_at=None,
+            finished_at=None,
+            cancelled_at=None,
+        )
+        created = await document_service.metadata_store.create_job(job)
+        await document_service.metadata_store.transition_job(
+            record.id, created.id, status="running", progress=0.4
+        )
+        return created.id
+
+    job_id = asyncio.run(_seed_running())
+
+    cancel = client.post(
+        f"/kbs/kb_cancel_running/jobs/{job_id}:cancel", headers=_HEADERS
+    )
+    assert cancel.status_code == 200, cancel.text
+    assert cancel.json()["status"] == "cancelling"
+
+    # Cancelling an already-cancelling job is a no-op that returns the job as-is.
+    again = client.post(
+        f"/kbs/kb_cancel_running/jobs/{job_id}:cancel", headers=_HEADERS
+    )
+    assert again.status_code == 200, again.text
+    assert again.json()["status"] == "cancelling"
+
+
+def test_cancel_terminal_job_is_noop(tmp_path):
+    """Cancelling a job that already reached a terminal state returns it
+    unchanged rather than erroring."""
+    client, kb_service, document_service, _job_service, _probe = _build_client(tmp_path)
+    _create_kb(client, "kb_cancel_terminal")
+    document_id = _upload_and_parse(client, "kb_cancel_terminal")
+
+    job_id = _seed_failed_build_job(
+        kb_service,
+        document_service,
+        kb_id="kb_cancel_terminal",
+        document_id=document_id,
+        idempotency_key=None,
+    )
+
+    cancel = client.post(
+        f"/kbs/kb_cancel_terminal/jobs/{job_id}:cancel", headers=_HEADERS
+    )
+    assert cancel.status_code == 200, cancel.text
+    body = cancel.json()
+    # Still failed — terminal states are no-ops, not transitioned to cancelled.
+    assert body["status"] == "failed"
+    assert body["error_code"] == "build_failed"
+
+
+def test_retry_beyond_max_retries_returns_409(tmp_path):
+    """When retry_count has already reached max_retries, :retry is refused."""
+    client, kb_service, document_service, _job_service, _probe = _build_client(tmp_path)
+    _create_kb(client, "kb_retry_exhausted")
+    document_id = _upload_and_parse(client, "kb_retry_exhausted")
+
+    job_id = _seed_failed_build_job(
+        kb_service,
+        document_service,
+        kb_id="kb_retry_exhausted",
+        document_id=document_id,
+        retry_count=3,
+        max_retries=3,
+        idempotency_key=None,
+    )
+
+    retry = client.post(
+        f"/kbs/kb_retry_exhausted/jobs/{job_id}:retry", json={}, headers=_HEADERS
+    )
+    assert retry.status_code == 409, retry.text
+
+
+def test_durable_parse_executor_redrives_queued_job(tmp_path):
+    """Exercise the REAL build_parse_executor (durable worker) end-to-end:
+    upload without auto-parse, hand the queued parse job to the worker
+    executor, and assert it re-drives parse to 'parsed' from persisted state."""
+    from lightrag.api.job_worker import build_parse_executor
+
+    client, kb_service, document_service, job_service, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_pexec")
+    metadata_store = document_service.metadata_store
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+
+    upload = client.post(
+        "/kbs/kb_pexec/documents:upload",
+        files=[("files", ("paper.pdf", b"pdf-bytes", "application/pdf"))],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200, upload.text
+    document_id = upload.json()["documents"][0]["id"]
+
+    async def _drive() -> str:
+        document = await document_service.get_document("kb_pexec", document_id)
+        # Queued parse job only; the executor itself does the parse_queued claim.
+        job, _created = await job_service.create_parse_job_once(
+            "kb_pexec",
+            document_id=document_id,
+            parser_hash="sha256:seed",
+            lightrag_doc_id=document.lightrag_doc_id,
+            parser_engine="mineru",
+            process_options="iF",
+            source_uri=document.source_uri,
+            source_hash=document.source_hash,
+        )
+        executor = build_parse_executor(
+            document_service=document_service,
+            registry=registry,
+            job_service=job_service,
+        )
+        claimed = await metadata_store.claim_next_worker_job(
+            job_types=["parse"], max_queued_at=None
+        )
+        assert claimed is not None and claimed.id == job.id
+        await executor(claimed)
+        return job.id
+
+    try:
+        job_id = asyncio.run(_drive())
+    finally:
+        asyncio.run(registry.shutdown())
+
+    job = client.get(f"/kbs/kb_pexec/jobs/{job_id}", headers=_HEADERS).json()
+    assert job["status"] == "succeeded", job
+    assert job["result"]["resumed_by_worker"] is True
+    detail = client.get(f"/kbs/kb_pexec/documents/{document_id}", headers=_HEADERS).json()
+    assert detail["status"] == "parsed"
+
+
+def test_durable_build_executor_redrives_queued_job(tmp_path):
+    """Exercise the REAL build_build_kg_executor (durable worker): a parsed
+    document with a queued build_kg job is re-driven to 'ready'."""
+    from lightrag.api.job_worker import build_build_kg_executor
+
+    client, kb_service, document_service, job_service, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_bexec")
+    metadata_store = document_service.metadata_store
+    index_service = IndexBuildService(document_service)
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+    document_id = _upload_and_parse(client, "kb_bexec")
+
+    async def _drive() -> str:
+        document = await document_service.get_document("kb_bexec", document_id)
+        rag = await registry.get("kb_bexec")
+        plan = await index_service.create_build_plan("kb_bexec", document_id, rag=rag)
+        # Queued build job only; the executor itself does the build_queued claim.
+        job, _created = await job_service.create_build_job_once(
+            "kb_bexec",
+            document_id=document_id,
+            parser_hash=plan.parser_hash,
+            index_hash=plan.index_hash,
+            source_hash=document.source_hash,
+            lightrag_doc_id=document.lightrag_doc_id,
+            sidecar_uri=plan.sidecar_uri,
+            blocks_path=plan.blocks_path,
+            process_options=plan.process_options,
+        )
+        executor = build_build_kg_executor(
+            document_service=document_service,
+            index_service=index_service,
+            registry=registry,
+            job_service=job_service,
+        )
+        claimed = await metadata_store.claim_next_worker_job(
+            job_types=["build_kg"], max_queued_at=None
+        )
+        assert claimed is not None and claimed.id == job.id
+        await executor(claimed)
+        return job.id
+
+    try:
+        job_id = asyncio.run(_drive())
+    finally:
+        asyncio.run(registry.shutdown())
+
+    job = client.get(f"/kbs/kb_bexec/jobs/{job_id}", headers=_HEADERS).json()
+    assert job["status"] == "succeeded", job
+    assert job["result"]["resumed_by_worker"] is True
+    detail = client.get(f"/kbs/kb_bexec/documents/{document_id}", headers=_HEADERS).json()
+    assert detail["status"] == "ready"

@@ -4714,6 +4714,37 @@ async def extract_keywords_only(
     return hl_keywords, ll_keywords
 
 
+def _normalize_doc_id_allowlist(query_param: QueryParam) -> set[str] | None:
+    """Return the document allow-list as a set, or ``None`` when unrestricted.
+
+    ``QueryParam.ids`` of ``None`` means "no scoping" (return ``None``); an
+    explicit list — including an empty list — is honoured verbatim so callers
+    can express "no document is in scope".
+    """
+    ids = getattr(query_param, "ids", None)
+    if ids is None:
+        return None
+    return {str(doc_id) for doc_id in ids}
+
+
+def _chunk_in_doc_scope(
+    chunk: dict | None, doc_id_allowlist: set[str] | None
+) -> bool:
+    """Check a chunk/record against the document allow-list.
+
+    ``doc_id_allowlist`` of ``None`` disables filtering. Otherwise the chunk's
+    ``full_doc_id`` must be present in the allow-list. Records without a
+    ``full_doc_id`` are conservatively excluded when filtering is active, since
+    their document membership cannot be verified.
+    """
+    if doc_id_allowlist is None:
+        return True
+    if not chunk:
+        return False
+    full_doc_id = chunk.get("full_doc_id")
+    return full_doc_id is not None and str(full_doc_id) in doc_id_allowlist
+
+
 async def _get_vector_context(
     query: str,
     chunks_vdb: BaseVectorStorage,
@@ -4740,8 +4771,15 @@ async def _get_vector_context(
         search_top_k = query_param.chunk_top_k or query_param.top_k
         cosine_threshold = chunks_vdb.cosine_better_than_threshold
 
+        # When a document allow-list is active, over-fetch so post-filtering
+        # still has a useful number of in-scope chunks to keep.
+        doc_id_allowlist = _normalize_doc_id_allowlist(query_param)
+        fetch_top_k = search_top_k
+        if doc_id_allowlist is not None:
+            fetch_top_k = min(max(search_top_k * 5, search_top_k), 1000)
+
         results = await chunks_vdb.query(
-            query, top_k=search_top_k, query_embedding=query_embedding
+            query, top_k=fetch_top_k, query_embedding=query_embedding
         )
         if not results:
             logger.info(
@@ -4752,6 +4790,8 @@ async def _get_vector_context(
         valid_chunks = []
         for result in results:
             if "content" in result:
+                if not _chunk_in_doc_scope(result, doc_id_allowlist):
+                    continue
                 chunk_with_metadata = {
                     "content": result["content"],
                     "created_at": result.get("created_at", None),
@@ -4760,6 +4800,8 @@ async def _get_vector_context(
                     "chunk_id": result.get("id"),  # Add chunk_id for deduplication
                 }
                 valid_chunks.append(chunk_with_metadata)
+                if len(valid_chunks) >= search_top_k:
+                    break
 
         logger.info(
             f"Naive query: {len(valid_chunks)} chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})"
@@ -5814,8 +5856,11 @@ async def _find_related_text_unit_from_entities(
 
     # Step 6: Build result chunks with valid data and update chunk tracking
     result_chunks = []
+    doc_id_allowlist = _normalize_doc_id_allowlist(query_param)
     for i, (chunk_id, chunk_data) in enumerate(zip(unique_chunk_ids, chunk_data_list)):
         if chunk_data is not None and "content" in chunk_data:
+            if not _chunk_in_doc_scope(chunk_data, doc_id_allowlist):
+                continue
             chunk_data_copy = chunk_data.copy()
             chunk_data_copy["source_type"] = "entity"
             chunk_data_copy["chunk_id"] = chunk_id  # Add chunk_id for deduplication
@@ -6109,8 +6154,11 @@ async def _find_related_text_unit_from_relations(
 
     # Step 6: Build result chunks with valid data and update chunk tracking
     result_chunks = []
+    doc_id_allowlist = _normalize_doc_id_allowlist(query_param)
     for i, (chunk_id, chunk_data) in enumerate(zip(unique_chunk_ids, chunk_data_list)):
         if chunk_data is not None and "content" in chunk_data:
+            if not _chunk_in_doc_scope(chunk_data, doc_id_allowlist):
+                continue
             chunk_data_copy = chunk_data.copy()
             chunk_data_copy["source_type"] = "relationship"
             chunk_data_copy["chunk_id"] = chunk_id  # Add chunk_id for deduplication

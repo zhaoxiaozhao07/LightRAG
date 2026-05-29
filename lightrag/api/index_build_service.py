@@ -31,6 +31,11 @@ class IndexBuildPlan:
     skipped: bool = False
     skip_reason: str | None = None
 
+    @property
+    def force(self) -> bool:
+        """Whether any force flag requires bypassing incremental reuse."""
+        return self.force_rechunk or self.force_extract or self.force_embedding
+
 
 @dataclass(slots=True)
 class BatchIndexBuildPlan:
@@ -240,6 +245,24 @@ class IndexBuildService:
             )
 
         track_id = generate_track_id(f"build_{plan.document.id}")
+        # A forced rebuild (``:reindex``, or any explicit ``force_*`` on
+        # ``:build-kg``) must actually re-run the LightRAG pipeline. LightRAG's
+        # enqueue silently drops a document whose id is already present in
+        # ``doc_status`` (``filter_keys``) or whose basename / content-hash
+        # matches an existing row. Because a KB document keeps the SAME
+        # ``lightrag_doc_id`` across rebuilds, re-enqueuing without first
+        # removing the old entry would be a no-op — the force flags would only
+        # bypass the KB-layer skip gate, not the engine-layer dedup. Delete the
+        # old LightRAG document first so the re-enqueue is processed afresh.
+        if plan.force and plan.document.lightrag_doc_id:
+            deletion_result = await rag.adelete_by_doc_id(plan.document.lightrag_doc_id)
+            status = getattr(deletion_result, "status", None)
+            if status not in {"success", "not_found"}:
+                raise RuntimeError(
+                    getattr(deletion_result, "message", None)
+                    or f"Forced reindex could not clear existing LightRAG doc "
+                    f"'{plan.document.lightrag_doc_id}' (status={status})"
+                )
         # LightRAG's enqueue performs filename-based dedup against doc_status
         # using the basename of ``file_path``. Two KB documents that share
         # the same ``source_name`` (e.g. both files sanitised to ``_.pdf``)

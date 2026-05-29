@@ -225,6 +225,72 @@ async def _ensure_query_documents_available(
             _raise_active_lifecycle_query_conflict(documents[0])
 
 
+async def _resolve_doc_id_scope(
+    document_service: DocumentLifecycleService,
+    kb_id: str,
+    doc_ids: List[str] | None,
+) -> List[str] | None:
+    """Compute the ``lightrag_doc_id`` allow-list to pass to ``QueryParam.ids``.
+
+    Retrieval scope rules:
+
+    - A document is *retrievable* only when ``enabled`` and not ``archived``
+      and it has an indexed ``lightrag_doc_id``.
+    - When ``filters.doc_ids`` is supplied, the scope is exactly those
+      documents (already validated to belong to the KB) intersected with the
+      retrievable set — disabled/archived ids silently drop out so they can
+      never leak into an answer.
+    - When no ``filters.doc_ids`` is supplied and every document is retrievable,
+      return ``None`` (unrestricted retrieval, full recall, zero overhead).
+    - When no ``filters.doc_ids`` is supplied but some documents are disabled or
+      archived, return the retrievable allow-list so excluded documents are
+      filtered out at retrieval time.
+
+    Returns ``None`` for "no scoping", otherwise a (possibly empty) list of
+    ``lightrag_doc_id`` values.
+    """
+    page_size = 200
+    offset = 0
+    all_documents: list[DocumentRecord] = []
+    while True:
+        documents, total = await document_service.list_documents(
+            kb_id, limit=page_size, offset=offset
+        )
+        all_documents.extend(documents)
+        offset += page_size
+        if offset >= total or not documents:
+            break
+
+    def _retrievable(document: DocumentRecord) -> bool:
+        return (
+            document.enabled
+            and not document.archived
+            and bool(document.lightrag_doc_id)
+        )
+
+    has_excluded = any(
+        (not document.enabled or document.archived) for document in all_documents
+    )
+
+    if doc_ids:
+        requested = set(doc_ids)
+        scope = [
+            str(document.lightrag_doc_id)
+            for document in all_documents
+            if document.id in requested and _retrievable(document)
+        ]
+        return scope
+
+    if not has_excluded:
+        return None
+
+    return [
+        str(document.lightrag_doc_id)
+        for document in all_documents
+        if _retrievable(document)
+    ]
+
+
 def create_kb_query_routes(
     document_service: DocumentLifecycleService,
     registry: LightRAGInstanceRegistry,
@@ -254,11 +320,15 @@ def create_kb_query_routes(
                 active_defaults=active_defaults,
             )
             param.stream = False
-            # NOTE: ``filters.doc_ids`` is currently validated against the KB
-            # metadata and active lifecycle state.
-            # Per-doc retrieval filtering inside QueryParam is not yet
-            # supported by LightRAG; KB workspace isolation already
-            # guarantees cross-KB separation.
+            # Enforce per-document retrieval scoping: ``filters.doc_ids`` plus
+            # the enabled/archived control-plane state are translated into a
+            # ``lightrag_doc_id`` allow-list applied inside retrieval. Cross-KB
+            # isolation is still guaranteed by workspace partitioning.
+            param.ids = await _resolve_doc_id_scope(
+                document_service,
+                kb_id,
+                request.filters.doc_ids if request.filters else None,
+            )
             result = await rag.aquery_llm(request.query, param=param)
             llm_response = result.get("llm_response", {})
             data = result.get("data", {})
@@ -309,6 +379,11 @@ def create_kb_query_routes(
             param = request.to_query_params(
                 is_stream=stream_mode,
                 active_defaults=active_defaults,
+            )
+            param.ids = await _resolve_doc_id_scope(
+                document_service,
+                kb_id,
+                request.filters.doc_ids if request.filters else None,
             )
             result = await rag.aquery_llm(request.query, param=param)
 
@@ -390,6 +465,11 @@ def create_kb_query_routes(
                 active_defaults=active_defaults,
             )
             param.stream = False
+            param.ids = await _resolve_doc_id_scope(
+                document_service,
+                kb_id,
+                request.filters.doc_ids if request.filters else None,
+            )
             result = await rag.aquery_data(request.query, param=param)
             return KBQueryDataResponse(
                 kb_id=kb_id,

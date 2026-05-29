@@ -212,7 +212,7 @@ POST /kbs/{kb_id}/documents/{document_id}:disable
 POST /kbs/{kb_id}/documents/{document_id}:enable
 ```
 
-返回 `DocumentResponse`。这两个动作只更新 SQLite 控制面 `enabled` 字段，不删除 source/artifact，也不触发 LightRAG storage 变更。当前 QueryParam 尚未接入按文档过滤，因此它们先作为 metadata control-plane 能力提供。
+返回 `DocumentResponse`。这两个动作只更新 SQLite 控制面 `enabled` 字段，不删除 source/artifact，也不触发 LightRAG storage 变更。`enabled` 现已接入检索层：禁用文档会被排除出 `QueryParam.ids` 白名单，因此不再参与 KB 级问答检索（无需删除即可临时下线一篇文档）。
 
 ### 2.7 文档删除
 
@@ -287,7 +287,7 @@ Content-Type: application/json
 ```
 
 行为：
-- 若 `(source_hash, parser_hash)` 命中 cache，直接复用 artifacts。
+- 解析缓存命中时直接复用 artifacts：缓存有效性由 MinerU/Docling 的 `*.mineru_raw` raw bundle manifest 校验（源文件大小 + 内容 sha256 + options 签名），而非 KB 控制面的 `source_hash`/`parser_hash`（后者用于增量决策与 diff，不作为 raw bundle cache key）。`force_reparse=true` 绕过该 raw bundle cache。
 - 同一文档已有 `parse_queued` / `parsing` / `build_queued` / `building` / `deleting` / `replacing` 时返回 `409`，原 active job 保持不变，新建的 job 同步标记 `failed`。
 - 成功后写入 `original` / `sidecar` / `blocks` artifact，MinerU/Docling 还会写 `raw_dir`。
 
@@ -381,7 +381,43 @@ Content-Type: application/json
 }
 ```
 
-`:reindex` 与 `:build-kg` 共用同一份后台执行逻辑，唯一区别是默认所有 `force_*` 为 `true`，永远不会触发 hash skip。
+`:reindex` 与 `:build-kg` 共用同一份后台执行逻辑，区别是默认所有 `force_*` 为 `true`，永远不会触发 KB 层的 `index_hash` skip。当任一 `force_*` 为真且文档已有 `lightrag_doc_id` 时，后台执行会先调用 `LightRAG.adelete_by_doc_id` 清除旧索引再 re-enqueue，从而真正绕过 LightRAG 引擎自身的 id/文件名/内容去重，确保已建文档被重新分块、抽取与嵌入（否则 enqueue 会把同 id 文档当作重复项静默丢弃，使重建变成空操作）。
+
+### 4.4 全 KB 重建
+
+```http
+POST /kbs/{kb_id}:rebuild
+Content-Type: application/json
+
+{
+  "force_rechunk": true,
+  "force_extract": true,
+  "force_embedding": true,
+  "idempotency_key": null
+}
+```
+
+行为：
+- 枚举该 KB 内所有处于可构建状态（`parsed` / `ready` / `build_failed`）的文档，复用 `:batch-reindex` 的批量构建路径对它们整体重建。
+- `force_*` 默认全为 `true`（保守全量重建）；可显式放宽以让命中 `index_hash` 的文档走 skip。
+- KB 内没有可构建文档时返回 no-op（`job_id=""`、`documents=[]`），不报 400。
+- KB 不存在返回 404；注册表/构建服务未配置返回 503。
+
+### 4.5 KB 级图谱查询
+
+> 通过 `LightRAGInstanceRegistry` 解析到该 KB 的 LightRAG 实例，因此图谱统计/标签/子图均按 workspace 隔离到单个知识库。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/kbs/{kb_id}/graph/status` | 图谱统计：`label_count` / `node_count` / `edge_count` / `is_truncated`（受 `max_nodes_scanned` 上限保护） |
+| `GET` | `/kbs/{kb_id}/graph/entities` | 实体标签分页列表，支持 `limit` / `offset` 与可选模糊搜索 `q`（大小写不敏感） |
+| `GET` | `/kbs/{kb_id}/graph/relations` | 关系（edge）分页列表，返回 `id/type/source/target/properties` |
+| `GET` | `/kbs/{kb_id}/graph` | 指定 `label` 的连通子图（`*` 表示整图），支持 `max_depth` / `max_nodes` |
+
+约束：
+- 这些接口为只读，复用全局 `/graph/*` 同款 LightRAG 方法，但带 KB workspace 边界。
+- `graph/status` 与 `graph/relations` 使用 `"*"` 通配做有界全图扫描（默认上限 100,000 节点）；超限时 `is_truncated=true`。
+- KB 不存在返回 404。
 
 ---
 
@@ -409,9 +445,9 @@ GET /kbs/{kb_id}/jobs/{job_id}
 | 字段 | 说明 |
 |---|---|
 | `id` | 任务 ID |
-| `job_type` | `upload` / `parse` / `build_kg` |
+| `job_type` | `upload` / `parse` / `build_kg` / `reindex` / `delete` / `replace` / `sync` / `clear_kb`（批量解析/构建/删除复用聚合 `parse`/`build_kg`/`delete` job 并带 `batch_id`） |
 | `status` | `queued` / `running` / `succeeded` / `failed` / `cancelling` / `cancelled` / `retrying` |
-| `stage` | 当前阶段：`uploading` / `parsing` / `building` |
+| `stage` | 当前阶段：`uploading` / `parsing` / `building` / `deleting` 等 |
 | `progress` | 0.0 ~ 1.0 |
 | `total_items / completed_items / failed_items` | 批量进度 |
 | `idempotency_key` | 幂等键 |
@@ -444,11 +480,25 @@ Content-Type: application/json
 
 行为：
 - 仅允许 `failed` 或 `cancelled` 任务重试；其他状态返回 `409`。
-- 任务回到 `queued`，清空 `result` / `error_code` / `error_message` / `started_at` / `finished_at` / `cancelled_at`。
+- 任务回到 `queued`，清空 `result` / `error_code` / `error_message` / `started_at` / `finished_at` / `cancelled_at`，并刷新 `queued_at`。
 - `retry_count += 1`；超过 `max_retries`（默认 3）返回 `409`。
-- 注意：当前 worker 是 in-process 后台任务，重试后需要由调用方再次触发同一接口或原始业务动作；durable worker 自动恢复和自动消费 queued job 仍待实现。
+- 重试后的消费方式取决于是否启用 durable worker：
+  - 默认（未启用）：worker 是 in-process 后台任务，重试后需由调用方再次触发同一接口或原始业务动作。
+  - 启用 `LIGHTRAG_KB_JOB_WORKER=true` 后：内置 durable worker 会自动消费回到 `queued` 的 `parse` / `build_kg` / `reindex` 单文档任务，无需客户端再次触发；服务重启后这些 `queued` 任务也会被自动续跑（见 5.5）。
 
-### 5.4 等待任务终态
+### 5.5 Durable job worker（可选）
+
+> 通过环境变量 `LIGHTRAG_KB_JOB_WORKER=true` 启用。默认关闭，关闭时行为与历史一致（仅 in-process 背景任务，重启后遗留任务一律标 `failed`）。
+
+启用后：
+- 服务启动会拉起一个后台轮询 worker，原子认领（`queued → running` 单赢 CAS）以下可从持久化状态重建的任务类型并执行到终态：`parse`、`build_kg`、`reindex`（均为单文档任务）。
+- **自动消费 `:retry`**：重试把任务重置回 `queued` 后，worker 在下一轮轮询中认领并重跑，客户端无需再次发起业务请求。
+- **重启续跑**：进程重启时，孤儿恢复会保留这些可恢复类型的 `queued` 任务（不再标 `failed`）交给 worker 继续执行；仍处于 `running` 的中途任务无法安全恢复，照旧标 `failed`，其文档同步重置为 `*_failed`，客户端 `:retry` 后即可被 worker 自动重跑。
+- **不抢占新任务**：worker 只认领 `queued_at` 早于宽限窗口（`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`，默认 5s）的任务；新建任务由其 in-process 背景任务在毫秒级转入 `running`，因此不会被 worker 抢跑，避免重复执行。
+- **暂不可恢复的类型**：`replace`、批量 `sync`、`delete`、`upload` 等依赖请求级上传字节或一次性上下文的任务未纳入 worker 自动恢复；它们重启后仍标 `failed`，需要重新发起请求。
+- 可调环境变量：`LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS`（默认 1.0s）、`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`（默认 5.0s）。
+
+### 5.6 等待任务终态
 
 ```http
 POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.5
@@ -483,6 +533,13 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 ## 七、知识库配置版本 Config Versions
 
 > 不可变的 KB 级配置快照。新建配置不会自动生效，需要显式 `:activate` 才会写入 `KnowledgeBase.active_config_version_id` 并 discard 缓存的 LightRAG 实例。当前实现会让后续实例重建时读取已支持的 active config 字段；未接入的配置项仍应视为 metadata / diff 能力。
+>
+> 已接入运行时的 active config 字段：
+> - `chunk_config`：`chunk_size`/`chunk_token_size`、`chunk_overlap_size`/`chunk_overlap_token_size`、`tiktoken_model_name`。
+> - `embedding_config`：`model`、`dim`/`embedding_dim`、`token_limit`/`max_token_size`（`model` 会触发重建 embedding provider 闭包）。
+> - `query_config`：`top_k`/`chunk_top_k`/`max_entity_tokens`/`max_relation_tokens`/`max_total_tokens`/`related_chunk_number`/`cosine_threshold` 等 QueryParam 字段。
+> - `extraction_config`：`language`（摘要/抽取语言）、`entity_types`（列表，自动渲染成 `entity_types_guidance` 并去重保序）或显式 `entity_types_guidance`（优先于 `entity_types`）、`entity_type_prompt_file`、`max_gleaning`/`max_extraction_records`/`max_extraction_entities`/`force_llm_summary_on_merge`。这些会 overlay 到 `addon_params` 与 LightRAG 抽取构造参数，并纳入 `index_hash`，因此变更会被 `:diff` 标为 `requires_reindex`。
+> - 仍未接入运行时（仅作 metadata/diff 保存）：`parser_config`（解析在 parse 阶段按文档 `parser_engine` 生效）、`llm_role_config`、`storage_config`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -605,12 +662,12 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 - 同 KB 内的查询不会读取其他 KB 的内容（`workspace` 隔离）；已加测试覆盖。
 - 若 KB 内存在 `deleting` / `replacing` 文档，或 `filters.doc_ids` 指向此类 active 文档，查询返回 `409`，避免读到删除/替换中的旧内容。
 - `mode` 支持 `local / global / hybrid / naive / mix / bypass`；建议默认 `mix`。
-- `filters.doc_ids` 当前阶段会校验 ID 必须属于本 KB（不在则 400 + `error_code=doc_ids_not_in_kb`）；retrieval 内部按 doc 精确过滤待 LightRAG QueryParam 增强后接入，KB 边界已由 workspace 保证。
+- `filters.doc_ids` 会先校验 ID 必须属于本 KB（不在则 400 + `error_code=doc_ids_not_in_kb`），随后在检索层精确生效：服务端把 `filters.doc_ids` 与"可检索集合"（`enabled=true` 且 `archived=false` 且已建索引、有 `lightrag_doc_id`）取交集，映射成 `QueryParam.ids`（即 `full_doc_id` 白名单）传入 LightRAG。被禁用/归档的文档即使显式出现在 `filters.doc_ids` 里也会被静默剔除，不会进入答案。KB 边界仍由 workspace 双重保证。
 - `include_chunk_content=true` 时 `references[].content` 返回该 reference 命中的 chunk 文本数组，便于评估与排查。
 - 非流式、结构化检索和流式首行都会在 `metadata` 中返回 active config 信息（存在时包含 `config_version_id`、`parser_hash`、`index_hash`、`query_hash`）。
 - 流式响应 `Content-Type: application/x-ndjson`：第一行是 `{kb_id, metadata}`，若 `include_references=true` 则同一行还包含 `references`；后续每行 `{response: "..."}`，错误时 `{error: "..."}`。
 - 短查询（< 3 字符）返回 422；KB 不存在 404。
-- `enabled=false` / `archived=true` 当前只作为 SQLite 控制面字段保存，尚未接入 QueryParam 过滤；需要业务侧避免把它们误解为检索层隔离。
+- `enabled=false` / `archived=true` 的文档已接入检索层过滤：这些文档不会被纳入 `QueryParam.ids` 白名单，因此 naive 向量检索、实体派生 chunk、关系派生 chunk 三路证据都不会再命中它们。注意当全部文档均可检索时为保持全召回与零开销，服务端传入 `ids=None`（不过滤）；一旦存在任意禁用/归档文档，则改为传入可检索白名单。检索内部按 chunk 的 `full_doc_id` 做精确成员校验；过滤生效时无法确定归属的 chunk（缺 `full_doc_id`）会被保守剔除。图谱实体/关系的"结构"层若被多文档共享，仍可能在 KG 上下文里出现，但其引用的 chunk 证据已按文档白名单过滤。
 
 ---
 
@@ -715,7 +772,7 @@ cancelled --> retrying --> queued
 |---|---|---|
 | `source_hash` | 上传 / 文本内容字节 | 重新解析 + 重新构建 |
 | `parser_hash` | 解析引擎 + process options | 重新解析 + 重新构建 |
-| `index_hash` | 当前 active runtime 已实际接入的 chunk / embedding 配置（如 chunk size/overlap、tokenizer、embedding model/dim/token limit） | 仅重新构建索引（复用解析产物） |
+| `index_hash` | 当前 active runtime 已实际接入的 chunk / embedding / extraction 配置（如 chunk size/overlap、tokenizer、embedding model/dim/token limit、extraction language/entity_types/抽取 caps） | 仅重新构建索引（复用解析产物） |
 
 `:build-kg` 命中 `index_hash` 且文档已 `ready` 时直接 skip；`:reindex` 始终绕过 skip。
 
