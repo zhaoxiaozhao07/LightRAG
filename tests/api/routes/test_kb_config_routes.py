@@ -3,16 +3,26 @@ from __future__ import annotations
 import importlib
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from lightrag.api.config_version_service import ConfigVersionService
+from lightrag.api.config_version_service import (
+    ConfigVersionService,
+    active_embedding_runtime_config_from_version,
+    active_query_defaults_from_rag,
+    active_query_metadata_from_rag,
+    apply_active_config_to_lightrag_kwargs,
+    attach_active_config_metadata,
+)
+from lightrag.api.index_build_service import compute_index_hash
 from lightrag.api.job_service import JobService
 from lightrag.api.kb_service import KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
-from lightrag.api.metadata_store import SQLiteMetadataStore
+from lightrag.api.metadata_store import ConfigVersionRecord, SQLiteMetadataStore
+from lightrag.utils import EmbeddingFunc
 
 _original_argv = sys.argv[:]
 sys.argv = [sys.argv[0]]
@@ -25,6 +35,39 @@ pytestmark = pytest.mark.offline
 
 _API_KEY = "test-key"
 _HEADERS = {"X-API-Key": _API_KEY}
+_SERVER_ENV_VARS_TO_ISOLATE = (
+    "LLM_BINDING",
+    "LLM_BINDING_HOST",
+    "LLM_BINDING_API_KEY",
+    "LLM_MODEL",
+    "EMBEDDING_BINDING",
+    "EMBEDDING_BINDING_HOST",
+    "EMBEDDING_BINDING_API_KEY",
+    "EMBEDDING_MODEL",
+    "EMBEDDING_DIM",
+    "RERANK_BINDING",
+    "EXTRACT_LLM_BINDING",
+    "EXTRACT_LLM_MODEL",
+    "EXTRACT_LLM_BINDING_HOST",
+    "EXTRACT_LLM_BINDING_API_KEY",
+    "KEYWORD_LLM_BINDING",
+    "KEYWORD_LLM_MODEL",
+    "KEYWORD_LLM_BINDING_HOST",
+    "KEYWORD_LLM_BINDING_API_KEY",
+    "QUERY_LLM_BINDING",
+    "QUERY_LLM_MODEL",
+    "QUERY_LLM_BINDING_HOST",
+    "QUERY_LLM_BINDING_API_KEY",
+    "VLM_LLM_BINDING",
+    "VLM_LLM_MODEL",
+    "VLM_LLM_BINDING_HOST",
+    "VLM_LLM_BINDING_API_KEY",
+    "LIGHTRAG_KV_STORAGE",
+    "LIGHTRAG_VECTOR_STORAGE",
+    "LIGHTRAG_GRAPH_STORAGE",
+    "LIGHTRAG_DOC_STATUS_STORAGE",
+    "LIGHTRAG_API_KEY",
+)
 
 
 class FakeRAG:
@@ -132,6 +175,7 @@ def test_config_version_activate_updates_kb_and_evicts_registry(tmp_path):
     # Force registry to load an instance
     import asyncio
     rag = asyncio.run(registry.get("kb_activate"))
+    assert isinstance(rag, FakeRAG)
     assert registry.is_loaded("kb_activate")
 
     create = client.post(
@@ -154,6 +198,259 @@ def test_config_version_activate_updates_kb_and_evicts_registry(tmp_path):
     # Activation must have discarded the cached LightRAG instance
     assert not registry.is_loaded("kb_activate")
     assert rag.finalized is True
+
+
+async def _fake_embed(texts: list[str]):
+    return texts
+
+
+def _config_version(config: dict[str, object]) -> ConfigVersionRecord:
+    return ConfigVersionRecord(
+        id="cfg_active",
+        kb_id="kb_runtime",
+        workspace="kb_runtime_ws",
+        version=1,
+        config=config,
+        parser_hash="sha256:parser-active",
+        index_hash="sha256:index-active",
+        query_hash="sha256:query-active",
+        created_at="2026-01-01T00:00:00Z",
+        activated_at="2026-01-01T00:00:00Z",
+        created_by="tester",
+    )
+
+
+def test_active_config_runtime_helpers_apply_supported_fields():
+    embedding_func = EmbeddingFunc(
+        embedding_dim=128,
+        func=_fake_embed,
+        max_token_size=512,
+        model_name="base-embed",
+    )
+    kwargs = {
+        "chunk_token_size": 256,
+        "chunk_overlap_token_size": 32,
+        "tiktoken_model_name": "old-tokenizer",
+        "top_k": 20,
+        "chunk_top_k": 5,
+        "max_entity_tokens": 1000,
+        "max_relation_tokens": 2000,
+        "max_total_tokens": 3000,
+        "cosine_threshold": 0.2,
+        "vector_db_storage_cls_kwargs": {"cosine_better_than_threshold": 0.2},
+        "related_chunk_number": 2,
+        "embedding_func": embedding_func,
+    }
+    active = _config_version(
+        {
+            "chunk_config": {
+                "chunk_size": 1024,
+                "chunk_overlap_size": 128,
+                "tiktoken_model_name": "gpt2",
+            },
+            "embedding_config": {
+                "dim": 768,
+                "token_limit": 4096,
+                "model": "bge-m3",
+            },
+            "query_config": {
+                "mode": "global",
+                "top_k": 77,
+                "chunk_top_k": 9,
+                "max_total_tokens": 9999,
+                "include_references": False,
+                "cosine_threshold": 0.42,
+                "unsupported_field": "ignored",
+            },
+            "llm_role_config": {"extract": "unsupported-runtime-role"},
+        }
+    )
+
+    updated = apply_active_config_to_lightrag_kwargs(dict(kwargs), active)
+
+    assert updated["chunk_token_size"] == 1024
+    assert updated["chunk_overlap_token_size"] == 128
+    assert updated["tiktoken_model_name"] == "gpt2"
+    assert updated["top_k"] == 77
+    assert updated["chunk_top_k"] == 9
+    assert updated["max_total_tokens"] == 9999
+    assert updated["cosine_threshold"] == 0.42
+    assert updated["cosine_better_than_threshold"] == 0.42
+    assert updated["vector_db_storage_cls_kwargs"] == {
+        "cosine_better_than_threshold": 0.42
+    }
+    assert updated["embedding_func"] is not embedding_func
+    assert updated["embedding_func"].embedding_dim == 768
+    assert updated["embedding_func"].max_token_size == 4096
+    assert updated["embedding_func"].model_name == "bge-m3"
+    assert embedding_func.embedding_dim == 128
+    assert active_embedding_runtime_config_from_version(active) == {
+        "embedding_dim": 768,
+        "max_token_size": 4096,
+        "model_name": "bge-m3",
+    }
+
+    rag = SimpleNamespace()
+    attach_active_config_metadata(rag, active)
+    expected_hashes = ConfigVersionService._derive_hashes(active.config)
+
+    assert active_query_defaults_from_rag(rag) == {
+        "mode": "global",
+        "top_k": 77,
+        "chunk_top_k": 9,
+        "max_total_tokens": 9999,
+        "include_references": False,
+    }
+    assert active_query_metadata_from_rag(rag) == {
+        "config_version_id": "cfg_active",
+        "parser_hash": "sha256:parser-active",
+        "index_hash": expected_hashes["index_hash"],
+        "query_hash": expected_hashes["query_hash"],
+    }
+    assert compute_index_hash(rag) == expected_hashes["index_hash"]
+
+
+def test_active_index_hash_ignores_unsupported_runtime_sections():
+    base_config = {
+        "chunk_config": {"chunk_size": 512},
+        "embedding_config": {"model": "bge-m3", "dim": 1024},
+        "llm_role_config": {"extract": "model-a"},
+    }
+    changed_unsupported_config = {
+        **base_config,
+        "llm_role_config": {"extract": "model-b"},
+    }
+
+    assert ConfigVersionService._derive_hashes(base_config)[
+        "index_hash"
+    ] == ConfigVersionService._derive_hashes(changed_unsupported_config)[
+        "index_hash"
+    ]
+
+    changed_supported_config = {
+        **base_config,
+        "embedding_config": {"model": "bge-large", "dim": 1024},
+    }
+    assert ConfigVersionService._derive_hashes(base_config)[
+        "index_hash"
+    ] != ConfigVersionService._derive_hashes(changed_supported_config)[
+        "index_hash"
+    ]
+
+
+def test_active_embedding_model_reaches_rebuilt_provider_closure(
+    tmp_path, monkeypatch
+):
+    import asyncio
+
+    import numpy as np
+
+    for var in _SERVER_ENV_VARS_TO_ISOLATE:
+        monkeypatch.delenv(var, raising=False)
+
+    for role in ("EXTRACT", "KEYWORD", "QUERY", "VLM"):
+        monkeypatch.setenv(f"{role}_LLM_BINDING", "openai")
+        monkeypatch.setenv(f"{role}_LLM_BINDING_HOST", "https://api.openai.com/v1")
+        monkeypatch.setenv(f"{role}_LLM_BINDING_API_KEY", "test-key")
+        monkeypatch.setenv(f"{role}_LLM_MODEL", "gpt-4o-mini")
+
+    monkeypatch.setenv("LLM_BINDING", "openai")
+    monkeypatch.setenv("LLM_BINDING_HOST", "https://api.openai.com/v1")
+    monkeypatch.setenv("LLM_BINDING_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("EMBEDDING_BINDING", "openai")
+    monkeypatch.setenv("EMBEDDING_BINDING_HOST", "https://api.openai.com/v1")
+    monkeypatch.setenv("EMBEDDING_BINDING_API_KEY", "test-key")
+    monkeypatch.setenv("EMBEDDING_MODEL", "base-env-embed")
+    monkeypatch.setenv("EMBEDDING_DIM", "1536")
+    monkeypatch.setenv("RERANK_BINDING", "null")
+    monkeypatch.setenv("LIGHTRAG_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lightrag-server",
+            "--working-dir",
+            str(tmp_path / "rag_storage"),
+            "--input-dir",
+            str(tmp_path / "inputs"),
+        ],
+    )
+
+    from lightrag.api.config import parse_args
+    from lightrag.api import lightrag_server
+    from lightrag.llm import openai as openai_llm
+
+    provider_calls: list[dict[str, object]] = []
+
+    async def fake_openai_embed(texts, **kwargs):
+        provider_calls.append(dict(kwargs))
+        return np.zeros((len(texts), 1536), dtype=np.float32)
+
+    monkeypatch.setattr(
+        openai_llm,
+        "openai_embed",
+        EmbeddingFunc(
+            embedding_dim=1536,
+            func=fake_openai_embed,
+            max_token_size=8192,
+            model_name="base-provider-embed",
+        ),
+    )
+
+    class CapturedLightRAG:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.workspace = kwargs["workspace"]
+            self.embedding_func = kwargs["embedding_func"]
+            self.ollama_server_infos = kwargs["ollama_server_infos"]
+            self.role_llm_builder = None
+            self.finalized = False
+
+        def register_role_llm_builder(self, builder):
+            self.role_llm_builder = builder
+
+        def get_llm_role_config(self):
+            return {}
+
+        async def initialize_storages(self):
+            return None
+
+        async def check_and_migrate_data(self):
+            return None
+
+        async def finalize_storages(self):
+            self.finalized = True
+
+    monkeypatch.setattr(lightrag_server, "LightRAG", CapturedLightRAG)
+    monkeypatch.setattr(
+        lightrag_server, "check_frontend_build", lambda: (False, False)
+    )
+
+    async def exercise_active_embedding_provider():
+        args = parse_args()
+        app = lightrag_server.create_app(args)
+        try:
+            await app.state.kb_service.initialize()
+            await app.state.metadata_store.initialize()
+
+            kb_id = "kb_active_embed"
+            await app.state.kb_service.create(kb_id=kb_id, name=kb_id)
+            version = await app.state.config_version_service.create(
+                kb_id,
+                config={"embedding_config": {"model": "active-kb-embed"}},
+            )
+            await app.state.config_version_service.activate(kb_id, version.id)
+
+            rag = await app.state.lightrag_registry.get(kb_id)
+            await rag.embedding_func(["probe"])
+
+            assert rag.embedding_func.model_name == "active-kb-embed"
+            assert provider_calls[-1]["model"] == "active-kb-embed"
+        finally:
+            await app.state.lightrag_registry.shutdown()
+
+    asyncio.run(exercise_active_embedding_provider())
 
 
 def test_config_version_diff_reports_changes(tmp_path):

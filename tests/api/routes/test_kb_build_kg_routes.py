@@ -567,6 +567,45 @@ def test_reindex_forces_rebuild_even_when_index_hash_matches(tmp_path):
     assert len(rag.enqueue_calls) == 2
 
 
+def test_batch_reindex_forces_rebuild_for_ready_documents(tmp_path):
+    client, *_, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_batch_reindex")
+    doc_a = _upload_and_parse(client, "kb_batch_reindex", filename="a.pdf")
+    doc_b = _upload_and_parse(client, "kb_batch_reindex", filename="b.pdf")
+
+    for document_id in (doc_a, doc_b):
+        built = client.post(
+            f"/kbs/kb_batch_reindex/documents/{document_id}:build-kg",
+            json={},
+            headers=_HEADERS,
+        )
+        assert built.status_code == 200, built.text
+    rag = probe.instances[0]
+    assert len(rag.enqueue_calls) == 2
+
+    response = client.post(
+        "/kbs/kb_batch_reindex/documents:batch-reindex",
+        json={"document_ids": [doc_a, doc_b]},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    job = client.get(
+        f"/kbs/kb_batch_reindex/jobs/{response.json()['job_id']}", headers=_HEADERS
+    )
+    assert job.status_code == 200
+    payload = job.json()
+    assert payload["status"] == "succeeded"
+    assert payload["completed_items"] == 2
+    assert payload["failed_items"] == 0
+    assert payload["result"]["summary"]["outcome"] == "succeeded"
+    items_by_doc = {item["document_id"]: item for item in payload["result"]["items"]}
+    assert set(items_by_doc) == {doc_a, doc_b}
+    assert all(item["status"] == "succeeded" for item in items_by_doc.values())
+    assert all(item["skipped"] is False for item in items_by_doc.values())
+    assert len(rag.enqueue_calls) == 4
+
+
 def test_build_kg_rejects_unparsed_document(tmp_path):
     client, *_ = _build_client(tmp_path)
     _create_kb(client, "kb_unparsed")

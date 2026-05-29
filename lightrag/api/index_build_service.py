@@ -352,6 +352,10 @@ def compute_index_hash(rag: Any) -> str:
     vectors, or KG content for a document. Query-time-only knobs (top_k etc.)
     are intentionally excluded.
     """
+    active_index_hash = getattr(rag, "kb_active_index_hash", None)
+    if active_index_hash:
+        return str(active_index_hash)
+
     addon = getattr(rag, "addon_params", {}) or {}
     payload = {
         "schema": "kb-index-hash-v1",

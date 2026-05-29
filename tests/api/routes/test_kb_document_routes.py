@@ -856,6 +856,32 @@ def test_replace_idempotency_key_reuses_existing_job_and_conflicts(tmp_path):
     assert conflict.status_code == 409
 
 
+def test_replace_auto_index_requires_auto_parse(tmp_path):
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_replace_auto_index")
+    upload = client.post(
+        "/kbs/kb_replace_auto_index/documents:upload",
+        files=[("files", ("paper.pdf", b"pdf", "application/pdf"))],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200
+    document_id = upload.json()["documents"][0]["id"]
+
+    response = client.post(
+        f"/kbs/kb_replace_auto_index/documents/{document_id}:replace"
+        "?auto_index=true&auto_parse=false",
+        files={"file": ("paper-v2.pdf", b"new", "application/pdf")},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "auto_index requires auto_parse for document replacement"
+    )
+
+
 def test_active_replace_blocks_parse_claim(tmp_path):
     client, _kb_service, store, _document_service, _job_service = _build_client(
         tmp_path

@@ -18,6 +18,7 @@ from lightrag.api.job_service import JobService
 from lightrag.api.kb_service import KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
 from lightrag.api.metadata_store import SQLiteMetadataStore
+from lightrag.base import QueryParam
 
 _original_argv = sys.argv[:]
 sys.argv = [sys.argv[0]]
@@ -48,12 +49,19 @@ class FakeRAG:
     def __init__(self, workspace: str):
         self.workspace = workspace
         self.queries: list[tuple[str, str]] = []  # (query, mode)
+        self.query_params: list[QueryParam] = []
+        self.kb_active_query_config: dict[str, object] = {}
+        self.kb_active_config_version_id: str | None = None
+        self.kb_active_parser_hash: str | None = None
+        self.kb_active_index_hash: str | None = None
+        self.kb_active_query_hash: str | None = None
 
     async def finalize_storages(self) -> None:
         return None
 
     async def aquery_llm(self, query: str, *, param):
         self.queries.append((query, param.mode))
+        self.query_params.append(param)
         return {
             "llm_response": {
                 "content": f"answer-from-{self.workspace}: {query}",
@@ -77,6 +85,7 @@ class FakeRAG:
 
     async def aquery_data(self, query: str, *, param):
         self.queries.append((query, param.mode))
+        self.query_params.append(param)
         return {
             "status": "success",
             "message": "ok",
@@ -133,10 +142,25 @@ class BuilderProbe:
     def __init__(self, *, streaming: bool = False):
         self.streaming = streaming
         self.instances: dict[str, FakeRAG] = {}
+        self.active_query_config: dict[str, object] = {}
+        self.active_config_version_id: str | None = None
+        self.active_parser_hash: str | None = None
+        self.active_index_hash: str | None = None
+        self.active_query_hash: str | None = None
 
     async def build(self, record) -> FakeRAG:
         cls = StreamingFakeRAG if self.streaming else FakeRAG
         rag = cls(record.workspace)
+        if self.active_query_config:
+            rag.kb_active_query_config = dict(self.active_query_config)
+        if self.active_config_version_id:
+            rag.kb_active_config_version_id = self.active_config_version_id
+        if self.active_parser_hash:
+            rag.kb_active_parser_hash = self.active_parser_hash
+        if self.active_index_hash:
+            rag.kb_active_index_hash = self.active_index_hash
+        if self.active_query_hash:
+            rag.kb_active_query_hash = self.active_query_hash
         self.instances[record.id] = rag
         return rag
 
@@ -241,6 +265,74 @@ def test_kb_query_includes_chunk_content_when_requested(tmp_path):
     assert refs[0]["content"] == [f"chunk content from {kb['workspace']}"]
 
 
+def test_kb_query_uses_active_query_defaults_and_metadata(tmp_path):
+    client, _kb_service, _document_service, _registry, probe = _build_client(tmp_path)
+    probe.active_query_config = {
+        "mode": "local",
+        "top_k": 7,
+        "chunk_top_k": 3,
+        "include_references": False,
+    }
+    probe.active_config_version_id = "cfg_active"
+    probe.active_parser_hash = "sha256:parser-active"
+    probe.active_index_hash = "sha256:index-active"
+    probe.active_query_hash = "sha256:query-active"
+    _create_kb(client, "kb_active_query")
+
+    response = client.post(
+        "/kbs/kb_active_query/query",
+        json={"query": "active query defaults"},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["mode"] == "local"
+    assert body["references"] is None
+    assert body["metadata"] == {
+        "config_version_id": "cfg_active",
+        "parser_hash": "sha256:parser-active",
+        "index_hash": "sha256:index-active",
+        "query_hash": "sha256:query-active",
+    }
+    rag = probe.instances["kb_active_query"]
+    param = rag.query_params[0]
+    assert param.mode == "local"
+    assert param.top_k == 7
+    assert param.chunk_top_k == 3
+    assert param.include_references is False
+
+
+def test_kb_query_request_overrides_active_query_defaults(tmp_path):
+    client, _kb_service, _document_service, _registry, probe = _build_client(tmp_path)
+    probe.active_query_config = {
+        "mode": "local",
+        "top_k": 7,
+        "include_references": False,
+    }
+    _create_kb(client, "kb_active_query_override")
+
+    response = client.post(
+        "/kbs/kb_active_query_override/query/data",
+        json={
+            "query": "override active defaults",
+            "mode": "global",
+            "top_k": 11,
+            "include_references": True,
+        },
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["metadata"]["query_mode"] == "global"
+    rag = probe.instances["kb_active_query_override"]
+    param = rag.query_params[0]
+    assert param.mode == "global"
+    assert param.top_k == 11
+    assert param.include_references is True
+
+
 def test_kb_query_data_returns_structured_payload(tmp_path):
     client, *_ = _build_client(tmp_path)
     kb = _create_kb(client, "kb_data")
@@ -293,6 +385,40 @@ def test_kb_query_stream_returns_ndjson(tmp_path):
     assert parsed[0]["references"][0]["file_path"].startswith(kb["workspace"] + "/")
     chunks = [item["response"] for item in parsed[1:]]
     assert chunks == ["first ", "second ", "third"]
+
+
+def test_kb_query_stream_includes_metadata_when_references_disabled(tmp_path):
+    client, _kb_service, _document_service, _registry, probe = _build_client(
+        tmp_path, streaming=True
+    )
+    probe.active_query_config = {"include_references": False}
+    probe.active_config_version_id = "cfg_stream_active"
+    probe.active_parser_hash = "sha256:stream-parser"
+    probe.active_index_hash = "sha256:stream-index"
+    probe.active_query_hash = "sha256:stream-query"
+    _create_kb(client, "kb_stream_no_refs")
+
+    with client.stream(
+        "POST",
+        "/kbs/kb_stream_no_refs/query/stream",
+        json={"query": "streaming no references", "stream": True},
+        headers=_HEADERS,
+    ) as response:
+        assert response.status_code == 200
+        body = b"".join(response.iter_bytes()).decode("utf-8")
+
+    lines = [line for line in body.split("\n") if line]
+    parsed = [json.loads(line) for line in lines]
+    assert parsed[0] == {
+        "kb_id": "kb_stream_no_refs",
+        "metadata": {
+            "config_version_id": "cfg_stream_active",
+            "parser_hash": "sha256:stream-parser",
+            "index_hash": "sha256:stream-index",
+            "query_hash": "sha256:stream-query",
+        },
+    }
+    assert [item["response"] for item in parsed[1:]] == ["first ", "second ", "third"]
 
 
 def test_kb_query_filters_doc_ids_must_belong_to_kb(tmp_path):

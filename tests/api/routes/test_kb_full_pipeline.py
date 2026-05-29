@@ -526,6 +526,46 @@ def test_sync_force_reparse_preserves_active_build_conflict(tmp_path):
     assert item["document_id"] == document_id
 
 
+def test_sync_force_reparse_preserves_active_replace_conflict(tmp_path):
+    client, _probe = _build_client(tmp_path)
+    _create_kb(client, "kb_sync_active_replace")
+
+    first_job = _sync(
+        client,
+        "kb_sync_active_replace",
+        [("manual/doc.pdf", "doc.pdf", b"active bytes")],
+        idempotency_key="active-replace-1",
+    )
+    first_final = _wait(client, "kb_sync_active_replace", first_job["id"])
+    assert first_final["status"] == "succeeded"
+    document_id = first_final["result"]["items"][0]["document_id"]
+
+    asyncio.run(
+        cast(Any, client.app).state.metadata_store.claim_document_replacing(
+            "kb_sync_active_replace",
+            document_id,
+            metadata_patch={"pending_replace_job_id": "job_active_replace"},
+        )
+    )
+
+    second_job = _sync(
+        client,
+        "kb_sync_active_replace",
+        [("manual/doc.pdf", "doc.pdf", b"active bytes")],
+        force_reparse=True,
+        idempotency_key="active-replace-2",
+    )
+    second_final = _wait(client, "kb_sync_active_replace", second_job["id"])
+
+    assert second_final["status"] == "failed"
+    assert second_final["failed_items"] == 1
+    item = second_final["result"]["items"][0]
+    assert item["status"] == "failed"
+    assert item["error_code"] == "replace_job_active"
+    assert item["existing_job_id"] == "job_active_replace"
+    assert item["document_id"] == document_id
+
+
 def test_source_key_identity_is_unique_in_metadata_store(tmp_path):
     client, _probe = _build_client(tmp_path)
     _create_kb(client, "kb_source_key_unique")

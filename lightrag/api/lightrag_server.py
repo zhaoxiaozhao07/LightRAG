@@ -59,7 +59,12 @@ from lightrag.parser.external.mineru.cache import MinerUParserOptions
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
-from lightrag.api.config_version_service import ConfigVersionService
+from lightrag.api.config_version_service import (
+    ConfigVersionService,
+    active_embedding_runtime_config_from_version,
+    apply_active_config_to_lightrag_kwargs,
+    attach_active_config_metadata,
+)
 from lightrag.api.document_lifecycle_service import DocumentLifecycleService
 from lightrag.api.index_build_service import IndexBuildService
 from lightrag.api.job_service import JobService
@@ -2017,41 +2022,71 @@ def create_app(args):
 
     # Initialize RAG with unified configuration
     try:
-        def build_lightrag_for_workspace(workspace: str) -> LightRAG:
-            rag_instance = LightRAG(
-                working_dir=args.working_dir,
-                workspace=workspace,
-                llm_model_func=create_llm_model_func(args.llm_binding),
-                llm_model_name=args.llm_model,
-                llm_model_max_async=args.max_async,
-                summary_max_tokens=args.summary_max_tokens,
-                summary_context_size=args.summary_context_size,
-                chunk_token_size=int(args.chunk_size),
-                chunk_overlap_token_size=int(args.chunk_overlap_size),
-                llm_model_kwargs=create_llm_model_kwargs(
+        def build_lightrag_for_workspace(
+            workspace: str,
+            active_config_version: Any | None = None,
+        ) -> LightRAG:
+            active_embedding_runtime = active_embedding_runtime_config_from_version(
+                active_config_version
+            )
+            workspace_embedding_func = embedding_func
+            active_embedding_model = active_embedding_runtime.get("model_name")
+            if active_embedding_model is not None:
+                workspace_embedding_func = create_optimized_embedding_function(
+                    config_cache=config_cache,
+                    binding=args.embedding_binding,
+                    model=str(active_embedding_model),
+                    host=args.embedding_binding_host,
+                    api_key=None
+                    if args.embedding_binding == "bedrock"
+                    else args.embedding_binding_api_key,
+                    args=args,
+                    document_prefix=args.embedding_document_prefix,
+                    query_prefix=args.embedding_query_prefix,
+                )
+                workspace_embedding_func.send_dimensions = embedding_func.send_dimensions
+
+            lightrag_kwargs = {
+                "working_dir": args.working_dir,
+                "workspace": workspace,
+                "llm_model_func": create_llm_model_func(args.llm_binding),
+                "llm_model_name": args.llm_model,
+                "llm_model_max_async": args.max_async,
+                "summary_max_tokens": args.summary_max_tokens,
+                "summary_context_size": args.summary_context_size,
+                "chunk_token_size": int(args.chunk_size),
+                "chunk_overlap_token_size": int(args.chunk_overlap_size),
+                "llm_model_kwargs": create_llm_model_kwargs(
                     args.llm_binding, args, llm_timeout
                 ),
-                embedding_func=embedding_func,
-                default_llm_timeout=llm_timeout,
-                default_embedding_timeout=embedding_timeout,
-                kv_storage=args.kv_storage,
-                graph_storage=args.graph_storage,
-                vector_storage=args.vector_storage,
-                doc_status_storage=args.doc_status_storage,
-                vector_db_storage_cls_kwargs={
+                "embedding_func": workspace_embedding_func,
+                "default_llm_timeout": llm_timeout,
+                "default_embedding_timeout": embedding_timeout,
+                "kv_storage": args.kv_storage,
+                "graph_storage": args.graph_storage,
+                "vector_storage": args.vector_storage,
+                "doc_status_storage": args.doc_status_storage,
+                "vector_db_storage_cls_kwargs": {
                     "cosine_better_than_threshold": args.cosine_threshold
                 },
-                enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
-                enable_llm_cache=args.enable_llm_cache,
-                vlm_process_enable=args.vlm_process_enable,
-                rerank_model_func=rerank_model_func,
-                rerank_model_max_async=args.rerank_max_async,
-                default_rerank_timeout=args.rerank_timeout,
-                max_parallel_insert=args.max_parallel_insert,
-                max_graph_nodes=args.max_graph_nodes,
-                addon_params=addon_params,
-                ollama_server_infos=ollama_server_infos,
-                role_llm_configs={
+                "enable_llm_cache_for_entity_extract": args.enable_llm_cache_for_extract,
+                "enable_llm_cache": args.enable_llm_cache,
+                "vlm_process_enable": args.vlm_process_enable,
+                "rerank_model_func": rerank_model_func,
+                "rerank_model_max_async": args.rerank_max_async,
+                "default_rerank_timeout": args.rerank_timeout,
+                "max_parallel_insert": args.max_parallel_insert,
+                "max_graph_nodes": args.max_graph_nodes,
+                "top_k": args.top_k,
+                "chunk_top_k": args.chunk_top_k,
+                "max_entity_tokens": args.max_entity_tokens,
+                "max_relation_tokens": args.max_relation_tokens,
+                "max_total_tokens": args.max_total_tokens,
+                "cosine_threshold": args.cosine_threshold,
+                "related_chunk_number": args.related_chunk_number,
+                "addon_params": addon_params,
+                "ollama_server_infos": ollama_server_infos,
+                "role_llm_configs": {
                     spec.name: RoleLLMConfig(
                         func=role_llm_configs[spec.name]["func"],
                         kwargs=role_llm_configs[spec.name]["kwargs"],
@@ -2076,7 +2111,12 @@ def create_app(args):
                     )
                     for spec in ROLES
                 },
+            }
+            lightrag_kwargs = apply_active_config_to_lightrag_kwargs(
+                lightrag_kwargs, active_config_version
             )
+            rag_instance = LightRAG(**lightrag_kwargs)
+            attach_active_config_metadata(rag_instance, active_config_version)
             rag_instance.register_role_llm_builder(
                 lambda role, meta: (
                     create_role_llm_func(role, meta),
@@ -2093,7 +2133,15 @@ def create_app(args):
     _log_role_provider_options(rag)
 
     async def build_kb_lightrag(record: KnowledgeBaseRecord) -> LightRAG:
-        rag_instance = build_lightrag_for_workspace(record.workspace)
+        active_config_version = None
+        if record.active_config_version_id:
+            active_config_version = await metadata_store.get_config_version(
+                record.id, record.active_config_version_id
+            )
+        rag_instance = build_lightrag_for_workspace(
+            record.workspace,
+            active_config_version=active_config_version,
+        )
         await rag_instance.initialize_storages()
         await rag_instance.check_and_migrate_data()
         return rag_instance

@@ -33,7 +33,7 @@
 | `GET` | `/kbs` | 列出所有知识库 |
 | `GET` | `/kbs/{kb_id}` | 获取知识库详情 |
 | `PATCH` | `/kbs/{kb_id}` | 局部更新知识库（名称、描述、状态等） |
-| `DELETE` | `/kbs/{kb_id}` | 软删除知识库；附加 `?hard=true` 触发异步硬删除 |
+| `DELETE` | `/kbs/{kb_id}` | 软删除知识库；附加 `?hard=true` 触发同步硬删除流程 |
 | `GET` | `/kbs/{kb_id}/status` | 知识库状态聚合（含运行中任务、pipeline 状态） |
 
 ### 1.1 创建知识库
@@ -427,7 +427,7 @@ POST /kbs/{kb_id}/jobs/{job_id}:cancel
 
 状态转换规则：
 - `queued` → `cancelled`，`error_code=cancelled_by_user`。
-- `running` / `retrying` → `cancelling`，由后台 worker 在下次检查点终止后转 `cancelled`。
+- `running` / `retrying` → `cancelling`；当前执行器是 in-process background task，只有任务体显式检查取消状态时才会停止，尚未提供 durable worker 级强制中断。
 - `succeeded` / `failed` / `cancelled` 视为 no-op，原样返回当前 job。
 - `cancelling` 视为 no-op。
 
@@ -446,7 +446,7 @@ Content-Type: application/json
 - 仅允许 `failed` 或 `cancelled` 任务重试；其他状态返回 `409`。
 - 任务回到 `queued`，清空 `result` / `error_code` / `error_message` / `started_at` / `finished_at` / `cancelled_at`。
 - `retry_count += 1`；超过 `max_retries`（默认 3）返回 `409`。
-- 注意：当前 worker 是 in-process 后台任务，重试后需要由调用方再次触发同一接口（durable worker 自动恢复仍待实现）。
+- 注意：当前 worker 是 in-process 后台任务，重试后需要由调用方再次触发同一接口或原始业务动作；durable worker 自动恢复和自动消费 queued job 仍待实现。
 
 ### 5.4 等待任务终态
 
@@ -482,7 +482,7 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 
 ## 七、知识库配置版本 Config Versions
 
-> 不可变的 KB 级配置快照。新建配置不会自动生效，需要显式 `:activate` 才会写入 `KnowledgeBase.active_config_version_id` 并 discard 缓存的 LightRAG 实例。
+> 不可变的 KB 级配置快照。新建配置不会自动生效，需要显式 `:activate` 才会写入 `KnowledgeBase.active_config_version_id` 并 discard 缓存的 LightRAG 实例。当前实现会让后续实例重建时读取已支持的 active config 字段；未接入的配置项仍应视为 metadata / diff 能力。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -521,7 +521,7 @@ POST /kbs/{kb_id}/configs/{version_id}:activate
 行为：
 - 更新 KB 的 `active_config_version_id`。
 - 写入配置版本的 `activated_at`。
-- 调用 `LightRAGInstanceRegistry.discard(kb_id)` 卸载实例，下次请求按新配置重建。
+- 调用 `LightRAGInstanceRegistry.discard(kb_id)` 卸载实例，下次请求按已支持的 active config 字段重建。
 - 若该 KB 上有 destructive job 在执行（如 `clear_kb`），discard 静默跳过。
 
 ### 7.3 配置 Diff
@@ -591,7 +591,13 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
   "response": "...",
   "references": [
     {"reference_id": "1", "file_path": "paper.pdf", "content": null}
-  ]
+  ],
+  "metadata": {
+    "config_version_id": "cfg_xxx",
+    "parser_hash": "sha256:...",
+    "index_hash": "sha256:...",
+    "query_hash": "sha256:..."
+  }
 }
 ```
 
@@ -601,8 +607,10 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 - `mode` 支持 `local / global / hybrid / naive / mix / bypass`；建议默认 `mix`。
 - `filters.doc_ids` 当前阶段会校验 ID 必须属于本 KB（不在则 400 + `error_code=doc_ids_not_in_kb`）；retrieval 内部按 doc 精确过滤待 LightRAG QueryParam 增强后接入，KB 边界已由 workspace 保证。
 - `include_chunk_content=true` 时 `references[].content` 返回该 reference 命中的 chunk 文本数组，便于评估与排查。
-- 流式响应 `Content-Type: application/x-ndjson`：第一行是 `{kb_id, references}`，后续每行 `{response: "..."}`，错误时 `{error: "..."}`。
+- 非流式、结构化检索和流式首行都会在 `metadata` 中返回 active config 信息（存在时包含 `config_version_id`、`parser_hash`、`index_hash`、`query_hash`）。
+- 流式响应 `Content-Type: application/x-ndjson`：第一行是 `{kb_id, metadata}`，若 `include_references=true` 则同一行还包含 `references`；后续每行 `{response: "..."}`，错误时 `{error: "..."}`。
 - 短查询（< 3 字符）返回 422；KB 不存在 404。
+- `enabled=false` / `archived=true` 当前只作为 SQLite 控制面字段保存，尚未接入 QueryParam 过滤；需要业务侧避免把它们误解为检索层隔离。
 
 ---
 
@@ -707,7 +715,7 @@ cancelled --> retrying --> queued
 |---|---|---|
 | `source_hash` | 上传 / 文本内容字节 | 重新解析 + 重新构建 |
 | `parser_hash` | 解析引擎 + process options | 重新解析 + 重新构建 |
-| `index_hash` | chunker / embedding / extraction prompt / language / entity_types 等 | 仅重新构建索引（复用解析产物） |
+| `index_hash` | 当前 active runtime 已实际接入的 chunk / embedding 配置（如 chunk size/overlap、tokenizer、embedding model/dim/token limit） | 仅重新构建索引（复用解析产物） |
 
 `:build-kg` 命中 `index_hash` 且文档已 `ready` 时直接 skip；`:reindex` 始终绕过 skip。
 

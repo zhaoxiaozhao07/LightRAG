@@ -263,6 +263,14 @@ def create_kb_routes(
     )
     async def update_knowledge_base(kb_id: str, request: KnowledgeBaseUpdateRequest):
         data = request.model_dump(exclude_unset=True)
+        if "active_config_version_id" in data:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "active_config_version_id must be changed via "
+                    "POST /kbs/{kb_id}/configs/{version_id}:activate"
+                ),
+            )
         try:
             record = await kb_service.update(kb_id, **data)
             return KnowledgeBaseResponse.from_record(record)

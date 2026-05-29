@@ -9,6 +9,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from lightrag.api.job_service import JobService
+from lightrag.api.kb_deletion_service import KBDeletionService
 from lightrag.api.kb_service import (
     KnowledgeBaseConflictError,
     KnowledgeBaseService,
@@ -16,6 +18,7 @@ from lightrag.api.kb_service import (
     validate_kb_id,
 )
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
+from lightrag.api.metadata_store import SQLiteMetadataStore
 from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
 
 _original_argv = sys.argv[:]
@@ -60,6 +63,32 @@ def _build_client(tmp_path: Path):
     app = FastAPI()
     app.include_router(create_kb_routes(service, registry, api_key=_API_KEY))
     return TestClient(app), service, registry, probe
+
+
+def _build_hard_delete_client(tmp_path: Path):
+    service = KnowledgeBaseService(tmp_path / "metadata" / "knowledge_bases.json")
+    metadata_store = SQLiteMetadataStore(tmp_path / "metadata" / "metadata.sqlite3")
+    job_service = JobService(service, metadata_store)
+    probe = BuilderProbe()
+    registry = LightRAGInstanceRegistry(service, probe.build, probe.finalize)
+    deletion_service = KBDeletionService(
+        service,
+        metadata_store,
+        registry,
+        input_root=tmp_path / "inputs",
+        working_dir=tmp_path / "working",
+    )
+    app = FastAPI()
+    app.include_router(
+        create_kb_routes(
+            service,
+            registry,
+            api_key=_API_KEY,
+            job_service=job_service,
+            deletion_service=deletion_service,
+        )
+    )
+    return TestClient(app), metadata_store, registry, probe
 
 
 def _create_kb_after_start_event(
@@ -274,8 +303,8 @@ def test_patch_preserves_omitted_fields_and_clears_explicit_null(tmp_path):
         json={"active_config_version_id": "cfg_1"},
         headers=_HEADERS,
     )
-    assert config_response.status_code == 200
-    assert config_response.json()["active_config_version_id"] == "cfg_1"
+    assert config_response.status_code == 400
+    assert "configs/{version_id}:activate" in config_response.json()["detail"]
 
     clear_response = client.patch(
         "/kbs/kb_patch",
@@ -283,7 +312,6 @@ def test_patch_preserves_omitted_fields_and_clears_explicit_null(tmp_path):
             "description": None,
             "owner_id": None,
             "tenant_id": None,
-            "active_config_version_id": None,
         },
         headers=_HEADERS,
     )
@@ -361,6 +389,70 @@ def test_status_handles_uninitialized_pipeline(tmp_path):
         assert registry.loaded_workspaces() == {}
     finally:
         finalize_share_data()
+
+
+def test_hard_delete_without_service_returns_503_after_soft_delete(tmp_path):
+    client, _service, _registry, _probe = _build_client(tmp_path)
+    create_response = client.post(
+        "/kbs", json={"id": "kb_hard_missing", "name": "Hard"}, headers=_HEADERS
+    )
+    assert create_response.status_code == 200
+
+    delete_response = client.delete(
+        "/kbs/kb_hard_missing?hard=true", headers=_HEADERS
+    )
+
+    assert delete_response.status_code == 503
+    assert delete_response.json()["detail"] == "KB hard-delete service is not configured"
+    include_deleted = client.get("/kbs?include_deleted=true", headers=_HEADERS)
+    assert include_deleted.status_code == 200
+    record = include_deleted.json()["knowledge_bases"][0]
+    assert record["id"] == "kb_hard_missing"
+    assert record["status"] == "deleted"
+    assert record["deleted_at"] is not None
+
+
+def test_hard_delete_route_purges_control_plane_and_files(tmp_path):
+    client, metadata_store, registry, probe = _build_hard_delete_client(tmp_path)
+    create_response = client.post(
+        "/kbs", json={"id": "kb_hard_route", "name": "Hard Route"}, headers=_HEADERS
+    )
+    assert create_response.status_code == 200
+    workspace = create_response.json()["workspace"]
+    input_workspace = tmp_path / "inputs" / workspace
+    input_workspace.mkdir(parents=True)
+    (input_workspace / "source.txt").write_text("raw", encoding="utf-8")
+    working_workspace = tmp_path / "working" / workspace
+    working_workspace.mkdir(parents=True)
+    (working_workspace / "graph.json").write_text("{}", encoding="utf-8")
+
+    rag = asyncio.run(registry.get("kb_hard_route"))
+    assert registry.is_loaded("kb_hard_route")
+    assert isinstance(rag, FakeRAG)
+
+    delete_response = client.delete(
+        "/kbs/kb_hard_route?hard=true", headers=_HEADERS
+    )
+
+    assert delete_response.status_code == 200, delete_response.text
+    payload = delete_response.json()
+    assert payload["status"] == "deleted"
+    assert payload["deleted_at"] is not None
+    assert not registry.is_loaded("kb_hard_route")
+    assert probe.finalized == [workspace]
+    assert not input_workspace.exists()
+    assert not working_workspace.exists()
+
+    docs, total_docs = asyncio.run(metadata_store.list_documents("kb_hard_route"))
+    assert docs == []
+    assert total_docs == 0
+    jobs, total_jobs = asyncio.run(metadata_store.list_jobs("kb_hard_route"))
+    assert total_jobs == 1
+    assert jobs[0].job_type == "clear_kb"
+    assert jobs[0].status == "succeeded"
+    result = jobs[0].result or {}
+    assert result["cleared_input_dir"] is True
+    assert result["finalized_storages"] is True
 
 
 def test_missing_kb_returns_404(tmp_path):

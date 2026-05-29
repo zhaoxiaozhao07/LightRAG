@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 from typing import Any
@@ -13,7 +14,10 @@ from lightrag.api.metadata_store import (
     ConfigVersionRecord,
     SQLiteMetadataStore,
 )
-from lightrag.utils import generate_track_id
+from lightrag.base import QueryParam
+from lightrag.utils import EmbeddingFunc, generate_track_id
+
+_ACTIVE_QUERY_CONFIG_KEYS = set(QueryParam.__dataclass_fields__)
 
 
 def _section_hash(section_name: str, payload: dict[str, Any] | None) -> str:
@@ -25,6 +29,213 @@ def _section_hash(section_name: str, payload: dict[str, Any] | None) -> str:
         "utf-8"
     )
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _config_section(
+    active_config_version: ConfigVersionRecord | None, section_name: str
+) -> dict[str, Any]:
+    if active_config_version is None:
+        return {}
+    return _raw_config_section(active_config_version.config, section_name)
+
+
+def _raw_config_section(config: dict[str, Any] | None, section_name: str) -> dict[str, Any]:
+    section = (config or {}).get(section_name)
+    return dict(section) if isinstance(section, dict) else {}
+
+
+def _first_present(config: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in config and config[key] is not None:
+            return config[key]
+    return None
+
+
+def _positive_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError("Active config integer values must be positive")
+    return parsed
+
+
+def _non_negative_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError("Active config integer values must be non-negative")
+    return parsed
+
+
+def _active_chunk_runtime_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    chunk_config = _raw_config_section(config, "chunk_config")
+    runtime: dict[str, Any] = {}
+    chunk_size = _positive_int(
+        _first_present(chunk_config, "chunk_token_size", "chunk_size")
+    )
+    if chunk_size is not None:
+        runtime["chunk_token_size"] = chunk_size
+    chunk_overlap = _non_negative_int(
+        _first_present(
+            chunk_config,
+            "chunk_overlap_token_size",
+            "chunk_overlap_size",
+            "overlap",
+        )
+    )
+    if chunk_overlap is not None:
+        runtime["chunk_overlap_token_size"] = chunk_overlap
+    if chunk_config.get("tiktoken_model_name") is not None:
+        runtime["tiktoken_model_name"] = str(chunk_config["tiktoken_model_name"])
+    return runtime
+
+
+def _active_embedding_runtime_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    embedding_config = _raw_config_section(config, "embedding_config")
+    runtime: dict[str, Any] = {}
+    embedding_dim = _positive_int(
+        _first_present(embedding_config, "embedding_dim", "dim")
+    )
+    if embedding_dim is not None:
+        runtime["embedding_dim"] = embedding_dim
+    max_token_size = _positive_int(
+        _first_present(embedding_config, "max_token_size", "token_limit")
+    )
+    if max_token_size is not None:
+        runtime["max_token_size"] = max_token_size
+    if embedding_config.get("model") is not None:
+        runtime["model_name"] = str(embedding_config["model"])
+    return runtime
+
+
+def active_embedding_runtime_config_from_version(
+    active_config_version: ConfigVersionRecord | None,
+) -> dict[str, Any]:
+    if active_config_version is None:
+        return {}
+    return _active_embedding_runtime_config(active_config_version.config)
+
+
+def _active_query_runtime_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    query_config = _raw_config_section(config, "query_config")
+    runtime = {
+        key: value
+        for key, value in query_config.items()
+        if key in _ACTIVE_QUERY_CONFIG_KEYS and value is not None
+    }
+    if query_config.get("cosine_threshold") is not None:
+        runtime["cosine_threshold"] = float(query_config["cosine_threshold"])
+    return runtime
+
+
+def _active_index_runtime_hash(config: dict[str, Any] | None) -> str:
+    return _section_hash(
+        "index",
+        {
+            "chunk": _active_chunk_runtime_config(config),
+            "embedding": _active_embedding_runtime_config(config),
+        },
+    )
+
+
+def _active_query_runtime_hash(config: dict[str, Any] | None) -> str:
+    return _section_hash("query", _active_query_runtime_config(config))
+
+
+def apply_active_config_to_lightrag_kwargs(
+    kwargs: dict[str, Any], active_config_version: ConfigVersionRecord | None
+) -> dict[str, Any]:
+    """Overlay supported active KB config fields onto LightRAG constructor kwargs.
+
+    This helper intentionally maps only fields that already have stable
+    LightRAG constructor/runtime equivalents. Unsupported config sections stay
+    persisted for diff/audit purposes until their runtime integration is added.
+    """
+    if active_config_version is None:
+        return kwargs
+
+    chunk_runtime = _active_chunk_runtime_config(active_config_version.config)
+    kwargs.update(chunk_runtime)
+
+    query_runtime = _active_query_runtime_config(active_config_version.config)
+    for key in (
+        "top_k",
+        "chunk_top_k",
+        "max_entity_tokens",
+        "max_relation_tokens",
+        "max_total_tokens",
+        "related_chunk_number",
+    ):
+        value = _positive_int(query_runtime.get(key))
+        if value is not None:
+            kwargs[key] = value
+    if query_runtime.get("cosine_threshold") is not None:
+        cosine_threshold = float(query_runtime["cosine_threshold"])
+        kwargs["cosine_threshold"] = cosine_threshold
+        kwargs["cosine_better_than_threshold"] = cosine_threshold
+        vector_kwargs = dict(kwargs.get("vector_db_storage_cls_kwargs") or {})
+        vector_kwargs["cosine_better_than_threshold"] = cosine_threshold
+        kwargs["vector_db_storage_cls_kwargs"] = vector_kwargs
+
+    embedding_runtime = _active_embedding_runtime_config(active_config_version.config)
+    embedding_func = kwargs.get("embedding_func")
+    if isinstance(embedding_func, EmbeddingFunc) and embedding_runtime:
+        embedding_updates: dict[str, Any] = {}
+        for source_key, target_key in (
+            ("embedding_dim", "embedding_dim"),
+            ("max_token_size", "max_token_size"),
+            ("model_name", "model_name"),
+        ):
+            if source_key in embedding_runtime:
+                embedding_updates[target_key] = embedding_runtime[source_key]
+        if embedding_updates:
+            kwargs["embedding_func"] = replace(embedding_func, **embedding_updates)
+
+    return kwargs
+
+
+def attach_active_config_metadata(
+    rag: Any, active_config_version: ConfigVersionRecord | None
+) -> None:
+    if active_config_version is None:
+        return
+    setattr(rag, "kb_active_config_version_id", active_config_version.id)
+    setattr(rag, "kb_active_config", active_config_version.config)
+    setattr(rag, "kb_active_parser_hash", active_config_version.parser_hash)
+    setattr(rag, "kb_active_index_hash", _active_index_runtime_hash(active_config_version.config))
+    setattr(rag, "kb_active_query_hash", _active_query_runtime_hash(active_config_version.config))
+    setattr(
+        rag,
+        "kb_active_query_config",
+        _active_query_runtime_config(active_config_version.config),
+    )
+
+
+def active_query_defaults_from_rag(rag: Any) -> dict[str, Any]:
+    query_config = getattr(rag, "kb_active_query_config", None)
+    if not isinstance(query_config, dict):
+        return {}
+    return {
+        key: value
+        for key, value in query_config.items()
+        if key in _ACTIVE_QUERY_CONFIG_KEYS and value is not None
+    }
+
+
+def active_query_metadata_from_rag(rag: Any) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for attr, key in (
+        ("kb_active_config_version_id", "config_version_id"),
+        ("kb_active_parser_hash", "parser_hash"),
+        ("kb_active_index_hash", "index_hash"),
+        ("kb_active_query_hash", "query_hash"),
+    ):
+        value = getattr(rag, attr, None)
+        if value is not None:
+            metadata[key] = value
+    return metadata
 
 
 class ConfigVersionService:
@@ -153,24 +364,17 @@ class ConfigVersionService:
     def _derive_hashes(config: dict[str, Any]) -> dict[str, str]:
         return {
             "parser_hash": _section_hash("parser", config.get("parser_config")),
-            "index_hash": _section_hash(
-                "index",
-                {
-                    "chunk": config.get("chunk_config"),
-                    "embedding": config.get("embedding_config"),
-                    "extraction": config.get("llm_role_config"),
-                },
-            ),
-            "query_hash": _section_hash("query", config.get("query_config")),
+            "index_hash": _active_index_runtime_hash(config),
+            "query_hash": _active_query_runtime_hash(config),
         }
 
     @staticmethod
     def _embedding_changed(
         active: dict[str, Any], target: dict[str, Any]
     ) -> bool:
-        active_embed = active.get("embedding_config") or {}
-        target_embed = target.get("embedding_config") or {}
-        for key in ("model", "dim"):
+        active_embed = _active_embedding_runtime_config(active)
+        target_embed = _active_embedding_runtime_config(target)
+        for key in ("model_name", "embedding_dim"):
             if active_embed.get(key) != target_embed.get(key):
                 return True
         return False

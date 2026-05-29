@@ -23,6 +23,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
+from lightrag.api.config_version_service import (
+    active_query_defaults_from_rag,
+    active_query_metadata_from_rag,
+)
 from lightrag.api.document_lifecycle_service import DocumentLifecycleService
 from lightrag.api.kb_service import KnowledgeBaseNotFoundError
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry
@@ -88,11 +92,22 @@ class KBQueryRequest(BaseModel):
                 raise ValueError("Each message 'role' must be a non-empty string.")
         return value
 
-    def to_query_params(self, *, is_stream: bool) -> QueryParam:
-        data = self.model_dump(
+    def to_query_params(
+        self,
+        *,
+        is_stream: bool,
+        active_defaults: dict[str, Any] | None = None,
+    ) -> QueryParam:
+        route_only_fields = {"query", "include_chunk_content", "filters"}
+        request_data = self.model_dump(
             exclude_none=True,
-            exclude={"query", "include_chunk_content", "filters"},
+            exclude=route_only_fields,
         )
+        explicit_fields = self.model_fields_set - route_only_fields
+        data = dict(request_data)
+        for key, value in (active_defaults or {}).items():
+            if key not in route_only_fields and key not in explicit_fields:
+                data[key] = value
         param = QueryParam(**data)
         param.stream = is_stream
         return param
@@ -109,6 +124,7 @@ class KBQueryResponse(BaseModel):
     mode: QueryMode
     response: str
     references: Optional[List[KBReferenceItem]] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class KBQueryDataResponse(BaseModel):
@@ -231,7 +247,12 @@ def create_kb_query_routes(
                 request.filters.doc_ids if request.filters else None,
             )
             rag = cast(Any, await registry.get(kb_id))
-            param = request.to_query_params(is_stream=False)
+            active_defaults = active_query_defaults_from_rag(rag)
+            active_metadata = active_query_metadata_from_rag(rag)
+            param = request.to_query_params(
+                is_stream=False,
+                active_defaults=active_defaults,
+            )
             param.stream = False
             # NOTE: ``filters.doc_ids`` is currently validated against the KB
             # metadata and active lifecycle state.
@@ -243,19 +264,21 @@ def create_kb_query_routes(
             data = result.get("data", {})
             references = data.get("references", [])
             response_text = llm_response.get("content") or "No relevant context found for the query."
-            if request.include_references and request.include_chunk_content:
+            include_references = bool(param.include_references)
+            if include_references and request.include_chunk_content:
                 references = _enrich_with_chunk_content(
                     references, data.get("chunks", [])
                 )
             return KBQueryResponse(
                 kb_id=kb_id,
-                mode=request.mode,
+                mode=cast(QueryMode, param.mode),
                 response=response_text,
                 references=[
                     KBReferenceItem(**ref) for ref in references
                 ]
-                if request.include_references
+                if include_references
                 else None,
+                metadata=active_metadata,
             )
         except HTTPException:
             raise
@@ -280,20 +303,31 @@ def create_kb_query_routes(
                 request.filters.doc_ids if request.filters else None,
             )
             rag = cast(Any, await registry.get(kb_id))
+            active_defaults = active_query_defaults_from_rag(rag)
+            active_metadata = active_query_metadata_from_rag(rag)
             stream_mode = request.stream if request.stream is not None else True
-            param = request.to_query_params(is_stream=stream_mode)
+            param = request.to_query_params(
+                is_stream=stream_mode,
+                active_defaults=active_defaults,
+            )
             result = await rag.aquery_llm(request.query, param=param)
 
             async def stream_generator():
                 references = result.get("data", {}).get("references", [])
                 llm_response = result.get("llm_response", {})
-                if request.include_references and request.include_chunk_content:
+                include_references = bool(param.include_references)
+                if include_references and request.include_chunk_content:
                     references = _enrich_with_chunk_content(
                         references, result.get("data", {}).get("chunks", [])
                     )
                 if llm_response.get("is_streaming"):
-                    if request.include_references:
-                        yield f"{json.dumps({'kb_id': kb_id, 'references': references})}\n"
+                    payload = {
+                        "kb_id": kb_id,
+                        "metadata": active_metadata,
+                    }
+                    if include_references:
+                        payload["references"] = references
+                    yield f"{json.dumps(payload)}\n"
                     iterator = llm_response.get("response_iterator")
                     if iterator:
                         try:
@@ -304,8 +338,12 @@ def create_kb_query_routes(
                             logger.error("KB stream error: %s", exc)
                             yield f"{json.dumps({'error': str(exc)})}\n"
                 else:
-                    body = {"kb_id": kb_id, "response": llm_response.get("content", "")}
-                    if request.include_references:
+                    body = {
+                        "kb_id": kb_id,
+                        "response": llm_response.get("content", ""),
+                        "metadata": active_metadata,
+                    }
+                    if include_references:
                         body["references"] = references
                     yield f"{json.dumps(body)}\n"
 
@@ -345,7 +383,12 @@ def create_kb_query_routes(
                 request.filters.doc_ids if request.filters else None,
             )
             rag = cast(Any, await registry.get(kb_id))
-            param = request.to_query_params(is_stream=False)
+            active_defaults = active_query_defaults_from_rag(rag)
+            active_metadata = active_query_metadata_from_rag(rag)
+            param = request.to_query_params(
+                is_stream=False,
+                active_defaults=active_defaults,
+            )
             param.stream = False
             result = await rag.aquery_data(request.query, param=param)
             return KBQueryDataResponse(
@@ -353,7 +396,7 @@ def create_kb_query_routes(
                 status=result.get("status", "success"),
                 message=result.get("message", ""),
                 data=result.get("data", {}),
-                metadata=result.get("metadata", {}),
+                metadata={**result.get("metadata", {}), **active_metadata},
             )
         except HTTPException:
             raise
