@@ -50,6 +50,7 @@ from lightrag.utils import (
     compute_mdhash_id,
     get_content_summary,
 )
+from lightrag.utils_pipeline import sidecar_uri_for
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +223,94 @@ def test_chunking_input_parity_raw_vs_lightrag(tmp_path, monkeypatch):
         assert not spy_lr["input"].startswith(
             LIGHTRAG_DOC_CONTENT_PREFIX
         ), "{{LRdoc}} marker leaked into chunking_func input"
+
+    asyncio.run(_run())
+
+
+@pytest.mark.offline
+def test_lightrag_document_path_accepts_sidecar_uri(tmp_path, monkeypatch):
+    """KB build passes parsed sidecars as file:// URIs; enqueue should
+    resolve them exactly like local paths."""
+
+    body = "Sidecar URI body"
+
+    async def _run():
+        input_dir = tmp_path / "input-uri"
+        parsed_dir = input_dir / "__parsed__" / "uri.parsed"
+        parsed_dir.mkdir(parents=True)
+        monkeypatch.setenv("INPUT_DIR", str(input_dir))
+
+        blocks_path = parsed_dir / "uri.blocks.jsonl"
+        _write_lightrag_blocks(blocks_path, [body])
+
+        rag = _new_rag(tmp_path / "work-uri")
+        await rag.initialize_storages()
+        try:
+            await rag.apipeline_enqueue_documents(
+                "",
+                file_paths="uri.lightrag",
+                docs_format=FULL_DOCS_FORMAT_LIGHTRAG,
+                lightrag_document_paths=sidecar_uri_for(parsed_dir),
+                track_id="track-uri",
+            )
+
+            doc_id = compute_mdhash_id("uri.lightrag", prefix="doc-")
+            full_doc = await rag.full_docs.get_by_id(doc_id)
+            assert full_doc is not None
+            assert full_doc["content"] == LIGHTRAG_DOC_CONTENT_PREFIX + body
+        finally:
+            await rag.finalize_storages()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.offline
+def test_lightrag_document_path_rejects_uri_outside_input_dir(tmp_path, monkeypatch):
+    async def _run():
+        input_dir = tmp_path / "input-contained"
+        input_dir.mkdir(parents=True)
+        outside_dir = tmp_path / "outside.parsed"
+        outside_dir.mkdir()
+        _write_lightrag_blocks(outside_dir / "outside.blocks.jsonl", ["outside"])
+        monkeypatch.setenv("INPUT_DIR", str(input_dir))
+
+        rag = _new_rag(tmp_path / "work-contained")
+        await rag.initialize_storages()
+        try:
+            with pytest.raises(ValueError, match="under INPUT_DIR"):
+                await rag.apipeline_enqueue_documents(
+                    "",
+                    file_paths="outside.lightrag",
+                    docs_format=FULL_DOCS_FORMAT_LIGHTRAG,
+                    lightrag_document_paths=sidecar_uri_for(outside_dir),
+                    track_id="track-outside",
+                )
+        finally:
+            await rag.finalize_storages()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.offline
+def test_lightrag_document_path_rejects_unsupported_uri(tmp_path, monkeypatch):
+    async def _run():
+        input_dir = tmp_path / "input-unsupported"
+        input_dir.mkdir(parents=True)
+        monkeypatch.setenv("INPUT_DIR", str(input_dir))
+
+        rag = _new_rag(tmp_path / "work-unsupported")
+        await rag.initialize_storages()
+        try:
+            with pytest.raises(ValueError, match="local file URI"):
+                await rag.apipeline_enqueue_documents(
+                    "",
+                    file_paths="remote.lightrag",
+                    docs_format=FULL_DOCS_FORMAT_LIGHTRAG,
+                    lightrag_document_paths="s3://bucket/remote.parsed/",
+                    track_id="track-unsupported",
+                )
+        finally:
+            await rag.finalize_storages()
 
     asyncio.run(_run())
 

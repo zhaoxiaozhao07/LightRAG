@@ -5,7 +5,9 @@ from typing import Any, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from lightrag.api.config_version_service import ConfigVersionService
 from lightrag.api.job_service import JobService
+from lightrag.api.kb_deletion_service import KBDeletionService
 from lightrag.api.kb_service import (
     KnowledgeBaseConflictError,
     KnowledgeBaseNotFoundError,
@@ -16,6 +18,10 @@ from lightrag.api.kb_service import (
     validate_kb_id,
 )
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry
+from lightrag.api.metadata_store import (
+    ConfigVersionRecord,
+    MetadataRecordNotFoundError,
+)
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.exceptions import PipelineNotInitializedError
 from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
@@ -117,6 +123,45 @@ class KnowledgeBaseStatusResponse(BaseModel):
     running_jobs: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class ConfigVersionCreateRequest(BaseModel):
+    config: dict[str, Any] = Field(default_factory=dict)
+    created_by: Optional[str] = None
+
+
+class ConfigVersionResponse(BaseModel):
+    id: str
+    kb_id: str
+    workspace: str
+    version: int
+    config: dict[str, Any]
+    parser_hash: Optional[str]
+    index_hash: Optional[str]
+    query_hash: Optional[str]
+    created_at: str
+    activated_at: Optional[str]
+    created_by: Optional[str]
+
+    @classmethod
+    def from_record(cls, record: ConfigVersionRecord) -> "ConfigVersionResponse":
+        return cls(**record.to_dict())
+
+
+class ConfigVersionListResponse(BaseModel):
+    versions: list[ConfigVersionResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class ConfigVersionDiffResponse(BaseModel):
+    target_version_id: str
+    active_version_id: Optional[str]
+    requires_reparse: bool
+    requires_reindex: bool
+    requires_vector_rebuild: bool
+    reasons: list[str]
+
+
 async def _copy_pipeline_status(workspace: str) -> tuple[bool, dict[str, Any]]:
     try:
         pipeline_status = await get_namespace_data("pipeline_status", workspace=workspace)
@@ -153,6 +198,8 @@ def create_kb_routes(
     registry: LightRAGInstanceRegistry,
     api_key: Optional[str] = None,
     job_service: JobService | None = None,
+    config_service: ConfigVersionService | None = None,
+    deletion_service: "KBDeletionService | None" = None,
 ):
     router = APIRouter(prefix="/kbs", tags=["knowledge-bases"])
     combined_auth = get_combined_auth_dependency(api_key)
@@ -233,11 +280,40 @@ def create_kb_routes(
         dependencies=[Depends(combined_auth)],
         summary="Delete a knowledge base",
     )
-    async def delete_knowledge_base(kb_id: str):
+    async def delete_knowledge_base(kb_id: str, hard: bool = False):
         try:
             record = await kb_service.delete(kb_id)
-            await registry.discard(record.id)
+            if hard:
+                if deletion_service is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="KB hard-delete service is not configured",
+                    )
+                # Synchronous (in-process) clear; for production this can
+                # be moved to a background task. Failures are surfaced via
+                # the clear_kb job and HTTP 500.
+                result = await deletion_service.hard_delete(record.id)
+                if result.errors:
+                    raise HTTPException(
+                        status_code=500,
+                        detail={
+                            "error_code": "kb_hard_delete_failed",
+                            "errors": result.errors,
+                            "job_id": result.job.id,
+                        },
+                    )
+            else:
+                try:
+                    await registry.discard(record.id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Soft delete completed but registry discard failed for '%s': %s",
+                        kb_id,
+                        exc,
+                    )
             return KnowledgeBaseResponse.from_record(record)
+        except HTTPException:
+            raise
         except KnowledgeBaseNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -284,5 +360,101 @@ def create_kb_routes(
         except Exception as exc:
             logger.error("Failed to get knowledge base status '%s': %s", kb_id, exc)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if config_service is not None:
+        active_config_service = config_service
+
+        @router.post(
+            "/{kb_id}/configs",
+            response_model=ConfigVersionResponse,
+            dependencies=[Depends(combined_auth)],
+            summary="Create a new KB configuration version",
+        )
+        async def create_config_version(
+            kb_id: str, request: ConfigVersionCreateRequest
+        ):
+            try:
+                record = await active_config_service.create(
+                    kb_id, config=request.config, created_by=request.created_by
+                )
+                return ConfigVersionResponse.from_record(record)
+            except KnowledgeBaseNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        @router.get(
+            "/{kb_id}/configs",
+            response_model=ConfigVersionListResponse,
+            dependencies=[Depends(combined_auth)],
+            summary="List KB configuration versions",
+        )
+        async def list_config_versions(
+            kb_id: str, limit: int = 50, offset: int = 0
+        ):
+            try:
+                versions, total = await active_config_service.list(
+                    kb_id, limit=limit, offset=offset
+                )
+                return ConfigVersionListResponse(
+                    versions=[
+                        ConfigVersionResponse.from_record(item) for item in versions
+                    ],
+                    total=total,
+                    limit=max(1, min(limit, 200)),
+                    offset=max(0, offset),
+                )
+            except KnowledgeBaseNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        @router.get(
+            "/{kb_id}/configs/{version_id}",
+            response_model=ConfigVersionResponse,
+            dependencies=[Depends(combined_auth)],
+            summary="Get a KB configuration version",
+        )
+        async def get_config_version(kb_id: str, version_id: str):
+            try:
+                return ConfigVersionResponse.from_record(
+                    await active_config_service.get(kb_id, version_id)
+                )
+            except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        @router.post(
+            "/{kb_id}/configs/{version_id}:activate",
+            response_model=ConfigVersionResponse,
+            dependencies=[Depends(combined_auth)],
+            summary="Activate a KB configuration version",
+        )
+        async def activate_config_version(kb_id: str, version_id: str):
+            try:
+                return ConfigVersionResponse.from_record(
+                    await active_config_service.activate(kb_id, version_id)
+                )
+            except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        @router.post(
+            "/{kb_id}/configs/{version_id}:diff",
+            response_model=ConfigVersionDiffResponse,
+            dependencies=[Depends(combined_auth)],
+            summary="Diff a KB configuration version against the active one",
+        )
+        async def diff_config_version(kb_id: str, version_id: str):
+            try:
+                return ConfigVersionDiffResponse(
+                    **await active_config_service.diff(kb_id, version_id)
+                )
+            except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return router

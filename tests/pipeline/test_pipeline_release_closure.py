@@ -31,6 +31,7 @@ from lightrag.utils import (
     compute_mdhash_id,
     safe_vdb_operation_with_exception,
 )
+from lightrag.utils_pipeline import resolve_sidecar_uri
 
 
 class _SimpleTokenizerImpl:
@@ -2557,9 +2558,10 @@ def test_write_lightrag_document_preserves_headings_and_table_dimensions(
         expected_sidecar_dir = (
             tmp_path / PARSED_DIR_NAME / "demo.docx.parsed"
         ).resolve()
+        assert full_doc is not None
         assert full_doc["sidecar_location"].startswith("file://")
         assert full_doc["sidecar_location"].endswith("/")
-        assert str(expected_sidecar_dir) in full_doc["sidecar_location"]
+        assert resolve_sidecar_uri(full_doc["sidecar_location"]) == expected_sidecar_dir
 
         await rag.finalize_storages()
 
@@ -2595,9 +2597,10 @@ def test_write_lightrag_document_strips_parser_hint_from_artifact_names(
             expected_sidecar_dir = (
                 tmp_path / PARSED_DIR_NAME / "demo.docx.parsed"
             ).resolve()
+            assert full_doc is not None
             assert full_doc["sidecar_location"].startswith("file://")
             assert full_doc["sidecar_location"].endswith("/")
-            assert str(expected_sidecar_dir) in full_doc["sidecar_location"]
+            assert resolve_sidecar_uri(full_doc["sidecar_location"]) == expected_sidecar_dir
         finally:
             await rag.finalize_storages()
 
@@ -2830,13 +2833,14 @@ def test_parse_mineru_to_lightrag_document(tmp_path, monkeypatch):
         assert equations["equations"]
 
         full_doc = await rag.full_docs.get_by_id("doc-1")
+        assert full_doc is not None
         assert full_doc["parse_format"] == "lightrag"
         # Per docs/FileProcessingConfiguration-zh.md spec, ``content`` is now
         # ``{{LRdoc}}`` followed by a leading-text summary of the document.
         assert full_doc["content"].startswith("{{LRdoc}}")
         assert full_doc["sidecar_location"].startswith("file://")
         assert full_doc["sidecar_location"].endswith("/")
-        assert str(blocks_path.parent.resolve()) in full_doc["sidecar_location"]
+        assert resolve_sidecar_uri(full_doc["sidecar_location"]) == blocks_path.parent.resolve()
 
         await rag.finalize_storages()
 

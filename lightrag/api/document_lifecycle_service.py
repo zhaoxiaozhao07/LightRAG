@@ -3,8 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
-import re
-from dataclasses import dataclass, field
+import shutil
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
@@ -42,7 +42,26 @@ from lightrag.utils import compute_mdhash_id, generate_track_id
 
 SourceType = Literal["upload", "text"]
 
-_SAFE_SOURCE_RE = re.compile(r"[^A-Za-z0-9._ -]+")
+# Sanitization rule: drop only path separators, control characters, and
+# characters that are unsafe inside a filename on common filesystems
+# (``<>:"|?*`` plus ASCII < 0x20). CJK / Latin-extended / accented letters
+# stay intact so two PDFs whose names differ only in CJK characters don't
+# both collapse to ``_.pdf`` and collide downstream in LightRAG's
+# filename-based dedup.
+_FILENAME_FORBIDDEN_CHARS = set('<>:"|?*\\/')
+
+
+def _sanitize_filename_char(char: str) -> str:
+    if not char:
+        return "_"
+    code = ord(char)
+    if code < 0x20 or code == 0x7F:
+        return "_"
+    if char in _FILENAME_FORBIDDEN_CHARS:
+        return "_"
+    return char
+
+
 _PARSEABLE_ENGINES = {
     PARSER_ENGINE_NATIVE,
     PARSER_ENGINE_MINERU,
@@ -96,11 +115,29 @@ class DocumentParseResult:
 
 
 @dataclass(slots=True)
+class DocumentDeleteFileResult:
+    deleted_source: bool = False
+    deleted_artifacts: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class DocumentReplacementSource:
+    source_name: str
+    content: bytes
+    source_hash: str
+    content_type: str | None
+    size_bytes: int
+
+
+@dataclass(slots=True)
 class ArtifactFileResult:
     artifact: ArtifactRecord
     path: Path
     filename: str
     media_type: str
+    is_directory: bool = False
 
 
 class DocumentLifecycleService:
@@ -249,7 +286,9 @@ class DocumentLifecycleService:
                         }
                     ),
                 },
-                result={"documents_created": len(documents)} if not auto_parse else None,
+                result={"documents_created": len(documents)}
+                if not auto_parse
+                else None,
                 error_code=None,
                 error_message=None,
                 created_at=now,
@@ -259,9 +298,11 @@ class DocumentLifecycleService:
                 finished_at=now if not auto_parse else None,
                 cancelled_at=None,
             )
-            created_documents, created_job, created = await self._metadata_store.create_documents_and_job(
-                documents, job
-            )
+            (
+                created_documents,
+                created_job,
+                created,
+            ) = await self._metadata_store.create_documents_and_job(documents, job)
             if not created:
                 self._cleanup_saved_sources(saved_paths, saved_dirs)
             return DocumentBatchResult(
@@ -301,6 +342,14 @@ class DocumentLifecycleService:
         record = await self._kb_service.get(kb_id)
         return await self._metadata_store.get_documents_by_ids(record.id, document_ids)
 
+    async def get_documents_by_source_keys(
+        self, kb_id: str, source_keys: list[str]
+    ) -> dict[str, DocumentRecord]:
+        record = await self._kb_service.get(kb_id)
+        return await self._metadata_store.get_documents_by_source_keys(
+            record.id, source_keys
+        )
+
     async def update_document(
         self,
         kb_id: str,
@@ -318,6 +367,306 @@ class DocumentLifecycleService:
             enabled=enabled,
             archived=archived,
         )
+
+    async def claim_delete(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        job: JobRecord,
+        delete_source_file: bool = False,
+        delete_artifacts: bool = False,
+    ) -> DocumentRecord:
+        record = await self._kb_service.get(kb_id)
+        return await self._metadata_store.claim_document_deleting(
+            record.id,
+            document_id,
+            metadata_patch={
+                "pending_delete_job_id": job.id,
+                "delete_source_file": delete_source_file,
+                "delete_artifacts": delete_artifacts,
+            },
+        )
+
+    async def claim_batch_delete(
+        self,
+        kb_id: str,
+        document_ids: list[str],
+        *,
+        job: JobRecord,
+        delete_source_file: bool = False,
+        delete_artifacts: bool = False,
+    ) -> tuple[list[DocumentRecord], list[dict[str, Any]]]:
+        record = await self._kb_service.get(kb_id)
+        claims = [
+            (
+                document_id,
+                {
+                    "pending_delete_job_id": job.id,
+                    "delete_source_file": delete_source_file,
+                    "delete_artifacts": delete_artifacts,
+                },
+            )
+            for document_id in document_ids
+        ]
+        return await self._metadata_store.claim_documents_deleting(record.id, claims)
+
+    async def complete_delete(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        job_id: str,
+        lightrag_result: dict[str, Any] | None = None,
+        file_result: DocumentDeleteFileResult | None = None,
+    ) -> DocumentRecord:
+        record = await self._kb_service.get(kb_id)
+        return await self._metadata_store.complete_document_delete(
+            record.id,
+            document_id,
+            metadata_patch={
+                "pending_delete_job_id": None,
+                "current_delete_job_id": None,
+                "last_delete_job_id": job_id,
+                "last_deleted_at": utc_now_iso(),
+                "lightrag_delete_result": lightrag_result,
+                "file_delete_result": asdict(file_result) if file_result else None,
+            },
+        )
+
+    async def fail_delete(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        job_id: str,
+        error_code: str,
+        error_message: str,
+    ) -> DocumentRecord:
+        record = await self._kb_service.get(kb_id)
+        return await self._metadata_store.fail_document_delete(
+            record.id,
+            document_id,
+            error_code=error_code,
+            error_message=error_message,
+            metadata_patch={
+                "pending_delete_job_id": None,
+                "current_delete_job_id": None,
+                "last_failed_delete_job_id": job_id,
+            },
+        )
+
+    def prepare_replacement_source(
+        self, source: DocumentSourceInput
+    ) -> DocumentReplacementSource:
+        if not source.content:
+            raise ValueError("Replacement document content cannot be empty")
+        safe_name = _sanitize_source_name(source.source_name)
+        return DocumentReplacementSource(
+            source_name=safe_name,
+            content=source.content,
+            source_hash=_content_hash(source.content),
+            content_type=source.content_type,
+            size_bytes=len(source.content),
+        )
+
+    async def claim_replace(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        job: JobRecord,
+        replacement: DocumentReplacementSource,
+        delete_source_file: bool = True,
+        delete_artifacts: bool = True,
+        delete_llm_cache: bool = False,
+        auto_parse: bool = False,
+        auto_index: bool = False,
+        parser_engine: str | None = None,
+        process_options: str | None = None,
+        force_reparse: bool = False,
+    ) -> DocumentRecord:
+        record = await self._kb_service.get(kb_id)
+        return await self._metadata_store.claim_document_replacing(
+            record.id,
+            document_id,
+            metadata_patch={
+                "pending_replace_job_id": job.id,
+                "replacement_source_name": replacement.source_name,
+                "replacement_source_hash": replacement.source_hash,
+                "delete_source_file": delete_source_file,
+                "delete_artifacts": delete_artifacts,
+                "delete_llm_cache": delete_llm_cache,
+                "auto_parse": auto_parse,
+                "auto_index": auto_index,
+                "parser_engine": parser_engine,
+                "process_options": process_options,
+                "force_reparse": force_reparse,
+            },
+        )
+
+    async def replace_document_source(
+        self,
+        kb_id: str,
+        document: DocumentRecord,
+        *,
+        job_id: str,
+        replacement: DocumentReplacementSource,
+        delete_source_file: bool = True,
+        delete_artifacts: bool = True,
+        lightrag_delete_result: dict[str, Any] | None = None,
+    ) -> tuple[DocumentRecord, DocumentDeleteFileResult]:
+        record = await self._kb_service.get(kb_id)
+        workspace_dir = (self._source_root / record.workspace).resolve(strict=False)
+        document_dir = (workspace_dir / document.id).resolve(strict=False)
+        try:
+            document_dir.relative_to(workspace_dir)
+        except ValueError as exc:
+            raise ValueError(
+                "Document replacement path escapes workspace directory"
+            ) from exc
+        document_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        staging_path = document_dir / f".replace-{job_id}.tmp"
+        staging_path.unlink(missing_ok=True)
+        try:
+            with staging_path.open("xb") as output:
+                output.write(replacement.content)
+                output.flush()
+
+            file_result = await self.cleanup_document_files(
+                kb_id,
+                document,
+                delete_source_file=delete_source_file,
+                delete_artifacts=delete_artifacts,
+            )
+            if file_result.errors:
+                raise RuntimeError("; ".join(file_result.errors))
+
+            target_path = _replacement_source_target(
+                document_dir, replacement.source_name, job_id
+            )
+            shutil.move(str(staging_path), str(target_path))
+            replaced = await self._metadata_store.complete_document_replace(
+                record.id,
+                document.id,
+                source_name=replacement.source_name,
+                source_uri=str(target_path),
+                source_hash=replacement.source_hash,
+                content_type=replacement.content_type,
+                size_bytes=replacement.size_bytes,
+                metadata_patch={
+                    "pending_replace_job_id": None,
+                    "current_replace_job_id": None,
+                    "last_replace_job_id": job_id,
+                    "last_replaced_at": utc_now_iso(),
+                    "previous_lightrag_doc_id": document.lightrag_doc_id,
+                    "lightrag_delete_result": lightrag_delete_result,
+                    "file_replace_result": asdict(file_result),
+                },
+            )
+            return replaced, file_result
+        except Exception:
+            staging_path.unlink(missing_ok=True)
+            raise
+
+    async def preflight_replace_cleanup(
+        self,
+        kb_id: str,
+        document: DocumentRecord,
+        *,
+        delete_source_file: bool,
+        delete_artifacts: bool,
+    ) -> None:
+        record = await self._kb_service.get(kb_id)
+        workspace_dir = (self._source_root / record.workspace).resolve(strict=False)
+        artifacts, _total = await self._metadata_store.list_document_artifacts(
+            record.id, document.id, limit=200
+        )
+        _validate_document_cleanup_paths(
+            workspace_dir,
+            document,
+            artifacts,
+            delete_source_file=delete_source_file,
+            delete_artifacts=delete_artifacts,
+        )
+
+    async def fail_replace(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        job_id: str,
+        error_code: str,
+        error_message: str,
+        clear_index_metadata: bool = False,
+        lightrag_delete_result: dict[str, Any] | None = None,
+    ) -> DocumentRecord:
+        record = await self._kb_service.get(kb_id)
+        return await self._metadata_store.fail_document_replace(
+            record.id,
+            document_id,
+            error_code=error_code,
+            error_message=error_message,
+            clear_index_metadata=clear_index_metadata,
+            metadata_patch={
+                "pending_replace_job_id": None,
+                "current_replace_job_id": None,
+                "last_failed_replace_job_id": job_id,
+                "lightrag_delete_result": lightrag_delete_result,
+            },
+        )
+
+    async def cleanup_document_files(
+        self,
+        kb_id: str,
+        document: DocumentRecord,
+        *,
+        delete_source_file: bool,
+        delete_artifacts: bool,
+    ) -> DocumentDeleteFileResult:
+        record = await self._kb_service.get(kb_id)
+        workspace_dir = (self._source_root / record.workspace).resolve(strict=False)
+        result = DocumentDeleteFileResult()
+        artifacts, _total = await self._metadata_store.list_document_artifacts(
+            record.id, document.id, limit=200
+        )
+        source_path: Path | None = None
+        document_dir: Path | None = None
+        if delete_source_file or delete_artifacts:
+            try:
+                source_path = _safe_workspace_path(workspace_dir, document.source_uri)
+                document_dir = source_path.parent.resolve(strict=False)
+            except ValueError as exc:
+                result.errors.append(f"source: {exc}")
+                return result
+
+        if delete_artifacts and document_dir is not None:
+            for artifact in artifacts:
+                try:
+                    artifact_path = _safe_document_path(
+                        workspace_dir,
+                        document_dir,
+                        artifact.uri,
+                    )
+                    if not artifact_path.exists():
+                        result.skipped.append(artifact.uri)
+                        continue
+                    _remove_path(artifact_path)
+                    result.deleted_artifacts.append(str(artifact_path))
+                except (OSError, ValueError) as exc:
+                    result.errors.append(f"artifact {artifact.id}: {exc}")
+
+        if delete_source_file and source_path is not None:
+            try:
+                if source_path.exists():
+                    _remove_path(source_path)
+                    result.deleted_source = True
+                    _remove_empty_parents(source_path.parent, stop_at=workspace_dir)
+                else:
+                    result.skipped.append(document.source_uri)
+            except (OSError, ValueError) as exc:
+                result.errors.append(f"source: {exc}")
+        return result
 
     async def create_parse_plan(
         self,
@@ -484,12 +833,20 @@ class DocumentLifecycleService:
         }
         source_path = str(plan.source_path)
         if plan.parser_engine == PARSER_ENGINE_NATIVE:
-            return await rag.parse_native(plan.lightrag_doc_id, source_path, content_data)
+            return await rag.parse_native(
+                plan.lightrag_doc_id, source_path, content_data
+            )
         if plan.parser_engine == PARSER_ENGINE_MINERU:
-            return await rag.parse_mineru(plan.lightrag_doc_id, source_path, content_data)
+            return await rag.parse_mineru(
+                plan.lightrag_doc_id, source_path, content_data
+            )
         if plan.parser_engine == PARSER_ENGINE_DOCLING:
-            return await rag.parse_docling(plan.lightrag_doc_id, source_path, content_data)
-        raise ValueError(f"Unsupported parser engine for KB parse: {plan.parser_engine}")
+            return await rag.parse_docling(
+                plan.lightrag_doc_id, source_path, content_data
+            )
+        raise ValueError(
+            f"Unsupported parser engine for KB parse: {plan.parser_engine}"
+        )
 
     async def complete_parse(
         self,
@@ -501,7 +858,10 @@ class DocumentLifecycleService:
         parsed_data: dict[str, Any],
     ) -> DocumentParseResult:
         artifacts = _build_parse_artifacts(plan, parsed_data)
-        document, created_artifacts = await self._metadata_store.complete_document_parse(
+        (
+            document,
+            created_artifacts,
+        ) = await self._metadata_store.complete_document_parse(
             kb_id,
             document_id,
             parser_hash=plan.parser_hash,
@@ -579,15 +939,18 @@ class DocumentLifecycleService:
         artifact = await self._metadata_store.get_document_artifact(
             record.id, document_id, artifact_id
         )
-        artifact_path = _resolve_downloadable_artifact_path(
+        artifact_path, is_directory = _resolve_artifact_path(
             self._source_root, document, artifact
         )
-        media_type = _artifact_media_type(document, artifact, artifact_path)
+        media_type = _artifact_media_type(
+            document, artifact, artifact_path, is_directory
+        )
         return ArtifactFileResult(
             artifact=artifact,
             path=artifact_path,
-            filename=artifact_path.name,
+            filename=artifact_path.name + (".zip" if is_directory else ""),
             media_type=media_type,
+            is_directory=is_directory,
         )
 
     async def _documents_for_job(
@@ -599,7 +962,9 @@ class DocumentLifecycleService:
         ):
             return await self._metadata_store.get_documents_by_ids(kb_id, document_ids)
         if job.batch_id:
-            return await self._metadata_store.list_documents_by_batch_id(kb_id, job.batch_id)
+            return await self._metadata_store.list_documents_by_batch_id(
+                kb_id, job.batch_id
+            )
         return []
 
     @staticmethod
@@ -622,7 +987,9 @@ def build_text_source(
     normalized_text = text.strip()
     if not normalized_text:
         raise ValueError("Text document cannot be empty")
-    name = source_name or f"text_{compute_mdhash_id(normalized_text, prefix='')[:12]}.txt"
+    name = (
+        source_name or f"text_{compute_mdhash_id(normalized_text, prefix='')[:12]}.txt"
+    )
     return DocumentSourceInput(
         source_name=name,
         content=normalized_text.encode("utf-8"),
@@ -642,10 +1009,9 @@ def _idempotency_fingerprint(payload: dict[str, Any]) -> str:
 
 
 def _sanitize_source_name(source_name: str) -> str:
-    clean_name = source_name.replace("/", "").replace("\\", "")
-    clean_name = clean_name.replace("..", "")
-    clean_name = "".join(char for char in clean_name if ord(char) >= 32 and char != "\x7f")
-    clean_name = _SAFE_SOURCE_RE.sub("_", clean_name).strip().strip(".")
+    clean_name = source_name.replace("..", "")
+    clean_name = "".join(_sanitize_filename_char(char) for char in clean_name)
+    clean_name = clean_name.strip().strip(".")
     if not clean_name:
         raise ValueError("Invalid document source name")
     return clean_name
@@ -671,11 +1037,45 @@ def _write_source_file(
     return target_path
 
 
-def _resolve_downloadable_artifact_path(
-    source_root: Path, document: DocumentRecord, artifact: ArtifactRecord
+def _replacement_source_target(
+    document_dir: Path, source_name: str, job_id: str
 ) -> Path:
-    if artifact.metadata.get("is_directory"):
-        raise ValueError("Directory artifacts cannot be downloaded directly")
+    target_path = document_dir / source_name
+    try:
+        resolved_document_dir = document_dir.resolve(strict=False)
+        resolved_target = target_path.resolve(strict=False)
+        if not resolved_target.is_relative_to(resolved_document_dir):
+            raise ValueError(
+                "Document replacement source path escapes document directory"
+            )
+    except OSError as exc:
+        raise ValueError("Invalid document replacement source path") from exc
+    if not target_path.exists():
+        return target_path
+    return document_dir / f"{job_id}_{source_name}"
+
+
+def _validate_document_cleanup_paths(
+    workspace_dir: Path,
+    document: DocumentRecord,
+    artifacts: list[ArtifactRecord],
+    *,
+    delete_source_file: bool,
+    delete_artifacts: bool,
+) -> None:
+    if not (delete_source_file or delete_artifacts):
+        return
+    source_path = _safe_workspace_path(workspace_dir, document.source_uri)
+    document_dir = source_path.parent.resolve(strict=False)
+    if delete_artifacts:
+        for artifact in artifacts:
+            _safe_document_path(workspace_dir, document_dir, artifact.uri)
+
+
+def _resolve_artifact_path(
+    source_root: Path, document: DocumentRecord, artifact: ArtifactRecord
+) -> tuple[Path, bool]:
+    """Return (path, is_directory) after running containment checks."""
     if not artifact.uri:
         raise ValueError("Artifact URI is empty")
 
@@ -691,14 +1091,69 @@ def _resolve_downloadable_artifact_path(
     )
     if not artifact_path.is_relative_to(allowed_document_dir):
         raise ValueError("Artifact path escapes document directory")
-    if not artifact_path.is_file():
+    is_directory = artifact_path.is_dir()
+    if not is_directory and not artifact_path.is_file():
+        raise ValueError("Artifact is neither a file nor a directory")
+    return artifact_path, is_directory
+
+
+def _safe_workspace_path(workspace_dir: Path, uri: str) -> Path:
+    path = Path(uri)
+    if not path.is_absolute():
+        path = workspace_dir / path
+    try:
+        resolved = path.resolve(strict=False)
+        resolved.relative_to(workspace_dir)
+    except ValueError as exc:
+        raise ValueError(f"Path is outside KB workspace: {uri}") from exc
+    return resolved
+
+
+def _safe_document_path(workspace_dir: Path, document_dir: Path, uri: str) -> Path:
+    path = _safe_workspace_path(workspace_dir, uri)
+    try:
+        path.resolve(strict=False).relative_to(document_dir)
+    except ValueError as exc:
+        raise ValueError(f"Path is outside document directory: {uri}") from exc
+    return path
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _remove_empty_parents(path: Path, *, stop_at: Path) -> None:
+    current = path
+    while current != stop_at and current.is_relative_to(stop_at):
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
+def _resolve_downloadable_artifact_path(
+    source_root: Path, document: DocumentRecord, artifact: ArtifactRecord
+) -> Path:
+    if artifact.metadata.get("is_directory"):
+        raise ValueError("Directory artifacts cannot be downloaded directly")
+    path, is_directory = _resolve_artifact_path(source_root, document, artifact)
+    if is_directory:
         raise ValueError("Artifact is not a downloadable file")
-    return artifact_path
+    return path
 
 
 def _artifact_media_type(
-    document: DocumentRecord, artifact: ArtifactRecord, path: Path
+    document: DocumentRecord,
+    artifact: ArtifactRecord,
+    path: Path,
+    is_directory: bool = False,
 ) -> str:
+    if is_directory:
+        return "application/zip"
     if artifact.artifact_type == "original" and document.content_type:
         return document.content_type
     if path.suffix.lower() == ".jsonl":
@@ -724,9 +1179,11 @@ def _resolve_parse_directives(
             engine, resolved_options = resolve_file_parser_directives(
                 source_path, require_external_endpoint=False
             )
-            process_options = process_options or document.metadata.get(
-                "process_options"
-            ) or resolved_options
+            process_options = (
+                process_options
+                or document.metadata.get("process_options")
+                or resolved_options
+            )
 
     if engine == PARSER_ENGINE_LEGACY:
         raise ValueError("KB parse endpoint does not support legacy parser engine")
@@ -737,7 +1194,9 @@ def _resolve_parse_directives(
         raise ValueError(f"Parser engine '{engine}' does not support .{suffix} files")
 
     raw_options = (
-        process_options if process_options is not None else document.metadata.get("process_options")
+        process_options
+        if process_options is not None
+        else document.metadata.get("process_options")
     )
     raw_options_text = "" if raw_options is None else str(raw_options)
     errors = validate_process_options(raw_options_text)

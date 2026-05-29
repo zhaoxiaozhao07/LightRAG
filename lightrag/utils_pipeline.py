@@ -16,7 +16,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import unquote, urlsplit
 
 from lightrag.base import DocProcessingStatus, DocStatus, DocStatusStorage
 from lightrag.constants import (
@@ -503,9 +503,8 @@ def sidecar_uri_for(parsed_artifact_dir: Path | str) -> str:
     The result always ends with ``/`` so a reader can distinguish a directory
     from a file at the URI level. Non-ASCII characters are percent-encoded.
     """
-    p = Path(parsed_artifact_dir).resolve()
-    encoded = quote(str(p), safe="/")
-    return f"file://{encoded}/"
+    uri = Path(parsed_artifact_dir).resolve().as_uri()
+    return uri if uri.endswith("/") else f"{uri}/"
 
 
 def resolve_sidecar_uri(uri: str | None) -> Path | None:
@@ -520,6 +519,19 @@ def resolve_sidecar_uri(uri: str | None) -> Path | None:
     if parts.scheme != "file":
         return None
     path_str = unquote(parts.path)
+    if parts.netloc:
+        if re.fullmatch(r"[A-Za-z]:", parts.netloc):
+            # Backward-compatible with the old malformed Windows form
+            # ``file://E:/path`` where the drive was parsed as netloc.
+            path_str = f"{parts.netloc}{path_str}"
+        else:
+            # UNC/network sidecar locations are intentionally not supported
+            # by the local reader; accepting them can trigger implicit
+            # network filesystem access on Windows.
+            return None
+    elif re.match(r"^/[A-Za-z]:($|/)", path_str):
+        # Standard Windows file URI: ``file:///E:/path``.
+        path_str = path_str[1:]
     if path_str.endswith("/") and len(path_str) > 1:
         path_str = path_str[:-1]
     return Path(path_str)

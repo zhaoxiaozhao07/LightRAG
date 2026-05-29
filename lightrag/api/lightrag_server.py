@@ -59,13 +59,16 @@ from lightrag.parser.external.mineru.cache import MinerUParserOptions
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.config_version_service import ConfigVersionService
 from lightrag.api.document_lifecycle_service import DocumentLifecycleService
 from lightrag.api.index_build_service import IndexBuildService
 from lightrag.api.job_service import JobService
+from lightrag.api.kb_deletion_service import KBDeletionService
 from lightrag.api.kb_service import KnowledgeBaseRecord, KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
 from lightrag.api.metadata_store import SQLiteMetadataStore
 from lightrag.api.routers.kb_document_routes import create_kb_document_routes
+from lightrag.api.routers.kb_query_routes import create_kb_query_routes
 from lightrag.api.routers.kb_routes import create_kb_routes
 
 from lightrag.utils import logger, set_verbose_debug
@@ -874,7 +877,6 @@ def create_app(args):
     )
     job_service = JobService(kb_service, metadata_store)
     index_build_service = IndexBuildService(document_lifecycle_service)
-
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """Lifespan context manager for startup and shutdown events"""
@@ -884,6 +886,15 @@ def create_app(args):
         try:
             await kb_service.initialize()
             await metadata_store.initialize()
+
+            # Recover orphan jobs left in queued/running/cancelling/retrying
+            # by a previous process — in-process workers cannot resume after
+            # a crash, so the user must retry through the cancel/retry API.
+            recovered = await job_service.recover_orphan_jobs()
+            if recovered:
+                ASCIIColors.yellow(
+                    f"\nRecovered {len(recovered)} orphan job(s) from previous process; marked as failed.\n"
+                )
 
             # Initialize database connections
             # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
@@ -2095,16 +2106,37 @@ def create_app(args):
         builder=build_kb_lightrag,
         finalizer=finalize_kb_lightrag,
     )
+    config_version_service = ConfigVersionService(
+        kb_service, metadata_store, kb_registry
+    )
+    kb_deletion_service = KBDeletionService(
+        kb_service,
+        metadata_store,
+        kb_registry,
+        input_root=Path(args.input_dir),
+        working_dir=Path(args.working_dir),
+    )
     app.state.kb_service = kb_service
     app.state.lightrag_registry = kb_registry
     app.state.metadata_store = metadata_store
     app.state.document_lifecycle_service = document_lifecycle_service
     app.state.job_service = job_service
+    app.state.config_version_service = config_version_service
+    app.state.kb_deletion_service = kb_deletion_service
 
     # Add routes
     # root_path is set on the app for reverse proxy support;
     # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
-    app.include_router(create_kb_routes(kb_service, kb_registry, api_key, job_service))
+    app.include_router(
+        create_kb_routes(
+            kb_service,
+            kb_registry,
+            api_key,
+            job_service,
+            config_service=config_version_service,
+            deletion_service=kb_deletion_service,
+        )
+    )
     app.include_router(
         create_kb_document_routes(
             document_lifecycle_service,
@@ -2112,6 +2144,13 @@ def create_app(args):
             api_key,
             registry=kb_registry,
             index_service=index_build_service,
+        )
+    )
+    app.include_router(
+        create_kb_query_routes(
+            document_lifecycle_service,
+            kb_registry,
+            api_key=api_key,
         )
     )
     app.include_router(create_document_routes(rag, doc_manager, api_key))

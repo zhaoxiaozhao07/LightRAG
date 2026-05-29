@@ -77,7 +77,7 @@ Final chunk list
 | Parameter | Source | Description |
 |---|---|---|
 | `content` | `full_docs[doc_id].content` | Concatenated merged text, used for fallback when sidecar is missing |
-| `blocks_path` | `full_docs[doc_id].lightrag_document_path` | Path to `.blocks.jsonl`, the primary input for the P strategy |
+| `blocks_path` | `full_docs[doc_id].sidecar_location` | Local `file://` sidecar directory URI; the first `*.blocks.jsonl` inside it is the primary input for the P strategy |
 | `chunk_token_size` | `chunk_options.chunk_token_size` / `CHUNK_P_SIZE` | Target hard cap N; defaults to `2000` |
 | `chunk_overlap_token_size` | `CHUNK_P_OVERLAP_SIZE` / `chunk_overlap_token_size` | Upper bound for long-body fallback overlap within the same content line and for the table bridging budget; defaults to `100` |
 | `tokenizer` | The tokenizer already parsed by LightRAG | Basis for all token counting and text overlap truncation |
@@ -366,7 +366,7 @@ Investigate in this order:
 
 1. Does `full_docs[doc_id].process_options` contain `P`?
 2. Is `full_docs[doc_id].parse_format` equal to `lightrag`? If `raw`, it is on the legacy path and P automatically falls back to R.
-3. Does the `.blocks.jsonl` pointed to by `lightrag_document_path` exist and is it non-empty?
+3. Does `sidecar_location` resolve to a local sidecar directory whose `.blocks.jsonl` exists and is non-empty?
 4. Are there `paragraph_semantic ... fallback to recursive_character` messages in the logs?
 
 ### 13.2 Tables Are Scattered; Preceding and Following Explanations Are Detached

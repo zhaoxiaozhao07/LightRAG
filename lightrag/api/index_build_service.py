@@ -14,6 +14,7 @@ from lightrag.api.metadata_store import (
     MetadataRecordNotFoundError,
 )
 from lightrag.utils import generate_track_id, logger
+from lightrag.utils_pipeline import sidecar_uri_for
 
 
 @dataclass(slots=True)
@@ -201,7 +202,6 @@ class IndexBuildService:
                 },
             )
             for plan in plans
-            if not plan.skipped
         ]
         return await self._document_service.metadata_store.claim_documents_build_queued(
             kb_id, claims
@@ -240,10 +240,17 @@ class IndexBuildService:
             )
 
         track_id = generate_track_id(f"build_{plan.document.id}")
+        # LightRAG's enqueue performs filename-based dedup against doc_status
+        # using the basename of ``file_path``. Two KB documents that share
+        # the same ``source_name`` (e.g. both files sanitised to ``_.pdf``)
+        # would otherwise collide and the second build would silently drop.
+        # Prefix the basename with the KB document id so each KB doc gets a
+        # globally unique key inside the LightRAG workspace.
+        unique_basename = _kb_unique_basename(plan)
         await rag.apipeline_enqueue_documents(
             input=[""],
             ids=[plan.document.lightrag_doc_id],
-            file_paths=[plan.document.source_uri],
+            file_paths=[unique_basename],
             track_id=track_id,
             docs_format="lightrag",
             lightrag_document_paths=[plan.sidecar_uri],
@@ -371,6 +378,20 @@ def compute_index_hash(rag: Any) -> str:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def _kb_unique_basename(plan: IndexBuildPlan) -> str:
+    """Build a basename that is globally unique inside the KB workspace.
+
+    LightRAG's filename-based dedup keys off the basename of the supplied
+    ``file_path``. KB-layer source names can collide (e.g. two CJK PDFs
+    that both sanitise to ``_.pdf``); prefixing with the KB document id
+    keeps each entry distinct without losing the original suffix used for
+    filetype detection downstream.
+    """
+    raw_name = (plan.document.source_name or "").strip() or "document"
+    safe_name = raw_name.replace("/", "_").replace("\\", "_")
+    return f"{plan.document.id}__{safe_name}"
+
+
 async def _collect_doc_status(rag: Any, plan: IndexBuildPlan) -> dict[str, Any]:
     doc_status_storage = getattr(rag, "doc_status", None)
     if doc_status_storage is None:
@@ -391,12 +412,10 @@ async def _collect_doc_status(rag: Any, plan: IndexBuildPlan) -> dict[str, Any]:
         rows = []
     row = rows[0] if rows else None
     if row is None:
-        return {
-            "skipped": False,
-            "chunks_count": None,
-            "entity_count": None,
-            "relation_count": None,
-        }
+        raise RuntimeError(
+            f"Document '{plan.document.id}' build did not create doc_status row "
+            f"for LightRAG doc '{plan.document.lightrag_doc_id}'"
+        )
     if row.get("status") != "processed":
         raise RuntimeError(
             f"Document '{plan.document.id}' build did not reach processed (status={row.get('status')}: {row.get('error_msg')})"
@@ -410,10 +429,7 @@ async def _collect_doc_status(rag: Any, plan: IndexBuildPlan) -> dict[str, Any]:
 
 
 def _to_sidecar_uri(directory: str) -> str:
-    path = Path(directory)
-    if path.is_dir() or path.suffix == "":
-        return f"file://{path.as_posix()}/"
-    return f"file://{path.as_posix()}/"
+    return sidecar_uri_for(directory)
 
 
 def _build_failure_item(

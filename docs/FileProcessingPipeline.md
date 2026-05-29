@@ -459,7 +459,7 @@ File enqueue and extraction results are written into `full_docs`:
 | `parse_format` | Content format: `pending_parse`, `raw`, `lightrag`. |
 | `content` | When `raw`, holds the extracted text; when `pending_parse`, it is an empty string; when `lightrag`, holds the **complete merged text** starting with `{{LRdoc}}` (concatenated body segments of all `type=="content"` lines in `.blocks.jsonl`). During chunking, `parse_native` strips the prefix and hands it to the chunking_func, going through exactly the same code path as `raw`. |
 | `content_hash` | MD5 of the content, used for cross-filename deduplication. For `parse_format=raw`, takes the hash of text after `sanitize_text_for_encoding`; for `parse_format=lightrag`, takes the hash of the `*.blocks.jsonl` file; for `parse_format=pending_parse`, not written, filled in after extraction completes. |
-| `lightrag_document_path` | When `parse_format=lightrag`, saves the path to the structured LightRAG Document; new records prefer to save the path relative to `INPUT_DIR`, e.g., `__parsed__/report.docx.parsed/report.blocks.jsonl`. Note that the subdirectories and the blocks filename in the path both use the canonicalized basename (without hint). |
+| `sidecar_location` | When `parse_format=lightrag`, saves the canonical local `file://` URI for the structured LightRAG Document sidecar directory, e.g., `file:///.../__parsed__/report.docx.parsed/`. Readers locate the first `*.blocks.jsonl` inside that directory. Direct `lightrag_document_paths` inputs may be relative paths under `INPUT_DIR` or local `file://` URIs; paths outside `INPUT_DIR` are rejected. |
 | `parse_engine` | The engine that actually completed extraction: `legacy`, `native`, `mineru`, `docling`. For files awaiting extraction, can also temporarily store the target engine. |
 | `process_options` | The original processing options string recorded at enqueue time (without engine name and the separator `-`), e.g., `"iet"`, `"R!"`, `""`. Downstream stages take this field as the authoritative source for deciding whether to enable image / table / equation analysis (`i/t/e`), whether to disable knowledge graph construction (`!`), and the chunking method (`F/R/V/P`). An empty string is equivalent to all defaults. |
 | `chunk_options` | The **frozen** snapshot of chunker parameters at enqueue time (slim dictionary: only the strategy sub-dictionary selected by `process_options` is retained, others discarded). Passed in by the SDK-path caller or assembled by `resolve_chunk_options(self.addon_params, process_options=…)` from instance fields (containing env defaults) as a fallback (see §3.1). `process_options` chooses which chunking strategy (F/R/V/P); `chunk_options` decides which parameters that chunker uses. The downstream `process_single_document` reads strategy-specific kwargs from this field before chunking; persistence guarantees that old documents behave reproducibly across env changes, resumes, and restarts. Rewritten together with `process_options` when re-parsing. |
@@ -597,7 +597,7 @@ The storage backend provides basename direct lookup via `get_doc_by_file_basenam
 - Documents with different filenames but identical extracted content are also considered duplicates. The hash here is the content hash of the final text or LightRAG Document obtained by the configured extraction engine; it is not the hash of the original file bytes.
 - `full_docs` and `doc_status` write or fill in the `content_hash` field according to the content format:
   - `parse_format=raw`: the MD5 of the text after `sanitize_text_for_encoding`.
-  - `parse_format=lightrag`: the MD5 of the `*.blocks.jsonl` file parsed out of `lightrag_document_path`. Relative paths are resolved against `INPUT_DIR`.
+  - `parse_format=lightrag`: the MD5 of the `*.blocks.jsonl` file resolved from `sidecar_location`. Relative `lightrag_document_paths` inputs are resolved against `INPUT_DIR` before `sidecar_location` is stored.
   - `parse_format=pending_parse`: no hash is written yet; it is filled in by subsequent steps after parsing actually completes (to avoid mistakenly judging by empty content).
 - The `legacy` path deduplicates content hashes after locally extracting text and during enqueue; on hit, this record is written as `FAILED duplicate`, and no new `full_docs`, chunks, or graph data are generated.
 - The `native` / `mineru` / `docling` paths first enqueue with `pending_parse`; after parsing completes and `content_hash` is filled in, if another document already has the same hash, this record is stopped before entering analysis, chunking, entity extraction, and graph writing.
@@ -753,7 +753,7 @@ Read `full_docs[doc_id]`:
 
 | `parse_format` | Verdict |
 | --- | --- |
-| `lightrag` and `lightrag_document_path` file exists | ✅ extracted |
+| `lightrag` and `sidecar_location` resolves to a local sidecar directory with `*.blocks.jsonl` | ✅ extracted |
 | `raw` and `content` is non-empty | ✅ extracted |
 | Other (including `pending_parse`, missing record) | ❌ not extracted |
 

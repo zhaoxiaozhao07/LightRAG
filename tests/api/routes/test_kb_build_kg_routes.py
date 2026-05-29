@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -9,11 +10,15 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from lightrag.api.document_lifecycle_service import DocumentLifecycleService
-from lightrag.api.index_build_service import IndexBuildService
+from lightrag.api.index_build_service import (
+    IndexBuildPlan,
+    IndexBuildService,
+    _collect_doc_status,
+)
 from lightrag.api.job_service import JobService
 from lightrag.api.kb_service import KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
-from lightrag.api.metadata_store import SQLiteMetadataStore
+from lightrag.api.metadata_store import DocumentRecord, SQLiteMetadataStore
 
 _original_argv = sys.argv[:]
 sys.argv = [sys.argv[0]]
@@ -53,6 +58,60 @@ class FakeDocStatus:
         }
 
 
+class FakeDeletionResult:
+    def __init__(self, doc_id: str, delete_llm_cache: bool):
+        self.status = "success"
+        self.doc_id = doc_id
+        self.delete_llm_cache = delete_llm_cache
+
+
+def _document_record(
+    *,
+    document_id: str = "doc_kb",
+    lightrag_doc_id: str = "doc-lr",
+) -> DocumentRecord:
+    return DocumentRecord(
+        id=document_id,
+        kb_id="kb_build",
+        workspace="workspace",
+        lightrag_doc_id=lightrag_doc_id,
+        source_type="file",
+        source_name="paper.pdf",
+        source_uri="paper.pdf",
+        source_hash="sha256:source",
+        content_type="application/pdf",
+        size_bytes=10,
+        parser_hash="sha256:parser",
+        index_hash=None,
+        status="parsed",
+        enabled=True,
+        archived=False,
+        chunks_count=None,
+        entity_count=None,
+        relation_count=None,
+        error_code=None,
+        error_message=None,
+        metadata={},
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+        deleted_at=None,
+    )
+
+
+def _build_plan(document: DocumentRecord) -> IndexBuildPlan:
+    return IndexBuildPlan(
+        document=document,
+        sidecar_uri=None,
+        blocks_path=None,
+        parser_hash=document.parser_hash or "",
+        index_hash="sha256:index",
+        process_options="",
+        force_rechunk=False,
+        force_extract=False,
+        force_embedding=False,
+    )
+
+
 class FakeRAG:
     def __init__(
         self,
@@ -82,10 +141,15 @@ class FakeRAG:
         self.doc_status = FakeDocStatus()
         self.build_should_fail_for = build_should_fail_for or set()
         self.enqueue_calls: list[dict] = []
+        self.delete_calls: list[tuple[str, bool]] = []
         self.process_calls: int = 0
 
     async def finalize_storages(self) -> None:
         return None
+
+    async def adelete_by_doc_id(self, doc_id, *, delete_llm_cache=False):
+        self.delete_calls.append((doc_id, delete_llm_cache))
+        return FakeDeletionResult(doc_id, delete_llm_cache)
 
     async def parse_native(self, doc_id, file_path, content_data):
         return await self._parse("native", doc_id, file_path, content_data)
@@ -160,14 +224,23 @@ class BuilderProbe:
         return None
 
 
-def _build_client(tmp_path: Path, *, probe: BuilderProbe | None = None):
+def _build_client(
+    tmp_path: Path,
+    *,
+    probe: BuilderProbe | None = None,
+    index_service_factory: Callable[[DocumentLifecycleService], IndexBuildService] | None = None,
+):
     kb_service = KnowledgeBaseService(tmp_path / "metadata" / "knowledge_bases.json")
     metadata_store = SQLiteMetadataStore(tmp_path / "metadata" / "metadata.sqlite3")
     document_service = DocumentLifecycleService(
         kb_service, metadata_store, tmp_path / "inputs"
     )
     job_service = JobService(kb_service, metadata_store)
-    index_service = IndexBuildService(document_service)
+    index_service = (
+        index_service_factory(document_service)
+        if index_service_factory is not None
+        else IndexBuildService(document_service)
+    )
     probe = probe or BuilderProbe()
     registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
     app = FastAPI()
@@ -217,6 +290,14 @@ def _upload_and_parse(
     assert detail.status_code == 200
     assert detail.json()["status"] == "parsed"
     return document_id
+
+
+async def test_collect_doc_status_missing_row_fails():
+    rag = FakeRAG("workspace")
+    plan = _build_plan(_document_record())
+
+    with pytest.raises(RuntimeError, match="did not create doc_status row"):
+        await _collect_doc_status(rag, plan)
 
 
 def test_build_kg_succeeds_and_stamps_index_hash(tmp_path):
@@ -277,6 +358,187 @@ def test_build_kg_skips_when_index_hash_matches(tmp_path):
     # Skipped path must not re-run the pipeline
     assert len(rag.enqueue_calls) == 1
     assert rag.process_calls == 1
+
+
+def test_replace_then_build_reindexes_new_source(tmp_path):
+    client, *_, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_replace_build")
+    document_id = _upload_and_parse(client, "kb_replace_build")
+    first = client.post(
+        f"/kbs/kb_replace_build/documents/{document_id}:build-kg",
+        json={},
+        headers=_HEADERS,
+    )
+    assert first.status_code == 200
+    rag = probe.instances[0]
+    assert len(rag.enqueue_calls) == 1
+    ready = client.get(f"/kbs/kb_replace_build/documents/{document_id}", headers=_HEADERS)
+    assert ready.status_code == 200
+    old_lightrag_doc_id = ready.json()["lightrag_doc_id"]
+    assert ready.json()["status"] == "ready"
+
+    replace = client.post(
+        f"/kbs/kb_replace_build/documents/{document_id}:replace"
+        "?auto_parse=true&parser_engine=mineru&process_options=iF",
+        files={"file": ("paper-v2.pdf", b"new-pdf", "application/pdf")},
+        headers=_HEADERS,
+    )
+    assert replace.status_code == 200, replace.text
+    replace_job = client.get(
+        f"/kbs/kb_replace_build/jobs/{replace.json()['id']}", headers=_HEADERS
+    )
+    assert replace_job.status_code == 200
+    assert replace_job.json()["status"] == "succeeded"
+    assert rag.delete_calls == [(old_lightrag_doc_id, False)]
+    after_replace = client.get(
+        f"/kbs/kb_replace_build/documents/{document_id}", headers=_HEADERS
+    )
+    assert after_replace.status_code == 200
+    after_payload = after_replace.json()
+    assert after_payload["status"] == "parsed"
+    assert after_payload["index_hash"] is None
+    assert after_payload["source_name"] == "paper-v2.pdf"
+
+    second = client.post(
+        f"/kbs/kb_replace_build/documents/{document_id}:build-kg",
+        json={},
+        headers=_HEADERS,
+    )
+    assert second.status_code == 200
+    second_job = client.get(
+        f"/kbs/kb_replace_build/jobs/{second.json()['id']}", headers=_HEADERS
+    )
+    assert second_job.status_code == 200
+    assert second_job.json()["status"] == "succeeded"
+    assert second_job.json()["result"]["skipped"] is False
+    assert len(rag.enqueue_calls) == 2
+    assert rag.process_calls == 2
+
+
+def test_skipped_build_claim_blocks_delete_race(tmp_path):
+    class RacingIndexBuildService(IndexBuildService):
+        async def create_build_plan(
+            self,
+            kb_id,
+            document_id,
+            *,
+            rag,
+            force_rechunk=False,
+            force_extract=False,
+            force_embedding=False,
+        ):
+            plan = await super().create_build_plan(
+                kb_id,
+                document_id,
+                rag=rag,
+                force_rechunk=force_rechunk,
+                force_extract=force_extract,
+                force_embedding=force_embedding,
+            )
+            if plan.skipped:
+                await self._document_service.metadata_store.claim_document_deleting(
+                    kb_id,
+                    document_id,
+                    metadata_patch={"pending_delete_job_id": "job_delete_race"},
+                )
+            return plan
+
+    client, _kb_service, _document_service, _job_service, _probe = _build_client(
+        tmp_path,
+        index_service_factory=RacingIndexBuildService,
+    )
+    _create_kb(client, "kb_skip_race")
+    document_id = _upload_and_parse(client, "kb_skip_race")
+
+    first = client.post(
+        f"/kbs/kb_skip_race/documents/{document_id}:build-kg",
+        json={},
+        headers=_HEADERS,
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        f"/kbs/kb_skip_race/documents/{document_id}:build-kg",
+        json={},
+        headers=_HEADERS,
+    )
+
+    assert second.status_code == 409
+    detail = second.json()["detail"]
+    assert detail["error_code"] == "delete_job_active"
+    assert detail["existing_job_id"] == "job_delete_race"
+    document = client.get(f"/kbs/kb_skip_race/documents/{document_id}", headers=_HEADERS)
+    assert document.status_code == 200
+    assert document.json()["status"] == "deleting"
+
+
+def test_batch_skipped_build_claim_blocks_delete_race(tmp_path):
+    class RacingIndexBuildService(IndexBuildService):
+        def __init__(self, document_service: DocumentLifecycleService):
+            super().__init__(document_service)
+            self.raced = False
+
+        async def create_build_plan(
+            self,
+            kb_id,
+            document_id,
+            *,
+            rag,
+            force_rechunk=False,
+            force_extract=False,
+            force_embedding=False,
+        ):
+            plan = await super().create_build_plan(
+                kb_id,
+                document_id,
+                rag=rag,
+                force_rechunk=force_rechunk,
+                force_extract=force_extract,
+                force_embedding=force_embedding,
+            )
+            if plan.skipped and not self.raced:
+                self.raced = True
+                await self._document_service.metadata_store.claim_document_deleting(
+                    kb_id,
+                    document_id,
+                    metadata_patch={"pending_delete_job_id": "job_batch_delete_race"},
+                )
+            return plan
+
+    client, _kb_service, _document_service, _job_service, _probe = _build_client(
+        tmp_path,
+        index_service_factory=RacingIndexBuildService,
+    )
+    _create_kb(client, "kb_batch_skip_race")
+    doc_a = _upload_and_parse(client, "kb_batch_skip_race", filename="a.pdf")
+    doc_b = _upload_and_parse(client, "kb_batch_skip_race", filename="b.pdf")
+    for document_id in (doc_a, doc_b):
+        first = client.post(
+            f"/kbs/kb_batch_skip_race/documents/{document_id}:build-kg",
+            json={},
+            headers=_HEADERS,
+        )
+        assert first.status_code == 200
+
+    response = client.post(
+        "/kbs/kb_batch_skip_race/documents:batch-build-kg",
+        json={"document_ids": [doc_a, doc_b]},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200
+    job = client.get(f"/kbs/kb_batch_skip_race/jobs/{response.json()['job_id']}", headers=_HEADERS)
+    assert job.status_code == 200
+    payload = job.json()
+    assert payload["status"] == "failed"
+    assert payload["completed_items"] == 1
+    assert payload["failed_items"] == 1
+    assert payload["result"]["summary"]["outcome"] == "partial_failure"
+    failures = [
+        item for item in payload["result"]["items"] if item["status"] == "failed"
+    ]
+    assert failures[0]["error_code"] == "delete_job_active"
+    assert failures[0]["existing_job_id"] == "job_batch_delete_race"
 
 
 def test_reindex_forces_rebuild_even_when_index_hash_matches(tmp_path):
@@ -551,3 +813,87 @@ def test_retry_failed_job_resets_to_queued(tmp_path):
     )
     # Cannot retry queued — must fail it first
     assert retry_again.status_code == 409
+
+
+def test_wait_for_job_returns_terminal_state(tmp_path):
+    client, *_ = _build_client(tmp_path)
+    _create_kb(client, "kb_wait")
+    document_id = _upload_and_parse(client, "kb_wait")
+
+    response = client.post(
+        f"/kbs/kb_wait/documents/{document_id}:build-kg",
+        json={},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 200
+    job_id = response.json()["id"]
+
+    waited = client.post(
+        f"/kbs/kb_wait/jobs/{job_id}:wait?timeout_seconds=10",
+        headers=_HEADERS,
+    )
+    assert waited.status_code == 200, waited.text
+    assert waited.json()["status"] == "succeeded"
+
+
+def test_wait_for_job_returns_408_on_timeout(tmp_path):
+    """If the job never reaches a terminal state inside the timeout window,
+    :wait returns 408 with the current status — not 200."""
+    client, _kb_service, document_service, _job_service, _probe = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_wait_timeout")
+
+    import asyncio
+
+    from lightrag.api.metadata_store import JobRecord
+    from lightrag.api.kb_service import utc_now_iso
+    from lightrag.utils import generate_track_id
+
+    async def seed_running_job() -> str:
+        record = await document_service.kb_service.get("kb_wait_timeout")
+        now = utc_now_iso()
+        job = JobRecord(
+            id=generate_track_id("job_running"),
+            kb_id=record.id,
+            workspace=record.workspace,
+            batch_id=None,
+            document_id=None,
+            job_type="parse",
+            status="queued",
+            stage="parsing",
+            progress=0.0,
+            total_items=1,
+            completed_items=0,
+            failed_items=0,
+            idempotency_key=None,
+            config_version_id=None,
+            config_hash=None,
+            retry_count=0,
+            max_retries=3,
+            payload={},
+            result=None,
+            error_code=None,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+            queued_at=now,
+            started_at=None,
+            finished_at=None,
+            cancelled_at=None,
+        )
+        created = await document_service.metadata_store.create_job(job)
+        await document_service.metadata_store.transition_job(
+            record.id, created.id, status="running", progress=0.5
+        )
+        return created.id
+
+    job_id = asyncio.run(seed_running_job())
+    response = client.post(
+        f"/kbs/kb_wait_timeout/jobs/{job_id}:wait?timeout_seconds=0.3&poll_interval_seconds=0.1",
+        headers=_HEADERS,
+    )
+    assert response.status_code == 408
+    detail = response.json()["detail"]
+    assert detail["error_code"] == "wait_timeout"
+    assert detail["current_status"] == "running"

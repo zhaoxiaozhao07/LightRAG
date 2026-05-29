@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from lightrag.base import DocProcessingStatus, DocStatus
 from lightrag.constants import (
@@ -81,6 +82,7 @@ from lightrag.utils_pipeline import (
     normalize_document_file_path,
     parsed_artifact_dir_for,
     resolve_doc_file_path,
+    resolve_sidecar_uri,
     sidecar_blocks_path,
     sidecar_uri_for,
     strip_lightrag_doc_prefix,
@@ -98,6 +100,14 @@ _INFLIGHT_DOC_STATUSES = (
     DocStatus.PARSING,
     DocStatus.ANALYZING,
 )
+
+
+def _looks_like_uri(value: str) -> bool:
+    """Return True for URI-looking inputs without misclassifying Windows paths."""
+    parts = urlsplit(value)
+    if not parts.scheme:
+        return False
+    return not (len(parts.scheme) == 1 and len(value) >= 2 and value[1] == ":")
 
 
 def _call_source_file_resolver(
@@ -541,10 +551,26 @@ class _PipelineMixin:
                 ) or path
                 # Resolve to an absolute path so the sidecar URI carries
                 # full location info; relative paths are interpreted under
-                # input_dir.
-                p = Path(raw_path)
+                # input_dir.  KB build passes sidecars as ``file://`` URIs;
+                # direct callers usually pass local paths.
+                input_root = input_dir_path().resolve()
+                p = resolve_sidecar_uri(raw_path)
+                if p is None:
+                    if _looks_like_uri(raw_path):
+                        raise ValueError(
+                            "LightRAG document sidecar path must be a local file URI "
+                            "or a filesystem path under INPUT_DIR"
+                        )
+                    p = Path(raw_path)
                 if not p.is_absolute():
-                    p = input_dir_path() / p
+                    p = input_root / p
+                p = p.resolve()
+                try:
+                    p.relative_to(input_root)
+                except ValueError as exc:
+                    raise ValueError(
+                        "LightRAG document sidecar path must stay under INPUT_DIR"
+                    ) from exc
                 # The user may point at the ``*.blocks.jsonl`` file itself
                 # or at its containing ``*.parsed/`` directory.  Sidecars
                 # are addressed by directory, so step up when given a file.

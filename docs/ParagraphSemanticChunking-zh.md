@@ -77,7 +77,7 @@ DOCX
 | 参数 | 来源 | 说明 |
 |---|---|---|
 | `content` | `full_docs[doc_id].content` | 拼接后的合并文本，用于 sidecar 缺失时降级 |
-| `blocks_path` | `full_docs[doc_id].lightrag_document_path` | `.blocks.jsonl` 路径，是 P 策略的主输入 |
+| `blocks_path` | `full_docs[doc_id].sidecar_location` | 本地 `file://` sidecar 目录 URI；目录内第一个 `*.blocks.jsonl` 是 P 策略的主输入 |
 | `chunk_token_size` | `chunk_options.chunk_token_size` / `CHUNK_P_SIZE` | 目标硬上限 N，默认 `2000` |
 | `chunk_overlap_token_size` | `CHUNK_P_OVERLAP_SIZE` / `chunk_overlap_token_size` | 同一内容行内长正文 fallback 与表格桥接预算的上限，默认 `100` |
 | `tokenizer` | LightRAG 已解析好的 tokenizer | 所有 token 计数与文本 overlap 截取的基准 |
@@ -366,7 +366,7 @@ jq '.[] | {heading, level, tokens, parent_headings}' \
 
 1. `full_docs[doc_id].process_options` 是否包含 `P`？
 2. `full_docs[doc_id].parse_format` 是否为 `lightrag`？若为 `raw`，说明走的是 legacy 路径，P 会自动降级到 R。
-3. `lightrag_document_path` 指向的 `.blocks.jsonl` 是否存在、是否非空？
+3. `sidecar_location` 是否能解析到本地 sidecar 目录，且目录内的 `.blocks.jsonl` 是否存在、非空？
 4. 日志中是否有 `paragraph_semantic ... fallback to recursive_character` 字样？
 
 ### 13.2 表格被切散、前后说明分离

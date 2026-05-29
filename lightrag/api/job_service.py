@@ -366,6 +366,10 @@ class JobService:
             error_message=error_message,
         )
 
+    async def recover_orphan_jobs(self) -> list[JobRecord]:
+        """Mark queued/running/cancelling/retrying jobs as failed at startup."""
+        return await self._metadata_store.recover_orphan_jobs()
+
     async def cancel_job(
         self, kb_id: str, job_id: str
     ) -> tuple[JobRecord, bool]:
@@ -499,6 +503,116 @@ class JobService:
             document_id=None,
             stage="building",
             total_items=total_items,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+
+    async def create_delete_job_once(
+        self,
+        kb_id: str,
+        *,
+        document_id: str,
+        lightrag_doc_id: str | None,
+        delete_source_file: bool = False,
+        delete_artifacts: bool = False,
+        delete_llm_cache: bool = False,
+        idempotency_key: str | None = None,
+    ) -> tuple[JobRecord, bool]:
+        payload = {
+            "document_id": document_id,
+            "lightrag_doc_id": lightrag_doc_id,
+            "delete_source_file": delete_source_file,
+            "delete_artifacts": delete_artifacts,
+            "delete_llm_cache": delete_llm_cache,
+        }
+        payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
+        return await self.create_job_once(
+            kb_id,
+            job_type="delete",
+            document_id=document_id,
+            stage="deleting",
+            total_items=1,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+
+    async def create_replace_job_once(
+        self,
+        kb_id: str,
+        *,
+        document_id: str,
+        previous_lightrag_doc_id: str | None,
+        source_name: str,
+        source_hash: str,
+        content_type: str | None,
+        size_bytes: int,
+        delete_source_file: bool = True,
+        delete_artifacts: bool = True,
+        delete_llm_cache: bool = False,
+        auto_parse: bool = False,
+        auto_index: bool = False,
+        parser_engine: str | None = None,
+        process_options: str | None = None,
+        force_reparse: bool = False,
+        idempotency_key: str | None = None,
+    ) -> tuple[JobRecord, bool]:
+        fingerprint_payload = {
+            "document_id": document_id,
+            "source_name": source_name,
+            "source_hash": source_hash,
+            "content_type": content_type,
+            "size_bytes": size_bytes,
+            "delete_source_file": delete_source_file,
+            "delete_artifacts": delete_artifacts,
+            "delete_llm_cache": delete_llm_cache,
+            "auto_parse": auto_parse,
+            "auto_index": auto_index,
+            "parser_engine": parser_engine,
+            "process_options": process_options,
+            "force_reparse": force_reparse,
+        }
+        payload = {
+            **fingerprint_payload,
+            "previous_lightrag_doc_id": previous_lightrag_doc_id,
+        }
+        payload["idempotency_fingerprint"] = _idempotency_fingerprint(
+            fingerprint_payload
+        )
+        return await self.create_job_once(
+            kb_id,
+            job_type="replace",
+            document_id=document_id,
+            stage="replacing",
+            total_items=1,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+
+    async def create_batch_delete_job_once(
+        self,
+        kb_id: str,
+        *,
+        batch_id: str,
+        document_ids: Sequence[str],
+        delete_source_file: bool = False,
+        delete_artifacts: bool = False,
+        delete_llm_cache: bool = False,
+        idempotency_key: str | None = None,
+    ) -> tuple[JobRecord, bool]:
+        payload = {
+            "document_ids": list(document_ids),
+            "delete_source_file": delete_source_file,
+            "delete_artifacts": delete_artifacts,
+            "delete_llm_cache": delete_llm_cache,
+        }
+        payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
+        return await self.create_job_once(
+            kb_id,
+            job_type="delete",
+            batch_id=batch_id,
+            document_id=None,
+            stage="deleting",
+            total_items=len(document_ids),
             payload=payload,
             idempotency_key=idempotency_key,
         )

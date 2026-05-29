@@ -459,7 +459,7 @@ selector → 子字典映射：F → `fixed_token`，R → `recursive_character`
 | `parse_format` | 内容格式：`pending_parse`, `raw`, `lightrag`。 |
 | `content` | `raw` 时保存抽取文本；`pending_parse` 时为空字符串；`lightrag` 时存储以 `{{LRdoc}}` 开头的**完整合并文本**（拼接 `.blocks.jsonl` 中所有 `type=="content"` 行的 body 段），分块阶段 `parse_native` 会剥离前缀后再交给 chunking_func，与 `raw` 走完全相同的代码路径。 |
 | `content_hash` | 内容 MD5，用于跨文件名查重。`parse_format=raw` 取 `sanitize_text_for_encoding` 后文本的 hash；`parse_format=lightrag` 取 `*.blocks.jsonl` 文件 hash；`parse_format=pending_parse` 不写入，待抽取完成后补上。 |
-| `lightrag_document_path` | `parse_format=lightrag` 时保存结构化 LightRAG Document 的路径；新记录优先保存为相对 `INPUT_DIR` 的路径，例如 `__parsed__/report.docx.parsed/report.blocks.jsonl`。注意路径中的子目录与 blocks 文件名都使用规范化 basename（不含 hint）。 |
+| `sidecar_location` | `parse_format=lightrag` 时保存结构化 LightRAG Document sidecar 目录的规范本地 `file://` URI，例如 `file:///.../__parsed__/report.docx.parsed/`。读取时在该目录内定位第一个 `*.blocks.jsonl`。直接传入的 `lightrag_document_paths` 可以是 `INPUT_DIR` 下的相对路径或本地 `file://` URI；超出 `INPUT_DIR` 的路径会被拒绝。 |
 | `parse_engine` | 实际完成抽取的引擎：`legacy`, `native`, `mineru`, `docling`。对于待抽取文件，也可暂存目标引擎。 |
 | `process_options` | 入队时记录的原始处理选项串（不含引擎名和分隔 `-`），例如 `"iet"`、`"R!"`、`""`。下游各阶段以此字段为权威源，决定是否启用图像/表格/公式分析（`i/t/e`）、是否禁止知识图谱构建（`!`）以及分块方式（`F/R/V/P`）。空字符串等价于全部默认值。 |
 | `chunk_options` | 入队时**冻结**的分块器参数快照（精简字典：只保留 `process_options` 选中的那一路策略子字典，其它策略丢弃）。由 SDK 路径调用方传入或由 `resolve_chunk_options(self.addon_params, process_options=…)` 从实例字段（含 env 默认）兜底（见 §3.1）。`process_options` 选哪种分块策略（F/R/V/P），`chunk_options` 决定那一路分块器使用哪些参数。下游 `process_single_document` 在分块前从此字段读取专属 kwargs；持久化保证 env 变化、续跑、重启后老文档行为可复现。重新解析时与 `process_options` 一同改写。 |
@@ -597,7 +597,7 @@ __parsed__/<base>.docling_raw/
 - 文件名不同但抽取后的内容完全相同的文档同样视为重复。这里的 hash 是按配置的抽取引擎得到最终文本或 LightRAG Document 后计算的内容 hash，不是原始文件字节 hash。
 - `full_docs` 与 `doc_status` 会按内容格式写入或补齐 `content_hash` 字段：
   - `parse_format=raw`：取经过 `sanitize_text_for_encoding` 之后的文本 MD5。
-  - `parse_format=lightrag`：取 `lightrag_document_path` 解析出的 `*.blocks.jsonl` 文件 MD5。相对路径按 `INPUT_DIR` 解析。
+  - `parse_format=lightrag`：取 `sidecar_location` 解析出的 `*.blocks.jsonl` 文件 MD5。相对 `lightrag_document_paths` 输入会先按 `INPUT_DIR` 解析，再写入 `sidecar_location`。
   - `parse_format=pending_parse`：暂不写入 hash，等到真正完成解析后由后续步骤补上（避免按空内容误判）。
 - `legacy` 路径会在本地提取文本后、入队时进行内容 hash 查重；命中重复时，本次记录写为 `FAILED duplicate`，不会生成新的 `full_docs`、chunks 或图数据。
 - `native` / `mineru` / `docling` 路径会先以 `pending_parse` 入队；真正完成解析并补齐 `content_hash` 后，如果发现其它文档已有相同 hash，本次记录会在进入分析、切块、实体抽取和图写入前停止。
@@ -753,7 +753,7 @@ PENDING ─►├─ q_mineru  ──► [mineru parser  × N2] ─┼─► q_a
 
 | `parse_format` | 判定 |
 | --- | --- |
-| `lightrag` 且 `lightrag_document_path` 文件存在 | ✅ 已抽取 |
+| `lightrag` 且 `sidecar_location` 可解析到包含 `*.blocks.jsonl` 的本地 sidecar 目录 | ✅ 已抽取 |
 | `raw` 且 `content` 非空 | ✅ 已抽取 |
 | 其它（含 `pending_parse`、记录缺失） | ❌ 未抽取 |
 

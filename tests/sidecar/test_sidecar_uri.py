@@ -5,6 +5,7 @@ introduced when ``full_docs`` collapsed its four path fields to
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -75,9 +76,32 @@ def test_resolve_sidecar_uri_tolerates_missing_trailing_slash(tmp_path):
 
 
 @pytest.mark.offline
+@pytest.mark.skipif(os.name != "nt", reason="Windows drive-letter URI regression")
+def test_sidecar_uri_round_trip_windows_drive(tmp_path):
+    sidecar_dir = tmp_path / "demo.parsed"
+    sidecar_dir.mkdir()
+
+    uri = sidecar_uri_for(sidecar_dir)
+
+    assert uri.startswith("file:///")
+    assert resolve_sidecar_uri(uri) == sidecar_dir.resolve()
+
+
+@pytest.mark.offline
+@pytest.mark.skipif(os.name != "nt", reason="Windows drive-letter URI regression")
+def test_resolve_sidecar_uri_tolerates_legacy_windows_drive_uri(tmp_path):
+    sidecar_dir = tmp_path / "legacy.parsed"
+    sidecar_dir.mkdir()
+    drive, rest = os.path.splitdrive(str(sidecar_dir.resolve()))
+    legacy_uri = f"file://{drive}{rest.replace(os.sep, '/')}/"
+
+    assert resolve_sidecar_uri(legacy_uri) == sidecar_dir.resolve()
+
+
+@pytest.mark.offline
 @pytest.mark.parametrize(
     "uri",
-    [None, "", SIDECAR_LOCATION_UNKNOWN, "s3://bucket/path/"],
+    [None, "", SIDECAR_LOCATION_UNKNOWN, "s3://bucket/path/", "file://host/share/"],
 )
 def test_resolve_sidecar_uri_returns_none_for_unsupported(uri):
     assert resolve_sidecar_uri(uri) is None

@@ -24,10 +24,14 @@ DocumentStatus = Literal[
     "building",
     "ready",
     "build_failed",
+    "deleting",
+    "delete_failed",
+    "replacing",
+    "replace_failed",
     "deleted",
 ]
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _T = TypeVar("_T")
 
 
@@ -47,18 +51,28 @@ class ActiveDocumentParseJobError(MetadataStoreError):
     def __init__(self, document_id: str, existing_job_id: str):
         self.document_id = document_id
         self.existing_job_id = existing_job_id
-        super().__init__(
-            f"Document '{document_id}' already has an active parse job"
-        )
+        super().__init__(f"Document '{document_id}' already has an active parse job")
 
 
 class ActiveDocumentBuildJobError(MetadataStoreError):
     def __init__(self, document_id: str, existing_job_id: str):
         self.document_id = document_id
         self.existing_job_id = existing_job_id
-        super().__init__(
-            f"Document '{document_id}' already has an active build job"
-        )
+        super().__init__(f"Document '{document_id}' already has an active build job")
+
+
+class ActiveDocumentDeleteJobError(MetadataStoreError):
+    def __init__(self, document_id: str, existing_job_id: str):
+        self.document_id = document_id
+        self.existing_job_id = existing_job_id
+        super().__init__(f"Document '{document_id}' already has an active delete job")
+
+
+class ActiveDocumentReplaceJobError(MetadataStoreError):
+    def __init__(self, document_id: str, existing_job_id: str):
+        self.document_id = document_id
+        self.existing_job_id = existing_job_id
+        super().__init__(f"Document '{document_id}' already has an active replace job")
 
 
 class DocumentNotParsedError(MetadataStoreError):
@@ -75,6 +89,16 @@ class IdempotencyKeyConflictError(MetadataStoreError):
         self.idempotency_key = idempotency_key
         super().__init__(
             f"Idempotency key '{idempotency_key}' is already used for a different request"
+        )
+
+
+class DuplicateDocumentSourceKeyError(MetadataStoreError):
+    def __init__(self, kb_id: str, source_key: str, existing_document_id: str):
+        self.kb_id = kb_id
+        self.source_key = source_key
+        self.existing_document_id = existing_document_id
+        super().__init__(
+            f"Source key '{source_key}' already belongs to document '{existing_document_id}'"
         )
 
 
@@ -251,6 +275,25 @@ class ConfigVersionRecord:
     activated_at: str | None
     created_by: str | None
 
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "ConfigVersionRecord":
+        return cls(
+            id=str(row["id"]),
+            kb_id=str(row["kb_id"]),
+            workspace=str(row["workspace"]),
+            version=int(row["version"]),
+            config=_loads_json_object(row["config_json"]),
+            parser_hash=row["parser_hash"],
+            index_hash=row["index_hash"],
+            query_hash=row["query_hash"],
+            created_at=str(row["created_at"]),
+            activated_at=row["activated_at"],
+            created_by=row["created_by"],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
 
 def _dumps_json(value: dict[str, Any] | None) -> str:
     return json.dumps(value or {}, ensure_ascii=False, sort_keys=True)
@@ -269,6 +312,14 @@ def _loads_optional_json_object(value: str | bytes | None) -> dict[str, Any] | N
     if value in (None, ""):
         return None
     return _loads_json_object(value)
+
+
+def _metadata_source_key(metadata: dict[str, Any]) -> str | None:
+    value = metadata.get("source_key")
+    if not isinstance(value, str):
+        return None
+    source_key = value.strip()
+    return source_key or None
 
 
 class SQLiteMetadataStore:
@@ -293,7 +344,9 @@ class SQLiteMetadataStore:
     ) -> tuple[list[DocumentRecord], JobRecord, bool]:
         await self._ensure_initialized()
 
-        def write(conn: sqlite3.Connection) -> tuple[list[DocumentRecord], JobRecord, bool]:
+        def write(
+            conn: sqlite3.Connection,
+        ) -> tuple[list[DocumentRecord], JobRecord, bool]:
             existing = self._get_job_by_idempotency_key(
                 conn, job.kb_id, job.idempotency_key, job_type=job.job_type
             )
@@ -372,7 +425,39 @@ class SQLiteMetadataStore:
                 [kb_id, *document_ids],
             ).fetchall()
         records_by_id = {row["id"]: DocumentRecord.from_row(row) for row in rows}
-        return [records_by_id[document_id] for document_id in document_ids if document_id in records_by_id]
+        return [
+            records_by_id[document_id]
+            for document_id in document_ids
+            if document_id in records_by_id
+        ]
+
+    async def get_documents_by_source_keys(
+        self, kb_id: str, source_keys: Sequence[str]
+    ) -> dict[str, DocumentRecord]:
+        await self._ensure_initialized()
+        ordered_keys = list(dict.fromkeys(source_keys))
+        if not ordered_keys:
+            return {}
+        placeholders = ", ".join("?" for _ in ordered_keys)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT d.*, sk.source_key AS mapped_source_key
+                FROM document_source_keys sk
+                JOIN documents d ON d.kb_id = sk.kb_id AND d.id = sk.document_id
+                WHERE sk.kb_id = ? AND sk.source_key IN ({placeholders})
+                    AND d.deleted_at IS NULL
+                ORDER BY d.updated_at DESC, d.created_at DESC, d.id DESC
+                """,
+                [kb_id, *ordered_keys],
+            ).fetchall()
+        documents: dict[str, DocumentRecord] = {}
+        wanted = set(ordered_keys)
+        for row in rows:
+            source_key = str(row["mapped_source_key"])
+            if source_key in wanted and source_key not in documents:
+                documents[source_key] = DocumentRecord.from_row(row)
+        return documents
 
     async def list_documents_by_batch_id(
         self, kb_id: str, batch_id: str
@@ -419,6 +504,13 @@ class SQLiteMetadataStore:
             if metadata_patch:
                 metadata.update(metadata_patch)
             now = utc_now_iso()
+            self._sync_document_source_key(
+                conn,
+                kb_id=kb_id,
+                document_id=document_id,
+                source_key=_metadata_source_key(metadata),
+                timestamp=now,
+            )
             conn.execute(
                 """
                 UPDATE documents
@@ -469,7 +561,9 @@ class SQLiteMetadataStore:
     ) -> tuple[list[DocumentRecord], list[dict[str, Any]]]:
         await self._ensure_initialized()
 
-        def write(conn: sqlite3.Connection) -> tuple[list[DocumentRecord], list[dict[str, Any]]]:
+        def write(
+            conn: sqlite3.Connection,
+        ) -> tuple[list[DocumentRecord], list[dict[str, Any]]]:
             documents: list[DocumentRecord] = []
             failures: list[dict[str, Any]] = []
             for document_id, metadata_patch in claims:
@@ -489,6 +583,36 @@ class SQLiteMetadataStore:
                             "document_id": document_id,
                             "status": "failed",
                             "error_code": "parse_job_active",
+                            "error_message": str(exc),
+                            "existing_job_id": exc.existing_job_id,
+                        }
+                    )
+                except ActiveDocumentBuildJobError as exc:
+                    failures.append(
+                        {
+                            "document_id": document_id,
+                            "status": "failed",
+                            "error_code": "build_job_active",
+                            "error_message": str(exc),
+                            "existing_job_id": exc.existing_job_id,
+                        }
+                    )
+                except ActiveDocumentDeleteJobError as exc:
+                    failures.append(
+                        {
+                            "document_id": document_id,
+                            "status": "failed",
+                            "error_code": "delete_job_active",
+                            "error_message": str(exc),
+                            "existing_job_id": exc.existing_job_id,
+                        }
+                    )
+                except ActiveDocumentReplaceJobError as exc:
+                    failures.append(
+                        {
+                            "document_id": document_id,
+                            "status": "failed",
+                            "error_code": "replace_job_active",
                             "error_message": str(exc),
                             "existing_job_id": exc.existing_job_id,
                         }
@@ -537,7 +661,9 @@ class SQLiteMetadataStore:
     ) -> tuple[DocumentRecord, list[ArtifactRecord]]:
         await self._ensure_initialized()
 
-        def write(conn: sqlite3.Connection) -> tuple[DocumentRecord, list[ArtifactRecord]]:
+        def write(
+            conn: sqlite3.Connection,
+        ) -> tuple[DocumentRecord, list[ArtifactRecord]]:
             document = self._update_document_parse_state(
                 conn,
                 kb_id,
@@ -630,6 +756,26 @@ class SQLiteMetadataStore:
                             "document_id": document_id,
                             "status": "failed",
                             "error_code": "build_job_active",
+                            "error_message": str(exc),
+                            "existing_job_id": exc.existing_job_id,
+                        }
+                    )
+                except ActiveDocumentDeleteJobError as exc:
+                    failures.append(
+                        {
+                            "document_id": document_id,
+                            "status": "failed",
+                            "error_code": "delete_job_active",
+                            "error_message": str(exc),
+                            "existing_job_id": exc.existing_job_id,
+                        }
+                    )
+                except ActiveDocumentReplaceJobError as exc:
+                    failures.append(
+                        {
+                            "document_id": document_id,
+                            "status": "failed",
+                            "error_code": "replace_job_active",
                             "error_message": str(exc),
                             "existing_job_id": exc.existing_job_id,
                         }
@@ -760,6 +906,285 @@ class SQLiteMetadataStore:
             )
         )
 
+    async def claim_document_deleting(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        metadata_patch: dict[str, Any],
+    ) -> DocumentRecord:
+        await self._ensure_initialized()
+        return await self._write(
+            lambda conn: self._claim_document_deleting(
+                conn,
+                kb_id,
+                document_id,
+                metadata_patch=metadata_patch,
+            )
+        )
+
+    async def claim_documents_deleting(
+        self,
+        kb_id: str,
+        claims: Sequence[tuple[str, dict[str, Any]]],
+    ) -> tuple[list[DocumentRecord], list[dict[str, Any]]]:
+        await self._ensure_initialized()
+
+        def write(
+            conn: sqlite3.Connection,
+        ) -> tuple[list[DocumentRecord], list[dict[str, Any]]]:
+            documents: list[DocumentRecord] = []
+            failures: list[dict[str, Any]] = []
+            for document_id, metadata_patch in claims:
+                try:
+                    documents.append(
+                        self._claim_document_deleting(
+                            conn,
+                            kb_id,
+                            document_id,
+                            metadata_patch=metadata_patch,
+                        )
+                    )
+                except ActiveDocumentParseJobError as exc:
+                    failures.append(
+                        {
+                            "document_id": document_id,
+                            "status": "failed",
+                            "error_code": "parse_job_active",
+                            "error_message": str(exc),
+                            "existing_job_id": exc.existing_job_id,
+                        }
+                    )
+                except ActiveDocumentBuildJobError as exc:
+                    failures.append(
+                        {
+                            "document_id": document_id,
+                            "status": "failed",
+                            "error_code": "build_job_active",
+                            "error_message": str(exc),
+                            "existing_job_id": exc.existing_job_id,
+                        }
+                    )
+                except ActiveDocumentDeleteJobError as exc:
+                    failures.append(
+                        {
+                            "document_id": document_id,
+                            "status": "failed",
+                            "error_code": "delete_job_active",
+                            "error_message": str(exc),
+                            "existing_job_id": exc.existing_job_id,
+                        }
+                    )
+                except ActiveDocumentReplaceJobError as exc:
+                    failures.append(
+                        {
+                            "document_id": document_id,
+                            "status": "failed",
+                            "error_code": "replace_job_active",
+                            "error_message": str(exc),
+                            "existing_job_id": exc.existing_job_id,
+                        }
+                    )
+                except MetadataRecordNotFoundError as exc:
+                    failures.append(
+                        {
+                            "document_id": document_id,
+                            "status": "failed",
+                            "error_code": "document_not_found",
+                            "error_message": str(exc),
+                        }
+                    )
+            return documents, failures
+
+        return await self._write(write)
+
+    async def complete_document_delete(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        metadata_patch: dict[str, Any],
+    ) -> DocumentRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> DocumentRecord:
+            current_row = conn.execute(
+                """
+                SELECT * FROM documents
+                WHERE kb_id = ? AND id = ? AND deleted_at IS NULL
+                """,
+                (kb_id, document_id),
+            ).fetchone()
+            if current_row is None:
+                raise MetadataRecordNotFoundError(f"Document '{document_id}' not found")
+            metadata = _loads_json_object(current_row["metadata_json"])
+            metadata.update(metadata_patch)
+            now = utc_now_iso()
+            conn.execute(
+                "DELETE FROM document_source_keys WHERE kb_id = ? AND document_id = ?",
+                (kb_id, document_id),
+            )
+            conn.execute(
+                "DELETE FROM document_artifacts WHERE kb_id = ? AND document_id = ?",
+                (kb_id, document_id),
+            )
+            conn.execute(
+                """
+                UPDATE documents
+                SET status = 'deleted', enabled = 0, archived = 1,
+                    error_code = NULL, error_message = NULL, metadata_json = ?,
+                    updated_at = ?, deleted_at = ?
+                WHERE kb_id = ? AND id = ?
+                """,
+                (_dumps_json(metadata), now, now, kb_id, document_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM documents WHERE kb_id = ? AND id = ?",
+                (kb_id, document_id),
+            ).fetchone()
+            if row is None:
+                raise MetadataRecordNotFoundError(f"Document '{document_id}' not found")
+            return DocumentRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def fail_document_delete(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        error_code: str,
+        error_message: str,
+        metadata_patch: dict[str, Any],
+    ) -> DocumentRecord:
+        await self._ensure_initialized()
+        return await self._write(
+            lambda conn: self._update_document_parse_state(
+                conn,
+                kb_id,
+                document_id,
+                status="delete_failed",
+                metadata_patch=metadata_patch,
+                error_code=error_code,
+                error_message=error_message,
+            )
+        )
+
+    async def claim_document_replacing(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        metadata_patch: dict[str, Any],
+    ) -> DocumentRecord:
+        await self._ensure_initialized()
+        return await self._write(
+            lambda conn: self._claim_document_replacing(
+                conn,
+                kb_id,
+                document_id,
+                metadata_patch=metadata_patch,
+            )
+        )
+
+    async def complete_document_replace(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        source_name: str,
+        source_uri: str,
+        source_hash: str,
+        content_type: str | None,
+        size_bytes: int,
+        metadata_patch: dict[str, Any],
+    ) -> DocumentRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> DocumentRecord:
+            current_row = conn.execute(
+                """
+                SELECT * FROM documents
+                WHERE kb_id = ? AND id = ? AND deleted_at IS NULL
+                """,
+                (kb_id, document_id),
+            ).fetchone()
+            if current_row is None:
+                raise MetadataRecordNotFoundError(f"Document '{document_id}' not found")
+            metadata = _loads_json_object(current_row["metadata_json"])
+            for key in _REPLACE_DERIVED_METADATA_KEYS:
+                metadata.pop(key, None)
+            metadata.update(metadata_patch)
+            now = utc_now_iso()
+            self._sync_document_source_key(
+                conn,
+                kb_id=kb_id,
+                document_id=document_id,
+                source_key=_metadata_source_key(metadata),
+                timestamp=now,
+            )
+            conn.execute(
+                "DELETE FROM document_artifacts WHERE kb_id = ? AND document_id = ?",
+                (kb_id, document_id),
+            )
+            conn.execute(
+                """
+                UPDATE documents
+                SET source_type = 'upload', source_name = ?, source_uri = ?,
+                    source_hash = ?, content_type = ?, size_bytes = ?,
+                    lightrag_doc_id = NULL, parser_hash = NULL, index_hash = NULL,
+                    status = 'uploaded', chunks_count = NULL, entity_count = NULL,
+                    relation_count = NULL, error_code = NULL, error_message = NULL,
+                    metadata_json = ?, updated_at = ?
+                WHERE kb_id = ? AND id = ?
+                """,
+                (
+                    source_name,
+                    source_uri,
+                    source_hash,
+                    content_type,
+                    size_bytes,
+                    _dumps_json(metadata),
+                    now,
+                    kb_id,
+                    document_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM documents WHERE kb_id = ? AND id = ?",
+                (kb_id, document_id),
+            ).fetchone()
+            if row is None:
+                raise MetadataRecordNotFoundError(f"Document '{document_id}' not found")
+            return DocumentRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def fail_document_replace(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        error_code: str,
+        error_message: str,
+        metadata_patch: dict[str, Any],
+        clear_index_metadata: bool = False,
+    ) -> DocumentRecord:
+        await self._ensure_initialized()
+        return await self._write(
+            lambda conn: self._update_document_parse_state(
+                conn,
+                kb_id,
+                document_id,
+                status="replace_failed",
+                metadata_patch=metadata_patch,
+                error_code=error_code,
+                error_message=error_message,
+                clear_lightrag_doc_id=clear_index_metadata,
+                clear_index_state=clear_index_metadata,
+            )
+        )
+
     async def list_document_artifacts(
         self,
         kb_id: str,
@@ -871,7 +1296,9 @@ class SQLiteMetadataStore:
             where += f" AND status IN ({placeholders})"
             params.extend(statuses)
         with self._connect() as conn:
-            total = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE {where}", params).fetchone()[0]
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE {where}", params
+            ).fetchone()[0]
             rows = conn.execute(
                 f"""
                 SELECT * FROM jobs
@@ -951,7 +1378,9 @@ class SQLiteMetadataStore:
                     if completed_items is not None
                     else current.completed_items,
                     failed_items if failed_items is not None else current.failed_items,
-                    _dumps_json(result) if result is not None else current_row["result_json"],
+                    _dumps_json(result)
+                    if result is not None
+                    else current_row["result_json"],
                     error_code,
                     error_message,
                     now,
@@ -1029,6 +1458,236 @@ class SQLiteMetadataStore:
 
         return await self._write(write)
 
+    async def create_config_version(
+        self, record: ConfigVersionRecord
+    ) -> ConfigVersionRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ConfigVersionRecord:
+            row = conn.execute(
+                "SELECT MAX(version) FROM kb_config_versions WHERE kb_id = ?",
+                (record.kb_id,),
+            ).fetchone()
+            next_version = (row[0] or 0) + 1 if row[0] is not None else 1
+            persisted = ConfigVersionRecord(
+                id=record.id,
+                kb_id=record.kb_id,
+                workspace=record.workspace,
+                version=next_version,
+                config=record.config,
+                parser_hash=record.parser_hash,
+                index_hash=record.index_hash,
+                query_hash=record.query_hash,
+                created_at=record.created_at,
+                activated_at=None,
+                created_by=record.created_by,
+            )
+            conn.execute(
+                """
+                INSERT INTO kb_config_versions (
+                    id, kb_id, workspace, version, config_json, parser_hash,
+                    index_hash, query_hash, created_at, activated_at, created_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    persisted.id,
+                    persisted.kb_id,
+                    persisted.workspace,
+                    persisted.version,
+                    _dumps_json(persisted.config),
+                    persisted.parser_hash,
+                    persisted.index_hash,
+                    persisted.query_hash,
+                    persisted.created_at,
+                    persisted.activated_at,
+                    persisted.created_by,
+                ),
+            )
+            return persisted
+
+        return await self._write(write)
+
+    async def list_config_versions(
+        self, kb_id: str, *, limit: int = 50, offset: int = 0
+    ) -> tuple[list[ConfigVersionRecord], int]:
+        await self._ensure_initialized()
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        with self._connect() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM kb_config_versions WHERE kb_id = ?", (kb_id,)
+            ).fetchone()[0]
+            rows = conn.execute(
+                """
+                SELECT * FROM kb_config_versions
+                WHERE kb_id = ?
+                ORDER BY version DESC
+                LIMIT ? OFFSET ?
+                """,
+                (kb_id, limit, offset),
+            ).fetchall()
+        return [ConfigVersionRecord.from_row(row) for row in rows], int(total)
+
+    async def get_config_version(
+        self, kb_id: str, version_id: str
+    ) -> ConfigVersionRecord:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM kb_config_versions
+                WHERE kb_id = ? AND id = ?
+                """,
+                (kb_id, version_id),
+            ).fetchone()
+        if row is None:
+            raise MetadataRecordNotFoundError(
+                f"Config version '{version_id}' not found"
+            )
+        return ConfigVersionRecord.from_row(row)
+
+    async def mark_config_version_activated(
+        self, kb_id: str, version_id: str
+    ) -> ConfigVersionRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ConfigVersionRecord:
+            row = conn.execute(
+                """
+                SELECT * FROM kb_config_versions
+                WHERE kb_id = ? AND id = ?
+                """,
+                (kb_id, version_id),
+            ).fetchone()
+            if row is None:
+                raise MetadataRecordNotFoundError(
+                    f"Config version '{version_id}' not found"
+                )
+            conn.execute(
+                """
+                UPDATE kb_config_versions
+                SET activated_at = ?
+                WHERE kb_id = ? AND id = ?
+                """,
+                (utc_now_iso(), kb_id, version_id),
+            )
+            refreshed = conn.execute(
+                """
+                SELECT * FROM kb_config_versions
+                WHERE kb_id = ? AND id = ?
+                """,
+                (kb_id, version_id),
+            ).fetchone()
+            assert refreshed is not None
+            return ConfigVersionRecord.from_row(refreshed)
+
+        return await self._write(write)
+
+    async def purge_kb_metadata(self, kb_id: str) -> dict[str, int]:
+        """Hard delete all SQLite control-plane state for a KB.
+
+        Returns the row count removed per table for audit purposes. Does
+        NOT touch on-disk artifacts / inputs / vector / graph storage —
+        callers must orchestrate those separately.
+        """
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> dict[str, int]:
+            counts: dict[str, int] = {}
+            for table in (
+                "document_artifacts",
+                "document_source_keys",
+                "kb_config_versions",
+                "jobs",
+                "documents",
+            ):
+                cursor = conn.execute(f"DELETE FROM {table} WHERE kb_id = ?", (kb_id,))
+                counts[table] = cursor.rowcount or 0
+            return counts
+
+        return await self._write(write)
+
+    async def recover_orphan_jobs(
+        self,
+        *,
+        error_code: str = "worker_orphaned",
+        error_message: str = "Job worker crashed before completion; please retry",
+    ) -> list[JobRecord]:
+        """Mark queued / running / cancelling / retrying jobs as failed.
+
+        Used at server startup: in-process background workers cannot resume
+        after a crash, so any jobs still in transient states are orphans
+        and must be transitioned to ``failed`` so the user can retry them
+        through the normal cancel/retry API. Documents stuck in
+        parse_queued / parsing / build_queued / building are also reset to
+        the corresponding ``*_failed`` state so the active-claim guard
+        stops treating them as having an in-flight job.
+        """
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> list[JobRecord]:
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status IN ('queued', 'running', 'cancelling', 'retrying')
+                """
+            ).fetchall()
+            updated: list[JobRecord] = []
+            now = utc_now_iso()
+            for row in rows:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'failed', error_code = ?, error_message = ?,
+                        updated_at = ?, finished_at = COALESCE(finished_at, ?)
+                    WHERE id = ?
+                    """,
+                    (error_code, error_message, now, now, row["id"]),
+                )
+                refreshed = conn.execute(
+                    "SELECT * FROM jobs WHERE id = ?", (row["id"],)
+                ).fetchone()
+                if refreshed is not None:
+                    updated.append(JobRecord.from_row(refreshed))
+            conn.execute(
+                """
+                UPDATE documents
+                SET status = 'parse_failed', error_code = ?, error_message = ?,
+                    updated_at = ?
+                WHERE status IN ('parse_queued', 'parsing')
+                """,
+                (error_code, error_message, now),
+            )
+            conn.execute(
+                """
+                UPDATE documents
+                SET status = 'build_failed', error_code = ?, error_message = ?,
+                    updated_at = ?
+                WHERE status IN ('build_queued', 'building')
+                """,
+                (error_code, error_message, now),
+            )
+            conn.execute(
+                """
+                UPDATE documents
+                SET status = 'delete_failed', error_code = ?, error_message = ?,
+                    updated_at = ?
+                WHERE status = 'deleting'
+                """,
+                (error_code, error_message, now),
+            )
+            conn.execute(
+                """
+                UPDATE documents
+                SET status = 'replace_failed', error_code = ?, error_message = ?,
+                    updated_at = ?
+                WHERE status = 'replacing'
+                """,
+                (error_code, error_message, now),
+            )
+            return updated
+
+        return await self._write(write)
 
     async def _ensure_initialized(self) -> None:
         if not self._initialized:
@@ -1096,6 +1755,19 @@ class SQLiteMetadataStore:
                 ON documents (kb_id, source_hash);
             CREATE INDEX IF NOT EXISTS idx_documents_workspace
                 ON documents (workspace);
+
+            CREATE TABLE IF NOT EXISTS document_source_keys (
+                kb_id TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (kb_id, source_key),
+                FOREIGN KEY (document_id) REFERENCES documents(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_document_source_keys_document
+                ON document_source_keys (kb_id, document_id);
 
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
@@ -1179,7 +1851,80 @@ class SQLiteMetadataStore:
             "INSERT OR IGNORE INTO metadata_schema(version, applied_at) VALUES (?, ?)",
             (_SCHEMA_VERSION, utc_now_iso()),
         )
+        self._backfill_document_source_keys(conn)
         conn.commit()
+
+    def _backfill_document_source_keys(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id, kb_id, metadata_json, created_at, updated_at
+            FROM documents
+            WHERE deleted_at IS NULL
+            ORDER BY updated_at DESC, created_at DESC, id DESC
+            """
+        ).fetchall()
+        for row in rows:
+            source_key = _metadata_source_key(_loads_json_object(row["metadata_json"]))
+            if source_key is None:
+                continue
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO document_source_keys (
+                    kb_id, source_key, document_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    row["kb_id"],
+                    source_key,
+                    row["id"],
+                    row["created_at"],
+                    row["updated_at"],
+                ),
+            )
+
+    def _sync_document_source_key(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        kb_id: str,
+        document_id: str,
+        source_key: str | None,
+        timestamp: str,
+    ) -> None:
+        if source_key is None:
+            conn.execute(
+                "DELETE FROM document_source_keys WHERE kb_id = ? AND document_id = ?",
+                (kb_id, document_id),
+            )
+            return
+        existing = conn.execute(
+            """
+            SELECT document_id
+            FROM document_source_keys
+            WHERE kb_id = ? AND source_key = ?
+            """,
+            (kb_id, source_key),
+        ).fetchone()
+        if existing is not None and existing["document_id"] != document_id:
+            raise DuplicateDocumentSourceKeyError(
+                kb_id, source_key, str(existing["document_id"])
+            )
+        conn.execute(
+            """
+            DELETE FROM document_source_keys
+            WHERE kb_id = ? AND document_id = ? AND source_key <> ?
+            """,
+            (kb_id, document_id, source_key),
+        )
+        conn.execute(
+            """
+            INSERT INTO document_source_keys (
+                kb_id, source_key, document_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(kb_id, source_key) DO UPDATE SET updated_at = excluded.updated_at
+            """,
+            (kb_id, source_key, document_id, timestamp, timestamp),
+        )
 
     def _insert_document(
         self, conn: sqlite3.Connection, document: DocumentRecord
@@ -1220,6 +1965,14 @@ class SQLiteMetadataStore:
                 document.updated_at,
                 document.deleted_at,
             ),
+        )
+        source_key = _metadata_source_key(document.metadata)
+        self._sync_document_source_key(
+            conn,
+            kb_id=document.kb_id,
+            document_id=document.id,
+            source_key=source_key,
+            timestamp=document.created_at,
         )
         return document
 
@@ -1389,6 +2142,21 @@ class SQLiteMetadataStore:
                 document_id,
                 _active_parse_job_id_from_row(current_row),
             )
+        if current_row["status"] in {"build_queued", "building"}:
+            raise ActiveDocumentBuildJobError(
+                document_id,
+                _active_build_job_id_from_row(current_row),
+            )
+        if current_row["status"] == "deleting":
+            raise ActiveDocumentDeleteJobError(
+                document_id,
+                _active_delete_job_id_from_row(current_row),
+            )
+        if current_row["status"] == "replacing":
+            raise ActiveDocumentReplaceJobError(
+                document_id,
+                _active_replace_job_id_from_row(current_row),
+            )
         return self._update_document_parse_state(
             conn,
             kb_id,
@@ -1422,6 +2190,16 @@ class SQLiteMetadataStore:
                 document_id,
                 _active_build_job_id_from_row(current_row),
             )
+        if status == "deleting":
+            raise ActiveDocumentDeleteJobError(
+                document_id,
+                _active_delete_job_id_from_row(current_row),
+            )
+        if status == "replacing":
+            raise ActiveDocumentReplaceJobError(
+                document_id,
+                _active_replace_job_id_from_row(current_row),
+            )
         if require_parsed and status not in {"parsed", "ready", "build_failed"}:
             raise DocumentNotParsedError(document_id, str(status))
         return self._update_document_parse_state(
@@ -1429,6 +2207,100 @@ class SQLiteMetadataStore:
             kb_id,
             document_id,
             status="build_queued",
+            metadata_patch=metadata_patch,
+            clear_error=True,
+        )
+
+    def _claim_document_deleting(
+        self,
+        conn: sqlite3.Connection,
+        kb_id: str,
+        document_id: str,
+        *,
+        metadata_patch: dict[str, Any],
+    ) -> DocumentRecord:
+        current_row = conn.execute(
+            """
+            SELECT * FROM documents
+            WHERE kb_id = ? AND id = ? AND deleted_at IS NULL
+            """,
+            (kb_id, document_id),
+        ).fetchone()
+        if current_row is None:
+            raise MetadataRecordNotFoundError(f"Document '{document_id}' not found")
+        status = str(current_row["status"])
+        if status in {"parse_queued", "parsing"}:
+            raise ActiveDocumentParseJobError(
+                document_id,
+                _active_parse_job_id_from_row(current_row),
+            )
+        if status in {"build_queued", "building"}:
+            raise ActiveDocumentBuildJobError(
+                document_id,
+                _active_build_job_id_from_row(current_row),
+            )
+        if status == "deleting":
+            raise ActiveDocumentDeleteJobError(
+                document_id,
+                _active_delete_job_id_from_row(current_row),
+            )
+        if status == "replacing":
+            raise ActiveDocumentReplaceJobError(
+                document_id,
+                _active_replace_job_id_from_row(current_row),
+            )
+        return self._update_document_parse_state(
+            conn,
+            kb_id,
+            document_id,
+            status="deleting",
+            metadata_patch=metadata_patch,
+            clear_error=True,
+        )
+
+    def _claim_document_replacing(
+        self,
+        conn: sqlite3.Connection,
+        kb_id: str,
+        document_id: str,
+        *,
+        metadata_patch: dict[str, Any],
+    ) -> DocumentRecord:
+        current_row = conn.execute(
+            """
+            SELECT * FROM documents
+            WHERE kb_id = ? AND id = ? AND deleted_at IS NULL
+            """,
+            (kb_id, document_id),
+        ).fetchone()
+        if current_row is None:
+            raise MetadataRecordNotFoundError(f"Document '{document_id}' not found")
+        status = str(current_row["status"])
+        if status in {"parse_queued", "parsing"}:
+            raise ActiveDocumentParseJobError(
+                document_id,
+                _active_parse_job_id_from_row(current_row),
+            )
+        if status in {"build_queued", "building"}:
+            raise ActiveDocumentBuildJobError(
+                document_id,
+                _active_build_job_id_from_row(current_row),
+            )
+        if status == "deleting":
+            raise ActiveDocumentDeleteJobError(
+                document_id,
+                _active_delete_job_id_from_row(current_row),
+            )
+        if status == "replacing":
+            raise ActiveDocumentReplaceJobError(
+                document_id,
+                _active_replace_job_id_from_row(current_row),
+            )
+        return self._update_document_parse_state(
+            conn,
+            kb_id,
+            document_id,
+            status="replacing",
             metadata_patch=metadata_patch,
             clear_error=True,
         )
@@ -1446,6 +2318,8 @@ class SQLiteMetadataStore:
         error_code: str | None = None,
         error_message: str | None = None,
         clear_error: bool = False,
+        clear_lightrag_doc_id: bool = False,
+        clear_index_state: bool = False,
     ) -> DocumentRecord:
         current_row = conn.execute(
             """
@@ -1460,16 +2334,37 @@ class SQLiteMetadataStore:
         metadata = _loads_json_object(current_row["metadata_json"])
         metadata.update(metadata_patch)
         now = utc_now_iso()
-        next_parser_hash = parser_hash if parser_hash is not None else current_row["parser_hash"]
+        if "source_key" in metadata_patch:
+            self._sync_document_source_key(
+                conn,
+                kb_id=kb_id,
+                document_id=document_id,
+                source_key=_metadata_source_key(metadata),
+                timestamp=now,
+            )
+        next_parser_hash = (
+            parser_hash if parser_hash is not None else current_row["parser_hash"]
+        )
         next_lightrag_doc_id = (
-            lightrag_doc_id if lightrag_doc_id is not None else current_row["lightrag_doc_id"]
+            None
+            if clear_lightrag_doc_id
+            else lightrag_doc_id
+            if lightrag_doc_id is not None
+            else current_row["lightrag_doc_id"]
+        )
+        next_index_hash = None if clear_index_state else current_row["index_hash"]
+        next_chunks_count = None if clear_index_state else current_row["chunks_count"]
+        next_entity_count = None if clear_index_state else current_row["entity_count"]
+        next_relation_count = (
+            None if clear_index_state else current_row["relation_count"]
         )
         next_error_code = None if clear_error else error_code
         next_error_message = None if clear_error else error_message
         conn.execute(
             """
             UPDATE documents
-            SET status = ?, parser_hash = ?, lightrag_doc_id = ?, error_code = ?,
+            SET status = ?, parser_hash = ?, lightrag_doc_id = ?, index_hash = ?,
+                chunks_count = ?, entity_count = ?, relation_count = ?, error_code = ?,
                 error_message = ?, metadata_json = ?, updated_at = ?
             WHERE kb_id = ? AND id = ?
             """,
@@ -1477,6 +2372,10 @@ class SQLiteMetadataStore:
                 status,
                 next_parser_hash,
                 next_lightrag_doc_id,
+                next_index_hash,
+                next_chunks_count,
+                next_entity_count,
+                next_relation_count,
                 next_error_code,
                 next_error_message,
                 _dumps_json(metadata),
@@ -1511,6 +2410,44 @@ def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+_REPLACE_DERIVED_METADATA_KEYS = {
+    "artifact_count",
+    "auto_index",
+    "auto_parse",
+    "blocks_path",
+    "build_skipped",
+    "build_skip_reason",
+    "build_started_at",
+    "current_build_job_id",
+    "current_parse_job_id",
+    "current_replace_job_id",
+    "force_embedding",
+    "force_extract",
+    "force_rechunk",
+    "force_reparse",
+    "last_built_at",
+    "last_build_job_id",
+    "last_failed_build_job_id",
+    "last_failed_parse_job_id",
+    "last_failed_parser_hash",
+    "last_parse_job_id",
+    "last_parsed_at",
+    "parse_engine",
+    "parse_format",
+    "parse_stage_skipped",
+    "parse_started_at",
+    "parser_engine",
+    "pending_build_job_id",
+    "pending_index_hash",
+    "pending_lightrag_doc_id",
+    "pending_parse_batch_id",
+    "pending_parse_job_id",
+    "pending_parser_hash",
+    "pending_replace_job_id",
+    "process_options",
+}
+
+
 def _active_parse_job_id_from_row(row: sqlite3.Row) -> str:
     metadata = _loads_json_object(row["metadata_json"])
     if row["status"] == "parse_queued":
@@ -1531,3 +2468,19 @@ def _active_build_job_id_from_row(row: sqlite3.Row) -> str:
         job_id = metadata.get("current_build_job_id")
         return str(job_id) if job_id else "unknown"
     return "unknown"
+
+
+def _active_delete_job_id_from_row(row: sqlite3.Row) -> str:
+    metadata = _loads_json_object(row["metadata_json"])
+    job_id = metadata.get("pending_delete_job_id") or metadata.get(
+        "current_delete_job_id"
+    )
+    return str(job_id) if job_id else "unknown"
+
+
+def _active_replace_job_id_from_row(row: sqlite3.Row) -> str:
+    metadata = _loads_json_object(row["metadata_json"])
+    job_id = metadata.get("pending_replace_job_id") or metadata.get(
+        "current_replace_job_id"
+    )
+    return str(job_id) if job_id else "unknown"
