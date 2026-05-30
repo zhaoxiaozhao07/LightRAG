@@ -6140,7 +6140,7 @@ async def _find_related_text_unit_from_relations(
         )
 
     logger.debug(
-        f"KG related chunks: {len(entity_chunks)} from entitys, {len(selected_chunk_ids)} from relations"
+        f"KG related chunks: {len(entity_chunks or [])} from entitys, {len(selected_chunk_ids)} from relations"
     )
 
     if not selected_chunk_ids:

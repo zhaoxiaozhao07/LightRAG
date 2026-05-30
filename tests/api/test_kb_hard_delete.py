@@ -5,6 +5,7 @@ from typing import cast
 
 import pytest
 
+from lightrag.api import kb_deletion_service
 from lightrag.api.kb_deletion_service import KBDeletionService
 from lightrag.api.kb_service import KnowledgeBaseService, utc_now_iso
 from lightrag.api.lightrag_registry import (
@@ -171,7 +172,9 @@ async def test_hard_delete_purges_metadata_and_input(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_hard_delete_records_errors_on_partial_failure(tmp_path: Path):
+async def test_hard_delete_succeeds_when_input_dir_absent(tmp_path: Path):
+    """Happy path: a KB whose input dir was never created still hard-deletes
+    cleanly — ``cleared_input_dir`` stays False, no errors, metadata purged."""
     kb_service = KnowledgeBaseService(tmp_path / "kb.json")
     await kb_service.initialize()
     record = await kb_service.create(kb_id="kb_fail", name="Fail")
@@ -196,3 +199,60 @@ async def test_hard_delete_records_errors_on_partial_failure(tmp_path: Path):
     assert result.cleared_input_dir is False
     assert result.errors == []
     assert result.purged_rows["documents"] == 1
+    assert result.job.status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_records_errors_when_storage_cleanup_fails(
+    tmp_path: Path, monkeypatch
+):
+    """If on-disk storage cleanup raises (e.g. a locked file / permission
+    error), the failure must be surfaced, not swallowed: ``result.errors`` is
+    populated and the clear_kb job ends ``failed`` with
+    ``kb_hard_delete_failed`` (which the route maps to HTTP 500)."""
+    kb_service = KnowledgeBaseService(tmp_path / "kb.json")
+    await kb_service.initialize()
+    record = await kb_service.create(kb_id="kb_fail", name="Fail")
+
+    store = SQLiteMetadataStore(tmp_path / "metadata.sqlite3")
+    await store.initialize()
+    doc = _doc(record.id, "doc_fail", workspace=record.workspace)
+    job = _job(record.id, record.workspace, job_id="job_fail")
+    await store.create_documents_and_job([doc], job)
+
+    input_root = tmp_path / "inputs"
+    working_dir = tmp_path / "working"
+    workspace_storage = working_dir / record.workspace
+    workspace_storage.mkdir(parents=True)
+    (workspace_storage / "graph.json").write_text("{}")
+
+    probe = BuilderProbe()
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+    await registry.get(record.id)
+
+    # Simulate the working-dir cleanup failing mid-delete.
+    def _boom(_path):
+        raise OSError("rmtree denied")
+
+    monkeypatch.setattr(kb_deletion_service.shutil, "rmtree", _boom)
+
+    deletion_service = KBDeletionService(
+        kb_service,
+        store,
+        registry,
+        input_root=input_root,
+        working_dir=working_dir,
+    )
+    await kb_service.delete(record.id)
+    result = await deletion_service.hard_delete(record.id)
+
+    # The failure is surfaced, not swallowed.
+    assert result.errors
+    assert any("working_dir" in err for err in result.errors)
+    # force_evict still ran and the control-plane purge still completed.
+    assert result.finalized_storages is True
+    assert result.purged_rows["documents"] == 1
+    # The clear_kb job lands in `failed` with the documented error_code.
+    assert result.job.status == "failed"
+    assert result.job.error_code == "kb_hard_delete_failed"
+    assert "working_dir" in (result.job.error_message or "")

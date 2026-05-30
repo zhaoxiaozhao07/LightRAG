@@ -1427,6 +1427,15 @@ class SQLiteMetadataStore:
                     f"Job '{job_id}' has reached max_retries={current.max_retries}"
                 )
             now = utc_now_iso()
+            # Preserve the existing idempotency key when the caller does not
+            # supply a new one; only an explicit non-null value replaces it.
+            # (Passing ``None`` through verbatim would wipe the original key,
+            # breaking get-or-create lookups for the retried job.)
+            preserved_idempotency_key = (
+                new_idempotency_key
+                if new_idempotency_key is not None
+                else current.idempotency_key
+            )
             conn.execute(
                 """
                 UPDATE jobs
@@ -1441,7 +1450,7 @@ class SQLiteMetadataStore:
                 """,
                 (
                     current.stage,
-                    new_idempotency_key,
+                    preserved_idempotency_key,
                     now,
                     now,
                     kb_id,

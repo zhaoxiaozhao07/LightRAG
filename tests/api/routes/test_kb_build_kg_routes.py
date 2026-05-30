@@ -628,6 +628,9 @@ def test_reindex_jobs_use_reindex_job_type(tmp_path):
     listed = client.get("/kbs/kb_jt/jobs?status=succeeded", headers=_HEADERS).json()
     reindex_jobs = [j for j in listed["jobs"] if j["job_type"] == "reindex"]
     assert len(reindex_jobs) >= 2
+
+
+def test_reindex_clears_old_index_before_reenqueue(tmp_path):
     """Regression: a forced reindex of an already-built document must clear the
     old LightRAG doc first, otherwise the engine's enqueue dedup (filter_keys +
     filename/content-hash) silently drops the re-enqueue and reindex becomes a
@@ -675,6 +678,11 @@ def test_reindex_jobs_use_reindex_job_type(tmp_path):
     ).json()
     assert after["status"] == "ready"
     assert after["chunks_count"] == 5
+
+
+def test_batch_reindex_rebuilds_all_documents(tmp_path):
+    """Regression: ``:batch-reindex`` force-rebuilds every document (no
+    index_hash skip) and re-enqueues each one through the pipeline."""
     client, *_, probe = _build_client(tmp_path)
     _create_kb(client, "kb_batch_reindex")
     doc_a = _upload_and_parse(client, "kb_batch_reindex", filename="a.pdf")
@@ -711,6 +719,60 @@ def test_reindex_jobs_use_reindex_job_type(tmp_path):
     assert all(item["status"] == "succeeded" for item in items_by_doc.values())
     assert all(item["skipped"] is False for item in items_by_doc.values())
     assert len(rag.enqueue_calls) == 4
+
+
+def test_upload_auto_parse_auto_index_drives_documents_to_ready(tmp_path):
+    """Regression: ``:upload?auto_parse=true&auto_index=true`` must actually run
+    the in-process background batch — parse each document AND chain the KG build
+    so they reach ``ready`` — not merely create a queued aggregate job. The
+    upload response still shows the ``parse_queued`` creation snapshot, but once
+    the request completes (FastAPI BackgroundTasks finish before TestClient
+    returns) the documents are parsed + indexed."""
+    client, *_, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_auto")
+
+    upload = client.post(
+        "/kbs/kb_auto/documents:upload"
+        "?auto_parse=true&auto_index=true&parser_engine=mineru&process_options=iF",
+        files=[
+            ("files", ("a.pdf", b"pdf-a", "application/pdf")),
+            ("files", ("b.pdf", b"pdf-b", "application/pdf")),
+        ],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200, upload.text
+    body = upload.json()
+    job_id = body["job_id"]
+    doc_ids = [doc["id"] for doc in body["documents"]]
+    assert len(doc_ids) == 2
+    # Response is the creation-time snapshot, captured before the background
+    # task advances the documents.
+    assert all(doc["status"] == "parse_queued" for doc in body["documents"])
+
+    # The aggregate parse(+build) job must reach a terminal success.
+    waited = client.post(
+        f"/kbs/kb_auto/jobs/{job_id}:wait?timeout_seconds=30",
+        headers=_HEADERS,
+    )
+    assert waited.status_code == 200, waited.text
+    waited_job = waited.json()
+    assert waited_job["status"] == "succeeded"
+    assert waited_job["job_type"] == "parse"
+
+    # Both documents were actually parsed AND indexed to `ready` — you cannot
+    # reach `ready` without the background parse + auto_index build running.
+    for doc_id in doc_ids:
+        detail = client.get(
+            f"/kbs/kb_auto/documents/{doc_id}", headers=_HEADERS
+        ).json()
+        assert detail["status"] == "ready", detail
+        assert detail["chunks_count"] == 5
+
+    # Corroborate at the engine boundary: parse ran for each doc and each was
+    # enqueued into the KG pipeline.
+    rag = probe.instances[0]
+    assert len(rag.parse_calls) == 2
+    assert len(rag.enqueue_calls) == 2
 
 
 def test_build_kg_rejects_unparsed_document(tmp_path):
@@ -961,6 +1023,80 @@ def test_retry_failed_job_resets_to_queued(tmp_path):
     )
     # Cannot retry queued — must fail it first
     assert retry_again.status_code == 409
+
+
+def test_retry_without_idempotency_key_preserves_original(tmp_path):
+    """Regression: ``:retry`` with no ``idempotency_key`` in the body must
+    PRESERVE the job's original key (the documented contract), not wipe it to
+    NULL. Only an explicit new key replaces it (see the test above)."""
+    client, _kb_service, _document_service, _job_service, _probe = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_retry_keep")
+    document_id = _upload_and_parse(client, "kb_retry_keep")
+
+    import asyncio
+
+    async def setup_failed_job():
+        record = await _kb_service.get("kb_retry_keep")
+        from lightrag.api.metadata_store import JobRecord
+        from lightrag.utils import generate_track_id
+        from lightrag.api.kb_service import utc_now_iso
+
+        now = utc_now_iso()
+        job = JobRecord(
+            id=generate_track_id("job_build"),
+            kb_id=record.id,
+            workspace=record.workspace,
+            batch_id=None,
+            document_id=document_id,
+            job_type="build_kg",
+            status="queued",
+            stage="building",
+            progress=0.0,
+            total_items=1,
+            completed_items=0,
+            failed_items=0,
+            idempotency_key="keep-me",
+            config_version_id=None,
+            config_hash=None,
+            retry_count=0,
+            max_retries=3,
+            payload={"document_id": document_id},
+            result=None,
+            error_code=None,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+            queued_at=now,
+            started_at=None,
+            finished_at=None,
+            cancelled_at=None,
+        )
+        created = await _document_service.metadata_store.create_job(job)
+        await _document_service.metadata_store.transition_job(
+            record.id,
+            created.id,
+            status="failed",
+            progress=1.0,
+            failed_items=1,
+            error_code="build_failed",
+            error_message="boom",
+        )
+        return created.id
+
+    job_id = asyncio.run(setup_failed_job())
+
+    # Retry with an empty body — no idempotency_key supplied.
+    retry = client.post(
+        f"/kbs/kb_retry_keep/jobs/{job_id}:retry", json={}, headers=_HEADERS
+    )
+    assert retry.status_code == 200, retry.text
+    payload = retry.json()
+    assert payload["status"] == "queued"
+    assert payload["retry_count"] == 1
+    # The original key survives the retry instead of being cleared to null.
+    assert payload["idempotency_key"] == "keep-me"
 
 
 def test_wait_for_job_returns_terminal_state(tmp_path):

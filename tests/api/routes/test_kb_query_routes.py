@@ -683,3 +683,123 @@ def test_chunk_doc_scope_helpers():
     empty = _normalize_doc_id_allowlist(QueryParam(ids=[]))
     assert empty == set()
     assert _chunk_in_doc_scope({"full_doc_id": "lr-a"}, empty) is False
+
+
+# ---------------------------------------------------------------------------
+# Engine-level chunk filtering EFFECT: prove QueryParam.ids actually drops
+# out-of-scope chunks at each of the three real retrieval evidence paths in
+# operate.py (naive vector / entity-derived / relation-derived) — not just the
+# pure helper above.
+# ---------------------------------------------------------------------------
+
+
+class _FakeChunksVDB:
+    """chunks_vdb stand-in for ``_get_vector_context``: returns a fixed result
+    set so the test can assert post-query doc-scope filtering."""
+
+    def __init__(self, results: list[dict]):
+        self._results = results
+        self.cosine_better_than_threshold = 0.0
+
+    async def query(self, query, top_k, query_embedding=None):
+        return [dict(item) for item in self._results]
+
+
+class _FakeTextChunksDB:
+    """text_chunks_db stand-in for the entity/relation chunk gatherers."""
+
+    def __init__(self, chunks: dict[str, dict], *, global_config: dict | None = None):
+        self._chunks = chunks
+        self.global_config = global_config or {}
+
+    async def get_by_ids(self, ids):
+        return [self._chunks.get(chunk_id) for chunk_id in ids]
+
+
+@pytest.mark.asyncio
+async def test_get_vector_context_filters_chunks_by_doc_id_allowlist():
+    """Naive vector evidence path: chunks whose ``full_doc_id`` is outside the
+    allow-list (and chunks with no ``full_doc_id``) are dropped; ``ids=None``
+    leaves everything in scope."""
+    from lightrag.operate import _get_vector_context
+
+    results = [
+        {"id": "c1", "content": "alpha", "full_doc_id": "lr-a", "file_path": "a.pdf"},
+        {"id": "c2", "content": "beta", "full_doc_id": "lr-b", "file_path": "b.pdf"},
+        {"id": "c3", "content": "orphan"},  # no full_doc_id => conservatively dropped
+    ]
+    vdb = _FakeChunksVDB(results)
+
+    scoped = await _get_vector_context(
+        "q", vdb, QueryParam(top_k=10, chunk_top_k=10, ids=["lr-a"])
+    )
+    assert [chunk["chunk_id"] for chunk in scoped] == ["c1"]
+
+    unscoped = await _get_vector_context(
+        "q", vdb, QueryParam(top_k=10, chunk_top_k=10, ids=None)
+    )
+    assert {chunk["chunk_id"] for chunk in unscoped} == {"c1", "c2", "c3"}
+
+
+@pytest.mark.asyncio
+async def test_find_related_text_unit_from_entities_filters_by_doc_id_allowlist():
+    """Entity-derived evidence path: chunks reached via an entity ``source_id``
+    are filtered against the doc allow-list before being returned."""
+    from lightrag.constants import GRAPH_FIELD_SEP
+    from lightrag.operate import _find_related_text_unit_from_entities
+
+    text_chunks_db = _FakeTextChunksDB(
+        {
+            "c_in": {"content": "in-scope", "full_doc_id": "lr-a"},
+            "c_out": {"content": "out-scope", "full_doc_id": "lr-b"},
+        },
+        # Force the deterministic WEIGHT selection (VECTOR needs query+vdb) with a
+        # high cap so both chunks are selected — isolating *filtering* from
+        # *selection*.
+        global_config={"kg_chunk_pick_method": "WEIGHT", "related_chunk_number": 10},
+    )
+    node_datas = [{"entity_name": "E1", "source_id": f"c_in{GRAPH_FIELD_SEP}c_out"}]
+
+    scoped = await _find_related_text_unit_from_entities(
+        node_datas, QueryParam(ids=["lr-a"]), text_chunks_db, knowledge_graph_inst=None
+    )
+    assert [chunk["chunk_id"] for chunk in scoped] == ["c_in"]
+    assert all(chunk["source_type"] == "entity" for chunk in scoped)
+
+    unscoped = await _find_related_text_unit_from_entities(
+        node_datas, QueryParam(ids=None), text_chunks_db, knowledge_graph_inst=None
+    )
+    assert {chunk["chunk_id"] for chunk in unscoped} == {"c_in", "c_out"}
+
+
+@pytest.mark.asyncio
+async def test_find_related_text_unit_from_relations_filters_by_doc_id_allowlist():
+    """Relation-derived evidence path: chunks reached via a relationship
+    ``source_id`` are filtered against the doc allow-list before being
+    returned."""
+    from lightrag.constants import GRAPH_FIELD_SEP
+    from lightrag.operate import _find_related_text_unit_from_relations
+
+    text_chunks_db = _FakeTextChunksDB(
+        {
+            "c_in": {"content": "in-scope", "full_doc_id": "lr-a"},
+            "c_out": {"content": "out-scope", "full_doc_id": "lr-b"},
+        },
+        global_config={"kg_chunk_pick_method": "WEIGHT", "related_chunk_number": 10},
+    )
+    edge_datas = [{"src_tgt": ("A", "B"), "source_id": f"c_in{GRAPH_FIELD_SEP}c_out"}]
+
+    # entity_chunks=[] mirrors the production caller (_build_query_context), which
+    # always passes the already-gathered entity chunks (a list) for dedup.
+    scoped = await _find_related_text_unit_from_relations(
+        edge_datas, QueryParam(ids=["lr-a"]), text_chunks_db, []
+    )
+    assert [chunk["chunk_id"] for chunk in scoped] == ["c_in"]
+    assert all(chunk["source_type"] == "relationship" for chunk in scoped)
+
+    # Omitting entity_chunks exercises the default (None): it must not crash the
+    # debug log (regression guard), and ids=None keeps every chunk.
+    unscoped = await _find_related_text_unit_from_relations(
+        edge_datas, QueryParam(ids=None), text_chunks_db
+    )
+    assert {chunk["chunk_id"] for chunk in unscoped} == {"c_in", "c_out"}
