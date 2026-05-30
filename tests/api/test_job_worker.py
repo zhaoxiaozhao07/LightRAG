@@ -161,33 +161,66 @@ async def test_claim_respects_job_type_filter(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_claim_skips_aggregate_jobs_without_document_id(tmp_path: Path):
-    """Aggregate non-delete jobs (document_id NULL — e.g. multi-file upload
-    auto_parse, batch-parse/build, and sync) must NOT be claimed by the durable
-    worker: they need request-scoped context the worker cannot reconstruct.
+async def test_claim_allows_aggregate_resumable_jobs(tmp_path: Path):
+    """Aggregate jobs whose document_ids/options live entirely in the persisted
+    payload (multi-file upload auto_parse, batch-parse/build/reindex, sync) ARE
+    claimable by the durable worker: the source files / artifacts are persisted
+    before the job runs, so the worker can re-drive them from document_ids.
     """
     store = await _make_store(tmp_path)
-    # Aggregate parse job: document_id=None, payload carries document_ids list.
+    # Aggregate parse job (oldest): document_id=None, payload carries doc ids.
     await store.create_job(
-        _job("kb_a", "agg_parse", job_type="parse", document_id=None)
+        _job(
+            "kb_a",
+            "agg_parse",
+            job_type="parse",
+            document_id=None,
+            queued_at="2026-05-29T09:00:00+00:00",
+        )
     )
-    # A real single-document parse job alongside it.
-    await _create_job(store, _job("kb_a", "single_parse", job_type="parse"))
+    # A single-document parse job created later.
+    single = _job(
+        "kb_a",
+        "single_parse",
+        job_type="parse",
+        queued_at="2026-05-29T10:00:00+00:00",
+    )
+    await _create_job(store, single)
 
-    claimed = await store.claim_next_worker_job(
+    # Oldest-first ordering claims the aggregate job before the single one.
+    first = await store.claim_next_worker_job(
         job_types=["parse"], max_queued_at=None
     )
-    # The single-doc job is claimed; the aggregate is skipped entirely.
-    assert claimed is not None
-    assert claimed.id == "single_parse"
+    assert first is not None
+    assert first.id == "agg_parse"
+    assert first.status == "running"
 
-    # Nothing else is claimable — the aggregate job is never picked up.
-    assert (
-        await store.claim_next_worker_job(job_types=["parse"], max_queued_at=None)
-        is None
+    second = await store.claim_next_worker_job(
+        job_types=["parse"], max_queued_at=None
     )
-    agg = await store.get_job("kb_a", "agg_parse")
-    assert agg.status == "queued"  # left untouched for its owner task
+    assert second is not None
+    assert second.id == "single_parse"
+
+
+@pytest.mark.asyncio
+async def test_claim_skips_non_resumable_aggregate_jobs(tmp_path: Path):
+    """Aggregate types NOT re-drivable from persisted state (multi-file
+    ``upload`` aggregate, ``replace`` request bytes) must NOT be claimed. The
+    multi-file ``upload`` (no auto_parse) carries no parse work and ``replace``
+    needs request-uploaded bytes, so neither is worker-resumable as an
+    aggregate document_id=None job.
+    """
+    store = await _make_store(tmp_path)
+    await store.create_job(
+        _job("kb_a", "agg_upload", job_type="upload", document_id=None)
+    )
+
+    claimed = await store.claim_next_worker_job(
+        job_types=["upload"], max_queued_at=None
+    )
+    assert claimed is None
+    agg = await store.get_job("kb_a", "agg_upload")
+    assert agg.status == "queued"
 
 
 @pytest.mark.asyncio

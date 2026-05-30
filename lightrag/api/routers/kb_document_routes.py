@@ -4157,6 +4157,36 @@ def create_kb_document_routes(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.get(
+        "/{kb_id}/jobs/dead-letter",
+        response_model=JobListResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="List dead-lettered knowledge base jobs",
+    )
+    async def list_dead_letter_jobs(
+        kb_id: str,
+        limit: int = 50,
+        offset: int = 0,
+    ):
+        """Jobs that are ``failed`` AND have exhausted ``max_retries`` — they
+        will not run again without operator intervention (``:retry`` is
+        rejected). Distinct from the general jobs list so operators can triage
+        terminal failures separately from still-retryable ones."""
+        try:
+            jobs, total = await job_service.list_dead_letter_jobs(
+                kb_id, limit=limit, offset=offset
+            )
+            return JobListResponse(
+                jobs=[JobResponse.from_record(item) for item in jobs],
+                total=total,
+                limit=max(1, min(limit, 200)),
+                offset=max(0, offset),
+            )
+        except KnowledgeBaseNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.get(
         "/{kb_id}/jobs/{job_id}",
         response_model=JobResponse,
         dependencies=[Depends(combined_auth)],

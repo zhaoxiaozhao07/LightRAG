@@ -19,6 +19,7 @@ from lightrag.constants import (
     PARSER_ENGINE_LEGACY,
     SUPPORTED_PARSER_ENGINES,
 )
+from lightrag.llm_roles import ROLE_NAMES
 from lightrag.parser.routing import (
     normalize_parser_engine,
     sanitize_process_options,
@@ -27,6 +28,34 @@ from lightrag.parser.routing import (
 from lightrag.utils import EmbeddingFunc, generate_track_id
 
 _ACTIVE_QUERY_CONFIG_KEYS = set(QueryParam.__dataclass_fields__)
+
+# Which roles, when their model/binding identity changes, invalidate built
+# index content (chunks / KG / vectors) vs only query-time behavior. The
+# extraction and VLM roles produce persisted KG/chunk content, so a change
+# there must trigger reindex; query/keyword roles only affect retrieval.
+_INDEX_AFFECTING_ROLES = frozenset({"extract", "vlm"})
+_QUERY_AFFECTING_ROLES = frozenset({"query", "keyword"})
+
+# Keys accepted inside an ``llm_role_config[<role>]`` mapping. ``model_kwargs``
+# and ``kwargs`` are aliases. Secret material (``api_key``) is accepted for
+# runtime wiring but excluded from hashing identity.
+_LLM_ROLE_CONFIG_KEYS = frozenset(
+    {
+        "model",
+        "binding",
+        "host",
+        "api_key",
+        "provider_options",
+        "model_kwargs",
+        "kwargs",
+        "max_async",
+        "timeout",
+    }
+)
+# Fields that change LLM *output* (and therefore built content / answers).
+# Excludes ``api_key`` (secret, not output-affecting) and perf-only knobs
+# (``max_async`` / ``timeout``).
+_LLM_ROLE_IDENTITY_KEYS = ("binding", "model", "host", "provider_options", "model_kwargs")
 
 
 def _section_hash(section_name: str, payload: dict[str, Any] | None) -> str:
@@ -258,20 +287,132 @@ def _active_extraction_runtime_config(
     return {"addon": addon, "kwargs": kwargs}
 
 
+def _active_llm_role_runtime_config(
+    config: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    """Resolve ``llm_role_config`` into per-role runtime override maps.
+
+    Accepts two shapes per role for convenience:
+
+    - a bare string, treated as ``{"model": <str>}``;
+    - a mapping with any of ``model`` / ``binding`` / ``host`` / ``api_key`` /
+      ``provider_options`` / ``model_kwargs`` (alias ``kwargs``) /
+      ``max_async`` / ``timeout``.
+
+    Returns ``{role: {normalized override kwargs}}`` for recognized roles
+    only. Unknown roles or keys raise ``ValueError`` so a bad config is
+    rejected at create time rather than silently ignored at runtime.
+    """
+    role_config = _raw_config_section(config, "llm_role_config")
+    runtime: dict[str, dict[str, Any]] = {}
+    if not role_config:
+        return runtime
+    for role, raw in role_config.items():
+        if not isinstance(role, str) or role.strip().lower() not in ROLE_NAMES:
+            raise ValueError(f"llm_role_config has unknown role: {role!r}")
+        normalized_role = role.strip().lower()
+        if isinstance(raw, str):
+            if not raw.strip():
+                raise ValueError(
+                    f"llm_role_config[{normalized_role!r}] model must be non-empty"
+                )
+            runtime[normalized_role] = {"model": raw.strip()}
+            continue
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"llm_role_config[{normalized_role!r}] must be a string or object"
+            )
+        override: dict[str, Any] = {}
+        for key, value in raw.items():
+            if key not in _LLM_ROLE_CONFIG_KEYS:
+                raise ValueError(
+                    f"llm_role_config[{normalized_role!r}] has unknown key: {key!r}"
+                )
+            if value is None:
+                continue
+            if key in {"model", "binding", "host"}:
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(
+                        f"llm_role_config[{normalized_role!r}].{key} must be a non-empty string"
+                    )
+                override[key] = value.strip()
+            elif key == "api_key":
+                if not isinstance(value, str) or not value:
+                    raise ValueError(
+                        f"llm_role_config[{normalized_role!r}].api_key must be a string"
+                    )
+                override["api_key"] = value
+            elif key in {"provider_options", "model_kwargs", "kwargs"}:
+                if not isinstance(value, dict):
+                    raise ValueError(
+                        f"llm_role_config[{normalized_role!r}].{key} must be an object"
+                    )
+                target_key = "model_kwargs" if key in {"model_kwargs", "kwargs"} else key
+                override[target_key] = dict(value)
+            else:  # max_async / timeout
+                parsed = _positive_int(value)
+                if parsed is not None:
+                    override[key] = parsed
+        if override:
+            runtime[normalized_role] = override
+    return runtime
+
+
+def active_llm_role_runtime_config_from_version(
+    active_config_version: ConfigVersionRecord | None,
+) -> dict[str, dict[str, Any]]:
+    """Public accessor: per-role LLM overrides for a config version (or ``{}``)."""
+    if active_config_version is None:
+        return {}
+    return _active_llm_role_runtime_config(active_config_version.config)
+
+
+def _llm_role_identity(
+    role_runtime: dict[str, dict[str, Any]], roles
+) -> dict[str, Any]:
+    """Output-affecting identity for the given roles, used in hashing.
+
+    Excludes ``api_key`` (secret) and ``max_async`` / ``timeout`` (perf only)
+    so rotating a key or tuning concurrency never forces a needless rebuild.
+    """
+    identity: dict[str, Any] = {}
+    for role in roles:
+        override = role_runtime.get(role)
+        if not override:
+            continue
+        role_identity = {
+            key: override[key]
+            for key in _LLM_ROLE_IDENTITY_KEYS
+            if key in override
+        }
+        if role_identity:
+            identity[role] = role_identity
+    return identity
+
+
 def _active_index_runtime_hash(config: dict[str, Any] | None) -> str:
     extraction = _active_extraction_runtime_config(config)
+    role_runtime = _active_llm_role_runtime_config(config)
     return _section_hash(
         "index",
         {
             "chunk": _active_chunk_runtime_config(config),
             "embedding": _active_embedding_runtime_config(config),
             "extraction": {**extraction["addon"], **extraction["kwargs"]},
+            "llm_roles": _llm_role_identity(role_runtime, _INDEX_AFFECTING_ROLES),
         },
     )
 
 
 def _active_query_runtime_hash(config: dict[str, Any] | None) -> str:
-    return _section_hash("query", _active_query_runtime_config(config))
+    role_runtime = _active_llm_role_runtime_config(config)
+    return _section_hash(
+        "query",
+        {
+            "query": _active_query_runtime_config(config),
+            "llm_roles": _llm_role_identity(role_runtime, _QUERY_AFFECTING_ROLES),
+        },
+    )
 
 
 def apply_active_config_to_lightrag_kwargs(

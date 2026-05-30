@@ -59,6 +59,13 @@ class KBDeletionService:
         self._working_dir = Path(working_dir) if working_dir else None
 
     async def hard_delete(self, kb_id: str) -> KBHardDeleteResult:
+        """Create a ``clear_kb`` job and run the destructive clear in-process.
+
+        Used by the synchronous ``DELETE /kbs/{kb_id}?hard=true`` route. The job
+        is created already ``running`` so the request can surface the final
+        result. For restart-resumable hard delete, use :meth:`enqueue_hard_delete`
+        (queued job) + :meth:`resume_hard_delete` (durable worker executor).
+        """
         record = await self._kb_service.get(kb_id, include_deleted=True)
         now = utc_now_iso()
         job = JobRecord(
@@ -78,7 +85,7 @@ class KBDeletionService:
             config_version_id=record.active_config_version_id,
             config_hash=None,
             retry_count=0,
-            max_retries=0,
+            max_retries=3,
             payload={"kb_id": record.id, "workspace": record.workspace},
             result=None,
             error_code=None,
@@ -91,6 +98,63 @@ class KBDeletionService:
             cancelled_at=None,
         )
         created = await self._metadata_store.create_job(job)
+        return await self._execute_clear(record, created)
+
+    async def enqueue_hard_delete(self, kb_id: str) -> JobRecord:
+        """Create a ``queued`` ``clear_kb`` job for a durable worker to drive.
+
+        Everything the clear needs (``kb_id`` / ``workspace``) lives in the job
+        payload, so the job survives a restart: orphan recovery keeps queued
+        ``clear_kb`` jobs (a resumable aggregate type) and the worker re-drives
+        it via :meth:`resume_hard_delete`.
+        """
+        record = await self._kb_service.get(kb_id, include_deleted=True)
+        now = utc_now_iso()
+        job = JobRecord(
+            id=generate_track_id("job_clear_kb"),
+            kb_id=record.id,
+            workspace=record.workspace,
+            batch_id=None,
+            document_id=None,
+            job_type="clear_kb",
+            status="queued",
+            stage="deleting",
+            progress=0.0,
+            total_items=1,
+            completed_items=0,
+            failed_items=0,
+            idempotency_key=None,
+            config_version_id=record.active_config_version_id,
+            config_hash=None,
+            retry_count=0,
+            max_retries=3,
+            payload={"kb_id": record.id, "workspace": record.workspace},
+            result=None,
+            error_code=None,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+            queued_at=now,
+            started_at=None,
+            finished_at=None,
+            cancelled_at=None,
+        )
+        return await self._metadata_store.create_job(job)
+
+    async def resume_hard_delete(self, job: JobRecord) -> KBHardDeleteResult:
+        """Run a clear for a ``clear_kb`` job already claimed by the worker.
+
+        The job has been transitioned ``queued → running`` by the worker's
+        atomic claim. The KB row may already be soft-deleted, so we look it up
+        with ``include_deleted=True``. The destructive steps are idempotent, so
+        re-running a partially-completed clear (e.g. after a crash + ``:retry``)
+        is safe.
+        """
+        record = await self._kb_service.get(job.kb_id, include_deleted=True)
+        return await self._execute_clear(record, job)
+
+    async def _execute_clear(self, record, job: JobRecord) -> KBHardDeleteResult:
+        created = job
         result = KBHardDeleteResult(job=created)
         try:
             async with self._registry.destructive_lock(record.id):
@@ -113,9 +177,9 @@ class KBDeletionService:
                 result.purged_rows = await self._metadata_store.purge_kb_metadata(
                     record.id
                 )
-                # The purge wiped the just-created clear_kb job alongside
-                # the rest of the KB's job history; re-insert it so we can
-                # transition it to the final status below.
+                # The purge wiped the clear_kb job alongside the rest of the
+                # KB's job history; re-insert it so we can transition it to the
+                # final status below.
                 created = await self._metadata_store.create_job(created)
 
             final_status = "succeeded" if not result.errors else "failed"

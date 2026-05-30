@@ -181,21 +181,35 @@ def build_parse_executor(
     document_service: Any,
     registry: Any,
     job_service: JobService,
+    index_service: Any | None = None,
 ) -> JobExecutor:
-    """Executor that re-drives a single-document ``parse`` job.
+    """Executor that re-drives ``parse`` jobs (single-document or aggregate).
 
-    Rebuilds the parse plan from the document's persisted parser directives,
-    re-claims the document into ``parse_queued`` (allowed from
-    ``parse_failed`` / ``uploaded`` / ``parsed`` — only active states block),
-    and reuses the same ``_execute_parse_plan`` helper the route uses, then
-    applies the terminal job transition.
+    Single-document jobs rebuild the parse plan from the document's persisted
+    parser directives, re-claim the document into ``parse_queued`` (allowed
+    from ``parse_failed`` / ``uploaded`` / ``parsed`` — only active states
+    block), and reuse the same ``_execute_parse_plan`` helper the route uses.
+
+    Aggregate jobs (``document_id`` is ``None``, payload carries
+    ``document_ids``) are produced by multi-file ``upload`` / ``texts``
+    ``auto_parse`` and by ``documents:batch-parse``. The source files are
+    persisted before the job runs, so the executor re-plans each document,
+    re-claims it (orphan recovery resets in-flight docs to ``parse_failed``),
+    parses it, and — when ``auto_index`` is set and an index service is wired —
+    chains the KG build to ``ready``. Per-item results aggregate into the
+    single job, mirroring the in-process ``_run_auto_parse_batch``.
     """
     # Lazy import to avoid a router <-> worker import cycle.
-    from lightrag.api.routers.kb_document_routes import _execute_parse_plan
+    from lightrag.api.routers.kb_document_routes import (
+        _batch_parse_failure_message,
+        _batch_parse_job_result,
+        _execute_build_plan,
+        _execute_parse_plan,
+    )
 
-    async def _run(job: JobRecord) -> None:
+    async def _run_single(job: JobRecord, payload: dict[str, Any]) -> None:
         kb_id = job.kb_id
-        document_id = job.document_id or job.payload.get("document_id")
+        document_id = job.document_id or payload.get("document_id")
         if not document_id:
             await job_service.transition_job(
                 kb_id,
@@ -207,7 +221,6 @@ def build_parse_executor(
                 error_message="parse job has no document_id",
             )
             return
-        payload = job.payload or {}
         plan = await document_service.create_parse_plan(
             kb_id,
             document_id,
@@ -261,6 +274,126 @@ def build_parse_executor(
                 error_message=item["error_message"],
             )
 
+    async def _run_aggregate(job: JobRecord, payload: dict[str, Any]) -> None:
+        kb_id = job.kb_id
+        raw_ids = payload.get("document_ids")
+        if not isinstance(raw_ids, list) or not all(
+            isinstance(item, str) and item for item in raw_ids
+        ):
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                failed_items=1,
+                error_code="worker_invalid_payload",
+                error_message="aggregate parse job has no valid document_ids payload",
+            )
+            return
+        document_ids = list(dict.fromkeys(raw_ids))
+        auto_index = bool(payload.get("auto_index", False))
+        item_results: list[dict[str, Any]] = []
+        completed_items = 0
+        failed_items = 0
+        rag = await registry.get(kb_id) if document_ids else None
+        for document_id in document_ids:
+            if rag is None:  # pragma: no cover — empty doc list cannot reach here
+                break
+            try:
+                plan = await document_service.create_parse_plan(
+                    kb_id,
+                    document_id,
+                    parser_engine=payload.get("parser_engine"),
+                    process_options=payload.get("process_options"),
+                    force_reparse=bool(payload.get("force_reparse", False)),
+                    auto_index=auto_index,
+                )
+                await document_service.mark_parse_queued(
+                    kb_id, document_id, job=job, plan=plan
+                )
+            except Exception as exc:  # noqa: BLE001 — per-item planning/claim failure
+                item_results.append(
+                    {
+                        "document_id": document_id,
+                        "status": "failed",
+                        "error_code": "parse_failed",
+                        "error_message": str(exc),
+                    }
+                )
+                failed_items += 1
+                continue
+            item = await _execute_parse_plan(
+                document_service=document_service,
+                kb_id=kb_id,
+                job_id=job.id,
+                plan=plan,
+                rag=rag,
+                job_service=job_service,
+            )
+            if (
+                item["status"] == "succeeded"
+                and auto_index
+                and index_service is not None
+            ):
+                try:
+                    build_plan = await index_service.create_build_plan(
+                        kb_id, document_id, rag=rag
+                    )
+                    if not build_plan.skipped:
+                        await index_service.claim_build_queued(
+                            kb_id, job_id=job.id, plan=build_plan
+                        )
+                    build_item = await _execute_build_plan(
+                        index_service=index_service,
+                        kb_id=kb_id,
+                        job_id=job.id,
+                        plan=build_plan,
+                        rag=rag,
+                        job_service=job_service,
+                    )
+                    item["build_result"] = build_item
+                    if build_item["status"] not in {"succeeded", "cancelled"}:
+                        item["status"] = "failed"
+                        item["error_code"] = build_item.get("error_code")
+                        item["error_message"] = build_item.get("error_message")
+                except Exception as exc:  # noqa: BLE001
+                    item["status"] = "failed"
+                    item["error_code"] = "build_failed"
+                    item["error_message"] = str(exc)
+            item_results.append(item)
+            if item["status"] == "succeeded":
+                completed_items += 1
+            else:
+                failed_items += 1
+        final_result = _batch_parse_job_result(
+            batch_id=job.batch_id or "",
+            total_items=len(document_ids),
+            completed_items=completed_items,
+            failed_items=failed_items,
+            items=item_results,
+        )
+        final_result["resumed_by_worker"] = True
+        await job_service.transition_job(
+            kb_id,
+            job.id,
+            status="succeeded" if failed_items == 0 else "failed",
+            progress=1.0,
+            completed_items=completed_items,
+            failed_items=failed_items,
+            result=final_result,
+            error_code=None if failed_items == 0 else "partial_parse_failed",
+            error_message=None
+            if failed_items == 0
+            else _batch_parse_failure_message(failed_items, len(document_ids)),
+        )
+
+    async def _run(job: JobRecord) -> None:
+        payload = job.payload or {}
+        if job.document_id is None and isinstance(payload.get("document_ids"), list):
+            await _run_aggregate(job, payload)
+            return
+        await _run_single(job, payload)
+
     return _run
 
 
@@ -271,12 +404,24 @@ def build_build_kg_executor(
     registry: Any,
     job_service: JobService,
 ) -> JobExecutor:
-    """Executor that re-drives a single-document ``build_kg`` / ``reindex`` job."""
-    from lightrag.api.routers.kb_document_routes import _execute_build_plan
+    """Executor that re-drives ``build_kg`` / ``reindex`` jobs.
 
-    async def _run(job: JobRecord) -> None:
+    Single-document jobs rebuild the plan and run it. Aggregate jobs
+    (``document_id`` is ``None``, payload carries ``document_ids``) are produced
+    by ``documents:batch-build-kg`` / ``:batch-reindex`` / ``kb:rebuild``; the
+    parse artifacts are already persisted, so the executor re-plans each
+    document from the persisted ``force_*`` directives and runs them, mirroring
+    the in-process batch build loop.
+    """
+    from lightrag.api.routers.kb_document_routes import (
+        _batch_build_failure_message,
+        _batch_build_job_result,
+        _execute_build_plan,
+    )
+
+    async def _run_single(job: JobRecord, payload: dict[str, Any]) -> None:
         kb_id = job.kb_id
-        document_id = job.document_id or job.payload.get("document_id")
+        document_id = job.document_id or payload.get("document_id")
         if not document_id:
             await job_service.transition_job(
                 kb_id,
@@ -288,7 +433,6 @@ def build_build_kg_executor(
                 error_message="build job has no document_id",
             )
             return
-        payload = job.payload or {}
         rag = await registry.get(kb_id)
         plan = await index_service.create_build_plan(
             kb_id,
@@ -345,6 +489,94 @@ def build_build_kg_executor(
                 error_code=item["error_code"],
                 error_message=item["error_message"],
             )
+
+    async def _run_aggregate(job: JobRecord, payload: dict[str, Any]) -> None:
+        kb_id = job.kb_id
+        raw_ids = payload.get("document_ids")
+        if not isinstance(raw_ids, list) or not all(
+            isinstance(item, str) and item for item in raw_ids
+        ):
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                failed_items=1,
+                error_code="worker_invalid_payload",
+                error_message="aggregate build job has no valid document_ids payload",
+            )
+            return
+        document_ids = list(dict.fromkeys(raw_ids))
+        rag = await registry.get(kb_id) if document_ids else None
+        batch_plan = await index_service.create_batch_build_plan(
+            kb_id,
+            document_ids,
+            rag=rag,
+            force_rechunk=bool(payload.get("force_rechunk", False)),
+            force_extract=bool(payload.get("force_extract", False)),
+            force_embedding=bool(payload.get("force_embedding", False)),
+        )
+        item_results: list[dict[str, Any]] = [*batch_plan.failures]
+        completed_items = 0
+        failed_items = len(item_results)
+        for plan in batch_plan.plans:
+            if not plan.skipped:
+                try:
+                    await index_service.claim_build_queued(
+                        kb_id, job_id=job.id, plan=plan
+                    )
+                except Exception as exc:  # noqa: BLE001 — per-item claim failure
+                    item_results.append(
+                        {
+                            "document_id": plan.document.id,
+                            "status": "failed",
+                            "error_code": "build_failed",
+                            "error_message": str(exc),
+                        }
+                    )
+                    failed_items += 1
+                    continue
+            item = await _execute_build_plan(
+                index_service=index_service,
+                kb_id=kb_id,
+                job_id=job.id,
+                plan=plan,
+                rag=rag,
+                job_service=job_service,
+            )
+            item_results.append(item)
+            if item["status"] == "succeeded":
+                completed_items += 1
+            else:
+                failed_items += 1
+        final_result = _batch_build_job_result(
+            batch_id=job.batch_id or batch_plan.batch_id,
+            total_items=len(document_ids),
+            completed_items=completed_items,
+            failed_items=failed_items,
+            items=item_results,
+        )
+        final_result["resumed_by_worker"] = True
+        await job_service.transition_job(
+            kb_id,
+            job.id,
+            status="succeeded" if failed_items == 0 else "failed",
+            progress=1.0,
+            completed_items=completed_items,
+            failed_items=failed_items,
+            result=final_result,
+            error_code=None if failed_items == 0 else "partial_build_failed",
+            error_message=None
+            if failed_items == 0
+            else _batch_build_failure_message(failed_items, len(document_ids)),
+        )
+
+    async def _run(job: JobRecord) -> None:
+        payload = job.payload or {}
+        if job.document_id is None and isinstance(payload.get("document_ids"), list):
+            await _run_aggregate(job, payload)
+            return
+        await _run_single(job, payload)
 
     return _run
 
@@ -516,5 +748,22 @@ def build_delete_executor(
             await _run_batch(job, payload)
             return
         await _run_single(job, payload)
+
+    return _run
+
+
+def build_clear_kb_executor(*, deletion_service: Any) -> JobExecutor:
+    """Executor that re-drives a queued ``clear_kb`` (KB hard-delete) job.
+
+    The job carries only ``kb_id`` / ``workspace`` and the destructive clear
+    (evict instance, drop working/input dirs, purge control-plane rows) is
+    idempotent, so a queued ``clear_kb`` job left by restart recovery can be
+    safely re-driven to completion. ``resume_hard_delete`` itself owns the
+    terminal job transition (succeeded/failed); the worker's backstop only
+    fires if it raises.
+    """
+
+    async def _run(job: JobRecord) -> None:
+        await deletion_service.resume_hard_delete(job)
 
     return _run

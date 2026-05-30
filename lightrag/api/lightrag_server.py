@@ -62,6 +62,7 @@ from lightrag.api.routers.ollama_api import OllamaAPI
 from lightrag.api.config_version_service import (
     ConfigVersionService,
     active_embedding_runtime_config_from_version,
+    active_llm_role_runtime_config_from_version,
     apply_active_config_to_lightrag_kwargs,
     attach_active_config_metadata,
 )
@@ -2166,6 +2167,14 @@ def create_app(args):
             record.workspace,
             active_config_version=active_config_version,
         )
+        role_overrides = active_llm_role_runtime_config_from_version(
+            active_config_version
+        )
+        for role, override in role_overrides.items():
+            # The role builder was registered during construction, so
+            # binding/model/host/api_key changes rebuild the role func; perf
+            # knobs (max_async/timeout) and kwargs apply directly.
+            await rag_instance.aupdate_llm_role_config(role, **override)
         await rag_instance.initialize_storages()
         await rag_instance.check_and_migrate_data()
         return rag_instance
@@ -2205,6 +2214,7 @@ def create_app(args):
         from lightrag.api.job_worker import (
             JobWorker,
             build_build_kg_executor,
+            build_clear_kb_executor,
             build_delete_executor,
             build_parse_executor,
         )
@@ -2213,6 +2223,7 @@ def create_app(args):
             document_service=document_lifecycle_service,
             registry=kb_registry,
             job_service=job_service,
+            index_service=index_build_service,
         )
         build_executor = build_build_kg_executor(
             document_service=document_lifecycle_service,
@@ -2226,6 +2237,9 @@ def create_app(args):
             job_service=job_service,
             index_service=index_build_service,
         )
+        clear_kb_executor = build_clear_kb_executor(
+            deletion_service=kb_deletion_service,
+        )
         job_worker = JobWorker(
             job_service,
             executors={
@@ -2233,6 +2247,7 @@ def create_app(args):
                 "build_kg": build_executor,
                 "reindex": build_executor,
                 "delete": delete_executor,
+                "clear_kb": clear_kb_executor,
             },
             poll_interval_seconds=get_env_value(
                 "LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS", 1.0, float

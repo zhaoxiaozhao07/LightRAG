@@ -256,3 +256,98 @@ async def test_hard_delete_records_errors_when_storage_cleanup_fails(
     assert result.job.status == "failed"
     assert result.job.error_code == "kb_hard_delete_failed"
     assert "working_dir" in (result.job.error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_enqueue_hard_delete_creates_queued_resumable_job(tmp_path: Path):
+    """``enqueue_hard_delete`` queues a clear_kb job that survives restart
+    recovery (clear_kb is a resumable aggregate type) and is claimable by the
+    durable worker."""
+    kb_service = KnowledgeBaseService(tmp_path / "kb.json")
+    await kb_service.initialize()
+    record = await kb_service.create(kb_id="kb_enqueue", name="Enqueue")
+
+    store = SQLiteMetadataStore(tmp_path / "metadata.sqlite3")
+    await store.initialize()
+    probe = BuilderProbe()
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+    deletion_service = KBDeletionService(
+        kb_service, store, registry, input_root=tmp_path / "inputs"
+    )
+
+    await kb_service.delete(record.id)
+    job = await deletion_service.enqueue_hard_delete(record.id)
+    assert job.status == "queued"
+    assert job.job_type == "clear_kb"
+
+    # Restart recovery keeps the queued clear_kb job for the worker.
+    recovered = await store.recover_orphan_jobs(
+        resumable_job_types={"parse", "build_kg", "reindex", "delete", "clear_kb"}
+    )
+    assert all(item.id != job.id for item in recovered)
+    survivor = await store.get_job(record.id, job.id)
+    assert survivor.status == "queued"
+
+    # The worker can atomically claim it.
+    claimed = await store.claim_next_worker_job(
+        job_types=["clear_kb"], max_queued_at=None
+    )
+    assert claimed is not None
+    assert claimed.id == job.id
+    assert claimed.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_resume_hard_delete_drives_claimed_job_to_succeeded(tmp_path: Path):
+    """The durable clear_kb executor re-drives a claimed job to completion:
+    the in-memory instance is finalized, input/working dirs are dropped, and
+    control-plane rows are purged."""
+    from lightrag.api.job_worker import build_clear_kb_executor
+
+    kb_service = KnowledgeBaseService(tmp_path / "kb.json")
+    await kb_service.initialize()
+    record = await kb_service.create(kb_id="kb_resume", name="Resume")
+
+    store = SQLiteMetadataStore(tmp_path / "metadata.sqlite3")
+    await store.initialize()
+    doc = _doc(record.id, "doc_resume", workspace=record.workspace)
+    seed = _job(record.id, record.workspace, job_id="seed_job")
+    await store.create_documents_and_job([doc], seed)
+
+    input_root = tmp_path / "inputs"
+    workspace_input = input_root / record.workspace / doc.id
+    workspace_input.mkdir(parents=True)
+    (workspace_input / "source.pdf").write_bytes(b"raw")
+    working_dir = tmp_path / "working"
+    workspace_storage = working_dir / record.workspace
+    workspace_storage.mkdir(parents=True)
+    (workspace_storage / "graph.json").write_text("{}")
+
+    probe = BuilderProbe()
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+    rag = cast(FakeRAG, await registry.get(record.id))
+    deletion_service = KBDeletionService(
+        kb_service,
+        store,
+        registry,
+        input_root=input_root,
+        working_dir=working_dir,
+    )
+
+    await kb_service.delete(record.id)
+    job = await deletion_service.enqueue_hard_delete(record.id)
+    claimed = await store.claim_next_worker_job(
+        job_types=["clear_kb"], max_queued_at=None
+    )
+    assert claimed is not None and claimed.id == job.id
+
+    executor = build_clear_kb_executor(deletion_service=deletion_service)
+    await executor(claimed)
+
+    final = await store.get_job(record.id, job.id)
+    assert final.status == "succeeded"
+    assert rag.finalized is True
+    assert not workspace_storage.exists()
+    assert not workspace_input.parent.exists()
+    docs, total = await store.list_documents(record.id)
+    assert total == 0 and docs == []

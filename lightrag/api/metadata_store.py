@@ -34,6 +34,40 @@ DocumentStatus = Literal[
 _SCHEMA_VERSION = 2
 _T = TypeVar("_T")
 
+# Aggregate jobs (``document_id IS NULL``) that a durable worker can still
+# re-drive after a restart because everything they need is persisted:
+# - ``delete``: ``documents:batch-delete`` carries ``document_ids`` + options;
+# - ``parse`` / ``build_kg`` / ``reindex``: ``batch-*`` and multi-file
+#   ``upload`` / ``texts`` auto_parse carry ``document_ids`` and the source
+#   files are already on disk before the job runs;
+# - ``clear_kb``: carries ``kb_id`` / ``workspace``; the destructive clear is
+#   idempotent so a queued job can be re-driven after restart.
+# Single-document ``replace`` would match the ``document_id IS NOT NULL`` arm,
+# but its uploaded bytes are not persisted for resume and no durable executor
+# is registered, so it is not worker-resumable today. Batch ``sync`` likewise
+# still needs per-item request bytes and is NOT worker-resumable.
+_AGGREGATE_RESUMABLE_JOB_TYPES: frozenset[str] = frozenset(
+    {"delete", "parse", "build_kg", "reindex", "clear_kb"}
+)
+
+
+def _worker_eligibility_sql(job_types: Sequence[str]) -> tuple[str, list[Any]]:
+    """SQL fragment + params selecting worker-claimable jobs.
+
+    A job is eligible when its ``job_type`` is one the worker handles AND it is
+    either single-document (``document_id`` set) or an aggregate type that is
+    safely re-drivable from persisted state.
+    """
+    type_placeholders = ",".join("?" for _ in job_types)
+    agg_types = sorted(_AGGREGATE_RESUMABLE_JOB_TYPES)
+    agg_placeholders = ",".join("?" for _ in agg_types)
+    fragment = (
+        f"status = 'queued' AND job_type IN ({type_placeholders}) "
+        f"AND (document_id IS NOT NULL OR job_type IN ({agg_placeholders}))"
+    )
+    params: list[Any] = [*job_types, *agg_types]
+    return fragment, params
+
 
 class MetadataStoreError(RuntimeError):
     pass
@@ -1310,6 +1344,42 @@ class SQLiteMetadataStore:
             ).fetchall()
         return [JobRecord.from_row(row) for row in rows], int(total)
 
+    async def list_dead_letter_jobs(
+        self,
+        kb_id: str,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[JobRecord], int]:
+        """List dead-lettered jobs: ``failed`` AND retries exhausted.
+
+        A job is dead-lettered once it is ``failed`` and ``retry_count >=
+        max_retries`` — :meth:`reset_job_for_retry` refuses to retry it, so it
+        will never run again without operator intervention. Surfacing these
+        separately lets operators triage terminal failures instead of scanning
+        every failed job (some of which are still retryable). ``cancelled`` jobs
+        are excluded: they were stopped deliberately, not exhausted.
+        """
+        await self._ensure_initialized()
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        where = "kb_id = ? AND status = 'failed' AND retry_count >= max_retries"
+        params: list[Any] = [kb_id]
+        with self._connect() as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE {where}", params
+            ).fetchone()[0]
+            rows = conn.execute(
+                f"""
+                SELECT * FROM jobs
+                WHERE {where}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, limit, offset],
+            ).fetchall()
+        return [JobRecord.from_row(row) for row in rows], int(total)
+
     async def get_job(self, kb_id: str, job_id: str) -> JobRecord:
         await self._ensure_initialized()
         with self._connect() as conn:
@@ -1660,13 +1730,16 @@ class SQLiteMetadataStore:
             now = utc_now_iso()
             for row in rows:
                 # Leave resumable queued jobs for the durable worker to pick up.
-                # Most worker executors claim only single-document jobs; delete
-                # also supports aggregate batch-delete jobs because their
-                # document_ids/options live entirely in the persisted payload.
+                # Single-document jobs and the aggregate types that are
+                # re-drivable from persisted state (batch-delete/parse/build/
+                # reindex/sync) are kept queued; other aggregates still fail.
                 if (
                     row["status"] == "queued"
                     and row["job_type"] in resumable
-                    and (row["document_id"] is not None or row["job_type"] == "delete")
+                    and (
+                        row["document_id"] is not None
+                        or row["job_type"] in _AGGREGATE_RESUMABLE_JOB_TYPES
+                    )
                 ):
                     continue
                 conn.execute(
@@ -1747,22 +1820,22 @@ class SQLiteMetadataStore:
         only jobs that have sat ``queued`` beyond the window — retried jobs and
         jobs whose owner crashed/restarted — are claimed.
 
-        Only single-document jobs are generally eligible. ``delete`` is the one
-        aggregate exception: ``documents:batch-delete`` carries all document ids
-        and delete options in ``payload_json``, so the durable delete executor can
-        safely re-drive it after a restart. Other aggregate jobs — multi-file
-        ``upload``, ``batch-parse`` / ``batch-build`` and ``sync`` — still need
-        request-scoped context and remain excluded.
+        Single-document jobs are eligible, plus the aggregate types listed in
+        :data:`_AGGREGATE_RESUMABLE_JOB_TYPES` whose payloads carry everything
+        needed to re-drive them: ``documents:batch-delete`` (document ids +
+        options), ``batch-parse`` / ``batch-build`` / ``batch-reindex`` and
+        multi-file ``upload`` / ``texts`` auto_parse (document ids; sources
+        already on disk), and ``clear_kb`` (kb_id/workspace; idempotent clear).
+        The worker only actually claims a type if an executor is registered for
+        it, so enabling a new (aggregate or single-document) type is gated by
+        both this predicate and executor registration — e.g. single-document
+        ``replace`` matches the predicate but has no durable executor, so it is
+        never claimed.
         """
         await self._ensure_initialized()
         if not job_types:
             return None
-        placeholders = ",".join("?" for _ in job_types)
-        params: list[Any] = list(job_types)
-        where = (
-            f"status = 'queued' AND job_type IN ({placeholders}) "
-            f"AND (document_id IS NOT NULL OR job_type = 'delete')"
-        )
+        where, params = _worker_eligibility_sql(job_types)
         if max_queued_at is not None:
             where += " AND queued_at <= ?"
             params.append(max_queued_at)

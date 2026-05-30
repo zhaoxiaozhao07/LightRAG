@@ -1413,6 +1413,44 @@ def test_retry_beyond_max_retries_returns_409(tmp_path):
     assert retry.status_code == 409, retry.text
 
 
+def test_dead_letter_list_returns_only_exhausted_failed_jobs(tmp_path):
+    """The dead-letter endpoint lists failed jobs whose retries are exhausted
+    (``retry_count >= max_retries``) and excludes still-retryable failures."""
+    client, kb_service, document_service, _job_service, _probe = _build_client(tmp_path)
+    _create_kb(client, "kb_deadletter")
+    document_id = _upload_and_parse(client, "kb_deadletter")
+
+    exhausted_id = _seed_failed_build_job(
+        kb_service,
+        document_service,
+        kb_id="kb_deadletter",
+        document_id=document_id,
+        retry_count=3,
+        max_retries=3,
+        idempotency_key=None,
+    )
+    # A still-retryable failed job must NOT show up in the dead-letter list.
+    retryable_id = _seed_failed_build_job(
+        kb_service,
+        document_service,
+        kb_id="kb_deadletter",
+        document_id=document_id,
+        retry_count=1,
+        max_retries=3,
+        idempotency_key=None,
+    )
+
+    response = client.get("/kbs/kb_deadletter/jobs/dead-letter", headers=_HEADERS)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    ids = {item["id"] for item in body["jobs"]}
+    assert exhausted_id in ids
+    assert retryable_id not in ids
+    assert body["total"] == 1
+    # The literal "dead-letter" path is not mistaken for a job_id lookup.
+    assert all(item["status"] == "failed" for item in body["jobs"])
+
+
 def test_durable_parse_executor_redrives_queued_job(tmp_path):
     """Exercise the REAL build_parse_executor (durable worker) end-to-end:
     upload without auto-parse, hand the queued parse job to the worker
@@ -1850,6 +1888,139 @@ def test_durable_batch_delete_executor_redrives_queued_job(tmp_path):
             ).status_code
             == 404
         )
+
+
+def test_durable_aggregate_parse_executor_redrives_queued_job(tmp_path):
+    """The durable parse worker re-drives an aggregate parse job (document_id
+    NULL, payload carries document_ids) after restart recovery — the multi-file
+    upload sources are persisted, so both docs reach 'parsed'."""
+    from lightrag.api.job_worker import build_parse_executor
+
+    client, kb_service, document_service, job_service, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_agg_pexec")
+    metadata_store = document_service.metadata_store
+    index_service = IndexBuildService(document_service)
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+
+    # Upload WITHOUT auto_parse: docs persist to disk in 'uploaded', no parse runs.
+    upload = client.post(
+        "/kbs/kb_agg_pexec/documents:upload",
+        files=[
+            ("files", ("a.pdf", b"a-bytes", "application/pdf")),
+            ("files", ("b.pdf", b"b-bytes", "application/pdf")),
+        ],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200, upload.text
+    document_ids = [doc["id"] for doc in upload.json()["documents"]]
+
+    async def _drive() -> str:
+        # Build an aggregate parse job with the SAME payload shape that
+        # ``create_source_batch`` produces for multi-file upload auto_parse
+        # (document_ids + parser_engine/process_options), then leave it queued
+        # to simulate restart recovery keeping resumable aggregates.
+        job = await job_service.create_job(
+            "kb_agg_pexec",
+            job_type="parse",
+            batch_id="batch_agg_parse",
+            stage="parsing",
+            total_items=len(document_ids),
+            payload={
+                "auto_parse": True,
+                "auto_index": False,
+                "parser_engine": "mineru",
+                "process_options": "iF",
+                "document_ids": document_ids,
+            },
+        )
+        recovered = await job_service.recover_orphan_jobs(
+            resumable_job_types={"parse", "build_kg", "reindex", "delete"}
+        )
+        assert all(item.id != job.id for item in recovered)
+        claimed = await metadata_store.claim_next_worker_job(
+            job_types=["parse"], max_queued_at=None
+        )
+        assert claimed is not None and claimed.id == job.id
+        executor = build_parse_executor(
+            document_service=document_service,
+            registry=registry,
+            job_service=job_service,
+            index_service=index_service,
+        )
+        await executor(claimed)
+        return job.id
+
+    try:
+        job_id = asyncio.run(_drive())
+    finally:
+        asyncio.run(registry.shutdown())
+
+    job = client.get(f"/kbs/kb_agg_pexec/jobs/{job_id}", headers=_HEADERS).json()
+    assert job["status"] == "succeeded", job
+    assert job["result"]["resumed_by_worker"] is True
+    assert job["completed_items"] == 2
+    for document_id in document_ids:
+        detail = client.get(
+            f"/kbs/kb_agg_pexec/documents/{document_id}", headers=_HEADERS
+        ).json()
+        assert detail["status"] == "parsed"
+
+
+def test_durable_aggregate_build_executor_redrives_queued_job(tmp_path):
+    """The durable build worker re-drives an aggregate build_kg job (document_id
+    NULL, payload carries document_ids) — parsed artifacts are persisted, so
+    both docs reach 'ready'."""
+    from lightrag.api.job_worker import build_build_kg_executor
+
+    client, kb_service, document_service, job_service, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_agg_bexec")
+    metadata_store = document_service.metadata_store
+    index_service = IndexBuildService(document_service)
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+    doc_a = _upload_and_parse(client, "kb_agg_bexec", filename="a.pdf")
+    doc_b = _upload_and_parse(client, "kb_agg_bexec", filename="b.pdf")
+    document_ids = [doc_a, doc_b]
+
+    async def _drive() -> str:
+        job, _created = await job_service.create_batch_build_job_once(
+            "kb_agg_bexec",
+            batch_id="batch_agg_build",
+            document_ids=document_ids,
+            total_items=len(document_ids),
+            plan_items=[],
+            planning_failures=[],
+        )
+        recovered = await job_service.recover_orphan_jobs(
+            resumable_job_types={"parse", "build_kg", "reindex", "delete"}
+        )
+        assert all(item.id != job.id for item in recovered)
+        claimed = await metadata_store.claim_next_worker_job(
+            job_types=["build_kg"], max_queued_at=None
+        )
+        assert claimed is not None and claimed.id == job.id
+        executor = build_build_kg_executor(
+            document_service=document_service,
+            index_service=index_service,
+            registry=registry,
+            job_service=job_service,
+        )
+        await executor(claimed)
+        return job.id
+
+    try:
+        job_id = asyncio.run(_drive())
+    finally:
+        asyncio.run(registry.shutdown())
+
+    job = client.get(f"/kbs/kb_agg_bexec/jobs/{job_id}", headers=_HEADERS).json()
+    assert job["status"] == "succeeded", job
+    assert job["result"]["resumed_by_worker"] is True
+    assert job["completed_items"] == 2
+    for document_id in document_ids:
+        detail = client.get(
+            f"/kbs/kb_agg_bexec/documents/{document_id}", headers=_HEADERS
+        ).json()
+        assert detail["status"] == "ready"
 
 
 def test_upload_auto_parse_actually_parses_in_process(tmp_path):

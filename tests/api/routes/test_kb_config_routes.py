@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from lightrag.api.config_version_service import (
     ConfigVersionService,
     active_embedding_runtime_config_from_version,
+    active_llm_role_runtime_config_from_version,
     active_parser_runtime_config_from_version,
     active_query_defaults_from_rag,
     active_query_metadata_from_rag,
@@ -395,11 +396,11 @@ def test_active_index_hash_ignores_unsupported_runtime_sections():
     base_config = {
         "chunk_config": {"chunk_size": 512},
         "embedding_config": {"model": "bge-m3", "dim": 1024},
-        "llm_role_config": {"extract": "model-a"},
+        "storage_config": {"graph_storage": "Neo4j"},
     }
     changed_unsupported_config = {
         **base_config,
-        "llm_role_config": {"extract": "model-b"},
+        "storage_config": {"graph_storage": "NetworkX"},
     }
 
     assert ConfigVersionService._derive_hashes(base_config)[
@@ -417,6 +418,96 @@ def test_active_index_hash_ignores_unsupported_runtime_sections():
     ] != ConfigVersionService._derive_hashes(changed_supported_config)[
         "index_hash"
     ]
+
+
+def test_extract_role_model_change_requires_reindex_via_index_hash():
+    """Changing the extraction LLM role model invalidates built KG content."""
+    base = {"llm_role_config": {"extract": "model-a"}}
+    changed = {"llm_role_config": {"extract": "model-b"}}
+    assert (
+        ConfigVersionService._derive_hashes(base)["index_hash"]
+        != ConfigVersionService._derive_hashes(changed)["index_hash"]
+    )
+
+
+def test_vlm_role_model_change_requires_reindex_via_index_hash():
+    base = {"llm_role_config": {"vlm": {"model": "vlm-a", "binding": "openai"}}}
+    changed = {"llm_role_config": {"vlm": {"model": "vlm-b", "binding": "openai"}}}
+    assert (
+        ConfigVersionService._derive_hashes(base)["index_hash"]
+        != ConfigVersionService._derive_hashes(changed)["index_hash"]
+    )
+
+
+def test_query_role_model_change_only_affects_query_hash():
+    """Query/keyword role identity is retrieval-time only: query_hash moves,
+    index_hash stays stable so no reindex is forced."""
+    base = {"llm_role_config": {"query": "q-model-a"}}
+    changed = {"llm_role_config": {"query": "q-model-b"}}
+    base_hashes = ConfigVersionService._derive_hashes(base)
+    changed_hashes = ConfigVersionService._derive_hashes(changed)
+    assert base_hashes["index_hash"] == changed_hashes["index_hash"]
+    assert base_hashes["query_hash"] != changed_hashes["query_hash"]
+
+
+def test_llm_role_secret_and_perf_knobs_excluded_from_hash():
+    """Rotating api_key or tuning max_async/timeout must not force a rebuild."""
+    base = {"llm_role_config": {"extract": {"model": "m", "api_key": "k1"}}}
+    rotated = {
+        "llm_role_config": {
+            "extract": {"model": "m", "api_key": "k2", "max_async": 8, "timeout": 90}
+        }
+    }
+    base_hashes = ConfigVersionService._derive_hashes(base)
+    rotated_hashes = ConfigVersionService._derive_hashes(rotated)
+    assert base_hashes["index_hash"] == rotated_hashes["index_hash"]
+    assert base_hashes["query_hash"] == rotated_hashes["query_hash"]
+
+
+def test_llm_role_config_rejects_unknown_role_and_keys():
+    with pytest.raises(ValueError):
+        ConfigVersionService._derive_hashes(
+            {"llm_role_config": {"unknown_role": "m"}}
+        )
+    with pytest.raises(ValueError):
+        ConfigVersionService._derive_hashes(
+            {"llm_role_config": {"extract": {"bogus_key": "x"}}}
+        )
+
+
+def test_active_llm_role_runtime_config_normalizes_shapes():
+    active = _config_version(
+        {
+            "llm_role_config": {
+                "extract": "string-model",
+                "query": {
+                    "model": "  q-model  ",
+                    "binding": "openai",
+                    "api_key": "secret",
+                    "kwargs": {"temperature": 0.1},
+                    "max_async": 4,
+                },
+                "vlm": {"model": None},
+            }
+        }
+    )
+
+    runtime = active_llm_role_runtime_config_from_version(active)
+
+    # Bare string normalizes to a model override.
+    assert runtime["extract"] == {"model": "string-model"}
+    # ``kwargs`` aliases to ``model_kwargs``; strings are stripped; ints kept.
+    assert runtime["query"] == {
+        "model": "q-model",
+        "binding": "openai",
+        "api_key": "secret",
+        "model_kwargs": {"temperature": 0.1},
+        "max_async": 4,
+    }
+    # A role whose only key resolves to None contributes no override.
+    assert "vlm" not in runtime
+    # None active version yields no overrides.
+    assert active_llm_role_runtime_config_from_version(None) == {}
 
 
 def test_active_embedding_model_reaches_rebuilt_provider_closure(
@@ -532,6 +623,131 @@ def test_active_embedding_model_reaches_rebuilt_provider_closure(
             await app.state.lightrag_registry.shutdown()
 
     asyncio.run(exercise_active_embedding_provider())
+
+
+def test_active_llm_role_config_reaches_built_instance(tmp_path, monkeypatch):
+    """The KB ``llm_role_config`` overrides are applied to the freshly built
+    LightRAG instance via ``aupdate_llm_role_config`` (so the registered role
+    builder rebuilds the role func with the KB's model)."""
+    import asyncio
+
+    import numpy as np
+
+    for var in _SERVER_ENV_VARS_TO_ISOLATE:
+        monkeypatch.delenv(var, raising=False)
+
+    for role in ("EXTRACT", "KEYWORD", "QUERY", "VLM"):
+        monkeypatch.setenv(f"{role}_LLM_BINDING", "openai")
+        monkeypatch.setenv(f"{role}_LLM_BINDING_HOST", "https://api.openai.com/v1")
+        monkeypatch.setenv(f"{role}_LLM_BINDING_API_KEY", "test-key")
+        monkeypatch.setenv(f"{role}_LLM_MODEL", "gpt-4o-mini")
+
+    monkeypatch.setenv("LLM_BINDING", "openai")
+    monkeypatch.setenv("LLM_BINDING_HOST", "https://api.openai.com/v1")
+    monkeypatch.setenv("LLM_BINDING_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("EMBEDDING_BINDING", "openai")
+    monkeypatch.setenv("EMBEDDING_BINDING_HOST", "https://api.openai.com/v1")
+    monkeypatch.setenv("EMBEDDING_BINDING_API_KEY", "test-key")
+    monkeypatch.setenv("EMBEDDING_MODEL", "base-env-embed")
+    monkeypatch.setenv("EMBEDDING_DIM", "1536")
+    monkeypatch.setenv("RERANK_BINDING", "null")
+    monkeypatch.setenv("LIGHTRAG_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lightrag-server",
+            "--working-dir",
+            str(tmp_path / "rag_storage"),
+            "--input-dir",
+            str(tmp_path / "inputs"),
+        ],
+    )
+
+    from lightrag.api.config import parse_args
+    from lightrag.api import lightrag_server
+    from lightrag.llm import openai as openai_llm
+
+    async def fake_openai_embed(texts, **kwargs):
+        return np.zeros((len(texts), 1536), dtype=np.float32)
+
+    monkeypatch.setattr(
+        openai_llm,
+        "openai_embed",
+        EmbeddingFunc(
+            embedding_dim=1536,
+            func=fake_openai_embed,
+            max_token_size=8192,
+            model_name="base-provider-embed",
+        ),
+    )
+
+    class CapturedLightRAG:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.workspace = kwargs["workspace"]
+            self.embedding_func = kwargs["embedding_func"]
+            self.ollama_server_infos = kwargs["ollama_server_infos"]
+            self.role_llm_builder = None
+            self.role_updates: list[dict[str, object]] = []
+            self.finalized = False
+
+        def register_role_llm_builder(self, builder):
+            self.role_llm_builder = builder
+
+        async def aupdate_llm_role_config(self, role, **override):
+            self.role_updates.append({"role": role, **override})
+
+        def get_llm_role_config(self):
+            return {}
+
+        async def initialize_storages(self):
+            return None
+
+        async def check_and_migrate_data(self):
+            return None
+
+        async def finalize_storages(self):
+            self.finalized = True
+
+    monkeypatch.setattr(lightrag_server, "LightRAG", CapturedLightRAG)
+    monkeypatch.setattr(
+        lightrag_server, "check_frontend_build", lambda: (False, False)
+    )
+
+    async def exercise_active_role_config():
+        args = parse_args()
+        app = lightrag_server.create_app(args)
+        try:
+            await app.state.kb_service.initialize()
+            await app.state.metadata_store.initialize()
+
+            kb_id = "kb_active_role"
+            await app.state.kb_service.create(kb_id=kb_id, name=kb_id)
+            version = await app.state.config_version_service.create(
+                kb_id,
+                config={
+                    "llm_role_config": {
+                        "extract": "kb-extract-model",
+                        "query": {"model": "kb-query-model", "max_async": 3},
+                    }
+                },
+            )
+            await app.state.config_version_service.activate(kb_id, version.id)
+
+            rag = await app.state.lightrag_registry.get(kb_id)
+            updates = {item["role"]: item for item in rag.role_updates}
+            assert updates["extract"]["model"] == "kb-extract-model"
+            assert updates["query"]["model"] == "kb-query-model"
+            assert updates["query"]["max_async"] == 3
+            # Roles without overrides are not touched.
+            assert "vlm" not in updates
+            assert "keyword" not in updates
+        finally:
+            await app.state.lightrag_registry.shutdown()
+
+    asyncio.run(exercise_active_role_config())
 
 
 def test_config_version_diff_reports_changes(tmp_path):

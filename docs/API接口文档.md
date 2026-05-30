@@ -65,7 +65,7 @@ Content-Type: application/json
   2. 删除 `working_dir/<workspace>`（如已配置）；
   3. 删除 `input_dir/<workspace>`（上传文件 + 解析 artifact）；
   4. 清空 SQLite 控制面（documents / jobs / artifacts / config_versions）。
-  返回前会创建一条 `clear_kb` 类型的 job 记录最终结果；任一步失败 HTTP 500 + `clear_kb` job 终态 `failed`。
+  返回前会创建一条 `clear_kb` 类型的 job 记录最终结果；任一步失败 HTTP 500 + `clear_kb` job 终态 `failed`。失败的 `clear_kb` job（`max_retries=3`）可经 `:retry` 重置回 `queued`；启用 durable worker（`LIGHTRAG_KB_JOB_WORKER=true`）时，queued 的 `clear_kb` job 会被孤儿恢复保留并由 worker 通过 `resume_hard_delete` 幂等续跑（`KBDeletionService.enqueue_hard_delete` 也可直接创建 queued job 交给 worker）。
 
 ### 1.3 知识库状态
 
@@ -434,6 +434,7 @@ Content-Type: application/json
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/kbs/{kb_id}/jobs` | 任务列表，支持状态 / 文档 ID 过滤 |
+| `GET` | `/kbs/{kb_id}/jobs/dead-letter` | 死信任务列表（`failed` 且重试已耗尽） |
 | `GET` | `/kbs/{kb_id}/jobs/{job_id}` | 任务详情 |
 | `POST` | `/kbs/{kb_id}/jobs/{job_id}:wait` | 阻塞等待任务到达终态（succeeded / failed / cancelled） |
 | `POST` | `/kbs/{kb_id}/jobs/{job_id}:cancel` | 取消任务 |
@@ -445,6 +446,17 @@ Content-Type: application/json
 GET /kbs/{kb_id}/jobs?status=running&document_id=doc_xxx&limit=50&offset=0
 GET /kbs/{kb_id}/jobs/{job_id}
 ```
+
+死信列表（dead-letter）：
+
+```http
+GET /kbs/{kb_id}/jobs/dead-letter?limit=50&offset=0
+```
+
+- 返回 `status=failed` 且 `retry_count >= max_retries` 的任务，即 `:retry` 已被拒绝、不会再自动重跑的终态失败任务。
+- 与普通 `/jobs?status=failed` 区分：后者包含仍可重试的失败任务，前者只列出需要人工介入的死信任务。
+- `cancelled` 任务不计入死信（属于主动取消，非耗尽重试）。
+- 路由注册顺序保证字面量 `dead-letter` 不会被当作 `job_id` 匹配。
 
 任务字段（`JobResponse`）核心列：
 
@@ -497,12 +509,12 @@ Content-Type: application/json
 > 通过环境变量 `LIGHTRAG_KB_JOB_WORKER=true` 启用。默认关闭，关闭时行为与历史一致（仅 in-process 背景任务，重启后遗留任务一律标 `failed`）。
 
 启用后：
-- 服务启动会拉起一个后台轮询 worker，原子认领（`queued → running` 单赢 CAS）以下可从持久化状态重建的任务类型并执行到终态：`parse`、`build_kg`、`reindex`、单文档 `delete`，以及 `documents:batch-delete` 聚合 `delete` job（`document_id=null`、payload 携带 `document_ids`）。`delete` 只需持久化的文档 id 列表 + 删除选项即可重建。
+- 服务启动会拉起一个后台轮询 worker，原子认领（`queued → running` 单赢 CAS）以下可从持久化状态重建的任务类型并执行到终态：单文档 `parse` / `build_kg` / `reindex` / `delete`，**聚合** `parse` / `build_kg` / `reindex`（`document_id=null`、payload 携带 `document_ids`，含多文件 `upload` / `texts` 的 auto_parse 聚合 job 与 `batch-parse` / `batch-build-kg` / `batch-reindex` / `:rebuild`），`documents:batch-delete` 聚合 `delete` job，以及 `clear_kb`（KB 硬删除，payload 携带 `kb_id`/`workspace`，幂等清理可重启续跑）。聚合 parse/build 之所以可恢复，是因为其源文件 / 解析产物在 job 运行前已落盘，worker 可凭 `document_ids` 重新规划并逐个 claim 执行。
 - **自动消费 `:retry`**：重试把任务重置回 `queued` 后，worker 在下一轮轮询中认领并重跑，客户端无需再次发起业务请求。
 - **重启续跑**：进程重启时，孤儿恢复会保留这些可恢复类型的 `queued` 任务（不再标 `failed`）交给 worker 继续执行；仍处于 `running` 的中途任务无法安全恢复，照旧标 `failed`，其文档同步重置为 `*_failed`，客户端 `:retry` 后即可被 worker 自动重跑。delete 续跑时若孤儿恢复已把文档从 `deleting` 重置为 `delete_failed`，worker 会重新 claim 回 `deleting` 再执行（`_claim_document_deleting` 接受同一 delete job id 的幂等 reclaim）。
 - **不抢占新任务**：worker 只认领 `queued_at` 早于宽限窗口（`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`，默认 5s）的任务；新建任务由其 in-process 背景任务在毫秒级转入 `running`，因此不会被 worker 抢跑，避免重复执行。
-- **聚合任务认领范围**：除 `documents:batch-delete` 外，其他聚合任务（多文件 `upload` 的 auto_parse、`batch-parse`/`batch-build`/`batch-reindex`、`sync`，均 `document_id=null`、payload 携带请求上下文）**不会**被认领，由创建请求的 in-process 任务负责；孤儿恢复也会把这类聚合 queued 任务直接标 `failed`，不会留为永不被认领的僵尸。
-- **暂不可恢复的类型**：`replace`、批量 `sync`、`upload`/`texts` 的 auto_parse 聚合任务等依赖请求级上传字节或一次性上下文的任务未纳入 worker 自动恢复；它们重启后仍标 `failed`，需要重新发起请求。
+- **暂不可恢复的类型**：`replace`（单文档，匹配认领谓词但未注册 durable executor，且上传字节未持久化）、批量 `sync`（依赖 per-item 请求字节）以及多文件 `upload`（无 auto_parse 时不产生解析工作）等依赖请求级上传字节或一次性上下文的任务未纳入 worker 自动恢复；它们重启后仍标 `failed`，需要重新发起请求。
+- **死信**：`failed` 且 `retry_count >= max_retries` 的任务不会再被 `:retry` 或 worker 重跑，可通过 `GET /kbs/{kb_id}/jobs/dead-letter` 单独列出做人工triage。
 - 可调环境变量：`LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS`（默认 1.0s）、`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`（默认 5.0s）。
 
 ### 5.6 等待任务终态
@@ -547,7 +559,8 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 > - `embedding_config`：`model`、`dim`/`embedding_dim`、`token_limit`/`max_token_size`（`model` 会触发重建 embedding provider 闭包）。
 > - `query_config`：`top_k`/`chunk_top_k`/`max_entity_tokens`/`max_relation_tokens`/`max_total_tokens`/`related_chunk_number`/`cosine_threshold` 等 QueryParam 字段。
 > - `extraction_config`：`language`（摘要/抽取语言）、`entity_types`（列表，自动渲染成 `entity_types_guidance` 并去重保序）或显式 `entity_types_guidance`（优先于 `entity_types`）、`entity_type_prompt_file`、`max_gleaning`/`max_extraction_records`/`max_extraction_entities`/`force_llm_summary_on_merge`。这些会 overlay 到 `addon_params` 与 LightRAG 抽取构造参数，并纳入 `index_hash`，因此变更会被 `:diff` 标为 `requires_reindex`。
-> - 仍未接入运行时（仅作 metadata/diff 保存）：parser 服务实例级参数、`llm_role_config`、`storage_config`。
+> - `llm_role_config`：按角色（`extract`/`keyword`/`query`/`vlm`）覆盖运行时 LLM。每个角色可为字符串（等价 `{"model": <str>}`）或对象（`model`/`binding`/`host`/`api_key`/`provider_options`/`model_kwargs`(别名 `kwargs`)/`max_async`/`timeout`）。配置创建时校验角色名与字段名（未知项报错）。实例构建后通过已注册的 role builder 调用 `aupdate_llm_role_config` 应用覆盖，因此 `binding`/`model`/`host`/`api_key` 变更会重建该角色的 LLM func。哈希影响：`extract`/`vlm` 角色的“输出身份”（`binding`/`model`/`host`/`provider_options`/`model_kwargs`，不含 `api_key` 与 `max_async`/`timeout`）纳入 `index_hash`（变更触发 `requires_reindex`）；`query`/`keyword` 角色身份纳入 `query_hash`（仅影响查询，不重建）。轮换 `api_key` 或调 `max_async`/`timeout` 不改变任何哈希、不触发重建。
+> - 仍未接入运行时（仅作 metadata/diff 保存）：parser 服务实例级参数、`storage_config`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|

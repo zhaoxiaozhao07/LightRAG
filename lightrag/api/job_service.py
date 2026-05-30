@@ -326,6 +326,15 @@ class JobService:
         )
         return jobs
 
+    async def list_dead_letter_jobs(
+        self, kb_id: str, *, limit: int = 50, offset: int = 0
+    ) -> tuple[list[JobRecord], int]:
+        """List dead-lettered jobs (failed + retries exhausted) for the KB."""
+        record = await self._kb_service.get(kb_id)
+        return await self._metadata_store.list_dead_letter_jobs(
+            record.id, limit=limit, offset=offset
+        )
+
     async def get_job(self, kb_id: str, job_id: str) -> JobRecord:
         record = await self._kb_service.get(kb_id)
         return await self._metadata_store.get_job(record.id, job_id)
