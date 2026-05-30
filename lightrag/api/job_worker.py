@@ -10,7 +10,8 @@ two gaps the audit called out:
    simply fails them.
 
 :class:`JobWorker` closes both gaps for job types that are *re-drivable from
-persisted state* (single-document ``parse`` / ``build_kg`` / ``reindex``).
+persisted state* (single-document ``parse`` / ``build_kg`` / ``reindex``
+plus single- and batch-document ``delete`` jobs).
 It polls the metadata store for eligible ``queued`` jobs, atomically claims
 each one (``queued → running`` single-winner CAS via
 :meth:`SQLiteMetadataStore.claim_next_worker_job`), and dispatches to a
@@ -26,8 +27,9 @@ age past the window and get picked up.
 The worker is **opt-in** (``LIGHTRAG_KB_JOB_WORKER=true``). When disabled, the
 system behaves exactly as before and orphan recovery fails every transient
 job. Executors that need request-scoped inputs that are not persisted (upload
-bytes for ``replace`` / batch ``sync``) are intentionally NOT registered as
-resumable; those job types still fail on restart and require a fresh request.
+bytes for ``replace`` / batch ``sync`` / aggregate parse-and-build upload
+jobs) are intentionally NOT registered as resumable; those job types still
+fail on restart and require a fresh request.
 """
 
 from __future__ import annotations
@@ -352,25 +354,25 @@ def build_delete_executor(
     document_service: Any,
     registry: Any,
     job_service: JobService,
+    index_service: Any | None = None,
 ) -> JobExecutor:
-    """Executor that re-drives a single-document ``delete`` job.
+    """Executor that re-drives persisted ``delete`` jobs.
 
-    Delete only needs the document id + delete options (all persisted on the
-    job payload), so it is safe to resume after a crash — unlike replace/sync
-    which need the request's uploaded bytes. On restart, orphan recovery resets
-    the document ``deleting -> delete_failed``; this executor re-claims it back
-    into ``deleting`` (``_claim_document_deleting`` accepts ``delete_failed``)
-    and re-runs the same delete used by the route. Batch delete jobs
-    (``document_id=None``) are not auto-resumed and are skipped here.
+    Delete jobs need only persisted document ids + delete options, so both
+    single-document and ``documents:batch-delete`` jobs can resume after a crash.
+    Replace/sync jobs still need request-uploaded bytes and remain non-resumable.
     """
-    from lightrag.api.routers.kb_document_routes import _execute_delete_document_impl
+    from lightrag.api.routers.kb_document_routes import (
+        _delete_failure_message,
+        _delete_job_result,
+        _execute_delete_document_impl,
+        _run_conservative_kb_rebuild,
+    )
 
-    async def _run(job: JobRecord) -> None:
+    async def _run_single(job: JobRecord, payload: dict[str, Any]) -> None:
         kb_id = job.kb_id
-        payload = job.payload or {}
         document_id = job.document_id or payload.get("document_id")
         if not document_id:
-            # Batch delete (document_id=None) is not auto-resumable.
             await job_service.transition_job(
                 kb_id,
                 job.id,
@@ -378,7 +380,7 @@ def build_delete_executor(
                 progress=1.0,
                 failed_items=1,
                 error_code="worker_invalid_payload",
-                error_message="delete job has no single document_id to resume",
+                error_message="delete job has no document_id",
             )
             return
         delete_source_file = bool(payload.get("delete_source_file", False))
@@ -386,7 +388,7 @@ def build_delete_executor(
         delete_llm_cache = bool(payload.get("delete_llm_cache", False))
         document = await document_service.claim_delete(
             kb_id,
-            document_id,
+            str(document_id),
             job=job,
             delete_source_file=delete_source_file,
             delete_artifacts=delete_artifacts,
@@ -402,17 +404,25 @@ def build_delete_executor(
             delete_llm_cache=delete_llm_cache,
         )
         if item["status"] == "succeeded":
+            result: dict[str, Any] = {
+                "document_id": item["document_id"],
+                "lightrag_doc_id": item.get("lightrag_doc_id"),
+                "resumed_by_worker": True,
+            }
+            if payload.get("strategy") == "rebuild_kb" and index_service is not None:
+                result["rebuild"] = await _run_conservative_kb_rebuild(
+                    document_service=document_service,
+                    index_service=index_service,
+                    registry=registry,
+                    kb_id=kb_id,
+                )
             await job_service.transition_job(
                 kb_id,
                 job.id,
                 status="succeeded",
                 progress=1.0,
                 completed_items=1,
-                result={
-                    "document_id": item["document_id"],
-                    "lightrag_doc_id": item.get("lightrag_doc_id"),
-                    "resumed_by_worker": True,
-                },
+                result=result,
             )
         else:
             await job_service.transition_job(
@@ -424,5 +434,87 @@ def build_delete_executor(
                 error_code=item["error_code"],
                 error_message=item["error_message"],
             )
+
+    async def _run_batch(job: JobRecord, payload: dict[str, Any]) -> None:
+        kb_id = job.kb_id
+        raw_document_ids = payload.get("document_ids")
+        if not isinstance(raw_document_ids, list) or not all(
+            isinstance(item, str) and item for item in raw_document_ids
+        ):
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                failed_items=1,
+                error_code="worker_invalid_payload",
+                error_message="batch delete job has no valid document_ids payload",
+            )
+            return
+        document_ids = list(dict.fromkeys(raw_document_ids))
+        delete_source_file = bool(payload.get("delete_source_file", False))
+        delete_artifacts = bool(payload.get("delete_artifacts", False))
+        delete_llm_cache = bool(payload.get("delete_llm_cache", False))
+        documents, claim_failures = await document_service.claim_batch_delete(
+            kb_id,
+            document_ids,
+            job=job,
+            delete_source_file=delete_source_file,
+            delete_artifacts=delete_artifacts,
+        )
+        item_results = [*claim_failures]
+        completed_items = 0
+        failed_items = len(item_results)
+        for document in documents:
+            item = await _execute_delete_document_impl(
+                document_service=document_service,
+                kb_id=kb_id,
+                job_id=job.id,
+                document=document,
+                active_registry=registry,
+                delete_source_file=delete_source_file,
+                delete_artifacts=delete_artifacts,
+                delete_llm_cache=delete_llm_cache,
+            )
+            item_results.append(item)
+            if item["status"] == "succeeded":
+                completed_items += 1
+            else:
+                failed_items += 1
+        final_result = _delete_job_result(
+            batch_id=job.batch_id,
+            total_items=len(document_ids),
+            completed_items=completed_items,
+            failed_items=failed_items,
+            items=item_results,
+        )
+        final_result["resumed_by_worker"] = True
+        if payload.get("strategy") == "rebuild_kb" and completed_items > 0 and index_service is not None:
+            final_result["rebuild"] = await _run_conservative_kb_rebuild(
+                document_service=document_service,
+                index_service=index_service,
+                registry=registry,
+                kb_id=kb_id,
+            )
+        await job_service.transition_job(
+            kb_id,
+            job.id,
+            status="succeeded" if failed_items == 0 else "failed",
+            progress=1.0,
+            completed_items=completed_items,
+            failed_items=failed_items,
+            result=final_result,
+            error_code=None if failed_items == 0 else "partial_delete_failed",
+            error_message=None
+            if failed_items == 0
+            else _delete_failure_message(failed_items, len(document_ids)),
+        )
+
+    async def _run(job: JobRecord) -> None:
+        payload = job.payload or {}
+        if job.document_id is None and isinstance(payload.get("document_ids"), list):
+            await _run_batch(job, payload)
+            return
+        await _run_single(job, payload)
 
     return _run

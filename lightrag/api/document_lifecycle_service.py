@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
+from lightrag.api.config_version_service import active_parser_runtime_config_from_version
 from lightrag.api.kb_service import KnowledgeBaseService, utc_now_iso
 from lightrag.api.metadata_store import (
     ActiveDocumentParseJobError,
@@ -67,6 +68,27 @@ _PARSEABLE_ENGINES = {
     PARSER_ENGINE_MINERU,
     PARSER_ENGINE_DOCLING,
 }
+_MARKDOWN_SUFFIXES = {".md", ".markdown"}
+_IMAGE_SUFFIXES = {
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".svg",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
+_ROOT_FILE_ARTIFACT_TYPES = {
+    "content_list.json": "content_list",
+    "middle.json": "middle_json",
+    "middle_json.json": "middle_json",
+    "model.json": "model_json",
+    "model_json.json": "model_json",
+    "layout.pdf": "layout_pdf",
+}
+_RAW_BUNDLE_MANIFEST = "_manifest.json"
 
 
 class DocumentLifecycleError(RuntimeError):
@@ -160,6 +182,14 @@ class DocumentLifecycleService:
     def kb_service(self) -> KnowledgeBaseService:
         return self._kb_service
 
+    async def _active_parser_defaults_for_record(self, record: Any) -> dict[str, str]:
+        if not record.active_config_version_id:
+            return {}
+        active_config_version = await self._metadata_store.get_config_version(
+            record.id, record.active_config_version_id
+        )
+        return active_parser_runtime_config_from_version(active_config_version)
+
     async def create_source_batch(
         self,
         kb_id: str,
@@ -175,6 +205,13 @@ class DocumentLifecycleService:
             raise ValueError("At least one document source is required")
 
         record = await self._kb_service.get(kb_id)
+        if auto_parse:
+            defaults = await self._active_parser_defaults_for_record(record)
+            parser_engine, process_options = _apply_parse_defaults(
+                parser_engine,
+                process_options,
+                defaults,
+            )
         job_type = "parse" if auto_parse else "upload"
         workspace_dir = self._source_root / record.workspace
         workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -686,7 +723,9 @@ class DocumentLifecycleService:
         force_reparse: bool = False,
         auto_index: bool = False,
     ) -> DocumentParsePlan:
-        document = await self.get_document(kb_id, document_id)
+        record = await self._kb_service.get(kb_id)
+        active_defaults = await self._active_parser_defaults_for_record(record)
+        document = await self._metadata_store.get_document(record.id, document_id)
         source_path = Path(document.source_uri)
         if not source_path.is_file():
             raise FileNotFoundError(f"Document source not found: {document.source_uri}")
@@ -696,6 +735,8 @@ class DocumentLifecycleService:
             document,
             parser_engine=parser_engine,
             process_options=process_options,
+            active_parser_engine=active_defaults.get("parser_engine"),
+            active_process_options=active_defaults.get("process_options"),
         )
         lightrag_doc_id = compute_mdhash_id(str(source_path), prefix="doc-")
         parser_hash = _parser_hash(engine=engine, process_options=options)
@@ -1170,41 +1211,61 @@ def _artifact_media_type(
     return guessed_type or "application/octet-stream"
 
 
+def _apply_parse_defaults(
+    parser_engine: str | None,
+    process_options: str | None,
+    defaults: dict[str, str],
+) -> tuple[str | None, str | None]:
+    if parser_engine is None:
+        parser_engine = defaults.get("parser_engine")
+    if process_options is None:
+        process_options = defaults.get("process_options")
+    return parser_engine, process_options
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
 def _resolve_parse_directives(
     source_path: Path,
     document: DocumentRecord,
     *,
     parser_engine: str | None,
     process_options: str | None,
+    active_parser_engine: str | None = None,
+    active_process_options: str | None = None,
 ) -> tuple[str, str]:
+    resolved_options: str | None = None
     if parser_engine is not None:
         engine = normalize_parser_engine(parser_engine)
     else:
         metadata_engine = document.metadata.get("parser_engine")
         if metadata_engine:
             engine = normalize_parser_engine(metadata_engine)
+        elif active_parser_engine is not None:
+            engine = normalize_parser_engine(active_parser_engine)
         else:
             engine, resolved_options = resolve_file_parser_directives(
                 source_path, require_external_endpoint=False
-            )
-            process_options = (
-                process_options
-                or document.metadata.get("process_options")
-                or resolved_options
             )
 
     if engine == PARSER_ENGINE_LEGACY:
         raise ValueError("KB parse endpoint does not support legacy parser engine")
     if engine not in _PARSEABLE_ENGINES or engine not in SUPPORTED_PARSER_ENGINES:
-        raise ValueError(f"Unsupported parser engine: {parser_engine}")
+        raise ValueError(f"Unsupported parser engine: {engine}")
     suffix = parser_suffix(source_path)
     if not parser_engine_supports_suffix(engine, suffix):
         raise ValueError(f"Parser engine '{engine}' does not support .{suffix} files")
 
-    raw_options = (
-        process_options
-        if process_options is not None
-        else document.metadata.get("process_options")
+    raw_options = _first_present(
+        process_options,
+        document.metadata.get("process_options"),
+        active_process_options,
+        resolved_options,
     )
     raw_options_text = "" if raw_options is None else str(raw_options)
     errors = validate_process_options(raw_options_text)
@@ -1323,7 +1384,94 @@ def _build_parse_artifacts(
                     },
                 )
             )
+            artifacts.extend(
+                _fine_grained_artifacts(
+                    plan,
+                    root=raw_dir,
+                    created_at=now,
+                    source="raw_dir",
+                )
+            )
+        artifacts.extend(
+            _fine_grained_artifacts(
+                plan,
+                root=sidecar_dir,
+                created_at=now,
+                source="sidecar",
+            )
+        )
     return artifacts
+
+
+def _fine_grained_artifacts(
+    plan: DocumentParsePlan,
+    *,
+    root: Path,
+    created_at: str,
+    source: str,
+) -> list[ArtifactRecord]:
+    if not root.is_dir():
+        return []
+
+    artifacts: list[ArtifactRecord] = []
+    seen: set[Path] = set()
+    root_resolved = root.resolve(strict=False)
+
+    def add(artifact_type: str, path: Path) -> None:
+        if path.is_symlink() or not path.is_file():
+            return
+        resolved = path.resolve(strict=False)
+        try:
+            resolved.relative_to(root_resolved)
+        except ValueError:
+            return
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        artifacts.append(
+            _artifact_record(
+                plan,
+                artifact_type=artifact_type,
+                uri=str(path),
+                path=path,
+                created_at=created_at,
+                metadata={
+                    "parse_engine": plan.parser_engine,
+                    "parser_hash": plan.parser_hash,
+                    "source": source,
+                    "relative_path": path.relative_to(root).as_posix(),
+                },
+            )
+        )
+
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        artifact_type = _fine_grained_artifact_type(path)
+        if artifact_type is not None:
+            add(artifact_type, path)
+
+    return artifacts
+
+
+def _fine_grained_artifact_type(path: Path) -> str | None:
+    name = path.name.lower()
+    suffix = path.suffix.lower()
+    if name == _RAW_BUNDLE_MANIFEST:
+        return None
+    if name in _ROOT_FILE_ARTIFACT_TYPES:
+        return _ROOT_FILE_ARTIFACT_TYPES[name]
+    if name.endswith("_content_list.json"):
+        return "content_list"
+    if name.endswith("_middle.json") or name.endswith("_middle_json.json"):
+        return "middle_json"
+    if name.endswith("_model.json") or name.endswith("_model_json.json"):
+        return "model_json"
+    if suffix in _MARKDOWN_SUFFIXES:
+        return "markdown"
+    if suffix in _IMAGE_SUFFIXES:
+        return "image"
+    return None
 
 
 def _artifact_record(

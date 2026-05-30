@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from lightrag.api.config_version_service import (
     ConfigVersionService,
     active_embedding_runtime_config_from_version,
+    active_parser_runtime_config_from_version,
     active_query_defaults_from_rag,
     active_query_metadata_from_rag,
     apply_active_config_to_lightrag_kwargs,
@@ -308,6 +309,22 @@ def test_active_config_runtime_helpers_apply_supported_fields():
         "query_hash": expected_hashes["query_hash"],
     }
     assert compute_index_hash(rag) == expected_hashes["index_hash"]
+
+
+def test_active_parser_runtime_helper_normalizes_supported_fields():
+    active = _config_version(
+        {
+            "parser_config": {
+                "engine": "MinerU",
+                "process_options": " i-F ",
+            },
+        }
+    )
+
+    assert active_parser_runtime_config_from_version(active) == {
+        "parser_engine": "mineru",
+        "process_options": "iF",
+    }
 
 
 def test_active_config_applies_extraction_runtime_fields():
@@ -660,6 +677,7 @@ def test_activate_skips_discard_while_destructive_lock_held(tmp_path):
         await kb_service.initialize()
         await kb_service.create(kb_id="kb_lock", name="Lock")
         rag = await registry.get("kb_lock")
+        assert isinstance(rag, FakeRAG)
         assert registry.is_loaded("kb_lock")
         version = await config_service.create("kb_lock", config=_BASE_CONFIG)
 

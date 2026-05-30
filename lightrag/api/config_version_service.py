@@ -15,6 +15,15 @@ from lightrag.api.metadata_store import (
     SQLiteMetadataStore,
 )
 from lightrag.base import QueryParam
+from lightrag.constants import (
+    PARSER_ENGINE_LEGACY,
+    SUPPORTED_PARSER_ENGINES,
+)
+from lightrag.parser.routing import (
+    normalize_parser_engine,
+    sanitize_process_options,
+    validate_process_options,
+)
 from lightrag.utils import EmbeddingFunc, generate_track_id
 
 _ACTIVE_QUERY_CONFIG_KEYS = set(QueryParam.__dataclass_fields__)
@@ -108,6 +117,36 @@ def _active_embedding_runtime_config(config: dict[str, Any] | None) -> dict[str,
     if embedding_config.get("model") is not None:
         runtime["model_name"] = str(embedding_config["model"])
     return runtime
+
+
+def _active_parser_runtime_config(config: dict[str, Any] | None) -> dict[str, str]:
+    parser_config = _raw_config_section(config, "parser_config")
+    runtime: dict[str, str] = {}
+    engine_value = _first_present(parser_config, "engine", "parser_engine")
+    if engine_value is not None:
+        engine = normalize_parser_engine(str(engine_value))
+        if engine == PARSER_ENGINE_LEGACY:
+            raise ValueError("parser_config.engine does not support legacy")
+        if engine not in SUPPORTED_PARSER_ENGINES:
+            raise ValueError(f"Unsupported parser_config.engine: {engine_value}")
+        runtime["parser_engine"] = engine
+
+    options_value = _first_present(parser_config, "process_options", "options")
+    if options_value is not None:
+        options_text = str(options_value)
+        errors = validate_process_options(options_text)
+        if errors:
+            raise ValueError("; ".join(errors))
+        runtime["process_options"] = sanitize_process_options(options_text)
+    return runtime
+
+
+def active_parser_runtime_config_from_version(
+    active_config_version: ConfigVersionRecord | None,
+) -> dict[str, str]:
+    if active_config_version is None:
+        return {}
+    return _active_parser_runtime_config(active_config_version.config)
 
 
 def active_embedding_runtime_config_from_version(
@@ -306,6 +345,11 @@ def attach_active_config_metadata(
     setattr(rag, "kb_active_query_hash", _active_query_runtime_hash(active_config_version.config))
     setattr(
         rag,
+        "kb_active_parser_config",
+        _active_parser_runtime_config(active_config_version.config),
+    )
+    setattr(
+        rag,
         "kb_active_query_config",
         _active_query_runtime_config(active_config_version.config),
     )
@@ -461,7 +505,9 @@ class ConfigVersionService:
     @staticmethod
     def _derive_hashes(config: dict[str, Any]) -> dict[str, str]:
         return {
-            "parser_hash": _section_hash("parser", config.get("parser_config")),
+            "parser_hash": _section_hash(
+                "parser", _active_parser_runtime_config(config)
+            ),
             "index_hash": _active_index_runtime_hash(config),
             "query_hash": _active_query_runtime_hash(config),
         }

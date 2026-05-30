@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
+from lightrag.api.config_version_service import ConfigVersionService
 from lightrag.api.document_lifecycle_service import (
     DocumentLifecycleService,
     DocumentSourceInput,
@@ -87,7 +88,16 @@ class FakeRAG:
         if engine == "mineru":
             raw_dir = parsed_dir.parent / f"{source_path.name}.mineru_raw"
             raw_dir.mkdir(parents=True, exist_ok=True)
+            images_dir = raw_dir / "images"
+            images_dir.mkdir(parents=True, exist_ok=True)
             (raw_dir / "full.md").write_text("# parsed", encoding="utf-8")
+            (raw_dir / "content_list.json").write_text(
+                '[{"type":"text","text":"parsed"}]', encoding="utf-8"
+            )
+            (raw_dir / "middle.json").write_text('{"pages":[]}', encoding="utf-8")
+            (raw_dir / "model.json").write_text('{"model":"mineru"}', encoding="utf-8")
+            (raw_dir / "layout.pdf").write_bytes(b"layout")
+            (images_dir / "page-1.png").write_bytes(b"image")
         if content_data.get("archive_source_after_parse", True):
             source_path.unlink()
         return {
@@ -146,10 +156,15 @@ def _build_client(
     job_service = JobService(kb_service, metadata_store)
     probe = probe or BuilderProbe()
     registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+    config_service = ConfigVersionService(kb_service, metadata_store, registry)
     app = FastAPI()
     app.include_router(
         create_kb_routes(
-            kb_service, registry, api_key=_API_KEY, job_service=job_service
+            kb_service,
+            registry,
+            api_key=_API_KEY,
+            job_service=job_service,
+            config_service=config_service,
         )
     )
     # wire_document_registry=False mimics "no parse worker wired": auto_parse
@@ -1120,7 +1135,18 @@ def test_parse_document_succeeds_and_persists_artifacts(tmp_path):
     assert artifacts.status_code == 200
     artifact_payload = artifacts.json()
     artifact_types = {item["artifact_type"] for item in artifact_payload["artifacts"]}
-    assert {"original", "sidecar", "blocks", "raw_dir"}.issubset(artifact_types)
+    assert {
+        "original",
+        "sidecar",
+        "blocks",
+        "raw_dir",
+        "markdown",
+        "content_list",
+        "middle_json",
+        "model_json",
+        "image",
+        "layout_pdf",
+    }.issubset(artifact_types)
     original = next(
         item
         for item in artifact_payload["artifacts"]
@@ -1128,6 +1154,19 @@ def test_parse_document_succeeds_and_persists_artifacts(tmp_path):
     )
     assert original["checksum"].startswith("sha256:")
     assert original["size_bytes"] == 3
+    content_list = next(
+        item
+        for item in artifact_payload["artifacts"]
+        if item["artifact_type"] == "content_list"
+    )
+    assert content_list["metadata"]["source"] == "raw_dir"
+    assert content_list["metadata"]["relative_path"] == "content_list.json"
+    image = next(
+        item
+        for item in artifact_payload["artifacts"]
+        if item["artifact_type"] == "image"
+    )
+    assert image["metadata"]["relative_path"] == "images/page-1.png"
 
     artifact_id = artifact_payload["artifacts"][0]["id"]
     detail = client.get(
@@ -1136,6 +1175,104 @@ def test_parse_document_succeeds_and_persists_artifacts(tmp_path):
     )
     assert detail.status_code == 200
     assert detail.json()["id"] == artifact_id
+
+
+def test_parse_document_uses_active_parser_config_defaults(tmp_path):
+    probe = BuilderProbe()
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path, probe=probe
+    )
+    _create_kb(client, "kb_parse_cfg")
+    config = client.post(
+        "/kbs/kb_parse_cfg/configs",
+        json={
+            "config": {
+                "parser_config": {
+                    "engine": "mineru",
+                    "process_options": " i-F ",
+                }
+            }
+        },
+        headers=_HEADERS,
+    )
+    assert config.status_code == 200
+    activate = client.post(
+        f"/kbs/kb_parse_cfg/configs/{config.json()['id']}:activate",
+        headers=_HEADERS,
+    )
+    assert activate.status_code == 200
+    upload = client.post(
+        "/kbs/kb_parse_cfg/documents:upload",
+        files=[("files", ("paper.pdf", b"pdf", "application/pdf"))],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200
+    document_id = upload.json()["documents"][0]["id"]
+
+    response = client.post(
+        f"/kbs/kb_parse_cfg/documents/{document_id}:parse",
+        json={},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["payload"]["parser_engine"] == "mineru"
+    assert response.json()["payload"]["process_options"] == "iF"
+    job = client.get(
+        f"/kbs/kb_parse_cfg/jobs/{response.json()['id']}", headers=_HEADERS
+    )
+    assert job.status_code == 200
+    assert job.json()["status"] == "succeeded"
+    assert probe.instances[0].parse_calls[0][0] == "mineru"
+    assert probe.instances[0].parse_calls[0][3]["process_options"] == "iF"
+    document = client.get(
+        f"/kbs/kb_parse_cfg/documents/{document_id}", headers=_HEADERS
+    )
+    assert document.status_code == 200
+    assert document.json()["metadata"]["parser_engine"] == "mineru"
+    assert document.json()["metadata"]["process_options"] == "iF"
+
+
+def test_auto_parse_upload_snapshots_active_parser_config_defaults(tmp_path):
+    client, _kb_service, _store, _document_service, _job_service = _build_client(tmp_path)
+    _create_kb(client, "kb_auto_parse_cfg")
+    config = client.post(
+        "/kbs/kb_auto_parse_cfg/configs",
+        json={
+            "config": {
+                "parser_config": {
+                    "engine": "mineru",
+                    "process_options": " i-F ",
+                }
+            }
+        },
+        headers=_HEADERS,
+    )
+    assert config.status_code == 200
+    activate = client.post(
+        f"/kbs/kb_auto_parse_cfg/configs/{config.json()['id']}:activate",
+        headers=_HEADERS,
+    )
+    assert activate.status_code == 200
+
+    upload = client.post(
+        "/kbs/kb_auto_parse_cfg/documents:upload?auto_parse=true",
+        files=[("files", ("paper.pdf", b"pdf", "application/pdf"))],
+        headers=_HEADERS,
+    )
+
+    assert upload.status_code == 200
+    payload = upload.json()
+    document = payload["documents"][0]
+    assert document["status"] == "parse_queued"
+    assert document["metadata"]["parser_engine"] == "mineru"
+    assert document["metadata"]["process_options"] == "iF"
+    job = client.get(
+        f"/kbs/kb_auto_parse_cfg/jobs/{payload['job_id']}", headers=_HEADERS
+    )
+    assert job.status_code == 200
+    assert job.json()["payload"]["parser_engine"] == "mineru"
+    assert job.json()["payload"]["process_options"] == "iF"
 
 
 def test_parse_document_idempotency_key_reuses_existing_job(tmp_path):
@@ -2108,4 +2245,3 @@ def test_delete_rebuild_kb_strategy_requires_index_service(tmp_path):
         headers=_HEADERS,
     )
     assert response.status_code == 503
-

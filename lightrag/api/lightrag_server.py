@@ -18,7 +18,7 @@ import sys
 import textwrap
 import uvicorn
 import pipmaster as pm
-from typing import Any
+from typing import Any, cast
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 from pathlib import Path
@@ -1010,7 +1010,10 @@ def create_app(args):
         """Get allowed origins from global_args
         Returns a list of allowed origins, defaults to ["*"] if not set
         """
-        origins_str = global_args.cors_origins
+        origins_value = global_args.cors_origins
+        if isinstance(origins_value, (list, tuple)):
+            return [str(origin).strip() for origin in origins_value]
+        origins_str = str(origins_value or "*")
         if origins_str == "*":
             return ["*"]
         return [origin.strip() for origin in origins_str.split(",")]
@@ -1151,7 +1154,7 @@ def create_app(args):
             system_prompt=None,
             history_messages=None,
             **kwargs,
-        ) -> str:
+        ) -> Any:
             from lightrag.llm.gemini import gemini_complete_if_cache
 
             if history_messages is None:
@@ -1413,7 +1416,7 @@ def create_app(args):
                     system_prompt=None,
                     history_messages=None,
                     **kwargs,
-                ) -> str:
+                ) -> Any:
                     if history_messages is None:
                         history_messages = []
                     if role_provider_options:
@@ -1465,7 +1468,7 @@ def create_app(args):
                     system_prompt=None,
                     history_messages=None,
                     **kwargs,
-                ) -> str:
+                ) -> Any:
                     if history_messages is None:
                         history_messages = []
                     kwargs["timeout"] = role_timeout
@@ -1616,6 +1619,8 @@ def create_app(args):
         final_embedding_dim = (
             args.embedding_dim if args.embedding_dim else provider_embedding_dim
         )
+        if final_embedding_dim is None:
+            raise ValueError("Embedding dimension could not be resolved")
         # Asymmetric embedding is explicit opt-in only. Provider-specific
         # validation decides whether task parameters or prefixes are required.
         asymmetric_opt_in = resolve_asymmetric_embedding_opt_in(
@@ -1857,7 +1862,7 @@ def create_app(args):
         system_prompt=None,
         history_messages=None,
         **kwargs,
-    ) -> str:
+    ) -> Any:
         # Lazy import
         from lightrag.llm.bedrock import bedrock_complete_if_cache
 
@@ -1981,7 +1986,10 @@ def create_app(args):
                     args.rerank_binding_host = default_base_url
 
         async def server_rerank_func(
-            query: str, documents: list, top_n: int = None, extra_body: dict = None
+            query: str,
+            documents: list,
+            top_n: int | None = None,
+            extra_body: dict | None = None,
         ):
             """Server rerank function with configuration from environment variables"""
             # Prepare kwargs for rerank function
@@ -2216,6 +2224,7 @@ def create_app(args):
             document_service=document_lifecycle_service,
             registry=kb_registry,
             job_service=job_service,
+            index_service=index_build_service,
         )
         job_worker = JobWorker(
             job_service,
@@ -2282,7 +2291,7 @@ def create_app(args):
     async def custom_swagger_ui_html(request: Request):
         """Custom Swagger UI HTML with local static files"""
         response = get_swagger_ui_html(
-            openapi_url=app.openapi_url,
+            openapi_url=app.openapi_url or "/openapi.json",
             title=app.title + " - Swagger UI",
             oauth2_redirect_url="/docs/oauth2-redirect",
             swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
@@ -2290,7 +2299,7 @@ def create_app(args):
             swagger_favicon_url="/static/swagger-ui/favicon-32x32.png",
             swagger_ui_parameters=app.swagger_ui_parameters,
         )
-        html = response.body.decode("utf-8")
+        html = bytes(response.body).decode("utf-8")
         html = _inject_swagger_theme(
             html, request.query_params.get("theme", "auto").lower()
         )
@@ -2810,7 +2819,7 @@ def main():
     # Configure logging before parsing args
     configure_logging()
     update_uvicorn_mode_config()
-    display_splash_screen(global_args)
+    display_splash_screen(cast(Any, global_args))
 
     # Note: Signal handlers are NOT registered here because:
     # - Uvicorn has built-in signal handling that properly calls lifespan shutdown

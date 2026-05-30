@@ -1635,14 +1635,16 @@ class SQLiteMetadataStore:
 
         When a durable :class:`~lightrag.api.job_worker.JobWorker` is enabled,
         ``resumable_job_types`` lists job types the worker can re-drive from
-        persisted state (e.g. ``{"parse", "build_kg", "reindex"}``). Jobs of
-        those types that are still ``queued`` (created but never started, or
-        reset by ``:retry``) are LEFT queued so the worker consumes them
-        instead of failing them. Jobs that were already ``running`` (their
-        in-process task died mid-flight) are still failed — they cannot be
-        safely resumed — and the document reset below makes their next retry
-        re-claimable. Default ``None`` preserves the original "fail
-        everything transient" behaviour.
+        persisted state (e.g. ``{"parse", "build_kg", "reindex", "delete"}``).
+        Jobs of those types that are still ``queued`` (created but never started,
+        or reset by ``:retry``) are LEFT queued so the worker consumes them
+        instead of failing them. ``delete`` is special: both single-document jobs
+        and aggregate ``documents:batch-delete`` jobs are resumable because all
+        required document ids and options are persisted in the job payload. Jobs
+        that were already ``running`` (their in-process task died mid-flight) are
+        still failed — they cannot be safely resumed — and the document reset
+        below makes their next retry re-claimable. Default ``None`` preserves the
+        original "fail everything transient" behaviour.
         """
         await self._ensure_initialized()
         resumable = set(resumable_job_types or set())
@@ -1658,14 +1660,13 @@ class SQLiteMetadataStore:
             now = utc_now_iso()
             for row in rows:
                 # Leave resumable queued jobs for the durable worker to pick up.
-                # Only SINGLE-document jobs are resumable: the worker claims by
-                # job_type AND document_id IS NOT NULL, so an aggregate job
-                # (document_id NULL — e.g. batch-delete) left queued here would
-                # never be claimed. Fail those so they don't leak as zombies.
+                # Most worker executors claim only single-document jobs; delete
+                # also supports aggregate batch-delete jobs because their
+                # document_ids/options live entirely in the persisted payload.
                 if (
                     row["status"] == "queued"
                     and row["job_type"] in resumable
-                    and row["document_id"] is not None
+                    and (row["document_id"] is not None or row["job_type"] == "delete")
                 ):
                     continue
                 conn.execute(
@@ -1746,13 +1747,12 @@ class SQLiteMetadataStore:
         only jobs that have sat ``queued`` beyond the window — retried jobs and
         jobs whose owner crashed/restarted — are claimed.
 
-        Only single-document jobs (``document_id IS NOT NULL``) are eligible.
-        Aggregate jobs — multi-file ``upload``, ``batch-parse`` / ``batch-build``
-        / ``batch-delete`` and ``sync`` — carry ``document_id = NULL`` and a
-        ``document_ids`` list in their payload; the single-document executors
-        cannot re-drive them (they would fail with ``worker_invalid_payload``),
-        so they are excluded here and remain the owner task's / a future
-        batch-aware worker's responsibility.
+        Only single-document jobs are generally eligible. ``delete`` is the one
+        aggregate exception: ``documents:batch-delete`` carries all document ids
+        and delete options in ``payload_json``, so the durable delete executor can
+        safely re-drive it after a restart. Other aggregate jobs — multi-file
+        ``upload``, ``batch-parse`` / ``batch-build`` and ``sync`` — still need
+        request-scoped context and remain excluded.
         """
         await self._ensure_initialized()
         if not job_types:
@@ -1760,8 +1760,8 @@ class SQLiteMetadataStore:
         placeholders = ",".join("?" for _ in job_types)
         params: list[Any] = list(job_types)
         where = (
-            f"status = 'queued' AND document_id IS NOT NULL "
-            f"AND job_type IN ({placeholders})"
+            f"status = 'queued' AND job_type IN ({placeholders}) "
+            f"AND (document_id IS NOT NULL OR job_type = 'delete')"
         )
         if max_queued_at is not None:
             where += " AND queued_at <= ?"
@@ -2349,9 +2349,22 @@ class SQLiteMetadataStore:
                 _active_build_job_id_from_row(current_row),
             )
         if status == "deleting":
+            existing_job_id = _active_delete_job_id_from_row(current_row)
+            requested_job_id = metadata_patch.get("pending_delete_job_id") or metadata_patch.get(
+                "current_delete_job_id"
+            )
+            if requested_job_id is not None and str(requested_job_id) == existing_job_id:
+                return self._update_document_parse_state(
+                    conn,
+                    kb_id,
+                    document_id,
+                    status="deleting",
+                    metadata_patch=metadata_patch,
+                    clear_error=True,
+                )
             raise ActiveDocumentDeleteJobError(
                 document_id,
-                _active_delete_job_id_from_row(current_row),
+                existing_job_id,
             )
         if status == "replacing":
             raise ActiveDocumentReplaceJobError(

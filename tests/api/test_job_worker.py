@@ -29,12 +29,16 @@ def _job(
     queued_at: str | None = None,
 ) -> JobRecord:
     now = utc_now_iso()
-    # Real single-document jobs always carry a document_id; default to the job
-    # id so fixtures match production (the worker only claims document_id IS NOT
-    # NULL). Pass document_id=None explicitly for aggregate-job fixtures.
-    resolved_document_id = (
-        f"doc_{job_id}" if document_id is _UNSET else document_id
-    )
+    # Real single-document jobs usually carry a document_id; default to the job
+    # id so fixtures match production. Pass document_id=None explicitly for
+    # aggregate-job fixtures such as batch-delete.
+    resolved_document_id: str | None
+    if document_id is _UNSET:
+        resolved_document_id = f"doc_{job_id}"
+    elif document_id is None or isinstance(document_id, str):
+        resolved_document_id = document_id
+    else:
+        resolved_document_id = str(document_id)
     return JobRecord(
         id=job_id,
         kb_id=kb_id,
@@ -158,9 +162,9 @@ async def test_claim_respects_job_type_filter(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_claim_skips_aggregate_jobs_without_document_id(tmp_path: Path):
-    """Aggregate jobs (document_id NULL — e.g. multi-file upload auto_parse,
-    batch-parse/build/delete) must NOT be claimed by the single-document
-    worker: it cannot re-drive them and would mis-mark worker_invalid_payload.
+    """Aggregate non-delete jobs (document_id NULL — e.g. multi-file upload
+    auto_parse, batch-parse/build, and sync) must NOT be claimed by the durable
+    worker: they need request-scoped context the worker cannot reconstruct.
     """
     store = await _make_store(tmp_path)
     # Aggregate parse job: document_id=None, payload carries document_ids list.
@@ -184,6 +188,23 @@ async def test_claim_skips_aggregate_jobs_without_document_id(tmp_path: Path):
     )
     agg = await store.get_job("kb_a", "agg_parse")
     assert agg.status == "queued"  # left untouched for its owner task
+
+
+@pytest.mark.asyncio
+async def test_claim_allows_aggregate_delete_jobs(tmp_path: Path):
+    """Batch delete has a persisted document_ids payload, so it is worker-safe."""
+    store = await _make_store(tmp_path)
+    await store.create_job(
+        _job("kb_a", "agg_delete", job_type="delete", document_id=None)
+    )
+
+    claimed = await store.claim_next_worker_job(
+        job_types=["delete"], max_queued_at=None
+    )
+
+    assert claimed is not None
+    assert claimed.id == "agg_delete"
+    assert claimed.status == "running"
 
 
 @pytest.mark.asyncio
@@ -325,7 +346,8 @@ async def test_worker_executor_error_marks_job_failed(tmp_path: Path):
 async def test_recovery_leaves_resumable_queued_jobs(tmp_path: Path):
     """With the worker enabled, queued resumable jobs survive restart recovery."""
     store = await _make_store(tmp_path)
-    # A queued parse job (resumable) + a queued delete job (not resumable) +
+    # A queued parse job (resumable) + a queued delete job (not in the
+    # resumable set for this run) +
     # a running parse job (mid-flight, cannot resume).
     await _create_job(store, _job("kb_r", "queued_parse", job_type="parse"))
     await _create_job(store, _job("kb_r", "queued_delete", job_type="delete"))
@@ -346,30 +368,35 @@ async def test_recovery_leaves_resumable_queued_jobs(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_recovery_leaves_resumable_delete_queued(tmp_path: Path):
-    """When 'delete' is a resumable type (single-doc delete needs only the
-    persisted payload), a queued delete job survives restart recovery."""
+    """When 'delete' is a resumable type, queued single-doc and batch delete
+    jobs survive restart recovery because their payload is enough to re-drive
+    them."""
     store = await _make_store(tmp_path)
     await _create_job(store, _job("kb_d", "queued_delete", job_type="delete"))
+    await store.create_job(
+        _job("kb_d", "queued_batch_delete", job_type="delete", document_id=None)
+    )
     await _create_job(store, _job("kb_d", "queued_upload", job_type="upload"))
 
     recovered = await store.recover_orphan_jobs(
         resumable_job_types={"parse", "build_kg", "reindex", "delete"}
     )
     recovered_ids = {job.id for job in recovered}
-    # delete is kept queued for the worker; upload (needs request bytes) fails.
+    # Delete is kept queued for the worker; upload (needs request bytes) fails.
     assert "queued_delete" not in recovered_ids
+    assert "queued_batch_delete" not in recovered_ids
     assert "queued_upload" in recovered_ids
 
-    survivor = await store.get_job("kb_d", "queued_delete")
-    assert survivor.status == "queued"
+    single = await store.get_job("kb_d", "queued_delete")
+    batch = await store.get_job("kb_d", "queued_batch_delete")
+    assert single.status == "queued"
+    assert batch.status == "queued"
 
 
 @pytest.mark.asyncio
-async def test_recovery_fails_aggregate_delete_even_when_delete_resumable(tmp_path: Path):
-    """An AGGREGATE delete job (document_id NULL, e.g. batch-delete) must be
-    FAILED on restart even though 'delete' is resumable: the worker only claims
-    document_id IS NOT NULL, so keeping it queued would leak a zombie that is
-    never picked up. Single-doc delete is still kept."""
+async def test_recovery_leaves_aggregate_delete_when_delete_resumable(tmp_path: Path):
+    """An aggregate delete job is now recoverable because the delete executor
+    can replay its persisted document_ids/options payload."""
     store = await _make_store(tmp_path)
     await store.create_job(
         _job("kb_b", "batch_delete", job_type="delete", document_id=None)
@@ -380,10 +407,9 @@ async def test_recovery_fails_aggregate_delete_even_when_delete_resumable(tmp_pa
         resumable_job_types={"parse", "build_kg", "reindex", "delete"}
     )
     recovered_ids = {job.id for job in recovered}
-    # Aggregate delete is failed; single-doc delete is kept for the worker.
-    assert "batch_delete" in recovered_ids
+    assert "batch_delete" not in recovered_ids
     assert "single_delete" not in recovered_ids
-    assert (await store.get_job("kb_b", "batch_delete")).status == "failed"
+    assert (await store.get_job("kb_b", "batch_delete")).status == "queued"
     assert (await store.get_job("kb_b", "single_delete")).status == "queued"
 
 
@@ -427,5 +453,3 @@ async def test_worker_run_loop_consumes_then_stops(tmp_path: Path):
     assert final.status == "succeeded"
     # After stop(), the loop task is cleared and nothing else is claimable.
     assert await worker.poll_once() is None
-
-

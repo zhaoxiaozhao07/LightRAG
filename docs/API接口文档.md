@@ -1,6 +1,6 @@
 # LightRAG API 接口文档
 
-> 文档版本：2026-05-29
+> 文档版本：2026-05-30
 > 适用范围：当前已经合并到 `main` 分支并通过测试的接口。
 > 路径前缀：所有路径均为相对路径；部署时通过 FastAPI `root_path` 或 `--api-prefix /api/v1` 暴露为 `/api/v1/...`。
 > 鉴权：除 `/health`、`/auth-status`、`/login` 等少数公开接口外，所有接口都受 `combined_auth` 依赖保护，需要在请求头携带 `X-API-Key: <api_key>` 或 JWT。
@@ -123,7 +123,7 @@ files: [a.pdf, b.docx]
 - 单请求最多 32 个文件，单文件和单请求总字节数均不得超过 `MAX_UPLOAD_SIZE`，未配置或非正数时 `413`。
 - 文件扩展名必须在 `SUPPORTED_DOCUMENT_EXTENSIONS` 列表中。
 - `auto_parse=true` 会创建一个 `job_type=parse` 的聚合任务（`document_id=null`、`batch_id` 非空、payload 携带 `document_ids` 列表），并在后台**实际逐个执行解析**（每个文档 `parse_queued → parsing → parsed`），结果聚合进该 job 的 `result.items[]`；同时 `auto_index=true` 会在每个文档解析成功后串联 KG 构建到 `ready`（需路由注入 `IndexBuildService`）。`auto_parse=false` 仅落 metadata，job 立即标记 `succeeded`。
-- 注意：该聚合 parse/build 任务由创建请求的 in-process 后台任务执行;它**不会**被 durable worker 认领（worker 仅认领 `document_id IS NOT NULL` 的单文档任务），因此服务在执行中途重启不会自动续跑该聚合任务，需重新发起。
+- 注意：该聚合 parse/build 任务由创建请求的 in-process 后台任务执行；它**不会**被 durable worker 认领，因此服务在执行中途重启不会自动续跑该聚合任务，需重新发起。`auto_parse=true` 且请求未显式传 `parser_engine/process_options` 时，会把当前 active `parser_config.engine/process_options` snapshot 到文档和 job metadata；`auto_parse=false` 不冻结这些默认值。
 - 同名文件会写入独立的 `<workspace>/<document_id>/<filename>` 目录，使用独占创建 (`O_EXCL`)。
 
 返回 `DocumentBatchResponse`：
@@ -160,7 +160,7 @@ Content-Type: application/json
 - 单文档文本上限 1 MB，单 metadata JSON 上限 64 KB。
 - 单请求最多 100 个文本。
 - `idempotency_key` 在 `(kb_id, job_type)` 维度唯一；指纹一致直接返回原 batch；指纹不一致返回 `409`。
-- `auto_parse=true` 与多文件 `:upload` 一致：创建 `job_type=parse` 聚合任务并在后台逐个解析；`auto_index=true` 解析成功后串联 KG 构建到 `ready`（需注入 `IndexBuildService`）。该聚合任务由 in-process 后台任务执行，不被 durable worker 认领。
+- `auto_parse=true` 与多文件 `:upload` 一致：创建 `job_type=parse` 聚合任务并在后台逐个解析；`auto_index=true` 解析成功后串联 KG 构建到 `ready`（需注入 `IndexBuildService`）。该聚合任务由 in-process 后台任务执行，不被 durable worker 认领。请求未显式传 `parser_engine/process_options` 时，会 snapshot 当前 active `parser_config.engine/process_options` 作为解析默认值；`auto_parse=false` 不冻结这些默认值。
 
 ### 2.3 批量增量同步
 
@@ -177,7 +177,7 @@ source_keys: ["manual/a.pdf", "manual/b.pdf"]
 - `source_key` 在同一 KB 内由 metadata store 原子唯一约束；并发 sync 不会为同一个外部文档创建两个活动 KB 文档。
 - 服务端先读取文件内容并计算 `source_hash`，再查找相同 `source_key` 的现有文档。
 - 找不到 `source_key`：创建新文档；`source_hash` 相同：跳过 source 替换，但若当前请求的 `parser_engine/process_options` 派生出的 `parser_hash` 与文档上次成功解析的值不同，仍会重解析并继续重建；`source_hash` 不同：复用单文档 replace 语义，保留原 `document_id`，先删除旧 `lightrag_doc_id` 后替换 source。
-- `auto_parse=true` 默认继续解析；`auto_index=true` 默认在解析成功后继续构建 KG/index，使成功 item 到达 `ready` 并可直接走 KB query。
+- `auto_parse=true` 默认继续解析；请求未显式传 `parser_engine/process_options` 时，会按当前 active `parser_config.engine/process_options` 作为解析默认值；`auto_index=true` 默认在解析成功后继续构建 KG/index，使成功 item 到达 `ready` 并可直接走 KB query。
 - 返回单个聚合 `sync` job。每个 item 在 `job.result.items[]` 中记录 `source_key`、`action`（`created` / `replaced` / `skipped` / `reparsed`）、`status`、`parse_result`、`build_result` 等；单个 item 失败不会阻塞其他 item，active parse/build/delete/replace 会保留对应 `*_job_active` 错误码和 `existing_job_id`。
 - `idempotency_key` 在 `(kb_id, job_type=sync)` 维度唯一；同 key 同文件和同参数复用原 job，同 key 不同请求返回 `409`。
 
@@ -245,7 +245,7 @@ Content-Type: application/json
 }
 ```
 
-创建单个聚合 `delete` job（`document_id=null`、`batch_id` 非空）。每个 item 独立 claim 和执行；active job、缺失文档等作为 per-item failure 写入 `job.result.items[]`，不阻塞其他可删除文档。
+创建单个聚合 `delete` job（`document_id=null`、`batch_id` 非空）。每个 item 独立 claim 和执行；active job、缺失文档等作为 per-item failure 写入 `job.result.items[]`，不阻塞其他可删除文档。启用 durable worker 时，`documents:batch-delete` 属于可恢复聚合任务：worker 可从 job payload 的 `document_ids` 与删除选项恢复执行，服务重启后 queued batch-delete 不会被孤儿恢复直接标失败。
 
 ### 2.8 文档替换
 
@@ -291,9 +291,10 @@ Content-Type: application/json
 ```
 
 行为：
+- 解析指令优先级为：请求体 `engine/process_options` > 文档 metadata 中已 snapshot 的 `parser_engine/process_options` > active config 的 `parser_config.engine/process_options` > 文件名/环境变量路由默认值。active `parser_config` 只提供默认值；请求体显式传值始终优先。
 - 解析缓存命中时直接复用 artifacts：缓存有效性由 MinerU/Docling 的 `*.mineru_raw` raw bundle manifest 校验（源文件大小 + 内容 sha256 + options 签名），而非 KB 控制面的 `source_hash`/`parser_hash`（后者用于增量决策与 diff，不作为 raw bundle cache key）。`force_reparse=true` 绕过该 raw bundle cache。
 - 同一文档已有 `parse_queued` / `parsing` / `build_queued` / `building` / `deleting` / `replacing` 时返回 `409`，原 active job 保持不变，新建的 job 同步标记 `failed`。
-- 成功后写入 `original` / `sidecar` / `blocks` artifact，MinerU/Docling 还会写 `raw_dir`。
+- 成功后写入 `original` / `sidecar` / `blocks` artifact，MinerU/Docling 还会写 `raw_dir`，并从 raw bundle 中记录细粒度文件 artifact：`markdown`、`content_list`、`middle_json`、`model_json`、`image`、`layout_pdf`。细粒度 artifact metadata 包含 `parse_engine`、`parser_hash`、`source`、`relative_path`。
 
 ### 3.2 批量解析
 
@@ -315,6 +316,7 @@ Content-Type: application/json
 - 创建单个聚合 `parse` job（`document_id=null`、`batch_id` 非空）。
 - 每个 item 独立成功 / 失败，记录在 `result.items[]`。
 - 任一 item 失败时聚合 job 终态为 `failed`，但已成功 item 不回滚。
+- 每个 item 使用与单文档解析相同的解析指令优先级；请求级 `engine/process_options` 会覆盖文档 metadata 和 active config 默认值。
 
 ---
 
@@ -488,19 +490,19 @@ Content-Type: application/json
 - `retry_count += 1`；超过 `max_retries`（默认 3）返回 `409`。
 - 重试后的消费方式取决于是否启用 durable worker：
   - 默认（未启用）：worker 是 in-process 后台任务，重试后需由调用方再次触发同一接口或原始业务动作。
-  - 启用 `LIGHTRAG_KB_JOB_WORKER=true` 后：内置 durable worker 会自动消费回到 `queued` 的 `parse` / `build_kg` / `reindex` 单文档任务，无需客户端再次触发；服务重启后这些 `queued` 任务也会被自动续跑（见 5.5）。
+  - 启用 `LIGHTRAG_KB_JOB_WORKER=true` 后：内置 durable worker 会自动消费回到 `queued` 的 `parse` / `build_kg` / `reindex` 单文档任务、单文档 `delete` 任务以及 `documents:batch-delete` 聚合任务，无需客户端再次触发；服务重启后这些 `queued` 任务也会被自动续跑（见 5.5）。
 
 ### 5.5 Durable job worker（可选）
 
 > 通过环境变量 `LIGHTRAG_KB_JOB_WORKER=true` 启用。默认关闭，关闭时行为与历史一致（仅 in-process 背景任务，重启后遗留任务一律标 `failed`）。
 
 启用后：
-- 服务启动会拉起一个后台轮询 worker，原子认领（`queued → running` 单赢 CAS）以下可从持久化状态重建的任务类型并执行到终态：`parse`、`build_kg`、`reindex`、单文档 `delete`（均为单文档任务；`delete` 只需持久化的文档 id + 删除选项即可重建）。
+- 服务启动会拉起一个后台轮询 worker，原子认领（`queued → running` 单赢 CAS）以下可从持久化状态重建的任务类型并执行到终态：`parse`、`build_kg`、`reindex`、单文档 `delete`，以及 `documents:batch-delete` 聚合 `delete` job（`document_id=null`、payload 携带 `document_ids`）。`delete` 只需持久化的文档 id 列表 + 删除选项即可重建。
 - **自动消费 `:retry`**：重试把任务重置回 `queued` 后，worker 在下一轮轮询中认领并重跑，客户端无需再次发起业务请求。
-- **重启续跑**：进程重启时，孤儿恢复会保留这些可恢复类型的 `queued` 任务（不再标 `failed`）交给 worker 继续执行；仍处于 `running` 的中途任务无法安全恢复，照旧标 `failed`，其文档同步重置为 `*_failed`，客户端 `:retry` 后即可被 worker 自动重跑。单文档 `delete` 续跑时若孤儿恢复已把文档从 `deleting` 重置为 `delete_failed`，worker 会重新 claim 回 `deleting` 再执行（`_claim_document_deleting` 接受 `delete_failed`）。
+- **重启续跑**：进程重启时，孤儿恢复会保留这些可恢复类型的 `queued` 任务（不再标 `failed`）交给 worker 继续执行；仍处于 `running` 的中途任务无法安全恢复，照旧标 `failed`，其文档同步重置为 `*_failed`，客户端 `:retry` 后即可被 worker 自动重跑。delete 续跑时若孤儿恢复已把文档从 `deleting` 重置为 `delete_failed`，worker 会重新 claim 回 `deleting` 再执行（`_claim_document_deleting` 接受同一 delete job id 的幂等 reclaim）。
 - **不抢占新任务**：worker 只认领 `queued_at` 早于宽限窗口（`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`，默认 5s）的任务；新建任务由其 in-process 背景任务在毫秒级转入 `running`，因此不会被 worker 抢跑，避免重复执行。
-- **仅认领单文档任务**：worker 的认领条件为 `status='queued' AND document_id IS NOT NULL AND job_type IN (...)`。聚合任务（多文件 `upload` 的 auto_parse、`batch-parse`/`batch-build`/`batch-reindex`/`batch-delete`、`sync`，均 `document_id=null`、payload 携带 `document_ids` 列表）**不会**被认领（单文档执行器无法重建它们,否则会误标 `worker_invalid_payload`），由创建请求的 in-process 任务负责;孤儿恢复也会把这类聚合 queued 任务直接标 `failed`，不会留为永不被认领的僵尸。
-- **暂不可恢复的类型**：`replace`、批量 `sync`、批量 `delete`（`document_id=null`）、`upload`/`texts` 的 auto_parse 聚合任务等依赖请求级上传字节或一次性上下文的任务未纳入 worker 自动恢复；它们重启后仍标 `failed`，需要重新发起请求。
+- **聚合任务认领范围**：除 `documents:batch-delete` 外，其他聚合任务（多文件 `upload` 的 auto_parse、`batch-parse`/`batch-build`/`batch-reindex`、`sync`，均 `document_id=null`、payload 携带请求上下文）**不会**被认领，由创建请求的 in-process 任务负责；孤儿恢复也会把这类聚合 queued 任务直接标 `failed`，不会留为永不被认领的僵尸。
+- **暂不可恢复的类型**：`replace`、批量 `sync`、`upload`/`texts` 的 auto_parse 聚合任务等依赖请求级上传字节或一次性上下文的任务未纳入 worker 自动恢复；它们重启后仍标 `failed`，需要重新发起请求。
 - 可调环境变量：`LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS`（默认 1.0s）、`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`（默认 5.0s）。
 
 ### 5.6 等待任务终态
@@ -520,7 +522,7 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 
 ## 六、知识库产物 Artifacts
 
-> 产物记录解析阶段产生的文件 / 目录。当前支持 `original` / `sidecar` / `blocks` / `raw_dir` 四种类型。
+> 产物记录解析阶段产生的文件 / 目录。当前支持 `original` / `sidecar` / `blocks` / `raw_dir`，以及 MinerU/Docling raw bundle 中的 `markdown` / `content_list` / `middle_json` / `model_json` / `image` / `layout_pdf` 等细粒度类型。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -529,7 +531,7 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 | `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:download` | 下载文件型产物 |
 
 下载约束：
-- 文件型产物（`original` / `blocks`）以 `FileResponse` 直接返回。
+- 文件型产物（`original` / `blocks` / `markdown` / `content_list` / `middle_json` / `model_json` / `image` / `layout_pdf`）以 `FileResponse` 直接返回。
 - 目录型产物（`sidecar` / `raw_dir`）以流式 zip 返回（`Content-Type: application/zip`），单次下载 zip 内未压缩字节上限 512 MB，超限返回 `413`。
 - 路径必须位于 `inputs/<workspace>/<document_id>` 内；跨 KB、缺失文件、路径逃逸均返回 `404` / `400`。
 
@@ -537,14 +539,15 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 
 ## 七、知识库配置版本 Config Versions
 
-> 不可变的 KB 级配置快照。新建配置不会自动生效，需要显式 `:activate` 才会写入 `KnowledgeBase.active_config_version_id` 并 discard 缓存的 LightRAG 实例。当前实现会让后续实例重建时读取已支持的 active config 字段；未接入的配置项仍应视为 metadata / diff 能力。
+> 不可变的 KB 级配置快照。新建配置不会自动生效，需要显式 `:activate` 才会写入 `KnowledgeBase.active_config_version_id` 并 discard 缓存的 LightRAG 实例。当前实现会让后续实例重建或 parse planning 时读取已支持的 active config 字段；未接入的配置项仍应视为 metadata / diff 能力。
 >
 > 已接入运行时的 active config 字段：
+> - `parser_config`：`engine`/`parser_engine`、`process_options`/`options`。这些字段会在创建配置时校验并规范化，作为解析默认值参与 `parser_hash`，并按“请求 > 文档 metadata > active config > 文件路由”的优先级生效。
 > - `chunk_config`：`chunk_size`/`chunk_token_size`、`chunk_overlap_size`/`chunk_overlap_token_size`、`tiktoken_model_name`。
 > - `embedding_config`：`model`、`dim`/`embedding_dim`、`token_limit`/`max_token_size`（`model` 会触发重建 embedding provider 闭包）。
 > - `query_config`：`top_k`/`chunk_top_k`/`max_entity_tokens`/`max_relation_tokens`/`max_total_tokens`/`related_chunk_number`/`cosine_threshold` 等 QueryParam 字段。
 > - `extraction_config`：`language`（摘要/抽取语言）、`entity_types`（列表，自动渲染成 `entity_types_guidance` 并去重保序）或显式 `entity_types_guidance`（优先于 `entity_types`）、`entity_type_prompt_file`、`max_gleaning`/`max_extraction_records`/`max_extraction_entities`/`force_llm_summary_on_merge`。这些会 overlay 到 `addon_params` 与 LightRAG 抽取构造参数，并纳入 `index_hash`，因此变更会被 `:diff` 标为 `requires_reindex`。
-> - 仍未接入运行时（仅作 metadata/diff 保存）：`parser_config`（解析在 parse 阶段按文档 `parser_engine` 生效）、`llm_role_config`、`storage_config`。
+> - 仍未接入运行时（仅作 metadata/diff 保存）：parser 服务实例级参数、`llm_role_config`、`storage_config`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -562,7 +565,7 @@ Content-Type: application/json
 
 {
   "config": {
-    "parser_config": {"engine": "mineru"},
+    "parser_config": {"engine": "mineru", "process_options": "iF"},
     "chunk_config": {"chunk_size": 512},
     "embedding_config": {"model": "bge-large", "dim": 1024},
     "llm_role_config": {"extract": "gpt-4o-mini"},

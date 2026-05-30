@@ -5,6 +5,7 @@ import importlib
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from fastapi import FastAPI
@@ -1433,12 +1434,15 @@ def test_durable_parse_executor_redrives_queued_job(tmp_path):
 
     async def _drive() -> str:
         document = await document_service.get_document("kb_pexec", document_id)
+        plan = await document_service.create_parse_plan(
+            "kb_pexec", document_id, parser_engine="mineru", process_options="iF"
+        )
         # Queued parse job only; the executor itself does the parse_queued claim.
         job, _created = await job_service.create_parse_job_once(
             "kb_pexec",
             document_id=document_id,
-            parser_hash="sha256:seed",
-            lightrag_doc_id=document.lightrag_doc_id,
+            parser_hash=plan.parser_hash,
+            lightrag_doc_id=plan.lightrag_doc_id,
             parser_engine="mineru",
             process_options="iF",
             source_uri=document.source_uri,
@@ -1484,6 +1488,7 @@ def test_durable_build_executor_redrives_queued_job(tmp_path):
         document = await document_service.get_document("kb_bexec", document_id)
         rag = await registry.get("kb_bexec")
         plan = await index_service.create_build_plan("kb_bexec", document_id, rag=rag)
+        assert document.lightrag_doc_id is not None
         # Queued build job only; the executor itself does the build_queued claim.
         job, _created = await job_service.create_build_job_once(
             "kb_bexec",
@@ -1531,12 +1536,13 @@ def test_build_executor_honors_cancelling_checkpoint(tmp_path):
     registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
     document_id = _upload_and_parse(client, "kb_build_cancel")
 
-    async def _drive() -> tuple[str, object]:
+    async def _drive() -> tuple[str, dict[str, Any]]:
         document = await document_service.get_document("kb_build_cancel", document_id)
         rag = await registry.get("kb_build_cancel")
         plan = await index_service.create_build_plan(
             "kb_build_cancel", document_id, rag=rag
         )
+        assert document.lightrag_doc_id is not None
         job, _created = await job_service.create_build_job_once(
             "kb_build_cancel",
             document_id=document_id,
@@ -1574,7 +1580,7 @@ def test_build_executor_honors_cancelling_checkpoint(tmp_path):
         asyncio.run(registry.shutdown())
 
     assert item["status"] == "cancelled"
-    rag = probe.instances[0]
+    rag = cast(FakeRAG, probe.instances[0])
     # Checkpoint fired BEFORE any pipeline call.
     assert rag.enqueue_calls == []
     assert rag.process_calls == 0
@@ -1599,8 +1605,7 @@ def test_parse_executor_honors_cancelling_checkpoint(tmp_path):
     assert upload.status_code == 200
     document_id = upload.json()["documents"][0]["id"]
 
-    async def _drive() -> tuple[str, object, object]:
-        document = await document_service.get_document("kb_parse_cancel", document_id)
+    async def _drive() -> tuple[str, dict[str, Any], FakeRAG]:
         plan = await document_service.create_parse_plan(
             "kb_parse_cancel", document_id, parser_engine="mineru", process_options="iF"
         )
@@ -1608,11 +1613,11 @@ def test_parse_executor_honors_cancelling_checkpoint(tmp_path):
             "kb_parse_cancel",
             document_id=document_id,
             parser_hash=plan.parser_hash,
-            lightrag_doc_id=document.lightrag_doc_id,
+            lightrag_doc_id=plan.lightrag_doc_id,
             parser_engine=plan.parser_engine,
             process_options=plan.process_options,
             source_uri=str(plan.source_path),
-            source_hash=document.source_hash,
+            source_hash=plan.document.source_hash,
         )
         await document_service.mark_parse_queued(
             "kb_parse_cancel", document_id, job=job, plan=plan
@@ -1632,7 +1637,7 @@ def test_parse_executor_honors_cancelling_checkpoint(tmp_path):
             rag=rag,
             job_service=job_service,
         )
-        return job.id, item, rag
+        return job.id, item, cast(FakeRAG, rag)
 
     try:
         job_id, item, rag = asyncio.run(_drive())
@@ -1715,6 +1720,7 @@ def test_durable_delete_executor_redrives_queued_job(tmp_path):
     async def _drive() -> tuple[str, str]:
         document = await document_service.get_document("kb_delexec", document_id)
         lightrag_doc_id = document.lightrag_doc_id
+        assert lightrag_doc_id is not None
         job, _created = await job_service.create_delete_job_once(
             "kb_delexec",
             document_id=document_id,
@@ -1765,6 +1771,85 @@ def test_durable_delete_executor_redrives_queued_job(tmp_path):
         ).status_code
         == 404
     )
+
+
+def test_durable_batch_delete_executor_redrives_queued_job(tmp_path):
+    """The durable delete worker must also re-drive aggregate batch-delete jobs.
+
+    The batch job's document_ids payload is persisted, so after restart
+    recovery leaves the job queued and the worker can claim and finish it.
+    """
+    from lightrag.api.job_worker import build_delete_executor
+
+    client, kb_service, document_service, job_service, probe = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_batch_delexec")
+    doc_a = _upload_and_parse(client, "kb_batch_delexec", filename="a.pdf")
+    doc_b = _upload_and_parse(client, "kb_batch_delexec", filename="b.pdf")
+    metadata_store = document_service.metadata_store
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+
+    async def _drive() -> tuple[str, str, str]:
+        job, _created = await job_service.create_batch_delete_job_once(
+            "kb_batch_delexec",
+            batch_id="batch_delete_resume",
+            document_ids=[doc_a, doc_b],
+            delete_source_file=False,
+            delete_artifacts=False,
+            delete_llm_cache=False,
+        )
+        documents, failures = await document_service.claim_batch_delete(
+            "kb_batch_delexec",
+            [doc_a, doc_b],
+            job=job,
+            delete_source_file=False,
+            delete_artifacts=False,
+        )
+        assert not failures
+        assert len(documents) == 2
+
+        # Simulate restart recovery: the queued batch job stays queued because
+        # delete is resumable, while the claimed docs are moved back to
+        # delete_failed so the worker can reclaim them.
+        recovered = await job_service.recover_orphan_jobs(
+            resumable_job_types={"parse", "build_kg", "reindex", "delete"}
+        )
+        assert all(item.id != job.id for item in recovered)
+
+        claimed = await metadata_store.claim_next_worker_job(
+            job_types=["delete"], max_queued_at=None
+        )
+        assert claimed is not None and claimed.id == job.id
+
+        executor = build_delete_executor(
+            document_service=document_service,
+            registry=registry,
+            job_service=job_service,
+        )
+        await executor(claimed)
+        return job.id, doc_a, doc_b
+
+    try:
+        job_id, doc_a, doc_b = asyncio.run(_drive())
+    finally:
+        asyncio.run(registry.shutdown())
+
+    job = client.get(f"/kbs/kb_batch_delexec/jobs/{job_id}", headers=_HEADERS).json()
+    assert job["status"] == "succeeded", job
+    assert job["result"]["resumed_by_worker"] is True
+    assert job["result"]["summary"]["outcome"] == "succeeded"
+    assert job["completed_items"] == 2
+    assert job["failed_items"] == 0
+    assert {item["document_id"] for item in job["result"]["items"]} == {doc_a, doc_b}
+
+    for document_id in (doc_a, doc_b):
+        assert (
+            client.get(
+                f"/kbs/kb_batch_delexec/documents/{document_id}", headers=_HEADERS
+            ).status_code
+            == 404
+        )
 
 
 def test_upload_auto_parse_actually_parses_in_process(tmp_path):
@@ -1833,5 +1918,3 @@ def test_texts_auto_parse_auto_index_reaches_ready(tmp_path):
         f"/kbs/kb_texts_ready/documents/{document_id}", headers=_HEADERS
     ).json()
     assert detail["status"] == "ready"
-
-
