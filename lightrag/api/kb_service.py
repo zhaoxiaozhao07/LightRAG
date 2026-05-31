@@ -211,6 +211,9 @@ class KnowledgeBaseService:
         async with self._lock:
             self._reload_metadata_locked()
 
+    async def close(self) -> None:
+        return None
+
     async def create(
         self,
         *,

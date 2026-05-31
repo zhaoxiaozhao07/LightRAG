@@ -73,6 +73,9 @@ from lightrag.api.kb_deletion_service import KBDeletionService
 from lightrag.api.kb_service import KnowledgeBaseRecord, KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
 from lightrag.api.metadata_store import SQLiteMetadataStore
+from lightrag.api.object_storage import create_object_storage_from_env
+from lightrag.api.postgres_kb_service import PostgresKnowledgeBaseService
+from lightrag.api.postgres_metadata_store import PostgresMetadataStore
 from lightrag.api.routers.kb_document_routes import create_kb_document_routes
 from lightrag.api.routers.kb_graph_routes import create_kb_graph_routes
 from lightrag.api.routers.kb_query_routes import create_kb_query_routes
@@ -873,14 +876,25 @@ def create_app(args):
 
     # Initialize document manager with workspace support for data isolation
     doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
-    kb_service = KnowledgeBaseService(
-        Path(args.working_dir) / "metadata" / "knowledge_bases.json"
-    )
-    metadata_store = SQLiteMetadataStore(
-        Path(args.working_dir) / "metadata" / "metadata.sqlite3"
-    )
+    kb_metadata_backend = os.getenv("LIGHTRAG_KB_METADATA_BACKEND", "local").strip().lower()
+    if kb_metadata_backend in {"postgres", "postgresql", "pg"}:
+        kb_service = PostgresKnowledgeBaseService.from_env()
+        metadata_store = PostgresMetadataStore.from_env()
+    elif kb_metadata_backend in {"", "local", "json", "sqlite"}:
+        kb_service = KnowledgeBaseService(
+            Path(args.working_dir) / "metadata" / "knowledge_bases.json"
+        )
+        metadata_store = SQLiteMetadataStore(
+            Path(args.working_dir) / "metadata" / "metadata.sqlite3"
+        )
+    else:
+        raise ValueError(
+            "Unsupported LIGHTRAG_KB_METADATA_BACKEND: "
+            f"{kb_metadata_backend!r}; expected local or postgres"
+        )
+    object_storage = create_object_storage_from_env()
     document_lifecycle_service = DocumentLifecycleService(
-        kb_service, metadata_store, Path(args.input_dir)
+        kb_service, metadata_store, Path(args.input_dir), object_storage=object_storage
     )
     job_service = JobService(kb_service, metadata_store)
     index_build_service = IndexBuildService(document_lifecycle_service)
@@ -893,6 +907,8 @@ def create_app(args):
         try:
             await kb_service.initialize()
             await metadata_store.initialize()
+            if object_storage is not None:
+                await object_storage.initialize()
 
             # Recover orphan jobs left in queued/running/cancelling/retrying
             # by a previous process. When the durable job worker is enabled,
@@ -932,6 +948,12 @@ def create_app(args):
             if worker is not None:
                 await worker.stop()
             await kb_registry.shutdown()
+            if object_storage is not None:
+                await object_storage.close()
+            if hasattr(metadata_store, "close"):
+                await metadata_store.close()
+            if hasattr(kb_service, "close"):
+                await kb_service.close()
             await rag.finalize_storages()
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
@@ -2196,6 +2218,7 @@ def create_app(args):
         kb_registry,
         input_root=Path(args.input_dir),
         working_dir=Path(args.working_dir),
+        object_storage=object_storage,
     )
     app.state.kb_service = kb_service
     app.state.lightrag_registry = kb_registry
@@ -2204,6 +2227,7 @@ def create_app(args):
     app.state.job_service = job_service
     app.state.config_version_service = config_version_service
     app.state.kb_deletion_service = kb_deletion_service
+    app.state.object_storage = object_storage
 
     # Optional durable job worker: re-drives queued single-document
     # parse / build_kg / reindex jobs (retry consumption + restart resume).
@@ -2514,6 +2538,8 @@ def create_app(args):
                     "doc_status_storage": args.doc_status_storage,
                     "graph_storage": args.graph_storage,
                     "vector_storage": args.vector_storage,
+                    "kb_metadata_backend": kb_metadata_backend or "local",
+                    "object_storage": os.getenv("LIGHTRAG_OBJECT_STORAGE", "local"),
                     "enable_llm_cache_for_extract": args.enable_llm_cache_for_extract,
                     "enable_llm_cache": args.enable_llm_cache,
                     "vlm_process_enable": args.vlm_process_enable,

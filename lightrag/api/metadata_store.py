@@ -371,6 +371,9 @@ class SQLiteMetadataStore:
                     self._initialize_schema(conn)
                 self._initialized = True
 
+    async def close(self) -> None:
+        return None
+
     async def create_documents_and_job(
         self,
         documents: Sequence[DocumentRecord],

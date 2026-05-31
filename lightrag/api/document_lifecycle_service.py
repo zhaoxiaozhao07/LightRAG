@@ -19,6 +19,8 @@ from lightrag.api.metadata_store import (
     MetadataRecordNotFoundError,
     SQLiteMetadataStore,
 )
+from lightrag.api.object_storage import ObjectStorage, ObjectStorageError
+from lightrag.api.postgres_metadata_store import PostgresMetadataStore
 from lightrag.constants import (
     DOCLING_RAW_DIR_SUFFIX,
     FULL_DOCS_FORMAT_LIGHTRAG,
@@ -42,6 +44,7 @@ from lightrag.parser.routing import (
 from lightrag.utils import compute_mdhash_id, generate_track_id
 
 SourceType = Literal["upload", "text"]
+MetadataStore = SQLiteMetadataStore | PostgresMetadataStore
 
 # Sanitization rule: drop only path separators, control characters, and
 # characters that are unsafe inside a filename on common filesystems
@@ -141,6 +144,7 @@ class DocumentParseResult:
 class DocumentDeleteFileResult:
     deleted_source: bool = False
     deleted_artifacts: list[str] = field(default_factory=list)
+    deleted_objects: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -167,15 +171,17 @@ class DocumentLifecycleService:
     def __init__(
         self,
         kb_service: KnowledgeBaseService,
-        metadata_store: SQLiteMetadataStore,
+        metadata_store: MetadataStore,
         source_root: str | Path,
+        object_storage: ObjectStorage | None = None,
     ):
         self._kb_service = kb_service
         self._metadata_store = metadata_store
         self._source_root = Path(source_root)
+        self._object_storage = object_storage
 
     @property
-    def metadata_store(self) -> SQLiteMetadataStore:
+    def metadata_store(self) -> MetadataStore:
         return self._metadata_store
 
     @property
@@ -221,6 +227,7 @@ class DocumentLifecycleService:
         now = utc_now_iso()
         saved_paths: list[Path] = []
         saved_dirs: list[Path] = []
+        saved_object_uris: list[str] = []
         documents: list[DocumentRecord] = []
         source_fingerprints: list[dict[str, Any]] = []
 
@@ -243,6 +250,14 @@ class DocumentLifecycleService:
                 target_path = _write_source_file(
                     workspace_dir, document_id, safe_name, source.content
                 )
+                source_object_uri = await self._persist_source_file(
+                    record.workspace,
+                    document_id,
+                    target_path,
+                    content_type=source.content_type,
+                )
+                if source_object_uri:
+                    saved_object_uris.append(source_object_uri)
                 saved_paths.append(target_path)
                 saved_dirs.append(target_path.parent)
                 documents.append(
@@ -269,6 +284,11 @@ class DocumentLifecycleService:
                         error_message=None,
                         metadata={
                             **source.metadata,
+                            **(
+                                {"source_object_uri": source_object_uri}
+                                if source_object_uri
+                                else {}
+                            ),
                             "batch_id": batch_id,
                             "auto_parse": auto_parse,
                             "auto_index": auto_index,
@@ -343,6 +363,7 @@ class DocumentLifecycleService:
             ) = await self._metadata_store.create_documents_and_job(documents, job)
             if not created:
                 self._cleanup_saved_sources(saved_paths, saved_dirs)
+                await self._cleanup_saved_objects(saved_object_uris)
             return DocumentBatchResult(
                 job=created_job,
                 batch_id=created_job.batch_id or batch_id,
@@ -351,6 +372,7 @@ class DocumentLifecycleService:
             )
         except Exception:
             self._cleanup_saved_sources(saved_paths, saved_dirs)
+            await self._cleanup_saved_objects(saved_object_uris)
             raise
 
     async def list_documents(
@@ -585,6 +607,12 @@ class DocumentLifecycleService:
                 document_dir, replacement.source_name, job_id
             )
             shutil.move(str(staging_path), str(target_path))
+            source_object_uri = await self._persist_source_file(
+                record.workspace,
+                document.id,
+                target_path,
+                content_type=replacement.content_type,
+            )
             replaced = await self._metadata_store.complete_document_replace(
                 record.id,
                 document.id,
@@ -601,6 +629,11 @@ class DocumentLifecycleService:
                     "previous_lightrag_doc_id": document.lightrag_doc_id,
                     "lightrag_delete_result": lightrag_delete_result,
                     "file_replace_result": asdict(file_result),
+                    **(
+                        {"source_object_uri": source_object_uri}
+                        if source_object_uri
+                        else {}
+                    ),
                 },
             )
             return replaced, file_result
@@ -688,6 +721,9 @@ class DocumentLifecycleService:
         if delete_artifacts:
             for artifact in artifacts:
                 try:
+                    deleted_object = await self._delete_artifact_object(artifact)
+                    if deleted_object:
+                        result.deleted_objects.append(deleted_object)
                     artifact_path = _safe_document_path(
                         workspace_dir,
                         document_dir,
@@ -698,18 +734,20 @@ class DocumentLifecycleService:
                         continue
                     _remove_path(artifact_path)
                     result.deleted_artifacts.append(str(artifact_path))
-                except (OSError, ValueError) as exc:
+                except (OSError, ValueError, RuntimeError) as exc:
                     result.errors.append(f"artifact {artifact.id}: {exc}")
 
         if delete_source_file and source_path is not None:
             try:
+                source_object_uri = document.metadata.get("source_object_uri")
+                deleted_source_object = await self._delete_object_uri(source_object_uri)
+                if deleted_source_object and isinstance(source_object_uri, str):
+                    result.deleted_objects.append(source_object_uri)
                 if source_path.exists():
                     _remove_path(source_path)
-                    result.deleted_source = True
-                    _remove_empty_parents(source_path.parent, stop_at=workspace_dir)
                 else:
                     result.skipped.append(document.source_uri)
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, RuntimeError) as exc:
                 result.errors.append(f"source: {exc}")
         return result
 
@@ -726,7 +764,7 @@ class DocumentLifecycleService:
         record = await self._kb_service.get(kb_id)
         active_defaults = await self._active_parser_defaults_for_record(record)
         document = await self._metadata_store.get_document(record.id, document_id)
-        source_path = Path(document.source_uri)
+        source_path = await self._ensure_source_cached(document)
         if not source_path.is_file():
             raise FileNotFoundError(f"Document source not found: {document.source_uri}")
 
@@ -907,6 +945,7 @@ class DocumentLifecycleService:
         parsed_data: dict[str, Any],
     ) -> DocumentParseResult:
         artifacts = _build_parse_artifacts(plan, parsed_data)
+        artifacts = await self._persist_parse_artifacts(plan, artifacts)
         (
             document,
             created_artifacts,
@@ -991,6 +1030,10 @@ class DocumentLifecycleService:
         artifact_path, is_directory = _resolve_artifact_path(
             self._source_root, document, artifact
         )
+        artifact_path = await self._ensure_artifact_cached(
+            document, artifact, artifact_path
+        )
+        is_directory = artifact_path.is_dir()
         media_type = _artifact_media_type(
             document, artifact, artifact_path, is_directory
         )
@@ -1028,6 +1071,111 @@ class DocumentLifecycleService:
                 directory.rmdir()
             except OSError:
                 pass
+
+    async def _cleanup_saved_objects(self, object_uris: list[str]) -> None:
+        for object_uri in object_uris:
+            await self._delete_object_uri(object_uri)
+
+    async def _persist_source_file(
+        self,
+        workspace: str,
+        document_id: str,
+        path: Path,
+        *,
+        content_type: str | None,
+    ) -> str | None:
+        if self._object_storage is None:
+            return None
+        key = f"workspaces/{workspace}/documents/{document_id}/source/{path.name}"
+        return await self._object_storage.upload_file(
+            path, key=key, content_type=content_type
+        )
+
+    async def _persist_parse_artifacts(
+        self, plan: DocumentParsePlan, artifacts: list[ArtifactRecord]
+    ) -> list[ArtifactRecord]:
+        if self._object_storage is None:
+            return artifacts
+        for artifact in artifacts:
+            path = Path(artifact.uri)
+            metadata = dict(artifact.metadata)
+            if artifact.artifact_type == "original":
+                source_object_uri = plan.document.metadata.get("source_object_uri")
+                if isinstance(source_object_uri, str) and source_object_uri:
+                    metadata["object_uri"] = source_object_uri
+                elif path.is_file():
+                    metadata["object_uri"] = await self._object_storage.upload_file(
+                        path,
+                        key=_artifact_object_key(plan.document, artifact, path),
+                        content_type=plan.document.content_type,
+                    )
+            elif path.is_dir():
+                metadata["object_prefix_uri"] = await self._object_storage.upload_directory(
+                    path,
+                    prefix=_artifact_object_prefix(plan.document, artifact, path),
+                )
+            elif path.is_file():
+                metadata["object_uri"] = await self._object_storage.upload_file(
+                    path,
+                    key=_artifact_object_key(plan.document, artifact, path),
+                )
+            artifact.metadata = metadata
+        return artifacts
+
+    async def _ensure_source_cached(self, document: DocumentRecord) -> Path:
+        source_path = Path(document.source_uri)
+        if source_path.is_file():
+            return source_path
+        object_uri = document.metadata.get("source_object_uri")
+        if self._object_storage is None or not isinstance(object_uri, str) or not object_uri:
+            return source_path
+        await self._object_storage.download_file(object_uri, source_path)
+        return source_path
+
+    async def _ensure_artifact_cached(
+        self, document: DocumentRecord, artifact: ArtifactRecord, artifact_path: Path
+    ) -> Path:
+        if artifact_path.exists():
+            return artifact_path
+        if self._object_storage is None:
+            return artifact_path
+        object_uri = artifact.metadata.get("object_uri")
+        if isinstance(object_uri, str) and object_uri:
+            await self._object_storage.download_file(object_uri, artifact_path)
+            return artifact_path
+        object_prefix_uri = artifact.metadata.get("object_prefix_uri")
+        if isinstance(object_prefix_uri, str) and object_prefix_uri:
+            artifact_path.mkdir(parents=True, exist_ok=True)
+            await self._object_storage.download_prefix(object_prefix_uri, artifact_path)
+            return artifact_path
+        return artifact_path
+
+    async def _delete_artifact_object(self, artifact: ArtifactRecord) -> str | None:
+        object_prefix_uri = artifact.metadata.get("object_prefix_uri")
+        if isinstance(object_prefix_uri, str) and object_prefix_uri:
+            deleted = await self._delete_object_prefix(object_prefix_uri)
+            return object_prefix_uri if deleted else None
+        object_uri = artifact.metadata.get("object_uri")
+        if isinstance(object_uri, str) and object_uri:
+            deleted = await self._delete_object_uri(object_uri)
+            return object_uri if deleted else None
+        return None
+
+    async def _delete_object_uri(self, object_uri: object) -> bool:
+        if self._object_storage is None or not isinstance(object_uri, str) or not object_uri:
+            return False
+        try:
+            return await self._object_storage.delete_uri(object_uri)
+        except ObjectStorageError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    async def _delete_object_prefix(self, object_uri: object) -> bool:
+        if self._object_storage is None or not isinstance(object_uri, str) or not object_uri:
+            return False
+        try:
+            return bool(await self._object_storage.delete_prefix(object_uri))
+        except ObjectStorageError as exc:
+            raise RuntimeError(str(exc)) from exc
 
 
 def build_text_source(
@@ -1104,6 +1252,40 @@ def _replacement_source_target(
     return document_dir / f"{job_id}_{source_name}"
 
 
+def _artifact_object_key(
+    document: DocumentRecord, artifact: ArtifactRecord, path: Path
+) -> str:
+    return "/".join(
+        [
+            "workspaces",
+            document.workspace,
+            "documents",
+            document.id,
+            "artifacts",
+            artifact.artifact_type,
+            artifact.id,
+            path.name,
+        ]
+    )
+
+
+def _artifact_object_prefix(
+    document: DocumentRecord, artifact: ArtifactRecord, path: Path
+) -> str:
+    return "/".join(
+        [
+            "workspaces",
+            document.workspace,
+            "documents",
+            document.id,
+            "artifacts",
+            artifact.artifact_type,
+            artifact.id,
+            path.name,
+        ]
+    )
+
+
 def _validate_document_cleanup_paths(
     workspace_dir: Path,
     document: DocumentRecord,
@@ -1129,9 +1311,7 @@ def _resolve_artifact_path(
         raise ValueError("Artifact URI is empty")
 
     try:
-        artifact_path = Path(artifact.uri).resolve(strict=True)
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(f"Artifact file not found: {artifact.id}") from exc
+        artifact_path = Path(artifact.uri).resolve(strict=False)
     except OSError as exc:
         raise ValueError("Invalid artifact path") from exc
 
@@ -1140,10 +1320,18 @@ def _resolve_artifact_path(
     )
     if not artifact_path.is_relative_to(allowed_document_dir):
         raise ValueError("Artifact path escapes document directory")
-    is_directory = artifact_path.is_dir()
-    if not is_directory and not artifact_path.is_file():
-        raise ValueError("Artifact is neither a file nor a directory")
-    return artifact_path, is_directory
+    if artifact_path.exists():
+        is_directory = artifact_path.is_dir()
+        if not is_directory and not artifact_path.is_file():
+            raise ValueError("Artifact is neither a file nor a directory")
+        return artifact_path, is_directory
+    object_uri = artifact.metadata.get("object_uri")
+    object_prefix_uri = artifact.metadata.get("object_prefix_uri")
+    if isinstance(object_uri, str) and object_uri:
+        return artifact_path, False
+    if isinstance(object_prefix_uri, str) and object_prefix_uri:
+        return artifact_path, True
+    raise FileNotFoundError(f"Artifact file not found: {artifact.id}")
 
 
 def _safe_workspace_path(workspace_dir: Path, uri: str) -> Path:

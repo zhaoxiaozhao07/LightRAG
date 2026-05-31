@@ -16,6 +16,7 @@ from lightrag.api.metadata_store import (
     JobRecord,
     SQLiteMetadataStore,
 )
+from lightrag.api.object_storage import ObjectStorage
 
 pytestmark = pytest.mark.offline
 
@@ -40,6 +41,19 @@ class BuilderProbe:
 
     async def finalize(self, rag) -> None:
         await rag.finalize_storages()
+
+
+class FakeObjectStorage(ObjectStorage):
+    def __init__(self, deleted_count: int = 3, *, fail: bool = False):
+        self.deleted_count = deleted_count
+        self.fail = fail
+        self.deleted_workspaces: list[str] = []
+
+    async def delete_workspace(self, workspace: str) -> int:
+        self.deleted_workspaces.append(workspace)
+        if self.fail:
+            raise RuntimeError("object cleanup denied")
+        return self.deleted_count
 
 
 def _doc(kb_id: str, doc_id: str, *, workspace: str) -> DocumentRecord:
@@ -131,6 +145,7 @@ async def test_hard_delete_purges_metadata_and_input(tmp_path: Path):
     probe = BuilderProbe()
     registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
     rag = cast(FakeRAG, await registry.get(record.id))
+    object_storage = FakeObjectStorage(deleted_count=5)
 
     deletion_service = KBDeletionService(
         kb_service,
@@ -138,6 +153,7 @@ async def test_hard_delete_purges_metadata_and_input(tmp_path: Path):
         registry,
         input_root=input_root,
         working_dir=working_dir,
+        object_storage=object_storage,
     )
     # Soft delete first (mirrors the route flow)
     await kb_service.delete(record.id)
@@ -146,6 +162,12 @@ async def test_hard_delete_purges_metadata_and_input(tmp_path: Path):
     assert result.errors == []
     assert result.cleared_input_dir is True
     assert result.finalized_storages is True
+    assert result.cleared_object_storage is True
+    assert result.deleted_objects == 5
+    assert object_storage.deleted_workspaces == [record.workspace]
+    assert result.job.result is not None
+    assert result.job.result["cleared_object_storage"] is True
+    assert result.job.result["deleted_objects"] == 5
     assert result.purged_rows["document_source_keys"] == 1
     assert result.purged_rows["documents"] == 1
     # Two jobs are purged: the seed `job_one` plus the clear_kb job that
@@ -256,6 +278,44 @@ async def test_hard_delete_records_errors_when_storage_cleanup_fails(
     assert result.job.status == "failed"
     assert result.job.error_code == "kb_hard_delete_failed"
     assert "working_dir" in (result.job.error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_records_errors_when_object_storage_cleanup_fails(tmp_path: Path):
+    kb_service = KnowledgeBaseService(tmp_path / "kb.json")
+    await kb_service.initialize()
+    record = await kb_service.create(kb_id="kb_object_fail", name="Object Fail")
+
+    store = SQLiteMetadataStore(tmp_path / "metadata.sqlite3")
+    await store.initialize()
+    doc = _doc(record.id, "doc_object_fail", workspace=record.workspace)
+    job = _job(record.id, record.workspace, job_id="job_object_fail")
+    await store.create_documents_and_job([doc], job)
+
+    probe = BuilderProbe()
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+    object_storage = FakeObjectStorage(fail=True)
+    deletion_service = KBDeletionService(
+        kb_service,
+        store,
+        registry,
+        input_root=tmp_path / "inputs",
+        object_storage=object_storage,
+    )
+
+    await kb_service.delete(record.id)
+    result = await deletion_service.hard_delete(record.id)
+
+    assert object_storage.deleted_workspaces == [record.workspace]
+    assert result.cleared_object_storage is False
+    assert result.deleted_objects == 0
+    assert any("object_storage" in err for err in result.errors)
+    assert result.job.status == "failed"
+    assert result.job.error_code == "kb_hard_delete_failed"
+    assert "object_storage" in (result.job.error_message or "")
+    assert result.job.result is not None
+    assert result.job.result["cleared_object_storage"] is False
+    assert result.job.result["deleted_objects"] == 0
 
 
 @pytest.mark.asyncio

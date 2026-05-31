@@ -17,6 +17,7 @@ from lightrag.api.job_service import JobService
 from lightrag.api.kb_service import KnowledgeBaseService, sanitize_workspace
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
 from lightrag.api.metadata_store import InvalidJobTransitionError, SQLiteMetadataStore
+from lightrag.api.object_storage import ObjectStorage
 from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
 
 _original_argv = sys.argv[:]
@@ -118,6 +119,82 @@ class FakeDeletionResult(BaseModel):
     file_path: str | None = None
 
 
+class FakeObjectStorage(ObjectStorage):
+    def __init__(self):
+        self.files: dict[str, bytes] = {}
+        self.prefix_files: dict[str, dict[str, bytes]] = {}
+        self.uploads: list[str] = []
+        self.directory_uploads: list[str] = []
+        self.downloads: list[tuple[str, Path]] = []
+        self.prefix_downloads: list[tuple[str, Path]] = []
+        self.deleted_uris: list[str] = []
+        self.deleted_prefixes: list[str] = []
+        self.deleted_workspaces: list[str] = []
+
+    async def initialize(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def upload_file(
+        self, local_path: Path, *, key: str, content_type: str | None = None
+    ) -> str:
+        uri = f"s3://fake-bucket/{key}"
+        self.files[uri] = local_path.read_bytes()
+        self.uploads.append(uri)
+        return uri
+
+    async def upload_directory(self, local_dir: Path, *, prefix: str) -> str:
+        uri = f"s3://fake-bucket/{prefix}/"
+        files: dict[str, bytes] = {}
+        for path in sorted(local_dir.rglob("*")):
+            if path.is_file() and not path.is_symlink():
+                files[path.relative_to(local_dir).as_posix()] = path.read_bytes()
+        self.prefix_files[uri] = files
+        self.directory_uploads.append(uri)
+        return uri
+
+    async def download_file(self, object_uri: str, local_path: Path) -> None:
+        self.downloads.append((object_uri, local_path))
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(self.files[object_uri])
+
+    async def download_prefix(self, prefix_uri: str, local_dir: Path) -> int:
+        self.prefix_downloads.append((prefix_uri, local_dir))
+        local_dir.mkdir(parents=True, exist_ok=True)
+        files = self.prefix_files[prefix_uri]
+        for relative_path, content in files.items():
+            target = local_dir / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        return len(files)
+
+    async def delete_uri(self, object_uri: str) -> bool:
+        self.deleted_uris.append(object_uri)
+        self.files.pop(object_uri, None)
+        return True
+
+    async def delete_prefix(self, prefix_uri: str) -> int:
+        self.deleted_prefixes.append(prefix_uri)
+        files = self.prefix_files.pop(prefix_uri, {})
+        return len(files)
+
+    async def delete_workspace(self, workspace: str) -> int:
+        self.deleted_workspaces.append(workspace)
+        marker = f"/workspaces/{workspace}/"
+        deleted = 0
+        for uri in list(self.files):
+            if marker in uri:
+                self.files.pop(uri, None)
+                deleted += 1
+        for uri, files in list(self.prefix_files.items()):
+            if marker in uri:
+                self.prefix_files.pop(uri, None)
+                deleted += len(files)
+        return deleted
+
+
 class BuilderProbe:
     def __init__(
         self,
@@ -147,11 +224,12 @@ def _build_client(
     *,
     probe: BuilderProbe | None = None,
     wire_document_registry: bool = True,
+    object_storage: FakeObjectStorage | None = None,
 ):
     kb_service = KnowledgeBaseService(tmp_path / "metadata" / "knowledge_bases.json")
     metadata_store = SQLiteMetadataStore(tmp_path / "metadata" / "metadata.sqlite3")
     document_service = DocumentLifecycleService(
-        kb_service, metadata_store, tmp_path / "inputs"
+        kb_service, metadata_store, tmp_path / "inputs", object_storage=object_storage
     )
     job_service = JobService(kb_service, metadata_store)
     probe = probe or BuilderProbe()
@@ -564,8 +642,9 @@ def test_delete_ready_document_invokes_lightrag_and_removes_files_when_requested
     tmp_path,
 ):
     probe = BuilderProbe()
+    object_storage = FakeObjectStorage()
     client, _kb_service, _store, _document_service, _job_service = _build_client(
-        tmp_path, probe=probe
+        tmp_path, probe=probe, object_storage=object_storage
     )
     _create_kb(client, "kb_delete_ready")
     document_id, artifacts = _upload_and_parse_document(client, "kb_delete_ready")
@@ -591,6 +670,12 @@ def test_delete_ready_document_invokes_lightrag_and_removes_files_when_requested
     assert job.status_code == 200
     assert job.json()["status"] == "succeeded"
     assert probe.instances[-1].delete_calls == [(lightrag_doc_id, True)]
+    deleted_objects = job.json()["result"]["items"][0]["file_delete_result"]["deleted_objects"]
+    assert document_payload["metadata"]["source_object_uri"] in deleted_objects
+    assert artifacts["sidecar"]["metadata"]["object_prefix_uri"] in deleted_objects
+    assert artifacts["blocks"]["metadata"]["object_uri"] in deleted_objects
+    assert document_payload["metadata"]["source_object_uri"] in object_storage.deleted_uris
+    assert artifacts["sidecar"]["metadata"]["object_prefix_uri"] in object_storage.deleted_prefixes
     assert not source_path.exists()
     assert not sidecar_path.exists()
     assert (
@@ -785,8 +870,9 @@ def test_delete_artifact_cleanup_rejects_workspace_escape(tmp_path):
 
 def test_replace_ready_document_resets_source_artifacts_and_old_index(tmp_path):
     probe = BuilderProbe()
+    object_storage = FakeObjectStorage()
     client, _kb_service, _store, _document_service, _job_service = _build_client(
-        tmp_path, probe=probe
+        tmp_path, probe=probe, object_storage=object_storage
     )
     _create_kb(client, "kb_replace_ready")
     document_id, artifacts = _upload_and_parse_document(client, "kb_replace_ready")
@@ -798,6 +884,8 @@ def test_replace_ready_document_resets_source_artifacts_and_old_index(tmp_path):
     old_source_path = Path(before_payload["source_uri"])
     old_sidecar_path = Path(artifacts["sidecar"]["uri"])
     old_lightrag_doc_id = before_payload["lightrag_doc_id"]
+    old_source_object_uri = before_payload["metadata"]["source_object_uri"]
+    old_sidecar_object_prefix_uri = artifacts["sidecar"]["metadata"]["object_prefix_uri"]
 
     response = client.post(
         f"/kbs/kb_replace_ready/documents/{document_id}:replace"
@@ -826,6 +914,11 @@ def test_replace_ready_document_resets_source_artifacts_and_old_index(tmp_path):
     assert payload["status"] == "uploaded"
     assert payload["source_name"] == "paper-v2.pdf"
     assert payload["source_hash"] != before_payload["source_hash"]
+    assert payload["metadata"]["source_object_uri"].startswith("s3://fake-bucket/")
+    assert payload["metadata"]["source_object_uri"] != old_source_object_uri
+    assert payload["metadata"]["source_object_uri"] in object_storage.files
+    assert old_source_object_uri in object_storage.deleted_uris
+    assert old_sidecar_object_prefix_uri in object_storage.deleted_prefixes
     assert payload["lightrag_doc_id"] is None
     assert payload["parser_hash"] is None
     assert payload["index_hash"] is None
@@ -1087,8 +1180,9 @@ def test_replace_background_start_failure_releases_replacing_claim(
 
 def test_parse_document_succeeds_and_persists_artifacts(tmp_path):
     probe = BuilderProbe()
+    object_storage = FakeObjectStorage()
     client, _kb_service, _store, _document_service, _job_service = _build_client(
-        tmp_path, probe=probe
+        tmp_path, probe=probe, object_storage=object_storage
     )
     _create_kb(client, "kb_parse")
     upload = client.post(
@@ -1123,6 +1217,9 @@ def test_parse_document_succeeds_and_persists_artifacts(tmp_path):
     assert document_payload["parser_hash"].startswith("sha256:")
     assert document_payload["lightrag_doc_id"].startswith("doc-")
     assert Path(document_payload["source_uri"]).exists()
+    assert document_payload["metadata"]["source_object_uri"].startswith(
+        "s3://fake-bucket/workspaces/"
+    )
 
     assert probe.instances
     _engine, _doc_id, _file_path, content_data = probe.instances[0].parse_calls[0]
@@ -1154,6 +1251,23 @@ def test_parse_document_succeeds_and_persists_artifacts(tmp_path):
     )
     assert original["checksum"].startswith("sha256:")
     assert original["size_bytes"] == 3
+    assert original["metadata"]["object_uri"] == document_payload["metadata"]["source_object_uri"]
+    assert original["metadata"]["object_uri"] in object_storage.files
+    sidecar = next(
+        item
+        for item in artifact_payload["artifacts"]
+        if item["artifact_type"] == "sidecar"
+    )
+    assert sidecar["metadata"]["object_prefix_uri"].startswith(
+        "s3://fake-bucket/workspaces/"
+    )
+    assert sidecar["metadata"]["object_prefix_uri"] in object_storage.prefix_files
+    blocks = next(
+        item
+        for item in artifact_payload["artifacts"]
+        if item["artifact_type"] == "blocks"
+    )
+    assert blocks["metadata"]["object_uri"] in object_storage.files
     content_list = next(
         item
         for item in artifact_payload["artifacts"]
@@ -1645,8 +1759,9 @@ def test_batch_parse_rejects_invalid_options_duplicates_and_cross_kb(tmp_path):
 
 
 def test_download_document_file_artifacts_returns_bytes(tmp_path):
+    object_storage = FakeObjectStorage()
     client, _kb_service, _store, _document_service, _job_service = _build_client(
-        tmp_path
+        tmp_path, object_storage=object_storage
     )
     _create_kb(client, "kb_artifact_download")
     document_id, artifacts = _upload_and_parse_document(
@@ -1667,6 +1782,7 @@ def test_download_document_file_artifacts_returns_bytes(tmp_path):
     assert "paper.pdf" in original_response.headers["content-disposition"]
 
     blocks = artifacts["blocks"]
+    Path(blocks["uri"]).unlink()
     blocks_response = client.get(
         f"/kbs/kb_artifact_download/documents/{document_id}/artifacts/{blocks['id']}:download",
         headers=_HEADERS,
@@ -1676,19 +1792,24 @@ def test_download_document_file_artifacts_returns_bytes(tmp_path):
         b'{"type":"content","text":"parsed"}\n'
     )
     assert blocks_response.headers["content-type"].startswith("application/x-ndjson")
+    assert object_storage.downloads[-1][0] == blocks["metadata"]["object_uri"]
 
 
 def test_download_document_artifact_streams_directory_as_zip(tmp_path):
     import io
     import zipfile
 
+    object_storage = FakeObjectStorage()
     client, _kb_service, _store, _document_service, _job_service = _build_client(
-        tmp_path
+        tmp_path, object_storage=object_storage
     )
     _create_kb(client, "kb_artifact_zip")
     document_id, artifacts = _upload_and_parse_document(client, "kb_artifact_zip")
 
     sidecar = artifacts["sidecar"]
+    import shutil
+
+    shutil.rmtree(Path(sidecar["uri"]))
     response = client.get(
         f"/kbs/kb_artifact_zip/documents/{document_id}/artifacts/{sidecar['id']}:download",
         headers=_HEADERS,
@@ -1698,6 +1819,7 @@ def test_download_document_artifact_streams_directory_as_zip(tmp_path):
     archive = zipfile.ZipFile(io.BytesIO(response.content))
     names = archive.namelist()
     assert any(name.endswith(".blocks.jsonl") for name in names)
+    assert object_storage.prefix_downloads[-1][0] == sidecar["metadata"]["object_prefix_uri"]
 
 
 def test_download_document_artifact_rejects_directories_and_missing_files(tmp_path):
@@ -1715,12 +1837,12 @@ def test_download_document_artifact_rejects_directories_and_missing_files(tmp_pa
 
     blocks = artifacts["blocks"]
     Path(blocks["uri"]).unlink()
-    missing_file_response = client.get(
+    blocks_response = client.get(
         f"/kbs/kb_artifact_errors/documents/{document_id}/artifacts/{blocks['id']}:download",
         headers=_HEADERS,
     )
-    assert missing_file_response.status_code == 404
-    assert "Artifact file not found" in missing_file_response.json()["detail"]
+    assert blocks_response.status_code == 404
+    assert "Artifact file not found" in blocks_response.json()["detail"]
 
 
 def test_download_document_artifact_rejects_cross_kb_and_path_escape(tmp_path):

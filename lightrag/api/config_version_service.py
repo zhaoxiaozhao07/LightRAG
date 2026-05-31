@@ -14,6 +14,7 @@ from lightrag.api.metadata_store import (
     ConfigVersionRecord,
     SQLiteMetadataStore,
 )
+from lightrag.api.postgres_metadata_store import PostgresMetadataStore
 from lightrag.base import QueryParam
 from lightrag.constants import (
     PARSER_ENGINE_LEGACY,
@@ -28,6 +29,7 @@ from lightrag.parser.routing import (
 from lightrag.utils import EmbeddingFunc, generate_track_id
 
 _ACTIVE_QUERY_CONFIG_KEYS = set(QueryParam.__dataclass_fields__)
+MetadataStore = SQLiteMetadataStore | PostgresMetadataStore
 
 # Which roles, when their model/binding identity changes, invalidate built
 # index content (chunks / KG / vectors) vs only query-time behavior. The
@@ -534,7 +536,7 @@ class ConfigVersionService:
     def __init__(
         self,
         kb_service: KnowledgeBaseService,
-        metadata_store: SQLiteMetadataStore,
+        metadata_store: MetadataStore,
         registry: LightRAGInstanceRegistry,
     ):
         self._kb_service = kb_service

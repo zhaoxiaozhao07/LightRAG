@@ -10,7 +10,11 @@ from lightrag.api.metadata_store import (
     JobRecord,
     SQLiteMetadataStore,
 )
+from lightrag.api.object_storage import ObjectStorage
+from lightrag.api.postgres_metadata_store import PostgresMetadataStore
 from lightrag.utils import generate_track_id, logger
+
+MetadataStore = SQLiteMetadataStore | PostgresMetadataStore
 
 
 @dataclass(slots=True)
@@ -18,6 +22,8 @@ class KBHardDeleteResult:
     job: JobRecord
     purged_rows: dict[str, int] = field(default_factory=dict)
     cleared_input_dir: bool = False
+    cleared_object_storage: bool = False
+    deleted_objects: int = 0
     finalized_storages: bool = False
     errors: list[str] = field(default_factory=list)
 
@@ -46,17 +52,19 @@ class KBDeletionService:
     def __init__(
         self,
         kb_service: KnowledgeBaseService,
-        metadata_store: SQLiteMetadataStore,
+        metadata_store: MetadataStore,
         registry: LightRAGInstanceRegistry,
         *,
         input_root: Path,
         working_dir: Path | None = None,
+        object_storage: ObjectStorage | None = None,
     ):
         self._kb_service = kb_service
         self._metadata_store = metadata_store
         self._registry = registry
         self._input_root = Path(input_root)
         self._working_dir = Path(working_dir) if working_dir else None
+        self._object_storage = object_storage
 
     async def hard_delete(self, kb_id: str) -> KBHardDeleteResult:
         """Create a ``clear_kb`` job and run the destructive clear in-process.
@@ -174,6 +182,15 @@ class KBDeletionService:
                     self._safe_rmtree(input_workspace, result, label="input_dir")
                     result.cleared_input_dir = True
 
+                if self._object_storage is not None:
+                    try:
+                        result.deleted_objects = await self._object_storage.delete_workspace(
+                            record.workspace
+                        )
+                        result.cleared_object_storage = True
+                    except Exception as exc:  # noqa: BLE001
+                        result.errors.append(f"object_storage: {exc}")
+
                 result.purged_rows = await self._metadata_store.purge_kb_metadata(
                     record.id
                 )
@@ -193,6 +210,8 @@ class KBDeletionService:
                 result={
                     "purged_rows": result.purged_rows,
                     "cleared_input_dir": result.cleared_input_dir,
+                    "cleared_object_storage": result.cleared_object_storage,
+                    "deleted_objects": result.deleted_objects,
                     "finalized_storages": result.finalized_storages,
                     "errors": result.errors,
                 },

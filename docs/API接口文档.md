@@ -1,6 +1,6 @@
 # LightRAG API 接口文档
 
-> 文档版本：2026-05-30
+> 文档版本：2026-05-31
 > 适用范围：当前已经合并到 `main` 分支并通过测试的接口。
 > 路径前缀：所有路径均为相对路径；部署时通过 FastAPI `root_path` 或 `--api-prefix /api/v1` 暴露为 `/api/v1/...`。
 > 鉴权：除 `/health`、`/auth-status`、`/login` 等少数公开接口外，所有接口都受 `combined_auth` 依赖保护，需要在请求头携带 `X-API-Key: <api_key>` 或 JWT。
@@ -20,12 +20,13 @@
 - [八、知识库问答 Query](#八知识库问答-query)
 - [九、兼容旧版 / 全局接口](#九兼容旧版--全局接口)
 - [十、状态机与字段说明](#十状态机与字段说明)
+- [十一、生产存储配置](#十一生产存储配置)
 
 ---
 
 ## 一、知识库管理 KB
 
-> 知识库是所有 KB 接口的边界。`kb_id` 派生出 LightRAG 的 `workspace`，并由 `LightRAGInstanceRegistry` 按需懒加载实例。
+> 知识库是所有 KB 接口的边界。`kb_id` 派生出 LightRAG 的 `workspace`，并由 `LightRAGInstanceRegistry` 按需懒加载实例。KB 控制面 metadata 默认使用 `WORKING_DIR/metadata/knowledge_bases.json` + `metadata.sqlite3`；设置 `LIGHTRAG_KB_METADATA_BACKEND=postgres` 后改用 PostgreSQL catalog/doc/job/artifact/config-version 表。设置 `LIGHTRAG_OBJECT_STORAGE=minio|s3` 后，上传源文件与解析产物会同步持久化到对象存储，`INPUT_DIR` 仍作为本地 cache。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -63,9 +64,10 @@ Content-Type: application/json
 - `DELETE /kbs/{kb_id}?hard=true`：触发同步硬删除流程。`KBDeletionService` 在 destructive lock 下依次执行：
   1. `force_evict` 在内存中的 LightRAG 实例并调用 `finalize_storages`；
   2. 删除 `working_dir/<workspace>`（如已配置）；
-  3. 删除 `input_dir/<workspace>`（上传文件 + 解析 artifact）；
-  4. 清空 SQLite 控制面（documents / jobs / artifacts / config_versions）。
-  返回前会创建一条 `clear_kb` 类型的 job 记录最终结果；任一步失败 HTTP 500 + `clear_kb` job 终态 `failed`。失败的 `clear_kb` job（`max_retries=3`）可经 `:retry` 重置回 `queued`；启用 durable worker（`LIGHTRAG_KB_JOB_WORKER=true`）时，queued 的 `clear_kb` job 会被孤儿恢复保留并由 worker 通过 `resume_hard_delete` 幂等续跑（`KBDeletionService.enqueue_hard_delete` 也可直接创建 queued job 交给 worker）。
+  3. 删除 `input_dir/<workspace>`（上传文件 + 解析 artifact 的本地 cache）；
+  4. 若启用对象存储，删除该 workspace 下的 source/artifact 对象；
+  5. 清空 metadata store 控制面（documents / jobs / artifacts / config_versions；local 模式为 SQLite，PostgreSQL 模式为对应表）。
+  返回前会创建一条 `clear_kb` 类型的 job 记录最终结果，`result` 包含 `cleared_object_storage` 和 `deleted_objects`；任一步失败 HTTP 500 + `clear_kb` job 终态 `failed`。失败的 `clear_kb` job（`max_retries=3`）可经 `:retry` 重置回 `queued`；启用 durable worker（`LIGHTRAG_KB_JOB_WORKER=true`）时，queued 的 `clear_kb` job 会被孤儿恢复保留并由 worker 通过 `resume_hard_delete` 幂等续跑（`KBDeletionService.enqueue_hard_delete` 也可直接创建 queued job 交给 worker）。
 
 ### 1.3 知识库状态
 
@@ -94,7 +96,7 @@ GET /kbs/{kb_id}/status
 
 ## 二、知识库文档 Documents
 
-> 文档生命周期由 `DocumentLifecycleService` 管理，元数据落 SQLite（`working_dir/metadata/metadata.sqlite3`）。同名文件会写入独立的子目录，跨进程并发写不会互相覆盖。
+> 文档生命周期由 `DocumentLifecycleService` 管理，元数据落 metadata store（local 模式为 `working_dir/metadata/metadata.sqlite3`，PostgreSQL 模式为 `kb_documents` / `kb_jobs` / `kb_document_artifacts` 等表）。同名文件会写入独立的 `INPUT_DIR/<workspace>/<document_id>/` 子目录，跨进程并发写不会互相覆盖。启用 `LIGHTRAG_OBJECT_STORAGE=minio|s3` 后，源文件会同步持久化到对象存储并在 `metadata.source_object_uri` 记录对象 URI；本地 `source_uri` 保留为 cache path。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -125,6 +127,7 @@ files: [a.pdf, b.docx]
 - `auto_parse=true` 会创建一个 `job_type=parse` 的聚合任务（`document_id=null`、`batch_id` 非空、payload 携带 `document_ids` 列表），并在后台**实际逐个执行解析**（每个文档 `parse_queued → parsing → parsed`），结果聚合进该 job 的 `result.items[]`；同时 `auto_index=true` 会在每个文档解析成功后串联 KG 构建到 `ready`（需路由注入 `IndexBuildService`）。`auto_parse=false` 仅落 metadata，job 立即标记 `succeeded`。
 - 注意：该聚合 parse/build 任务由创建请求的 in-process 后台任务执行；它**不会**被 durable worker 认领，因此服务在执行中途重启不会自动续跑该聚合任务，需重新发起。`auto_parse=true` 且请求未显式传 `parser_engine/process_options` 时，会把当前 active `parser_config.engine/process_options` snapshot 到文档和 job metadata；`auto_parse=false` 不冻结这些默认值。
 - 同名文件会写入独立的 `<workspace>/<document_id>/<filename>` 目录，使用独占创建 (`O_EXCL`)。
+- 若启用对象存储，上传成功后每个 document 的 `metadata.source_object_uri` 为 `s3://<bucket>/<prefix>/workspaces/<workspace>/documents/<document_id>/source/<filename>`；本地文件仍保留，用于 parser/build/download。
 
 返回 `DocumentBatchResponse`：
 
@@ -214,7 +217,7 @@ POST /kbs/{kb_id}/documents/{document_id}:disable
 POST /kbs/{kb_id}/documents/{document_id}:enable
 ```
 
-返回 `DocumentResponse`。这两个动作只更新 SQLite 控制面 `enabled` 字段，不删除 source/artifact，也不触发 LightRAG storage 变更。`enabled` 现已接入检索层：禁用文档会被排除出 `QueryParam.ids` 白名单，因此不再参与 KB 级问答检索（无需删除即可临时下线一篇文档）。
+返回 `DocumentResponse`。这两个动作只更新 metadata 控制面 `enabled` 字段，不删除 source/artifact，也不触发 LightRAG storage 变更。`enabled` 现已接入检索层：禁用文档会被排除出 `QueryParam.ids` 白名单，因此不再参与 KB 级问答检索（无需删除即可临时下线一篇文档）。
 
 ### 2.7 文档删除
 
@@ -227,8 +230,7 @@ DELETE /kbs/{kb_id}/documents/{document_id}?delete_source_file=false&delete_arti
 - 若文档已有 `lightrag_doc_id`，后台任务调用 `LightRAG.adelete_by_doc_id`；底层返回 `success` 或 `not_found` 都视为删除成功，适配尚未入库或已被清理的文档。
 - **共享图谱删除策略 `strategy`**（`safe` / `rebuild_doc_scope` / `rebuild_kb`，默认 `safe`）：`safe` 与 `rebuild_doc_scope` 复用 `adelete_by_doc_id` 内建的 source-attribution（按剩余来源判定）+ 共享实体保守重建，仅清除失去最后来源的实体/关系；`rebuild_kb` 在删除成功后对 KB 内剩余可构建文档执行一次保守全量 force-reindex（重派生可能受删除影响的共享图谱），结果记录在 job `result.rebuild`。`rebuild_kb` 需路由注入 `IndexBuildService`，否则返回 `503`。
 - **`delete_graph_orphans`**（默认 `true`）：引擎始终修剪失去最后来源的孤立实体/关系；显式传 `false` 暂不支持，返回 `400`。
-- `delete_source_file=true` / `delete_artifacts=true` 时仅允许删除 `INPUT_DIR/<workspace>/<document_id>/...` 内的 source/artifact 文件或目录（source 与 artifact 均锚定到规范化的 `<workspace>/<document_id>` 目录做 containment 校验），路径逃逸会使 job 失败并保留文档为 `delete_failed`。
-- 成功后文档软删除为 `deleted` 并写入 `deleted_at`，列表和详情默认不再返回该文档，artifact metadata 同步清理。
+- `delete_source_file=true` / `delete_artifacts=true` 时仅允许删除 `INPUT_DIR/<workspace>/<document_id>/...` 内的 source/artifact 文件或目录（source 与 artifact 均锚定到规范化的 `<workspace>/<document_id>` 目录做 containment 校验），路径逃逸会使 job 失败并保留文档为 `delete_failed`。启用对象存储时会同步删除 `metadata.source_object_uri`、artifact `metadata.object_uri` / `metadata.object_prefix_uri`，并在 job result 的 `file_delete_result.deleted_objects[]` 中返回已清理对象 URI/prefix。
 
 批量删除：
 
@@ -259,8 +261,8 @@ file: new-paper.pdf
 行为：
 - 创建 `replace` job，并将文档原子 claim 到 `replacing`；已有 `parse_queued/parsing`、`build_queued/building`、`deleting` 或 `replacing` 时返回 `409`。
 - 若旧文档已有 `lightrag_doc_id`，后台任务先调用 `LightRAG.adelete_by_doc_id` 清理旧索引；底层返回 `success` 或 `not_found` 都视为可继续替换。
-- `delete_source_file=true` / `delete_artifacts=true` 时只允许清理 `INPUT_DIR/<workspace>/<document_id>/...` 内的旧 source/artifact；路径逃逸会使 job 失败，文档进入 `replace_failed`。
-- 替换成功后保留原 `document_id`，写入新的 `source_name/source_uri/source_hash/content_type/size_bytes`，清空旧 `parser_hash/index_hash/lightrag_doc_id/chunks_count/entity_count/relation_count` 和解析/索引派生 metadata，并回到 `uploaded`。
+- `delete_source_file=true` / `delete_artifacts=true` 时只允许清理 `INPUT_DIR/<workspace>/<document_id>/...` 内的旧 source/artifact；路径逃逸会使 job 失败，文档进入 `replace_failed`。启用对象存储时会同步删除旧 source/artifact 对象。
+- 替换成功后保留原 `document_id`，写入新的 `source_name/source_uri/source_hash/content_type/size_bytes`，清空旧 `parser_hash/index_hash/lightrag_doc_id/chunks_count/entity_count/relation_count` 和解析/索引派生 metadata，并回到 `uploaded`；启用对象存储时新的 `metadata.source_object_uri` 指向新 source 对象。
 - `auto_parse=true` 会在同一个 replace job 中继续执行单文档 parse；`auto_index=true` 要求同时 `auto_parse=true` 且路由创建时已注入 `IndexBuildService`，解析成功后继续构建 KG。
 - `idempotency_key` 在 `(kb_id, job_type=replace)` 维度唯一；同 key 同文件和同参数复用原 job，同 key 不同请求返回 `409`。
 
@@ -294,7 +296,7 @@ Content-Type: application/json
 - 解析指令优先级为：请求体 `engine/process_options` > 文档 metadata 中已 snapshot 的 `parser_engine/process_options` > active config 的 `parser_config.engine/process_options` > 文件名/环境变量路由默认值。active `parser_config` 只提供默认值；请求体显式传值始终优先。
 - 解析缓存命中时直接复用 artifacts：缓存有效性由 MinerU/Docling 的 `*.mineru_raw` raw bundle manifest 校验（源文件大小 + 内容 sha256 + options 签名），而非 KB 控制面的 `source_hash`/`parser_hash`（后者用于增量决策与 diff，不作为 raw bundle cache key）。`force_reparse=true` 绕过该 raw bundle cache。
 - 同一文档已有 `parse_queued` / `parsing` / `build_queued` / `building` / `deleting` / `replacing` 时返回 `409`，原 active job 保持不变，新建的 job 同步标记 `failed`。
-- 成功后写入 `original` / `sidecar` / `blocks` artifact，MinerU/Docling 还会写 `raw_dir`，并从 raw bundle 中记录细粒度文件 artifact：`markdown`、`content_list`、`middle_json`、`model_json`、`image`、`layout_pdf`。细粒度 artifact metadata 包含 `parse_engine`、`parser_hash`、`source`、`relative_path`。
+- 成功后写入 `original` / `sidecar` / `blocks` artifact，MinerU/Docling 还会写 `raw_dir`，并从 raw bundle 中记录细粒度文件 artifact：`markdown`、`content_list`、`middle_json`、`model_json`、`image`、`layout_pdf`。细粒度 artifact metadata 包含 `parse_engine`、`parser_hash`、`source`、`relative_path`。启用对象存储时，文件 artifact 额外写入 `metadata.object_uri`，目录 artifact 写入 `metadata.object_prefix_uri`；`original` artifact 复用 document 的 `metadata.source_object_uri`。
 
 ### 3.2 批量解析
 
@@ -429,7 +431,7 @@ Content-Type: application/json
 
 ## 五、知识库任务 Jobs
 
-> 任务持久化在 SQLite，跨进程可见。所有耗时操作均会创建 job，客户端通过 `job_id` 跟踪进度。
+> 任务持久化在 metadata store（local SQLite 或 PostgreSQL），跨进程可见。所有耗时操作均会创建 job，客户端通过 `job_id` 跟踪进度。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -523,7 +525,7 @@ Content-Type: application/json
 POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.5
 ```
 
-服务端持续轮询 SQLite 直到任务进入 `succeeded` / `failed` / `cancelled` 三态之一并返回最终 `JobResponse`；超时未到终态返回 `408 Request Timeout` 携带 `current_status`。
+服务端持续轮询 metadata store 直到任务进入 `succeeded` / `failed` / `cancelled` 三态之一并返回最终 `JobResponse`；超时未到终态返回 `408 Request Timeout` 携带 `current_status`。
 
 约束：
 - `timeout_seconds` 限制在 `[0.1, 600.0]`；客户端可按需调小。
@@ -534,7 +536,7 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 
 ## 六、知识库产物 Artifacts
 
-> 产物记录解析阶段产生的文件 / 目录。当前支持 `original` / `sidecar` / `blocks` / `raw_dir`，以及 MinerU/Docling raw bundle 中的 `markdown` / `content_list` / `middle_json` / `model_json` / `image` / `layout_pdf` 等细粒度类型。
+> 产物记录解析阶段产生的文件 / 目录。当前支持 `original` / `sidecar` / `blocks` / `raw_dir`，以及 MinerU/Docling raw bundle 中的 `markdown` / `content_list` / `middle_json` / `model_json` / `image` / `layout_pdf` 等细粒度类型。`uri` 是本地 cache path；启用对象存储后，metadata 会额外包含 `object_uri` 或 `object_prefix_uri`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -546,6 +548,7 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 - 文件型产物（`original` / `blocks` / `markdown` / `content_list` / `middle_json` / `model_json` / `image` / `layout_pdf`）以 `FileResponse` 直接返回。
 - 目录型产物（`sidecar` / `raw_dir`）以流式 zip 返回（`Content-Type: application/zip`），单次下载 zip 内未压缩字节上限 512 MB，超限返回 `413`。
 - 路径必须位于 `inputs/<workspace>/<document_id>` 内；跨 KB、缺失文件、路径逃逸均返回 `404` / `400`。
+- 启用对象存储时，如果本地 cache path 缺失，下载接口会先从 `metadata.object_uri` / `metadata.object_prefix_uri` restore 到原 cache path，再返回文件或 zip。当前接口仍返回服务端代理的 bytes/zip，尚未暴露预签名 URL。
 
 ---
 
@@ -819,3 +822,44 @@ cancelled --> retrying --> queued
 | 400 | - | `delete_graph_orphans=false` 暂不支持 |
 | 413 | - | 上传体积超出 `MAX_UPLOAD_SIZE` 或文本超限 |
 | 503 | - | 注册表 / 构建服务未配置（含 `strategy=rebuild_kb` 缺少 IndexBuildService） |
+
+---
+
+## 十一、生产存储配置
+
+KB 控制面 metadata 与 LightRAG engine storage 是两套配置：
+
+- `LIGHTRAG_KV_STORAGE` / `LIGHTRAG_VECTOR_STORAGE` / `LIGHTRAG_GRAPH_STORAGE` / `LIGHTRAG_DOC_STATUS_STORAGE` 控制底层 RAG 数据（full docs、chunks、vectors、graph、doc status）。
+- `LIGHTRAG_KB_METADATA_BACKEND` 控制 KB catalog、documents、jobs、artifacts、config versions 等业务控制面 metadata。
+
+### 11.1 PostgreSQL 控制面 metadata
+
+```env
+LIGHTRAG_KB_METADATA_BACKEND=postgres
+LIGHTRAG_KB_POSTGRES_HOST=192.168.1.66
+LIGHTRAG_KB_POSTGRES_PORT=5433
+LIGHTRAG_KB_POSTGRES_USER=admin
+LIGHTRAG_KB_POSTGRES_PASSWORD=123456
+LIGHTRAG_KB_POSTGRES_DATABASE=knowledge_base
+# 可选：LIGHTRAG_KB_POSTGRES_DSN=postgresql://admin:123456@192.168.1.66:5433/knowledge_base
+LIGHTRAG_KB_POSTGRES_POOL_MIN_SIZE=1
+LIGHTRAG_KB_POSTGRES_POOL_MAX_SIZE=10
+```
+
+启用后服务启动时会创建/迁移所需表：`kb_catalog_schema`、`kb_catalog`、`kb_metadata_schema`、`kb_documents`、`kb_jobs`、`kb_document_artifacts`、`kb_config_versions`。默认不设置或设置为 `local/json/sqlite` 时仍使用 `WORKING_DIR/metadata/knowledge_bases.json` + `metadata.sqlite3`。
+
+### 11.2 MinIO / S3 source 与 artifact 存储
+
+```env
+LIGHTRAG_OBJECT_STORAGE=minio
+LIGHTRAG_OBJECT_STORAGE_ENDPOINT=http://192.168.1.66:19000
+LIGHTRAG_OBJECT_STORAGE_BUCKET=lightrag-kb
+LIGHTRAG_OBJECT_STORAGE_ACCESS_KEY_ID=admin
+LIGHTRAG_OBJECT_STORAGE_SECRET_ACCESS_KEY=admin123
+LIGHTRAG_OBJECT_STORAGE_USE_SSL=false
+LIGHTRAG_OBJECT_STORAGE_REGION=us-east-1
+LIGHTRAG_OBJECT_STORAGE_PREFIX=kb
+LIGHTRAG_OBJECT_STORAGE_CREATE_BUCKET=true
+```
+
+对象 key 组织在 `<prefix>/workspaces/<workspace>/documents/<document_id>/...` 下。`INPUT_DIR` 仍是本地 cache：parser、build、download 继续使用本地 path；当 cache 缺失时，download/parse planning 会按 metadata 中的对象 URI restore。硬删除 KB 时会按 workspace prefix 清理对象。

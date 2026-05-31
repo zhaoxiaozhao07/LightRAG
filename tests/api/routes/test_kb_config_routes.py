@@ -68,6 +68,16 @@ _SERVER_ENV_VARS_TO_ISOLATE = (
     "LIGHTRAG_VECTOR_STORAGE",
     "LIGHTRAG_GRAPH_STORAGE",
     "LIGHTRAG_DOC_STATUS_STORAGE",
+    "LIGHTRAG_KB_METADATA_BACKEND",
+    "LIGHTRAG_OBJECT_STORAGE",
+    "LIGHTRAG_OBJECT_STORAGE_ENDPOINT",
+    "LIGHTRAG_OBJECT_STORAGE_BUCKET",
+    "LIGHTRAG_OBJECT_STORAGE_ACCESS_KEY_ID",
+    "LIGHTRAG_OBJECT_STORAGE_SECRET_ACCESS_KEY",
+    "LIGHTRAG_OBJECT_STORAGE_USE_SSL",
+    "LIGHTRAG_OBJECT_STORAGE_REGION",
+    "LIGHTRAG_OBJECT_STORAGE_PREFIX",
+    "LIGHTRAG_OBJECT_STORAGE_CREATE_BUCKET",
     "LIGHTRAG_API_KEY",
 )
 
@@ -537,6 +547,8 @@ def test_active_embedding_model_reaches_rebuilt_provider_closure(
     monkeypatch.setenv("EMBEDDING_DIM", "1536")
     monkeypatch.setenv("RERANK_BINDING", "null")
     monkeypatch.setenv("LIGHTRAG_API_KEY", _API_KEY)
+    monkeypatch.setenv("LIGHTRAG_KB_METADATA_BACKEND", "local")
+    monkeypatch.setenv("LIGHTRAG_OBJECT_STORAGE", "local")
     monkeypatch.setattr(
         sys,
         "argv",
@@ -653,6 +665,8 @@ def test_active_llm_role_config_reaches_built_instance(tmp_path, monkeypatch):
     monkeypatch.setenv("EMBEDDING_DIM", "1536")
     monkeypatch.setenv("RERANK_BINDING", "null")
     monkeypatch.setenv("LIGHTRAG_API_KEY", _API_KEY)
+    monkeypatch.setenv("LIGHTRAG_KB_METADATA_BACKEND", "local")
+    monkeypatch.setenv("LIGHTRAG_OBJECT_STORAGE", "local")
     monkeypatch.setattr(
         sys,
         "argv",
@@ -748,6 +762,201 @@ def test_active_llm_role_config_reaches_built_instance(tmp_path, monkeypatch):
             await app.state.lightrag_registry.shutdown()
 
     asyncio.run(exercise_active_role_config())
+
+
+def test_create_app_selects_postgres_kb_metadata_backend(tmp_path, monkeypatch):
+    import numpy as np
+
+    for var in _SERVER_ENV_VARS_TO_ISOLATE:
+        monkeypatch.delenv(var, raising=False)
+
+    monkeypatch.setenv("LLM_BINDING", "openai")
+    monkeypatch.setenv("LLM_BINDING_HOST", "https://api.openai.com/v1")
+    monkeypatch.setenv("LLM_BINDING_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("EMBEDDING_BINDING", "openai")
+    monkeypatch.setenv("EMBEDDING_BINDING_HOST", "https://api.openai.com/v1")
+    monkeypatch.setenv("EMBEDDING_BINDING_API_KEY", "test-key")
+    monkeypatch.setenv("EMBEDDING_MODEL", "base-env-embed")
+    monkeypatch.setenv("EMBEDDING_DIM", "1536")
+    monkeypatch.setenv("RERANK_BINDING", "null")
+    monkeypatch.setenv("LIGHTRAG_API_KEY", _API_KEY)
+    monkeypatch.setenv("LIGHTRAG_KB_METADATA_BACKEND", "postgres")
+    monkeypatch.setenv("LIGHTRAG_OBJECT_STORAGE", "minio")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lightrag-server",
+            "--working-dir",
+            str(tmp_path / "rag_storage"),
+            "--input-dir",
+            str(tmp_path / "inputs"),
+        ],
+    )
+
+    from lightrag.api.config import parse_args
+    from lightrag.api import lightrag_server
+    from lightrag.llm import openai as openai_llm
+
+    async def fake_openai_embed(texts, **kwargs):
+        return np.zeros((len(texts), 1536), dtype=np.float32)
+
+    monkeypatch.setattr(
+        openai_llm,
+        "openai_embed",
+        EmbeddingFunc(
+            embedding_dim=1536,
+            func=fake_openai_embed,
+            max_token_size=8192,
+            model_name="base-provider-embed",
+        ),
+    )
+
+    class CapturedLightRAG:
+        def __init__(self, **kwargs):
+            self.workspace = kwargs["workspace"]
+            self.embedding_func = kwargs["embedding_func"]
+            self.ollama_server_infos = kwargs["ollama_server_infos"]
+
+        def register_role_llm_builder(self, _builder):
+            return None
+
+        def get_llm_role_config(self):
+            return {}
+
+        async def initialize_storages(self):
+            from lightrag.kg.shared_storage import (
+                initialize_pipeline_status,
+                initialize_share_data,
+                set_default_workspace,
+            )
+
+            initialize_share_data()
+            set_default_workspace(self.workspace)
+            await initialize_pipeline_status(workspace=self.workspace)
+
+        async def check_and_migrate_data(self):
+            return None
+
+        async def finalize_storages(self):
+            return None
+
+        async def get_llm_queue_status(self, include_base=False):
+            return {"include_base": include_base}
+
+        async def get_embedding_queue_status(self):
+            return {}
+
+        async def get_rerank_queue_status(self):
+            return {}
+
+    class FakePostgresKBService(KnowledgeBaseService):
+        @classmethod
+        def from_env(cls):
+            return cls(tmp_path / "postgres-kb.json")
+
+    class FakePostgresMetadataStore(SQLiteMetadataStore):
+        @classmethod
+        def from_env(cls):
+            return cls(tmp_path / "postgres-metadata.sqlite3")
+
+    class FakeObjectStorage:
+        def __init__(self):
+            self.initialized = False
+            self.closed = False
+
+        async def initialize(self):
+            self.initialized = True
+
+        async def close(self):
+            self.closed = True
+
+        async def delete_workspace(self, _workspace):
+            return 0
+
+    fake_object_storage = FakeObjectStorage()
+    monkeypatch.setattr(lightrag_server, "LightRAG", CapturedLightRAG)
+    monkeypatch.setattr(
+        lightrag_server, "check_frontend_build", lambda: (False, False)
+    )
+    monkeypatch.setattr(
+        lightrag_server, "PostgresKnowledgeBaseService", FakePostgresKBService
+    )
+    monkeypatch.setattr(lightrag_server, "PostgresMetadataStore", FakePostgresMetadataStore)
+    monkeypatch.setattr(
+        lightrag_server,
+        "create_object_storage_from_env",
+        lambda: fake_object_storage,
+    )
+
+    args = parse_args()
+    app = lightrag_server.create_app(args)
+    assert isinstance(app.state.kb_service, FakePostgresKBService)
+    assert isinstance(app.state.metadata_store, FakePostgresMetadataStore)
+    assert app.state.object_storage is fake_object_storage
+    with TestClient(app) as client:
+        health = client.get("/health", headers=_HEADERS)
+        assert health.status_code == 200
+        config = health.json()["configuration"]
+        assert config["kb_metadata_backend"] == "postgres"
+        assert config["object_storage"] == "minio"
+        assert fake_object_storage.initialized is True
+    assert fake_object_storage.closed is True
+
+
+def test_create_app_rejects_unknown_kb_metadata_backend(tmp_path, monkeypatch):
+    import numpy as np
+
+    for var in _SERVER_ENV_VARS_TO_ISOLATE:
+        monkeypatch.delenv(var, raising=False)
+
+    monkeypatch.setenv("LLM_BINDING", "openai")
+    monkeypatch.setenv("LLM_BINDING_HOST", "https://api.openai.com/v1")
+    monkeypatch.setenv("LLM_BINDING_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("EMBEDDING_BINDING", "openai")
+    monkeypatch.setenv("EMBEDDING_BINDING_HOST", "https://api.openai.com/v1")
+    monkeypatch.setenv("EMBEDDING_BINDING_API_KEY", "test-key")
+    monkeypatch.setenv("EMBEDDING_MODEL", "base-env-embed")
+    monkeypatch.setenv("EMBEDDING_DIM", "1536")
+    monkeypatch.setenv("RERANK_BINDING", "null")
+    monkeypatch.setenv("LIGHTRAG_KB_METADATA_BACKEND", "bogus")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lightrag-server",
+            "--working-dir",
+            str(tmp_path / "rag_storage"),
+            "--input-dir",
+            str(tmp_path / "inputs"),
+        ],
+    )
+
+    from lightrag.api.config import parse_args
+    from lightrag.api import lightrag_server
+    from lightrag.llm import openai as openai_llm
+
+    async def fake_openai_embed(texts, **kwargs):
+        return np.zeros((len(texts), 1536), dtype=np.float32)
+
+    monkeypatch.setattr(
+        openai_llm,
+        "openai_embed",
+        EmbeddingFunc(
+            embedding_dim=1536,
+            func=fake_openai_embed,
+            max_token_size=8192,
+            model_name="base-provider-embed",
+        ),
+    )
+    monkeypatch.setattr(
+        lightrag_server, "check_frontend_build", lambda: (False, False)
+    )
+
+    with pytest.raises(ValueError, match="Unsupported LIGHTRAG_KB_METADATA_BACKEND"):
+        lightrag_server.create_app(parse_args())
 
 
 def test_config_version_diff_reports_changes(tmp_path):

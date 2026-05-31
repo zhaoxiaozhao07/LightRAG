@@ -11,16 +11,18 @@ from lightrag.api.metadata_store import (
     MetadataJobStatus,
     SQLiteMetadataStore,
 )
+from lightrag.api.postgres_metadata_store import PostgresMetadataStore
 from lightrag.utils import generate_track_id
 
 _RUNNING_JOB_STATUSES = ("queued", "running", "retrying", "cancelling")
+MetadataStore = SQLiteMetadataStore | PostgresMetadataStore
 
 
 class JobService:
     def __init__(
         self,
         kb_service: KnowledgeBaseService,
-        metadata_store: SQLiteMetadataStore,
+        metadata_store: MetadataStore,
     ):
         self._kb_service = kb_service
         self._metadata_store = metadata_store

@@ -35,3 +35,26 @@
 - vlm_url: http://192.168.1.66:8001
 - model_name: MinerU2.5-Pro-2B
 - backend：vlm-http-client
+
+## PostgreSQL 数据库
+
+| 参数       | 值                                                             |
+| ---------- | -------------------------------------------------------------- |
+| Host       | `192.168.1.66`                                               |
+| Port       | `5433`                                                       |
+| 用户名     | `admin`                                                      |
+| 密码       | `123456`                                                     |
+| 数据库名   | `knowledge_base`                                             |
+| 连接字符串 | `postgresql://admin:123456@192.168.1.66:5433/knowledge_base` |
+
+---
+
+## MinIO 对象存储
+
+| 参数         | 值                            |
+| ------------ | ----------------------------- |
+| API Endpoint | `http://192.168.1.66:19000` |
+| Console 地址 | `http://192.168.1.66:19001` |
+| Access Key   | `admin`                     |
+| Secret Key   | `admin123`                  |
+| 是否使用 SSL | `False`                     |

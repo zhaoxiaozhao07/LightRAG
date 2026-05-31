@@ -1089,12 +1089,7 @@ async def _execute_delete_document_impl(
             "status": "succeeded",
             "lightrag_doc_id": document.lightrag_doc_id,
             "lightrag_delete_result": _deletion_result_payload(lightrag_result),
-            "file_delete_result": {
-                "deleted_source": file_result.deleted_source,
-                "deleted_artifacts": file_result.deleted_artifacts,
-                "skipped": file_result.skipped,
-                "errors": file_result.errors,
-            },
+            "file_delete_result": _file_result_payload(file_result),
         }
     except Exception as exc:  # noqa: BLE001
         logger.error(
@@ -1177,6 +1172,7 @@ def _file_result_payload(result: Any) -> dict[str, Any]:
     return {
         "deleted_source": getattr(result, "deleted_source", False),
         "deleted_artifacts": list(getattr(result, "deleted_artifacts", [])),
+        "deleted_objects": list(getattr(result, "deleted_objects", [])),
         "skipped": list(getattr(result, "skipped", [])),
         "errors": list(getattr(result, "errors", [])),
     }
