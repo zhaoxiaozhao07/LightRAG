@@ -40,15 +40,17 @@ _T = TypeVar("_T")
 # - ``parse`` / ``build_kg`` / ``reindex``: ``batch-*`` and multi-file
 #   ``upload`` / ``texts`` auto_parse carry ``document_ids`` and the source
 #   files are already on disk before the job runs;
+# - ``sync``: ``documents:sync`` stages upload bytes under the batch id before
+#   the queued aggregate job is created and persists per-item source keys,
+#   source names, hashes, content types, and sync options in the job payload;
 # - ``clear_kb``: carries ``kb_id`` / ``workspace``; the destructive clear is
 #   idempotent so a queued job can be re-driven after restart.
 # Single-document ``replace`` matches the ``document_id IS NOT NULL`` arm and is
 # now worker-resumable: its uploaded bytes are staged to disk at claim time
 # (``stage_replacement_bytes``) and a ``replace`` executor is registered, so a
-# queued/retried replace job can be re-driven from disk. Batch ``sync`` still
-# needs per-item request bytes for all items and is NOT worker-resumable.
+# queued/retried replace job can be re-driven from disk.
 _AGGREGATE_RESUMABLE_JOB_TYPES: frozenset[str] = frozenset(
-    {"delete", "parse", "build_kg", "reindex", "clear_kb"}
+    {"delete", "parse", "build_kg", "reindex", "sync", "clear_kb"}
 )
 
 
@@ -1709,16 +1711,16 @@ class SQLiteMetadataStore:
 
         When a durable :class:`~lightrag.api.job_worker.JobWorker` is enabled,
         ``resumable_job_types`` lists job types the worker can re-drive from
-        persisted state (e.g. ``{"parse", "build_kg", "reindex", "delete"}``).
+        persisted state (e.g. ``{"parse", "build_kg", "reindex", "delete", "sync"}``).
         Jobs of those types that are still ``queued`` (created but never started,
         or reset by ``:retry``) are LEFT queued so the worker consumes them
-        instead of failing them. ``delete`` is special: both single-document jobs
-        and aggregate ``documents:batch-delete`` jobs are resumable because all
-        required document ids and options are persisted in the job payload. Jobs
-        that were already ``running`` (their in-process task died mid-flight) are
-        still failed — they cannot be safely resumed — and the document reset
-        below makes their next retry re-claimable. Default ``None`` preserves the
-        original "fail everything transient" behaviour.
+        instead of failing them. ``delete`` and ``sync`` are special: aggregate
+        jobs are resumable only when their document ids/options or staged source
+        bytes are persisted in the job payload/files. Jobs that were already
+        ``running`` (their in-process task died mid-flight) are still failed —
+        they cannot be safely resumed — and the document reset below makes their
+        next retry re-claimable. Default ``None`` preserves the original "fail
+        everything transient" behaviour.
         """
         await self._ensure_initialized()
         resumable = set(resumable_job_types or set())

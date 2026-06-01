@@ -1798,10 +1798,10 @@ security_check_env_file
     assert "AUTH_ACCOUNTS uses a predictable password prefix." in result.stdout
 
 
-def test_security_check_reports_api_key_only_with_default_whitelist(
+def test_security_check_passes_api_key_only_with_default_whitelist(
     tmp_path: Path,
 ) -> None:
-    """API-key-only deployment with unset WHITELIST_PATHS inherits /api/* and must be flagged."""
+    """API-key-only deployment with unset WHITELIST_PATHS inherits safe /health only."""
     write_text_lines(tmp_path / ".env", ["LIGHTRAG_API_KEY=my-secret-key"])
     result = subprocess.run(
         [
@@ -1820,8 +1820,8 @@ security_check_env_file
         text=True,
         check=False,
     )
-    assert result.returncode == 1
-    assert "WHITELIST_PATHS exposes /api routes" in result.stdout
+    assert result.returncode == 0
+    assert "WHITELIST_PATHS exposes /api routes" not in result.stdout
 
 
 def test_security_check_reports_api_key_only_with_explicit_api_wildcard_whitelist(

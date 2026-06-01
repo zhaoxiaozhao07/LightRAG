@@ -125,7 +125,7 @@ files: [a.pdf, b.docx]
 - 单请求最多 32 个文件，单文件和单请求总字节数均不得超过 `MAX_UPLOAD_SIZE`，未配置或非正数时 `413`。
 - 文件扩展名必须在 `SUPPORTED_DOCUMENT_EXTENSIONS` 列表中。
 - `auto_parse=true` 会创建一个 `job_type=parse` 的聚合任务（`document_id=null`、`batch_id` 非空、payload 携带 `document_ids` 列表），并在后台**实际逐个执行解析**（每个文档 `parse_queued → parsing → parsed`），结果聚合进该 job 的 `result.items[]`；同时 `auto_index=true` 会在每个文档解析成功后串联 KG 构建到 `ready`（需路由注入 `IndexBuildService`）。`auto_parse=false` 仅落 metadata，job 立即标记 `succeeded`。
-- 注意：该聚合 parse/build 任务由创建请求的 in-process 后台任务执行；它**不会**被 durable worker 认领，因此服务在执行中途重启不会自动续跑该聚合任务，需重新发起。`auto_parse=true` 且请求未显式传 `parser_engine/process_options` 时，会把当前 active `parser_config.engine/process_options` snapshot 到文档和 job metadata；`auto_parse=false` 不冻结这些默认值。
+- 注意：该聚合 parse/build 任务默认由创建请求的 in-process 后台任务立即执行；启用 `LIGHTRAG_KB_JOB_WORKER=true` 后，`queued` 且超过 `LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS` 的可恢复聚合任务可被 durable worker 认领，并凭 `payload.document_ids` 续跑。若未启用 durable worker，服务在执行中途重启仍需客户端重新触发或重试。`auto_parse=true` 且请求未显式传 `parser_engine/process_options` 时，会把当前 active `parser_config.engine/process_options` snapshot 到文档和 job metadata；`auto_parse=false` 不冻结这些默认值。
 - 同名文件会写入独立的 `<workspace>/<document_id>/<filename>` 目录，使用独占创建 (`O_EXCL`)。
 - 若启用对象存储，上传成功后每个 document 的 `metadata.source_object_uri` 为 `s3://<bucket>/<prefix>/workspaces/<workspace>/documents/<document_id>/source/<filename>`；本地文件仍保留，用于 parser/build/download。
 
@@ -163,7 +163,7 @@ Content-Type: application/json
 - 单文档文本上限 1 MB，单 metadata JSON 上限 64 KB。
 - 单请求最多 100 个文本。
 - `idempotency_key` 在 `(kb_id, job_type)` 维度唯一；指纹一致直接返回原 batch；指纹不一致返回 `409`。
-- `auto_parse=true` 与多文件 `:upload` 一致：创建 `job_type=parse` 聚合任务并在后台逐个解析；`auto_index=true` 解析成功后串联 KG 构建到 `ready`（需注入 `IndexBuildService`）。该聚合任务由 in-process 后台任务执行，不被 durable worker 认领。请求未显式传 `parser_engine/process_options` 时，会 snapshot 当前 active `parser_config.engine/process_options` 作为解析默认值；`auto_parse=false` 不冻结这些默认值。
+- `auto_parse=true` 与多文件 `:upload` 一致：创建 `job_type=parse` 聚合任务并在后台逐个解析；`auto_index=true` 解析成功后串联 KG 构建到 `ready`（需注入 `IndexBuildService`）。该聚合任务默认由 in-process 后台任务执行；启用 `LIGHTRAG_KB_JOB_WORKER=true` 后，`queued` 且超过 grace window 的可恢复聚合 parse job 可由 durable worker 认领并续跑。请求未显式传 `parser_engine/process_options` 时，会 snapshot 当前 active `parser_config.engine/process_options` 作为解析默认值；`auto_parse=false` 不冻结这些默认值。
 
 ### 2.3 批量增量同步
 
@@ -505,19 +505,20 @@ Content-Type: application/json
 - `retry_count += 1`；超过 `max_retries`（默认 3）返回 `409`。
 - 重试后的消费方式取决于是否启用 durable worker：
   - 默认（未启用）：worker 是 in-process 后台任务，重试后需由调用方再次触发同一接口或原始业务动作。
-  - 启用 `LIGHTRAG_KB_JOB_WORKER=true` 后：内置 durable worker 会自动消费回到 `queued` 的 `parse` / `build_kg` / `reindex` 单文档任务、单文档 `delete` 任务以及 `documents:batch-delete` 聚合任务，无需客户端再次触发；服务重启后这些 `queued` 任务也会被自动续跑（见 5.5）。
+  - 启用 `LIGHTRAG_KB_JOB_WORKER=true` 后：内置 durable worker 会自动消费回到 `queued` 的 `parse` / `build_kg` / `reindex` 单文档任务、单文档 `delete` / `replace` 任务、聚合 `sync` 任务以及 `documents:batch-delete` 聚合任务，无需客户端再次触发；服务重启后这些 `queued` 任务也会被自动续跑（见 5.5）。
 
 ### 5.5 Durable job worker（可选）
 
 > 通过环境变量 `LIGHTRAG_KB_JOB_WORKER=true` 启用。默认关闭，关闭时行为与历史一致（仅 in-process 背景任务，重启后遗留任务一律标 `failed`）。
 
 启用后：
-- 服务启动会拉起一个后台轮询 worker，原子认领（`queued → running` 单赢 CAS）以下可从持久化状态重建的任务类型并执行到终态：单文档 `parse` / `build_kg` / `reindex` / `delete` / `replace`，**聚合** `parse` / `build_kg` / `reindex`（`document_id=null`、payload 携带 `document_ids`，含多文件 `upload` / `texts` 的 auto_parse 聚合 job 与 `batch-parse` / `batch-build-kg` / `batch-reindex` / `:rebuild`），`documents:batch-delete` 聚合 `delete` job，以及 `clear_kb`（KB 硬删除，payload 携带 `kb_id`/`workspace`，幂等清理可重启续跑）。聚合 parse/build 之所以可恢复，是因为其源文件 / 解析产物在 job 运行前已落盘，worker 可凭 `document_ids` 重新规划并逐个 claim 执行。
+- 服务启动会拉起一个后台轮询 worker，原子认领（`queued → running` 单赢 CAS）以下可从持久化状态重建的任务类型并执行到终态：单文档 `parse` / `build_kg` / `reindex` / `delete` / `replace`，**聚合** `parse` / `build_kg` / `reindex`（`document_id=null`、payload 携带 `document_ids`，含多文件 `upload` / `texts` 的 auto_parse 聚合 job 与 `batch-parse` / `batch-build-kg` / `batch-reindex` / `:rebuild`），聚合 `sync`（payload 携带 `batch_id` 与 per-item `source_key/source_name/source_hash`，请求字节已落盘到 `.sync-staging/<batch_id>/`），`documents:batch-delete` 聚合 `delete` job，以及 `clear_kb`（KB 硬删除，payload 携带 `kb_id`/`workspace`，幂等清理可重启续跑）。聚合 parse/build 之所以可恢复，是因为其源文件 / 解析产物在 job 运行前已落盘，worker 可凭 `document_ids` 重新规划并逐个 claim 执行；聚合 sync 则凭 staged request bytes 重建 `DocumentSourceInput` 并复用同一 per-item 同步逻辑。
 - **单文档 `replace` 现已可恢复**：replace 创建并 claim 时会把替换源字节落盘到 `INPUT_DIR/<workspace>/<document_id>/.replace-staging-<job_id>.bin`，因此 worker 可在重启/`:retry` 后凭 staged 字节重建 `DocumentReplacementSource`，重新 claim 文档进入 `replacing`，复用与同步路径一致的执行逻辑（删旧索引 → 换 source → 可选 auto_parse/auto_index），终态后清理 staging 文件。若 staged 字节缺失（历史 job 未落盘），worker 以 `replace_not_resumable` 明确失败而非猜测。
+- **批量 `sync` 现已可恢复**：sync route 在创建聚合 job 前为每个 item 落盘请求字节，并在 payload 中持久化 `batch_id`、`source_key`、`source_name`、`source_hash`、`content_type` 与同步选项；worker 重启/`:retry` 后按 staged bytes 重建每个 source，重新执行 created/replaced/skipped 与可选 parse/build。staging 只在终态 job transition 成功后 best-effort 清理；若 staged bytes 缺失或 hash 不匹配，worker 以 `sync_not_resumable` 明确失败。
 - **自动消费 `:retry`**：重试把任务重置回 `queued` 后，worker 在下一轮轮询中认领并重跑，客户端无需再次发起业务请求。
 - **重启续跑**：进程重启时，孤儿恢复会保留这些可恢复类型的 `queued` 任务（不再标 `failed`）交给 worker 继续执行；仍处于 `running` 的中途任务无法安全恢复，照旧标 `failed`，其文档同步重置为 `*_failed`，客户端 `:retry` 后即可被 worker 自动重跑。delete 续跑时若孤儿恢复已把文档从 `deleting` 重置为 `delete_failed`，worker 会重新 claim 回 `deleting` 再执行（`_claim_document_deleting` 接受同一 delete job id 的幂等 reclaim）；replace 续跑同理从 `replace_failed` 重新 claim 回 `replacing`。
 - **不抢占新任务**：worker 只认领 `queued_at` 早于宽限窗口（`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`，默认 5s）的任务；新建任务由其 in-process 背景任务在毫秒级转入 `running`，因此不会被 worker 抢跑，避免重复执行。
-- **暂不可恢复的类型**：批量 `sync`（一次请求多文件，需要为 *所有* item 落盘 per-item 请求字节并定义部分批次的续跑语义，属更大改造）以及多文件 `upload`（无 auto_parse 时不产生解析工作）等任务未纳入 worker 自动恢复；它们重启后仍标 `failed`，需要重新发起请求。
+- **需重新发起的类型**：多文件 `upload` 且 `auto_parse=false` 时不产生可重驱动解析工作；其他没有持久化请求上下文的历史/自定义任务仍会在孤儿恢复时标 `failed`，需要重新发起请求。
 - **死信**：`failed` 且 `retry_count >= max_retries` 的任务不会再被 `:retry` 或 worker 重跑，可通过 `GET /kbs/{kb_id}/jobs/dead-letter` 单独列出做人工triage。
 - 可调环境变量：`LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS`（默认 1.0s）、`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`（默认 5.0s）。
 
@@ -716,7 +717,7 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 | `DELETE` | `/documents/delete_entity` | 删除实体 |
 | `DELETE` | `/documents/delete_relation` | 删除关系 |
 | `GET` | `/documents/track_status/{track_id}` | 跟踪 ID 状态查询 |
-| `GET` | `/documents/paginated` | 分页文档状态 |
+| `POST` | `/documents/paginated` | 分页文档状态 |
 | `GET` | `/documents/status_counts` | 状态统计 |
 | `POST` | `/documents/reprocess_failed` | 重处理失败文档 |
 | `POST` | `/documents/cancel_pipeline` | 取消运行中的 pipeline |
@@ -726,7 +727,7 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/query` | 非流式问答 |
-| `POST` | `/query/stream` | 流式问答（SSE） |
+| `POST` | `/query/stream` | 流式问答（NDJSON，`Content-Type: application/x-ndjson`） |
 | `POST` | `/query/data` | 仅返回结构化检索数据，不调用 LLM 生成 |
 
 支持的 `mode`：`local` / `global` / `hybrid` / `naive` / `mix` / `bypass`。
@@ -748,7 +749,7 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 
 ### 7.4 Ollama 兼容（`/api`）
 
-挂载 `OllamaAPI`，对外提供与 Ollama 接口兼容的端点（`/api/tags`、`/api/chat` 等）。
+挂载 `OllamaAPI`，对外提供与 Ollama 接口兼容的端点（`/api/tags`、`/api/chat` 等）。默认 `WHITELIST_PATHS` 仅放行 `/health`；如果要让 Ollama 兼容端点免 API Key，需要显式配置 `WHITELIST_PATHS=/health,/api/*`。
 
 ---
 
@@ -850,6 +851,15 @@ LIGHTRAG_KB_POSTGRES_POOL_MAX_SIZE=10
 
 启用后服务启动时会创建/迁移所需表：`kb_catalog_schema`、`kb_catalog`、`kb_metadata_schema`、`kb_documents`、`kb_jobs`、`kb_document_artifacts`、`kb_config_versions`。默认不设置或设置为 `local/json/sqlite` 时仍使用 `WORKING_DIR/metadata/knowledge_bases.json` + `metadata.sqlite3`。
 
+从本地 JSON/SQLite 控制面迁移到 PostgreSQL 时，先在旧 `WORKING_DIR` 上运行迁移工具做 dry-run，再执行真实导入：
+
+```bash
+lightrag-migrate-kb-metadata --working-dir ./rag_storage --dry-run
+lightrag-migrate-kb-metadata --working-dir ./rag_storage --strategy fail --yes
+```
+
+可用参数包括 `--postgres-dsn`（覆盖环境变量）、`--kb-id`（只迁移指定 KB，可重复）、`--strategy fail|skip|overwrite`、`--json`。该工具只迁移 KB catalog、documents、jobs、artifacts、config_versions 与 `source_key` projection；不会复制源文件、解析产物、向量库、图存储或 text chunks，这些仍需依赖既有 `INPUT_DIR` / 对象存储 / LightRAG engine storage 运维流程。
+
 > 测试覆盖：`PostgresMetadataStore` 与 `SQLiteMetadataStore` 由 `tests/api/test_metadata_store_contract.py` 用同一组用例参数化校验行为等价。SQLite 参数始终运行；设置 `LIGHTRAG_KB_POSTGRES_TEST_DSN`（或 `POSTGRES_TEST_DSN`）后会对**真实 PostgreSQL** 执行同一契约（每次唯一 `kb_id` + 结束 `purge`，对共享库安全），例如：
 >
 > ```bash
@@ -873,6 +883,8 @@ LIGHTRAG_OBJECT_STORAGE_PREFIX=kb
 LIGHTRAG_OBJECT_STORAGE_CREATE_BUCKET=true
 ```
 
+依赖要求：`aioboto3>=12,<16` 是 MinIO/S3 对象存储后端的运行时依赖。未设置 `LIGHTRAG_OBJECT_STORAGE` 或设置为 `local` 时不会创建 S3 client，也不需要该依赖；设置为 `minio` 或 `s3` 时需使用包含该依赖的 API 安装（源码环境执行 `uv sync --extra api`，包安装使用 `pip install "lightrag-hku[api]"`），老环境升级后也需要重新同步依赖。缺失时服务会在对象存储初始化阶段给出明确错误；若只是本地开发且不需要对象存储，可改回 `LIGHTRAG_OBJECT_STORAGE=local`。
+
 对象 key 组织在 `<prefix>/workspaces/<workspace>/documents/<document_id>/...` 下。`INPUT_DIR` 仍是本地 cache：parser、build、download 继续使用本地 path；当 cache 缺失时，download/parse planning 会按 metadata 中的对象 URI restore。硬删除 KB 时会按 workspace prefix 清理对象。
 
-> 测试覆盖：`tests/api/test_object_storage_s3.py` 仅在 boto3 client 边界打桩（`aioboto3` 在 `S3ObjectStorage._new_session` 内惰性 import，可注入 fake session 离线运行），直测出厂 `S3ObjectStorage` 的 key 前缀规范化、URI 构建/解析、bucket 自动创建、upload/download 往返、目录逐文件上传、`list_objects_v2` 分页与续传 token、`delete_uri`/`delete_prefix`/`delete_workspace` 与 backend 选择，不需要安装 aioboto3 或连接真实 MinIO/S3。
+> 测试覆盖：`tests/api/test_object_storage_s3.py` 仅在 boto3 client 边界打桩（`aioboto3` 在 `S3ObjectStorage._new_session` 内惰性 import，可注入 fake session 离线运行），直测出厂 `S3ObjectStorage` 的 key 前缀规范化、URI 构建/解析、bucket 自动创建、upload/download 往返、目录逐文件上传、`list_objects_v2` 分页与续传 token、`delete_uri`/`delete_prefix`/`delete_workspace` 与 backend 选择。该测试路径不需要连接真实 MinIO/S3；生产启用 `LIGHTRAG_OBJECT_STORAGE=minio|s3` 仍需要 `aioboto3`。

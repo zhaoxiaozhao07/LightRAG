@@ -19,6 +19,7 @@ from lightrag.llm.binding_options import (
 )
 from lightrag.base import OllamaServerInfos
 import sys
+from typing import cast
 
 from lightrag.constants import (
     DEFAULT_WOKERS,
@@ -635,7 +636,7 @@ def parse_args() -> argparse.Namespace:
     # Add environment variables that were previously read directly
     args.cors_origins = get_env_value("CORS_ORIGINS", "*")
     args.summary_language = get_env_value("SUMMARY_LANGUAGE", DEFAULT_SUMMARY_LANGUAGE)
-    args.whitelist_paths = get_env_value("WHITELIST_PATHS", "/health,/api/*")
+    args.whitelist_paths = get_env_value("WHITELIST_PATHS", "/health")
 
     # For JWT Auth
     args.auth_accounts = get_env_value("AUTH_ACCOUNTS", "")
@@ -751,8 +752,9 @@ def parse_args() -> argparse.Namespace:
 
 def update_uvicorn_mode_config():
     # If in uvicorn mode and workers > 1, force it to 1 and log warning
-    if global_args.workers > 1:
-        original_workers = global_args.workers
+    workers = cast(int, global_args.workers)
+    if workers > 1:
+        original_workers = workers
         global_args.workers = 1
         # Log warning directly here
         logging.debug(

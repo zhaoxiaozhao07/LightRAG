@@ -27,9 +27,10 @@ age past the window and get picked up.
 The worker is **opt-in** (``LIGHTRAG_KB_JOB_WORKER=true``). When disabled, the
 system behaves exactly as before and orphan recovery fails every transient
 job. Executors that need request-scoped inputs that are not persisted (upload
-bytes for ``replace`` / batch ``sync`` / aggregate parse-and-build upload
-jobs) are intentionally NOT registered as resumable; those job types still
-fail on restart and require a fresh request.
+bytes for aggregate parse-and-build upload jobs) are intentionally NOT
+registered as resumable; those job types still fail on restart and require a
+fresh request. Replace and aggregate sync jobs stage request bytes before they
+are queued, so the worker can resume them from persisted files.
 """
 
 from __future__ import annotations
@@ -592,7 +593,6 @@ def build_delete_executor(
 
     Delete jobs need only persisted document ids + delete options, so both
     single-document and ``documents:batch-delete`` jobs can resume after a crash.
-    Replace/sync jobs still need request-uploaded bytes and remain non-resumable.
     """
     from lightrag.api.routers.kb_document_routes import (
         _delete_failure_message,
@@ -844,9 +844,6 @@ def build_replace_executor(
             process_options=payload.get("process_options"),
             force_reparse=bool(payload.get("force_reparse", False)),
         )
-        await document_service.clear_staged_replacement(
-            kb_id, document_id, job_id=job.id
-        )
         if item["status"] == "succeeded":
             item["resumed_by_worker"] = True
             await job_service.transition_job(
@@ -868,6 +865,211 @@ def build_replace_executor(
                 error_message=item.get("error_message", "replace failed"),
                 result=item,
             )
+        await document_service.clear_staged_replacement(
+            kb_id, document_id, job_id=job.id
+        )
+
+    return _run
+
+
+def build_sync_executor(
+    *,
+    document_service: Any,
+    registry: Any,
+    job_service: JobService,
+    index_service: Any | None = None,
+) -> JobExecutor:
+    """Executor that re-drives queued aggregate ``documents:sync`` jobs.
+
+    Sync is resumable only because the route stages every upload to disk before
+    creating the queued aggregate job, and the job payload persists each staged
+    item's source key/name/hash/content type/options. The worker reconstructs
+    ``DocumentSourceInput`` values from those files and then calls the same
+    per-item sync helper the route uses. Missing staged files fail clearly as
+    ``sync_not_resumable`` instead of guessing from incomplete state.
+    """
+    from lightrag.api.routers.kb_document_routes import (
+        _execute_sync_item,
+        _sync_failure_message,
+        _sync_job_result,
+    )
+
+    def _invalid_payload_message(message: str) -> str:
+        return f"sync job has invalid resumable payload: {message}"
+
+    async def _clear_staged_sync_if_terminal(
+        kb_id: str, batch_id: Any | None
+    ) -> None:
+        if isinstance(batch_id, str) and batch_id:
+            await document_service.clear_staged_sync_sources(kb_id, batch_id=batch_id)
+
+    async def _fail_invalid_payload(
+        job: JobRecord, message: str, *, batch_id: Any | None = None
+    ) -> None:
+        await job_service.transition_job(
+            job.kb_id,
+            job.id,
+            status="failed",
+            progress=1.0,
+            failed_items=1,
+            error_code="worker_invalid_payload",
+            error_message=_invalid_payload_message(message),
+        )
+        await _clear_staged_sync_if_terminal(job.kb_id, batch_id)
+
+    async def _run(job: JobRecord) -> None:
+        kb_id = job.kb_id
+        payload = job.payload or {}
+        raw_items = payload.get("items")
+        batch_id = job.batch_id or payload.get("batch_id")
+        if job.document_id is not None:
+            await _fail_invalid_payload(
+                job, "sync jobs must be aggregate jobs", batch_id=batch_id
+            )
+            return
+        if not isinstance(batch_id, str) or not batch_id:
+            await _fail_invalid_payload(job, "missing batch_id")
+            return
+        if not isinstance(raw_items, list) or not raw_items:
+            await _fail_invalid_payload(job, "missing items", batch_id=batch_id)
+            return
+
+        prepared_sources: list[dict[str, Any]] = []
+        for index, raw_item in enumerate(raw_items):
+            if not isinstance(raw_item, dict):
+                await _fail_invalid_payload(
+                    job, "item is not an object", batch_id=batch_id
+                )
+                return
+            source_key = raw_item.get("source_key")
+            source_name = raw_item.get("source_name")
+            source_hash = raw_item.get("source_hash")
+            if not isinstance(source_key, str) or not source_key:
+                await _fail_invalid_payload(
+                    job, "item missing source_key", batch_id=batch_id
+                )
+                return
+            if not isinstance(source_name, str) or not source_name:
+                await _fail_invalid_payload(
+                    job, "item missing source_name", batch_id=batch_id
+                )
+                return
+            if not isinstance(source_hash, str) or not source_hash:
+                await _fail_invalid_payload(
+                    job, "item missing source_hash", batch_id=batch_id
+                )
+                return
+            content_type = raw_item.get("content_type")
+            if content_type is not None and not isinstance(content_type, str):
+                await _fail_invalid_payload(
+                    job, "item content_type must be a string", batch_id=batch_id
+                )
+                return
+            try:
+                source = await document_service.load_staged_sync_source(
+                    kb_id,
+                    batch_id=batch_id,
+                    item_index=index,
+                    source_name=source_name,
+                    content_type=content_type,
+                    metadata={"source_key": source_key},
+                    expected_hash=source_hash,
+                )
+            except ValueError as exc:
+                await job_service.transition_job(
+                    kb_id,
+                    job.id,
+                    status="failed",
+                    progress=1.0,
+                    failed_items=1,
+                    error_code="sync_not_resumable",
+                    error_message=str(exc),
+                )
+                await _clear_staged_sync_if_terminal(kb_id, batch_id)
+                return
+            if source is None:
+                await job_service.transition_job(
+                    kb_id,
+                    job.id,
+                    status="failed",
+                    progress=1.0,
+                    failed_items=1,
+                    error_code="sync_not_resumable",
+                    error_message=(
+                        "sync source bytes were not staged for this job; "
+                        "re-submit the sync request"
+                    ),
+                )
+                await _clear_staged_sync_if_terminal(kb_id, batch_id)
+                return
+            prepared_sources.append(
+                {
+                    "source_key": source_key,
+                    "source": source,
+                    "source_hash": source_hash,
+                    "content_type": content_type,
+                    "size_bytes": int(raw_item.get("size_bytes") or len(source.content)),
+                }
+            )
+
+        item_results: list[dict[str, Any]] = []
+        completed_items = 0
+        failed_items = 0
+        skipped_items = 0
+        rag: Any | None = None
+        existing_by_source_key = await document_service.get_documents_by_source_keys(
+            kb_id, [str(item["source_key"]) for item in prepared_sources]
+        )
+        for prepared in prepared_sources:
+            item, rag = await _execute_sync_item(
+                document_service=document_service,
+                kb_id=kb_id,
+                job=job,
+                prepared=prepared,
+                existing_by_source_key=existing_by_source_key,
+                active_registry=registry,
+                active_index_service=index_service,
+                rag=rag,
+                auto_parse=bool(payload.get("auto_parse", False)),
+                auto_index=bool(payload.get("auto_index", False)),
+                parser_engine=payload.get("parser_engine"),
+                process_options=payload.get("process_options"),
+                force_reparse=bool(payload.get("force_reparse", False)),
+                delete_source_file=bool(payload.get("delete_source_file", True)),
+                delete_artifacts=bool(payload.get("delete_artifacts", True)),
+                delete_llm_cache=bool(payload.get("delete_llm_cache", False)),
+            )
+            item_results.append(item)
+            if item["status"] == "failed":
+                failed_items += 1
+            else:
+                completed_items += 1
+                if item["status"] == "skipped":
+                    skipped_items += 1
+
+        final_result = _sync_job_result(
+            batch_id=batch_id,
+            total_items=len(prepared_sources),
+            completed_items=completed_items,
+            failed_items=failed_items,
+            skipped_items=skipped_items,
+            items=item_results,
+        )
+        final_result["resumed_by_worker"] = True
+        await job_service.transition_job(
+            kb_id,
+            job.id,
+            status="succeeded" if failed_items == 0 else "failed",
+            progress=1.0,
+            completed_items=completed_items,
+            failed_items=failed_items,
+            result=final_result,
+            error_code=None if failed_items == 0 else "partial_sync_failed",
+            error_message=None
+            if failed_items == 0
+            else _sync_failure_message(failed_items, len(prepared_sources)),
+        )
+        await document_service.clear_staged_sync_sources(kb_id, batch_id=batch_id)
 
     return _run
 

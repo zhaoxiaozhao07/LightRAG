@@ -241,6 +241,23 @@ async def test_claim_allows_aggregate_delete_jobs(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_claim_allows_aggregate_sync_jobs(tmp_path: Path):
+    """Batch sync has staged source bytes plus source keys/options in payload."""
+    store = await _make_store(tmp_path)
+    await store.create_job(
+        _job("kb_a", "agg_sync", job_type="sync", document_id=None)
+    )
+
+    claimed = await store.claim_next_worker_job(
+        job_types=["sync"], max_queued_at=None
+    )
+
+    assert claimed is not None
+    assert claimed.id == "agg_sync"
+    assert claimed.status == "running"
+
+
+@pytest.mark.asyncio
 async def test_claim_grace_window_excludes_fresh_jobs(tmp_path: Path):
     store = await _make_store(tmp_path)
     # Job queued "now"; a cutoff in the past must not claim it.
@@ -409,21 +426,27 @@ async def test_recovery_leaves_resumable_delete_queued(tmp_path: Path):
     await store.create_job(
         _job("kb_d", "queued_batch_delete", job_type="delete", document_id=None)
     )
+    await store.create_job(
+        _job("kb_d", "queued_sync", job_type="sync", document_id=None)
+    )
     await _create_job(store, _job("kb_d", "queued_upload", job_type="upload"))
 
     recovered = await store.recover_orphan_jobs(
-        resumable_job_types={"parse", "build_kg", "reindex", "delete"}
+        resumable_job_types={"parse", "build_kg", "reindex", "delete", "sync"}
     )
     recovered_ids = {job.id for job in recovered}
-    # Delete is kept queued for the worker; upload (needs request bytes) fails.
+    # Delete/sync are kept queued for the worker; upload (needs request bytes) fails.
     assert "queued_delete" not in recovered_ids
     assert "queued_batch_delete" not in recovered_ids
+    assert "queued_sync" not in recovered_ids
     assert "queued_upload" in recovered_ids
 
     single = await store.get_job("kb_d", "queued_delete")
     batch = await store.get_job("kb_d", "queued_batch_delete")
+    sync = await store.get_job("kb_d", "queued_sync")
     assert single.status == "queued"
     assert batch.status == "queued"
+    assert sync.status == "queued"
 
 
 @pytest.mark.asyncio

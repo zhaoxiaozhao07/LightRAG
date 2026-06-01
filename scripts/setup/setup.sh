@@ -3170,7 +3170,7 @@ security_check_env_file() {
 
     effective_whitelist="$whitelist_paths"
     if [[ "$whitelist_is_set" != "yes" ]]; then
-      effective_whitelist="/health,/api/*"
+      effective_whitelist="/health"
     fi
     if whitelist_exposes_api_routes "$effective_whitelist"; then
       report_security_issue \
@@ -3183,7 +3183,7 @@ security_check_env_file() {
   if [[ -z "$auth_accounts" && -n "$api_key" ]]; then
     effective_whitelist="$whitelist_paths"
     if [[ "$whitelist_is_set" != "yes" ]]; then
-      effective_whitelist="/health,/api/*"
+      effective_whitelist="/health"
     fi
     if whitelist_exposes_api_routes "$effective_whitelist"; then
       report_security_issue \

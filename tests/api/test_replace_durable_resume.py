@@ -34,10 +34,10 @@ from lightrag.api.document_lifecycle_service import (
 )
 from lightrag.api.index_build_service import IndexBuildService
 from lightrag.api.job_service import JobService
-from lightrag.api.job_worker import JobWorker, build_replace_executor
+from lightrag.api.job_worker import JobWorker, build_replace_executor, build_sync_executor
 from lightrag.api.kb_service import KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry
-from lightrag.api.metadata_store import SQLiteMetadataStore
+from lightrag.api.metadata_store import JobRecord, SQLiteMetadataStore
 
 # Reuse the fully-wired FakeRAG/BuilderProbe from the build-kg route tests.
 from tests.api.routes.test_kb_build_kg_routes import BuilderProbe, FakeRAG  # noqa: F401
@@ -243,6 +243,71 @@ async def test_worker_fails_replace_without_staged_bytes(tmp_path):
     assert final["error_code"] == "replace_not_resumable"
 
 
+async def test_worker_keeps_replace_staging_when_terminal_transition_fails(
+    tmp_path, monkeypatch
+):
+    env = _wire(tmp_path)
+    client = env["client"]
+    document_service = env["document_service"]
+    job_service = env["job_service"]
+    kb_id = "kb_replace_terminal_fail"
+    document_id = _ready_document(client, kb_id)
+    before = client.get(f"/kbs/{kb_id}/documents/{document_id}", headers=_HEADERS).json()
+    replacement = document_service.prepare_replacement_source(
+        DocumentSourceInput(
+            source_name="paper-v2.pdf",
+            content=b"replacement-kept-on-transition-failure",
+            source_type="upload",
+            content_type="application/pdf",
+            metadata={},
+        )
+    )
+    job, created = await job_service.create_replace_job_once(
+        kb_id,
+        document_id=document_id,
+        previous_lightrag_doc_id=before["lightrag_doc_id"],
+        source_name=replacement.source_name,
+        source_hash=replacement.source_hash,
+        content_type=replacement.content_type,
+        size_bytes=replacement.size_bytes,
+        auto_parse=False,
+        auto_index=False,
+    )
+    assert created is True
+    staged_path = await document_service.stage_replacement_bytes(
+        kb_id, document_id, job_id=job.id, replacement=replacement
+    )
+    original_transition_job = job_service.transition_job
+
+    async def fail_terminal_transition(
+        kb_id_arg: str, job_id_arg: str, **kwargs
+    ) -> JobRecord:
+        if kwargs.get("status") in {"succeeded", "failed"}:
+            raise RuntimeError("terminal transition exploded")
+        return await original_transition_job(kb_id_arg, job_id_arg, **kwargs)
+
+    monkeypatch.setattr(job_service, "transition_job", fail_terminal_transition)
+
+    worker = JobWorker(
+        job_service,
+        executors={
+            "replace": build_replace_executor(
+                document_service=document_service,
+                registry=env["registry"],
+                job_service=job_service,
+                index_service=env["index_service"],
+            )
+        },
+        claim_grace_seconds=0.0,
+    )
+    claimed = await worker.poll_once()
+    assert claimed is not None and claimed.id == job.id
+
+    assert Path(staged_path).exists()
+    persisted = await job_service.get_job(kb_id, job.id)
+    assert persisted.status == "running"
+
+
 async def test_orphan_recovery_preserves_queued_replace_job(tmp_path):
     """A queued ``replace`` job must survive restart orphan-recovery when the
     durable worker lists ``replace`` as resumable (so the worker can re-drive
@@ -292,3 +357,244 @@ async def test_orphan_recovery_preserves_queued_replace_job(tmp_path):
         resumable_job_types={"parse"}
     )
     assert any(r.id == job2.id for r in recovered2)
+
+
+async def test_worker_resumes_queued_sync_from_staged_sources(tmp_path):
+    env = _wire(tmp_path)
+    client = env["client"]
+    document_service = env["document_service"]
+    job_service = env["job_service"]
+    kb_id = "kb_sync_resume"
+    assert (
+        client.post("/kbs", json={"id": kb_id, "name": kb_id}, headers=_HEADERS).status_code
+        == 200
+    )
+
+    batch_id = "batch_sync_resume"
+    source = DocumentSourceInput(
+        source_name="resume.pdf",
+        content=b"resumable-sync-bytes",
+        source_type="upload",
+        content_type="application/pdf",
+        metadata={"source_key": "manual/resume.pdf"},
+    )
+    source_hash = document_service.prepare_replacement_source(source).source_hash
+    staged_path = await document_service.stage_sync_source_bytes(
+        kb_id,
+        batch_id=batch_id,
+        item_index=0,
+        source=source,
+    )
+    job, created = await job_service.create_job_once(
+        kb_id,
+        job_type="sync",
+        batch_id=batch_id,
+        stage="syncing",
+        total_items=1,
+        payload={
+            "batch_id": batch_id,
+            "items": [
+                {
+                    "source_key": "manual/resume.pdf",
+                    "source_name": "resume.pdf",
+                    "source_hash": source_hash,
+                    "content_type": "application/pdf",
+                    "size_bytes": len(source.content),
+                }
+            ],
+            "source_keys": ["manual/resume.pdf"],
+            "auto_parse": True,
+            "auto_index": True,
+            "parser_engine": "mineru",
+            "process_options": "iF",
+            "force_reparse": False,
+            "delete_source_file": True,
+            "delete_artifacts": True,
+            "delete_llm_cache": False,
+        },
+    )
+    assert created and job.status == "queued"
+
+    worker = JobWorker(
+        job_service,
+        executors={
+            "sync": build_sync_executor(
+                document_service=document_service,
+                registry=env["registry"],
+                job_service=job_service,
+                index_service=env["index_service"],
+            )
+        },
+        claim_grace_seconds=0.0,
+    )
+    claimed = await worker.poll_once()
+    assert claimed is not None and claimed.id == job.id
+
+    final = client.get(f"/kbs/{kb_id}/jobs/{job.id}", headers=_HEADERS).json()
+    assert final["status"] == "succeeded", final
+    assert final["job_type"] == "sync"
+    assert final["completed_items"] == 1
+    assert final["result"]["resumed_by_worker"] is True
+    item = final["result"]["items"][0]
+    assert item["action"] == "created"
+    assert item["status"] == "succeeded"
+    assert item["source_key"] == "manual/resume.pdf"
+    assert item["parse_result"]["status"] == "succeeded"
+    assert item["build_result"]["status"] == "succeeded"
+    assert not Path(staged_path).exists()
+
+    documents = client.get(f"/kbs/{kb_id}/documents", headers=_HEADERS).json()["documents"]
+    assert len(documents) == 1
+    assert documents[0]["metadata"]["source_key"] == "manual/resume.pdf"
+    assert documents[0]["status"] == "ready"
+
+
+async def test_worker_keeps_sync_staging_when_terminal_transition_fails(
+    tmp_path, monkeypatch
+):
+    env = _wire(tmp_path)
+    client = env["client"]
+    document_service = env["document_service"]
+    job_service = env["job_service"]
+    kb_id = "kb_sync_terminal_fail"
+    assert (
+        client.post("/kbs", json={"id": kb_id, "name": kb_id}, headers=_HEADERS).status_code
+        == 200
+    )
+
+    batch_id = "batch_sync_terminal_fail"
+    source = DocumentSourceInput(
+        source_name="retain.pdf",
+        content=b"retain-sync-bytes",
+        source_type="upload",
+        content_type="application/pdf",
+        metadata={"source_key": "manual/retain.pdf"},
+    )
+    source_hash = document_service.prepare_replacement_source(source).source_hash
+    staged_path = await document_service.stage_sync_source_bytes(
+        kb_id,
+        batch_id=batch_id,
+        item_index=0,
+        source=source,
+    )
+    job, created = await job_service.create_job_once(
+        kb_id,
+        job_type="sync",
+        batch_id=batch_id,
+        stage="syncing",
+        total_items=1,
+        payload={
+            "batch_id": batch_id,
+            "items": [
+                {
+                    "source_key": "manual/retain.pdf",
+                    "source_name": "retain.pdf",
+                    "source_hash": source_hash,
+                    "content_type": "application/pdf",
+                    "size_bytes": len(source.content),
+                }
+            ],
+            "source_keys": ["manual/retain.pdf"],
+            "auto_parse": False,
+            "auto_index": False,
+            "force_reparse": False,
+            "delete_source_file": True,
+            "delete_artifacts": True,
+            "delete_llm_cache": False,
+        },
+    )
+    assert created and job.status == "queued"
+    original_transition_job = job_service.transition_job
+
+    async def fail_terminal_transition(
+        kb_id_arg: str, job_id_arg: str, **kwargs
+    ) -> JobRecord:
+        if kwargs.get("status") in {"succeeded", "failed"}:
+            raise RuntimeError("terminal transition exploded")
+        return await original_transition_job(kb_id_arg, job_id_arg, **kwargs)
+
+    monkeypatch.setattr(job_service, "transition_job", fail_terminal_transition)
+
+    worker = JobWorker(
+        job_service,
+        executors={
+            "sync": build_sync_executor(
+                document_service=document_service,
+                registry=env["registry"],
+                job_service=job_service,
+                index_service=env["index_service"],
+            )
+        },
+        claim_grace_seconds=0.0,
+    )
+    claimed = await worker.poll_once()
+    assert claimed is not None and claimed.id == job.id
+
+    assert Path(staged_path).exists()
+    persisted = await job_service.get_job(kb_id, job.id)
+    assert persisted.status == "running"
+
+
+async def test_orphan_recovery_preserves_queued_sync_job(tmp_path):
+    env = _wire(tmp_path)
+    client = env["client"]
+    job_service = env["job_service"]
+    metadata_store = env["metadata_store"]
+    kb_id = "kb_sync_orphan"
+    assert (
+        client.post("/kbs", json={"id": kb_id, "name": kb_id}, headers=_HEADERS).status_code
+        == 200
+    )
+
+    job, created = await job_service.create_job_once(
+        kb_id,
+        job_type="sync",
+        batch_id="batch_sync_orphan",
+        stage="syncing",
+        total_items=1,
+        payload={
+            "batch_id": "batch_sync_orphan",
+            "items": [
+                {
+                    "source_key": "manual/orphan.pdf",
+                    "source_name": "orphan.pdf",
+                    "source_hash": "sha256:x",
+                    "content_type": "application/pdf",
+                    "size_bytes": 1,
+                }
+            ],
+            "source_keys": ["manual/orphan.pdf"],
+        },
+    )
+    assert created and job.status == "queued"
+
+    recovered = await metadata_store.recover_orphan_jobs(
+        resumable_job_types={"parse", "build_kg", "reindex", "delete", "replace", "sync"}
+    )
+    assert all(r.id != job.id for r in recovered), "queued sync must be preserved"
+    assert (await job_service.get_job(kb_id, job.id)).status == "queued"
+
+    job2, _ = await job_service.create_job_once(
+        kb_id,
+        job_type="sync",
+        batch_id="batch_sync_orphan_2",
+        stage="syncing",
+        total_items=1,
+        payload={
+            "batch_id": "batch_sync_orphan_2",
+            "items": [
+                {
+                    "source_key": "manual/orphan-2.pdf",
+                    "source_name": "orphan-2.pdf",
+                    "source_hash": "sha256:y",
+                    "content_type": "application/pdf",
+                    "size_bytes": 1,
+                }
+            ],
+            "source_keys": ["manual/orphan-2.pdf"],
+        },
+        idempotency_key="sync-orphan-2",
+    )
+    recovered2 = await metadata_store.recover_orphan_jobs(resumable_job_types={"parse"})
+    assert any(r.id == job2.id for r in recovered2)
+    assert (await job_service.get_job(kb_id, job2.id)).status == "failed"

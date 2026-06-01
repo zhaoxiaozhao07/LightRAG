@@ -930,12 +930,63 @@ def test_replace_ready_document_resets_source_artifacts_and_old_index(tmp_path):
     assert new_source_path.read_bytes() == b"new-pdf"
     assert not old_source_path.exists()
     assert not old_sidecar_path.exists()
+    staged_replace_path = (
+        tmp_path
+        / "inputs"
+        / "kb_replace_ready"
+        / document_id
+        / f".replace-staging-{response.json()['id']}.bin"
+    )
+    assert not staged_replace_path.exists()
 
     artifacts_after = client.get(
         f"/kbs/kb_replace_ready/documents/{document_id}/artifacts", headers=_HEADERS
     )
     assert artifacts_after.status_code == 200
     assert artifacts_after.json()["total"] == 0
+
+
+def test_sync_cleans_partial_staging_when_later_item_fails(tmp_path, monkeypatch):
+    client, _kb_service, _store, document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_sync_partial_stage")
+    original_stage_sync_source_bytes = document_service.stage_sync_source_bytes
+    staged_paths: list[Path] = []
+
+    async def fail_after_first_stage(kb_id, *, batch_id, item_index, source):
+        staged_path = await original_stage_sync_source_bytes(
+            kb_id,
+            batch_id=batch_id,
+            item_index=item_index,
+            source=source,
+        )
+        staged_paths.append(Path(staged_path))
+        if item_index == 1:
+            raise RuntimeError("stage exploded")
+        return staged_path
+
+    monkeypatch.setattr(
+        document_service,
+        "stage_sync_source_bytes",
+        fail_after_first_stage,
+    )
+
+    response = client.post(
+        "/kbs/kb_sync_partial_stage/documents:sync?auto_index=false",
+        files=[
+            ("files", ("one.pdf", b"one", "application/pdf")),
+            ("files", ("two.pdf", b"two", "application/pdf")),
+        ],
+        data={"source_keys": ["manual/one.pdf", "manual/two.pdf"]},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 500
+    assert len(staged_paths) == 2
+    assert not any(path.exists() for path in staged_paths)
+    sync_staging_root = tmp_path / "inputs" / "kb_sync_partial_stage" / ".sync-staging"
+    assert not any(sync_staging_root.glob("**/*"))
 
 
 def test_replace_idempotency_key_reuses_existing_job_and_conflicts(tmp_path):

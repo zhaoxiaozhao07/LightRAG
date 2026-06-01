@@ -41,7 +41,7 @@ from lightrag.parser.routing import (
     sanitize_process_options,
     validate_process_options,
 )
-from lightrag.utils import compute_mdhash_id, generate_track_id
+from lightrag.utils import compute_mdhash_id, generate_track_id, logger
 
 SourceType = Literal["upload", "text"]
 MetadataStore = SQLiteMetadataStore | PostgresMetadataStore
@@ -546,6 +546,24 @@ class DocumentLifecycleService:
         )
         return document_dir / f".replace-staging-{job_id}.bin"
 
+    def _sync_staging_dir(self, workspace: str, batch_id: str) -> Path:
+        """Deterministic directory for staged aggregate ``sync`` request bytes.
+
+        Sync jobs are aggregate jobs (``document_id`` is ``None``), so their
+        resumable state must live outside any one document directory until the
+        worker decides whether each source creates, skips, or replaces a
+        document. The batch id is generated before job creation and persisted in
+        the job row, making this path reconstructable after restart.
+        """
+        workspace_dir = (self._source_root / workspace).resolve(strict=False)
+        return workspace_dir / ".sync-staging" / batch_id
+
+    def _sync_staging_path(
+        self, workspace: str, batch_id: str, item_index: int, source_name: str
+    ) -> Path:
+        safe_name = _sanitize_source_name(source_name)
+        return self._sync_staging_dir(workspace, batch_id) / f"{item_index:04d}_{safe_name}"
+
     async def stage_replacement_bytes(
         self,
         kb_id: str,
@@ -614,7 +632,82 @@ class DocumentLifecycleService:
         staging_path = self._replacement_staging_path(
             record.workspace, document_id, job_id
         )
-        staging_path.unlink(missing_ok=True)
+        try:
+            staging_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning(
+                "Failed to remove staged replacement bytes at %s",
+                staging_path,
+            )
+
+    async def stage_sync_source_bytes(
+        self,
+        kb_id: str,
+        *,
+        batch_id: str,
+        item_index: int,
+        source: DocumentSourceInput,
+    ) -> str:
+        """Persist one aggregate ``sync`` source before the job is queued.
+
+        The in-process route can still use request-memory bytes, but the durable
+        worker only depends on this staged copy plus the persisted job payload.
+        """
+        if not source.content:
+            raise ValueError("Sync document content cannot be empty")
+        record = await self._kb_service.get(kb_id)
+        staging_dir = self._sync_staging_dir(record.workspace, batch_id)
+        staging_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        staging_path = self._sync_staging_path(
+            record.workspace, batch_id, item_index, source.source_name
+        )
+        with staging_path.open("xb") as output:
+            output.write(source.content)
+            output.flush()
+        return str(staging_path)
+
+    async def load_staged_sync_source(
+        self,
+        kb_id: str,
+        *,
+        batch_id: str,
+        item_index: int,
+        source_name: str,
+        content_type: str | None,
+        metadata: dict[str, Any],
+        expected_hash: str,
+    ) -> DocumentSourceInput | None:
+        """Rebuild a sync source from staged bytes for worker resume."""
+        record = await self._kb_service.get(kb_id)
+        staging_path = self._sync_staging_path(
+            record.workspace, batch_id, item_index, source_name
+        )
+        if not staging_path.is_file():
+            return None
+        content = staging_path.read_bytes()
+        actual_hash = _content_hash(content)
+        if actual_hash != expected_hash:
+            raise ValueError(
+                f"Staged sync source hash mismatch for {source_name}: "
+                f"expected {expected_hash}, got {actual_hash}"
+            )
+        return DocumentSourceInput(
+            source_name=source_name,
+            content=content,
+            source_type="upload",
+            content_type=content_type,
+            metadata=metadata,
+        )
+
+    async def clear_staged_sync_sources(self, kb_id: str, *, batch_id: str) -> None:
+        """Best-effort removal of staged aggregate sync bytes after terminal state."""
+        try:
+            record = await self._kb_service.get(kb_id)
+        except Exception:  # noqa: BLE001 — never let cleanup break the caller
+            return
+        staging_dir = self._sync_staging_dir(record.workspace, batch_id)
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
     async def claim_replace(
         self,

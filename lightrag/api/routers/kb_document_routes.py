@@ -1608,6 +1608,122 @@ def _active_job_conflict_detail(
 
 
 
+async def _run_sync_followups(
+    *,
+    document_service: DocumentLifecycleService,
+    kb_id: str,
+    job: JobRecord,
+    document: DocumentRecord,
+    item: dict[str, Any],
+    active_registry: LightRAGInstanceRegistry,
+    active_index_service: IndexBuildService | None,
+    rag: Any | None,
+    auto_parse: bool,
+    auto_index: bool,
+    parser_engine: str | None,
+    process_options: str | None,
+    force_reparse: bool,
+) -> tuple[dict[str, Any], Any | None]:
+    if not auto_parse:
+        return item, rag
+
+    parse_plan = await document_service.create_parse_plan(
+        kb_id,
+        document.id,
+        parser_engine=parser_engine,
+        process_options=process_options,
+        force_reparse=force_reparse,
+        auto_index=auto_index,
+    )
+    status_requires_parse = document.status in {
+        "uploaded",
+        "parse_queued",
+        "parsing",
+        "parse_failed",
+        "replace_failed",
+    }
+    parse_needed = (
+        force_reparse
+        or document.parser_hash != parse_plan.parser_hash
+        or status_requires_parse
+    )
+    if parse_needed:
+        if item.get("action") == "skipped":
+            item["action"] = "reparsed"
+            if document.parser_hash != parse_plan.parser_hash:
+                item["skip_reason"] = "parser_hash_changed"
+            elif force_reparse:
+                item["skip_reason"] = "force_reparse"
+        if rag is None:
+            rag = cast(Any, await active_registry.get(kb_id))
+        await document_service.mark_parse_queued(
+            kb_id,
+            document.id,
+            job=job,
+            plan=parse_plan,
+        )
+        parse_item = await _execute_parse_plan(
+            document_service=document_service,
+            kb_id=kb_id,
+            job_id=job.id,
+            plan=parse_plan,
+            rag=rag,
+        )
+        item["parse_result"] = parse_item
+        if parse_item["status"] != "succeeded":
+            item.update(
+                {
+                    "status": "failed",
+                    "error_code": parse_item.get("error_code", "parse_failed"),
+                    "error_message": parse_item.get(
+                        "error_message", "Document sync parse failed"
+                    ),
+                }
+            )
+            return item, rag
+        item["status"] = "succeeded"
+        item.pop("skip_reason", None)
+
+    if auto_index:
+        if active_index_service is None:
+            raise RuntimeError("KB index build service is not configured")
+        if rag is None:
+            rag = cast(Any, await active_registry.get(kb_id))
+        build_plan = await active_index_service.create_build_plan(
+            kb_id,
+            document.id,
+            rag=rag,
+        )
+        await active_index_service.claim_build_queued(
+            kb_id,
+            job_id=job.id,
+            plan=build_plan,
+        )
+        build_item = await _execute_build_plan(
+            index_service=active_index_service,
+            kb_id=kb_id,
+            job_id=job.id,
+            plan=build_plan,
+            rag=rag,
+        )
+        item["build_result"] = build_item
+        if build_item["status"] != "succeeded":
+            item.update(
+                {
+                    "status": "failed",
+                    "error_code": build_item.get("error_code", "build_failed"),
+                    "error_message": build_item.get(
+                        "error_message", "Document sync build failed"
+                    ),
+                }
+            )
+            return item, rag
+        if not build_item.get("skipped"):
+            item["status"] = "succeeded"
+            item.pop("skip_reason", None)
+    return item, rag
+
+
 async def _execute_replace_document(
     *,
     document_service: DocumentLifecycleService,
@@ -1786,6 +1902,184 @@ async def _execute_replace_document(
             ),
             "error_message": str(exc),
         }
+
+
+async def _execute_sync_item(
+    *,
+    document_service: DocumentLifecycleService,
+    kb_id: str,
+    job: JobRecord,
+    prepared: dict[str, Any],
+    existing_by_source_key: dict[str, DocumentRecord],
+    active_registry: LightRAGInstanceRegistry,
+    active_index_service: IndexBuildService | None,
+    rag: Any | None,
+    auto_parse: bool,
+    auto_index: bool,
+    parser_engine: str | None,
+    process_options: str | None,
+    force_reparse: bool,
+    delete_source_file: bool,
+    delete_artifacts: bool,
+    delete_llm_cache: bool,
+) -> tuple[dict[str, Any], Any | None]:
+    source_key = str(prepared["source_key"])
+    source = cast(DocumentSourceInput, prepared["source"])
+    source_hash = str(prepared["source_hash"])
+    item: dict[str, Any] = {
+        "source_key": source_key,
+        "source_name": source.source_name,
+        "source_hash": source_hash,
+    }
+    try:
+        existing = existing_by_source_key.get(source_key)
+        if existing is None:
+            create_result = await document_service.create_source_batch(
+                kb_id,
+                [source],
+                auto_parse=False,
+                auto_index=False,
+            )
+            document = create_result.documents[0]
+            item.update(
+                {
+                    "action": "created",
+                    "status": "succeeded",
+                    "document_id": document.id,
+                    "upload_job_id": create_result.job.id,
+                }
+            )
+            item, rag = await _run_sync_followups(
+                document_service=document_service,
+                kb_id=kb_id,
+                job=job,
+                document=document,
+                item=item,
+                active_registry=active_registry,
+                active_index_service=active_index_service,
+                rag=rag,
+                auto_parse=auto_parse,
+                auto_index=auto_index,
+                parser_engine=parser_engine,
+                process_options=process_options,
+                force_reparse=force_reparse,
+            )
+        elif existing.source_hash == source_hash:
+            item.update(
+                {
+                    "action": "skipped",
+                    "status": "skipped",
+                    "skip_reason": "source_hash_match",
+                    "document_id": existing.id,
+                }
+            )
+            item, rag = await _run_sync_followups(
+                document_service=document_service,
+                kb_id=kb_id,
+                job=job,
+                document=existing,
+                item=item,
+                active_registry=active_registry,
+                active_index_service=active_index_service,
+                rag=rag,
+                auto_parse=auto_parse,
+                auto_index=auto_index,
+                parser_engine=parser_engine,
+                process_options=process_options,
+                force_reparse=force_reparse,
+            )
+        else:
+            replacement = document_service.prepare_replacement_source(source)
+            claimed = await document_service.claim_replace(
+                kb_id,
+                existing.id,
+                job=job,
+                replacement=replacement,
+                delete_source_file=delete_source_file,
+                delete_artifacts=delete_artifacts,
+                delete_llm_cache=delete_llm_cache,
+                auto_parse=auto_parse,
+                auto_index=auto_index,
+                parser_engine=parser_engine,
+                process_options=process_options,
+                force_reparse=force_reparse,
+            )
+            replace_item = await _execute_replace_document(
+                document_service=document_service,
+                kb_id=kb_id,
+                job=job,
+                document=claimed,
+                replacement=replacement,
+                active_registry=active_registry,
+                active_index_service=active_index_service,
+                delete_source_file=delete_source_file,
+                delete_artifacts=delete_artifacts,
+                delete_llm_cache=delete_llm_cache,
+                auto_parse=auto_parse,
+                auto_index=auto_index,
+                parser_engine=parser_engine,
+                process_options=process_options,
+                force_reparse=force_reparse,
+            )
+            item.update(replace_item)
+            item["action"] = "replaced"
+
+        document_id = item.get("document_id")
+        if item["status"] in {"succeeded", "skipped"} and isinstance(
+            document_id, str
+        ):
+            await document_service.update_document(
+                kb_id,
+                document_id,
+                metadata_patch={
+                    "source_key": source_key,
+                    "last_sync_job_id": job.id,
+                    "last_synced_at": utc_now_iso(),
+                },
+            )
+        return item, rag
+    except (
+        ActiveDocumentParseJobError,
+        ActiveDocumentBuildJobError,
+        ActiveDocumentDeleteJobError,
+        ActiveDocumentReplaceJobError,
+    ) as exc:
+        item.update(
+            {
+                "action": item.get("action", "unknown"),
+                "status": "failed",
+                **_active_job_conflict_detail(exc),
+            }
+        )
+        return item, rag
+    except DuplicateDocumentSourceKeyError as exc:
+        item.update(
+            {
+                "action": item.get("action", "unknown"),
+                "status": "failed",
+                "error_code": "source_key_conflict",
+                "error_message": str(exc),
+                "existing_document_id": exc.existing_document_id,
+            }
+        )
+        return item, rag
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Failed to sync source_key '%s' for KB '%s': %s",
+            source_key,
+            kb_id,
+            exc,
+        )
+        item.update(
+            {
+                "action": item.get("action", "unknown"),
+                "status": "failed",
+                "error_code": "sync_item_failed",
+                "error_message": str(exc),
+            }
+        )
+        return item, rag
+
 
 def create_kb_document_routes(
     document_service: DocumentLifecycleService,
@@ -2092,294 +2386,6 @@ def create_kb_document_routes(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-
-    async def _run_sync_followups(
-        *,
-        kb_id: str,
-        job: JobRecord,
-        document: DocumentRecord,
-        item: dict[str, Any],
-        active_registry: LightRAGInstanceRegistry,
-        active_index_service: IndexBuildService | None,
-        rag: Any | None,
-        auto_parse: bool,
-        auto_index: bool,
-        parser_engine: str | None,
-        process_options: str | None,
-        force_reparse: bool,
-    ) -> tuple[dict[str, Any], Any | None]:
-        if not auto_parse:
-            return item, rag
-
-        parse_plan = await document_service.create_parse_plan(
-            kb_id,
-            document.id,
-            parser_engine=parser_engine,
-            process_options=process_options,
-            force_reparse=force_reparse,
-            auto_index=auto_index,
-        )
-        status_requires_parse = document.status in {
-            "uploaded",
-            "parse_queued",
-            "parsing",
-            "parse_failed",
-            "replace_failed",
-        }
-        parse_needed = (
-            force_reparse
-            or document.parser_hash != parse_plan.parser_hash
-            or status_requires_parse
-        )
-        if parse_needed:
-            if item.get("action") == "skipped":
-                item["action"] = "reparsed"
-                if document.parser_hash != parse_plan.parser_hash:
-                    item["skip_reason"] = "parser_hash_changed"
-                elif force_reparse:
-                    item["skip_reason"] = "force_reparse"
-            if rag is None:
-                rag = cast(Any, await active_registry.get(kb_id))
-            await document_service.mark_parse_queued(
-                kb_id,
-                document.id,
-                job=job,
-                plan=parse_plan,
-            )
-            parse_item = await _execute_parse_plan(
-                document_service=document_service,
-                kb_id=kb_id,
-                job_id=job.id,
-                plan=parse_plan,
-                rag=rag,
-            )
-            item["parse_result"] = parse_item
-            if parse_item["status"] != "succeeded":
-                item.update(
-                    {
-                        "status": "failed",
-                        "error_code": parse_item.get("error_code", "parse_failed"),
-                        "error_message": parse_item.get(
-                            "error_message", "Document sync parse failed"
-                        ),
-                    }
-                )
-                return item, rag
-            item["status"] = "succeeded"
-            item.pop("skip_reason", None)
-
-        if auto_index:
-            if active_index_service is None:
-                raise RuntimeError("KB index build service is not configured")
-            if rag is None:
-                rag = cast(Any, await active_registry.get(kb_id))
-            build_plan = await active_index_service.create_build_plan(
-                kb_id,
-                document.id,
-                rag=rag,
-            )
-            await active_index_service.claim_build_queued(
-                kb_id,
-                job_id=job.id,
-                plan=build_plan,
-            )
-            build_item = await _execute_build_plan(
-                index_service=active_index_service,
-                kb_id=kb_id,
-                job_id=job.id,
-                plan=build_plan,
-                rag=rag,
-            )
-            item["build_result"] = build_item
-            if build_item["status"] != "succeeded":
-                item.update(
-                    {
-                        "status": "failed",
-                        "error_code": build_item.get("error_code", "build_failed"),
-                        "error_message": build_item.get(
-                            "error_message", "Document sync build failed"
-                        ),
-                    }
-                )
-                return item, rag
-            if not build_item.get("skipped"):
-                item["status"] = "succeeded"
-                item.pop("skip_reason", None)
-        return item, rag
-
-    async def _execute_sync_item(
-        *,
-        kb_id: str,
-        job: JobRecord,
-        prepared: dict[str, Any],
-        existing_by_source_key: dict[str, DocumentRecord],
-        active_registry: LightRAGInstanceRegistry,
-        active_index_service: IndexBuildService | None,
-        rag: Any | None,
-        auto_parse: bool,
-        auto_index: bool,
-        parser_engine: str | None,
-        process_options: str | None,
-        force_reparse: bool,
-        delete_source_file: bool,
-        delete_artifacts: bool,
-        delete_llm_cache: bool,
-    ) -> tuple[dict[str, Any], Any | None]:
-        source_key = str(prepared["source_key"])
-        source = cast(DocumentSourceInput, prepared["source"])
-        source_hash = str(prepared["source_hash"])
-        item: dict[str, Any] = {
-            "source_key": source_key,
-            "source_name": source.source_name,
-            "source_hash": source_hash,
-        }
-        try:
-            existing = existing_by_source_key.get(source_key)
-            if existing is None:
-                create_result = await document_service.create_source_batch(
-                    kb_id,
-                    [source],
-                    auto_parse=False,
-                    auto_index=False,
-                )
-                document = create_result.documents[0]
-                item.update(
-                    {
-                        "action": "created",
-                        "status": "succeeded",
-                        "document_id": document.id,
-                        "upload_job_id": create_result.job.id,
-                    }
-                )
-                item, rag = await _run_sync_followups(
-                    kb_id=kb_id,
-                    job=job,
-                    document=document,
-                    item=item,
-                    active_registry=active_registry,
-                    active_index_service=active_index_service,
-                    rag=rag,
-                    auto_parse=auto_parse,
-                    auto_index=auto_index,
-                    parser_engine=parser_engine,
-                    process_options=process_options,
-                    force_reparse=force_reparse,
-                )
-            elif existing.source_hash == source_hash:
-                item.update(
-                    {
-                        "action": "skipped",
-                        "status": "skipped",
-                        "skip_reason": "source_hash_match",
-                        "document_id": existing.id,
-                    }
-                )
-                item, rag = await _run_sync_followups(
-                    kb_id=kb_id,
-                    job=job,
-                    document=existing,
-                    item=item,
-                    active_registry=active_registry,
-                    active_index_service=active_index_service,
-                    rag=rag,
-                    auto_parse=auto_parse,
-                    auto_index=auto_index,
-                    parser_engine=parser_engine,
-                    process_options=process_options,
-                    force_reparse=force_reparse,
-                )
-            else:
-                replacement = document_service.prepare_replacement_source(source)
-                claimed = await document_service.claim_replace(
-                    kb_id,
-                    existing.id,
-                    job=job,
-                    replacement=replacement,
-                    delete_source_file=delete_source_file,
-                    delete_artifacts=delete_artifacts,
-                    delete_llm_cache=delete_llm_cache,
-                    auto_parse=auto_parse,
-                    auto_index=auto_index,
-                    parser_engine=parser_engine,
-                    process_options=process_options,
-                    force_reparse=force_reparse,
-                )
-                replace_item = await _execute_replace_document(
-                    document_service=document_service,
-                    kb_id=kb_id,
-                    job=job,
-                    document=claimed,
-                    replacement=replacement,
-                    active_registry=active_registry,
-                    active_index_service=active_index_service,
-                    delete_source_file=delete_source_file,
-                    delete_artifacts=delete_artifacts,
-                    delete_llm_cache=delete_llm_cache,
-                    auto_parse=auto_parse,
-                    auto_index=auto_index,
-                    parser_engine=parser_engine,
-                    process_options=process_options,
-                    force_reparse=force_reparse,
-                )
-                item.update(replace_item)
-                item["action"] = "replaced"
-
-            document_id = item.get("document_id")
-            if item["status"] in {"succeeded", "skipped"} and isinstance(
-                document_id, str
-            ):
-                await document_service.update_document(
-                    kb_id,
-                    document_id,
-                    metadata_patch={
-                        "source_key": source_key,
-                        "last_sync_job_id": job.id,
-                        "last_synced_at": utc_now_iso(),
-                    },
-                )
-            return item, rag
-        except (
-            ActiveDocumentParseJobError,
-            ActiveDocumentBuildJobError,
-            ActiveDocumentDeleteJobError,
-            ActiveDocumentReplaceJobError,
-        ) as exc:
-            item.update(
-                {
-                    "action": item.get("action", "unknown"),
-                    "status": "failed",
-                    **_active_job_conflict_detail(exc),
-                }
-            )
-            return item, rag
-        except DuplicateDocumentSourceKeyError as exc:
-            item.update(
-                {
-                    "action": item.get("action", "unknown"),
-                    "status": "failed",
-                    "error_code": "source_key_conflict",
-                    "error_message": str(exc),
-                    "existing_document_id": exc.existing_document_id,
-                }
-            )
-            return item, rag
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "Failed to sync source_key '%s' for KB '%s': %s",
-                source_key,
-                kb_id,
-                exc,
-            )
-            item.update(
-                {
-                    "action": item.get("action", "unknown"),
-                    "status": "failed",
-                    "error_code": "sync_item_failed",
-                    "error_message": str(exc),
-                }
-            )
-            return item, rag
-
     @router.post(
         "/{kb_id}/documents:sync",
         response_model=JobResponse,
@@ -2428,6 +2434,8 @@ def create_kb_document_routes(
 
         active_registry = registry
         active_index_service = index_service
+        batch_id: str | None = None
+        sync_staged = False
         try:
             normalized_keys = [_normalize_sync_source_key(item) for item in source_keys]
             if len(set(normalized_keys)) != len(normalized_keys):
@@ -2475,6 +2483,14 @@ def create_kb_document_routes(
                 )
 
             batch_id = generate_track_id("batch")
+            for item_index, prepared in enumerate(prepared_sources):
+                await document_service.stage_sync_source_bytes(
+                    kb_id,
+                    batch_id=batch_id,
+                    item_index=item_index,
+                    source=cast(DocumentSourceInput, prepared["source"]),
+                )
+                sync_staged = True
             fingerprint_payload = {
                 "items": [
                     {
@@ -2499,6 +2515,7 @@ def create_kb_document_routes(
             }
             payload = {
                 **fingerprint_payload,
+                "batch_id": batch_id,
                 "source_keys": normalized_keys,
                 "idempotency_fingerprint": _idempotency_fingerprint(
                     fingerprint_payload
@@ -2514,6 +2531,8 @@ def create_kb_document_routes(
                 idempotency_key=idempotency_key,
             )
             if not created_job:
+                await document_service.clear_staged_sync_sources(kb_id, batch_id=batch_id)
+                sync_staged = False
                 return JobResponse.from_record(job)
 
             async def _sync_task() -> None:
@@ -2544,6 +2563,7 @@ def create_kb_document_routes(
                     )
                     for prepared in prepared_sources:
                         item, rag = await _execute_sync_item(
+                            document_service=document_service,
                             kb_id=kb_id,
                             job=job,
                             prepared=prepared,
@@ -2591,6 +2611,9 @@ def create_kb_document_routes(
                         error_message=None
                         if failed_items == 0
                         else _sync_failure_message(failed_items, len(prepared_sources)),
+                    )
+                    await document_service.clear_staged_sync_sources(
+                        kb_id, batch_id=batch_id
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.error(
@@ -2642,18 +2665,32 @@ def create_kb_document_routes(
                         error_code="sync_failed",
                         error_message=str(exc),
                     )
+                    await document_service.clear_staged_sync_sources(
+                        kb_id, batch_id=batch_id
+                    )
 
             background_tasks.add_task(_sync_task)
+            sync_staged = False
             return JobResponse.from_record(job)
         except HTTPException:
+            if sync_staged and batch_id is not None:
+                await document_service.clear_staged_sync_sources(kb_id, batch_id=batch_id)
             raise
         except KnowledgeBaseNotFoundError as exc:
+            if sync_staged and batch_id is not None:
+                await document_service.clear_staged_sync_sources(kb_id, batch_id=batch_id)
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except IdempotencyKeyConflictError as exc:
+            if sync_staged and batch_id is not None:
+                await document_service.clear_staged_sync_sources(kb_id, batch_id=batch_id)
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
+            if sync_staged and batch_id is not None:
+                await document_service.clear_staged_sync_sources(kb_id, batch_id=batch_id)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
+            if sync_staged and batch_id is not None:
+                await document_service.clear_staged_sync_sources(kb_id, batch_id=batch_id)
             logger.error("Failed to start document sync for KB '%s': %s", kb_id, exc)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -2829,6 +2866,11 @@ def create_kb_document_routes(
                             error_code=item.get("error_code", "replace_failed"),
                             error_message=item.get("error_message"),
                         )
+                    await document_service.clear_staged_replacement(
+                        kb_id,
+                        document_id,
+                        job_id=job.id,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.error(
                         "Failed to run replace job '%s' for KB '%s': %s",
@@ -2870,6 +2912,12 @@ def create_kb_document_routes(
                             "Replace job '%s' for KB '%s' was already terminal",
                             job.id,
                             kb_id,
+                        )
+                    else:
+                        await document_service.clear_staged_replacement(
+                            kb_id,
+                            document_id,
+                            job_id=job.id,
                         )
 
             background_tasks.add_task(_replace_task)

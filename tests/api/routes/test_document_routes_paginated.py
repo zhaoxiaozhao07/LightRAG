@@ -117,3 +117,13 @@ def test_documents_paginated_status_filters_override_status_filter():
         "parsing-doc",
         "analyzing-doc",
     ]
+
+
+def test_documents_paginated_is_post_only():
+    response = _client.get(
+        "/documents/paginated",
+        headers=_headers,
+        params={"status_filter": "processed"},
+    )
+
+    assert response.status_code == 405

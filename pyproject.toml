@@ -157,6 +157,7 @@ lightrag-gunicorn = "lightrag.api.run_with_gunicorn:main"
 lightrag-hash-password = "lightrag.tools.hash_password:main"
 lightrag-download-cache = "lightrag.tools.download_cache:main"
 lightrag-clean-llmqc = "lightrag.tools.clean_llm_query_cache:main"
+lightrag-migrate-kb-metadata = "lightrag.tools.migrate_kb_metadata_to_postgres:main"
 
 [project.urls]
 Homepage = "https://github.com/HKUDS/LightRAG"
