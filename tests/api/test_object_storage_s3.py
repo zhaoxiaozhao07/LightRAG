@@ -16,6 +16,7 @@ testing the shipped code).
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -40,6 +41,7 @@ class _FakeS3Client:
     def __init__(self, state: "_FakeS3State", *, page_size: int = 2):
         self._state = state
         self._page_size = page_size
+        self.meta = _FakeClientMeta(state)
 
     async def __aenter__(self) -> "_FakeS3Client":
         return self
@@ -80,7 +82,7 @@ class _FakeS3Client:
             keys = [key for key in keys if key > ContinuationToken]
         page = keys[: self._page_size]
         truncated = len(keys) > self._page_size
-        result = {"Contents": [{"Key": key} for key in page]}
+        result: dict[str, Any] = {"Contents": [{"Key": key} for key in page]}
         if truncated:
             result["IsTruncated"] = True
             result["NextContinuationToken"] = page[-1]
@@ -104,6 +106,20 @@ class _FakeS3State:
         self.extra_args: dict[tuple[str, str], dict | None] = {}
         self.buckets: set[str] = set()
         self.calls: list[tuple] = []
+        self.registered_events: list[str] = []
+
+
+class _FakeEvents:
+    def __init__(self, state: _FakeS3State) -> None:
+        self._state = state
+
+    def register(self, event_name: str, handler) -> None:
+        self._state.registered_events.append(event_name)
+
+
+class _FakeClientMeta:
+    def __init__(self, state: _FakeS3State) -> None:
+        self.events = _FakeEvents(state)
 
 
 class _FakeSession:
@@ -150,6 +166,8 @@ async def test_initialize_creates_bucket_when_missing():
     # The s3 client is configured with the endpoint/credentials from config.
     assert session.client_kwargs[0]["endpoint_url"] == "http://fake:9000"
     assert session.client_kwargs[0]["aws_access_key_id"] == "admin"
+    assert "before-send.s3.PutObject" in state.registered_events
+    assert "before-send.s3.UploadPart" in state.registered_events
 
 
 async def test_initialize_skips_create_when_bucket_present():
@@ -173,7 +191,9 @@ async def test_upload_file_applies_prefix_and_returns_uri(tmp_path: Path):
     assert uri == f"s3://lightrag-kb/{expected_key}"
     assert state.objects[("lightrag-kb", expected_key)] == b"pdf-bytes"
     # mime type guessed from extension.
-    assert state.extra_args[("lightrag-kb", expected_key)]["ContentType"] == "application/pdf"
+    extra_args = state.extra_args[("lightrag-kb", expected_key)]
+    assert extra_args is not None
+    assert extra_args["ContentType"] == "application/pdf"
 
 
 async def test_upload_and_download_roundtrip(tmp_path: Path):
@@ -292,3 +312,41 @@ def test_create_object_storage_from_env_selection(monkeypatch):
     monkeypatch.setenv("LIGHTRAG_OBJECT_STORAGE", "weird-backend")
     with pytest.raises(ObjectStorageError):
         create_object_storage_from_env()
+
+
+def test_remove_expect_header_is_case_insensitive():
+    class _Request:
+        headers = {"expect": "100-continue", "Content-Length": "5"}
+
+    S3ObjectStorage._remove_expect_header(_Request())
+
+    assert _Request.headers == {"Content-Length": "5"}
+
+
+def test_object_storage_config_reads_disable_expect_flag(monkeypatch):
+    monkeypatch.setenv("LIGHTRAG_OBJECT_STORAGE", "minio")
+    monkeypatch.setenv("LIGHTRAG_OBJECT_STORAGE_DISABLE_EXPECT_HEADER", "false")
+
+    config = ObjectStorageConfig.from_env()
+
+    assert config.disable_expect_header is False
+
+
+async def test_configure_client_can_keep_expect_header_registration_disabled():
+    storage, state, _ = _make_storage()
+    storage._config = ObjectStorageConfig(
+        backend="minio",
+        bucket="lightrag-kb",
+        endpoint_url="http://fake:9000",
+        access_key_id="admin",
+        secret_access_key="admin123",
+        region_name="us-east-1",
+        prefix="kb",
+        use_ssl=False,
+        create_bucket=True,
+        disable_expect_header=False,
+    )
+
+    await storage.initialize()
+
+    assert state.registered_events == []

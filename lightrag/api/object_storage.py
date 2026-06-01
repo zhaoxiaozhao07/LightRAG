@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 import mimetypes
 import os
 from dataclasses import dataclass
@@ -19,6 +21,7 @@ class ObjectStorageConfig:
     prefix: str = "kb"
     use_ssl: bool = False
     create_bucket: bool = True
+    disable_expect_header: bool = True
 
     @classmethod
     def from_env(cls) -> "ObjectStorageConfig":
@@ -35,6 +38,9 @@ class ObjectStorageConfig:
             prefix=os.getenv("LIGHTRAG_OBJECT_STORAGE_PREFIX", "kb").strip("/"),
             use_ssl=_env_bool("LIGHTRAG_OBJECT_STORAGE_USE_SSL", default=False),
             create_bucket=_env_bool("LIGHTRAG_OBJECT_STORAGE_CREATE_BUCKET", default=True),
+            disable_expect_header=_env_bool(
+                "LIGHTRAG_OBJECT_STORAGE_DISABLE_EXPECT_HEADER", default=True
+            ),
         )
 
 
@@ -235,19 +241,45 @@ class S3ObjectStorage(ObjectStorage):
             ) from exc
         return aioboto3.Session()
 
-    def _client(self) -> Any:
+    @asynccontextmanager
+    async def _client(self) -> AsyncIterator[Any]:
         session = self._session
         if session is None:
             session = self._new_session()
             self._session = session
-        return session.client(
+        async with session.client(
             "s3",
             endpoint_url=self._config.endpoint_url,
             aws_access_key_id=self._config.access_key_id,
             aws_secret_access_key=self._config.secret_access_key,
             region_name=self._config.region_name,
             use_ssl=self._config.use_ssl,
-        )
+        ) as client:
+            self._configure_client(client)
+            yield client
+
+    def _configure_client(self, client: Any) -> None:
+        if not self._config.disable_expect_header:
+            return
+        events = getattr(getattr(client, "meta", None), "events", None)
+        register = getattr(events, "register", None)
+        if register is None:
+            return
+        register("before-send.s3.PutObject", self._remove_expect_header)
+        register("before-send.s3.UploadPart", self._remove_expect_header)
+
+    @staticmethod
+    def _remove_expect_header(request: Any, **_: Any) -> None:
+        headers = getattr(request, "headers", None)
+        if headers is None:
+            return
+        if "Expect" in headers:
+            del headers["Expect"]
+            return
+        for header_name in list(headers):
+            if str(header_name).lower() == "expect":
+                del headers[header_name]
+                return
 
     def _normalize_key(self, key: str) -> str:
         key = key.strip("/")

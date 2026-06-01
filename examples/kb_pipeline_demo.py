@@ -32,6 +32,7 @@ import argparse
 import hashlib
 import json
 import mimetypes
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -44,6 +45,18 @@ except ImportError as exc:  # pragma: no cover - 运行期检查
     raise SystemExit(
         "需要安装 httpx 才能运行该脚本：pip install httpx"
     ) from exc
+
+
+def _prefer_utf8_stdio() -> None:
+    if os.name != "nt":
+        return
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+_prefer_utf8_stdio()
 
 
 # 与服务端 ``SUPPORTED_DOCUMENT_EXTENSIONS`` 保持一致的子集。可按需扩展。
@@ -67,6 +80,7 @@ BUILD_WAIT_TIMEOUT = 1800.0
 JOB_WAIT_SERVER_WINDOW = 600.0
 JOB_WAIT_HTTP_GRACE = 10.0
 JOB_WAIT_ACTIVE_STATES = {"queued", "running"}
+DEFAULT_HTTP_TIMEOUT = 300.0
 
 QUERY_MODES = ("local", "global", "hybrid", "naive", "mix", "bypass")
 
@@ -226,7 +240,7 @@ def interactive_query_loop(
     turn = 0
     while True:
         try:
-            line = input("\n[问答] ❯ ").strip()
+            line = input("\n[问答] > ").strip()
         except EOFError:
             print()
             return
@@ -407,6 +421,12 @@ def parse_args() -> argparse.Namespace:
         default=BUILD_WAIT_TIMEOUT,
         help="单个 build_kg / parse job 的最长等待时间（秒）",
     )
+    parser.add_argument(
+        "--http-timeout",
+        type=float,
+        default=DEFAULT_HTTP_TIMEOUT,
+        help="普通 HTTP 请求超时时间（秒），用于上传/创建/查询等非 job wait 请求",
+    )
     return parser.parse_args()
 
 
@@ -492,6 +512,13 @@ class KBClient:
                 params=params,
                 files={"files": (file_path.name, fp, mime)},
             )
+        response.raise_for_status()
+        return response.json()
+
+    def get_document(self, kb_id: str, document_id: str) -> dict[str, Any] | None:
+        response = self._client.get(f"/kbs/{kb_id}/documents/{document_id}")
+        if response.status_code == 404:
+            return None
         response.raise_for_status()
         return response.json()
 
@@ -625,7 +652,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     files = discover_files(folder)
     print(f"[info] 在 {folder} 下发现 {len(files)} 个候选文件")
 
-    client = KBClient(args.server, args.api_key)
+    client = KBClient(args.server, args.api_key, timeout=args.http_timeout)
     try:
         kb_record = client.ensure_kb(args.kb_id, args.kb_name or args.kb_id)
         print(
@@ -639,15 +666,28 @@ def run_pipeline(args: argparse.Namespace) -> int:
             return 0
 
         # 1. 计算 hash，分类：新增 / 变化 / 未变 / 已删
-        new_files: list[Path] = []
-        changed_files: list[Path] = []
-        unchanged_files: list[Path] = []
+        discovered: list[tuple[str, Path, str]] = []
         seen_keys: set[str] = set()
-
         for file_path in files:
             key = str(file_path.relative_to(folder)).replace("\\", "/")
             seen_keys.add(key)
-            content_hash = hash_file(file_path)
+            discovered.append((key, file_path, hash_file(file_path)))
+
+        for key, entry in list(state.files.items()):
+            if key not in seen_keys:
+                continue
+            if client.get_document(args.kb_id, entry.document_id) is None:
+                print(
+                    f"[warn] 状态文件中的文档不存在于服务端，将重新上传：{key} "
+                    f"(doc_id={entry.document_id})"
+                )
+                state.files.pop(key, None)
+
+        new_files: list[Path] = []
+        changed_files: list[Path] = []
+        unchanged_files: list[Path] = []
+
+        for key, file_path, content_hash in discovered:
             previous = state.files.get(key)
             if previous is None:
                 new_files.append(file_path)

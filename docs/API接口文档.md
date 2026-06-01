@@ -881,10 +881,13 @@ LIGHTRAG_OBJECT_STORAGE_USE_SSL=false
 LIGHTRAG_OBJECT_STORAGE_REGION=us-east-1
 LIGHTRAG_OBJECT_STORAGE_PREFIX=kb
 LIGHTRAG_OBJECT_STORAGE_CREATE_BUCKET=true
+LIGHTRAG_OBJECT_STORAGE_DISABLE_EXPECT_HEADER=true
 ```
 
 依赖要求：`aioboto3>=12,<16` 是 MinIO/S3 对象存储后端的运行时依赖。未设置 `LIGHTRAG_OBJECT_STORAGE` 或设置为 `local` 时不会创建 S3 client，也不需要该依赖；设置为 `minio` 或 `s3` 时需使用包含该依赖的 API 安装（源码环境执行 `uv sync --extra api`，包安装使用 `pip install "lightrag-hku[api]"`），老环境升级后也需要重新同步依赖。缺失时服务会在对象存储初始化阶段给出明确错误；若只是本地开发且不需要对象存储，可改回 `LIGHTRAG_OBJECT_STORAGE=local`。
 
+`LIGHTRAG_OBJECT_STORAGE_DISABLE_EXPECT_HEADER` 默认为 `true`：上传 `PutObject` / multipart `UploadPart` 前会移除 botocore 自动添加的 `Expect: 100-continue` 请求头，以兼容部分 MinIO 或反向代理组合在 100-continue 握手上挂起并最终返回 `RequestTimeout` 的场景。若生产 S3 网关明确依赖该头，可显式设置为 `false`。
+
 对象 key 组织在 `<prefix>/workspaces/<workspace>/documents/<document_id>/...` 下。`INPUT_DIR` 仍是本地 cache：parser、build、download 继续使用本地 path；当 cache 缺失时，download/parse planning 会按 metadata 中的对象 URI restore。硬删除 KB 时会按 workspace prefix 清理对象。
 
-> 测试覆盖：`tests/api/test_object_storage_s3.py` 仅在 boto3 client 边界打桩（`aioboto3` 在 `S3ObjectStorage._new_session` 内惰性 import，可注入 fake session 离线运行），直测出厂 `S3ObjectStorage` 的 key 前缀规范化、URI 构建/解析、bucket 自动创建、upload/download 往返、目录逐文件上传、`list_objects_v2` 分页与续传 token、`delete_uri`/`delete_prefix`/`delete_workspace` 与 backend 选择。该测试路径不需要连接真实 MinIO/S3；生产启用 `LIGHTRAG_OBJECT_STORAGE=minio|s3` 仍需要 `aioboto3`。
+> 测试覆盖：`tests/api/test_object_storage_s3.py` 仅在 boto3 client 边界打桩（`aioboto3` 在 `S3ObjectStorage._new_session` 内惰性 import，可注入 fake session 离线运行），直测出厂 `S3ObjectStorage` 的 key 前缀规范化、URI 构建/解析、bucket 自动创建、upload/download 往返、目录逐文件上传、`list_objects_v2` 分页与续传 token、`delete_uri`/`delete_prefix`/`delete_workspace`、`Expect` 请求头兼容处理与 backend 选择。该测试路径不需要连接真实 MinIO/S3；生产启用 `LIGHTRAG_OBJECT_STORAGE=minio|s3` 仍需要 `aioboto3`。
