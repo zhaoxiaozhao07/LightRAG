@@ -531,6 +531,91 @@ class DocumentLifecycleService:
             size_bytes=len(source.content),
         )
 
+    def _replacement_staging_path(
+        self, workspace: str, document_id: str, job_id: str
+    ) -> Path:
+        """Deterministic on-disk location for replacement bytes staged at claim
+        time so a durable worker can resume a ``replace`` job after a restart.
+
+        Lives inside the document directory (same containment boundary as the
+        source/artifacts) and is keyed by job id so concurrent replace attempts
+        never collide. A leading dot keeps it out of artifact listings.
+        """
+        document_dir = (self._source_root / workspace / document_id).resolve(
+            strict=False
+        )
+        return document_dir / f".replace-staging-{job_id}.bin"
+
+    async def stage_replacement_bytes(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        job_id: str,
+        replacement: DocumentReplacementSource,
+    ) -> str:
+        """Persist replacement bytes to disk at claim time.
+
+        The in-process replace task uses the in-memory ``replacement``; this
+        staged copy exists purely so that if the process crashes mid-replace
+        (orphan recovery → ``replace_failed`` → ``:retry`` → ``queued``), the
+        durable worker can rebuild the ``DocumentReplacementSource`` from disk
+        instead of needing the original request bytes.
+        """
+        record = await self._kb_service.get(kb_id)
+        document_dir = (self._source_root / record.workspace / document_id).resolve(
+            strict=False
+        )
+        document_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        staging_path = self._replacement_staging_path(
+            record.workspace, document_id, job_id
+        )
+        staging_path.write_bytes(replacement.content)
+        return str(staging_path)
+
+    async def load_staged_replacement(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        job_id: str,
+        source_name: str,
+        source_hash: str,
+        content_type: str | None,
+        size_bytes: int,
+    ) -> DocumentReplacementSource | None:
+        """Rebuild a ``DocumentReplacementSource`` from staged bytes for worker
+        resume. Returns ``None`` when the staging file is absent (e.g. the
+        original request never staged, so the job is not worker-resumable)."""
+        record = await self._kb_service.get(kb_id)
+        staging_path = self._replacement_staging_path(
+            record.workspace, document_id, job_id
+        )
+        if not staging_path.is_file():
+            return None
+        content = staging_path.read_bytes()
+        return DocumentReplacementSource(
+            source_name=source_name,
+            content=content,
+            source_hash=source_hash,
+            content_type=content_type,
+            size_bytes=size_bytes,
+        )
+
+    async def clear_staged_replacement(
+        self, kb_id: str, document_id: str, *, job_id: str
+    ) -> None:
+        """Best-effort removal of the staged replacement bytes once the replace
+        job reaches a terminal state."""
+        try:
+            record = await self._kb_service.get(kb_id)
+        except Exception:  # noqa: BLE001 — never let cleanup break the caller
+            return
+        staging_path = self._replacement_staging_path(
+            record.workspace, document_id, job_id
+        )
+        staging_path.unlink(missing_ok=True)
+
     async def claim_replace(
         self,
         kb_id: str,

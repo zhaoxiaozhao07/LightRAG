@@ -6,7 +6,7 @@ import io
 import json
 import zipfile
 from pathlib import Path
-from typing import Any, Literal, Optional, cast
+from typing import Any, Literal, Optional, Sequence, cast
 
 from fastapi import (
     APIRouter,
@@ -309,7 +309,7 @@ class BatchDeleteDocumentsRequest(BaseModel):
     delete_artifacts: bool = False
     delete_llm_cache: bool = False
     delete_graph_orphans: bool = True
-    strategy: Literal["safe", "rebuild_doc_scope", "rebuild_kb"] = "safe"
+    strategy: Literal["safe", "rebuild_doc_scope", "rebuild_kb", "rebuild_subgraph"] = "safe"
     idempotency_key: Optional[str] = None
 
     @field_validator("document_ids", mode="after")
@@ -678,6 +678,61 @@ async def _cancel_build_item(
     }
 
 
+async def _run_parse_with_forced_cancel(
+    *,
+    document_service: DocumentLifecycleService,
+    job_service: "JobService | None",
+    kb_id: str,
+    job_id: str,
+    plan: Any,
+    rag: Any,
+    poll_interval: float = 0.25,
+) -> dict[str, Any]:
+    """Run the parse (MinerU/native/docling) await, force-cancellable mid-flight.
+
+    The parse stage is the one long single ``await`` in the document pipeline
+    (a MinerU/Docling call can run for minutes). Stage-boundary cooperative
+    cancellation cannot interrupt it once entered. Here we run ``run_parse`` as
+    its own ``asyncio.Task`` and concurrently poll the job status; when the job
+    flips to ``cancelling`` we ``cancel()`` the in-flight task and stop.
+
+    This is **safe for the parse stage specifically** because parse is
+    idempotent: it writes a MinerU/Docling raw bundle + sidecar that a re-run
+    simply overwrites, and on cancel we reset the document to ``parse_failed``
+    (recoverable via ``:retry``). It is deliberately NOT applied to the
+    KG-build / vector-upsert stages, where a mid-``await`` interrupt could leave
+    a half-merged graph or partially-written vectors. Returns the parsed-data
+    dict on success; raises :class:`asyncio.CancelledError` when force-cancelled.
+
+    When ``job_service`` is None (no way to observe cancellation) it degrades to
+    a plain ``await`` with no polling overhead.
+    """
+    if job_service is None:
+        return await document_service.run_parse(rag, plan)
+
+    parse_task = asyncio.ensure_future(document_service.run_parse(rag, plan))
+    try:
+        while True:
+            done, _pending = await asyncio.wait({parse_task}, timeout=poll_interval)
+            if parse_task in done:
+                return parse_task.result()
+            if await _job_is_cancelling(job_service, kb_id, job_id):
+                parse_task.cancel()
+                try:
+                    await parse_task
+                except asyncio.CancelledError:
+                    pass
+                raise asyncio.CancelledError()
+    except asyncio.CancelledError:
+        if not parse_task.done():
+            parse_task.cancel()
+            try:
+                await parse_task
+            except asyncio.CancelledError:
+                pass
+        raise
+
+
 async def _execute_parse_plan(
     *,
     document_service: DocumentLifecycleService,
@@ -695,7 +750,21 @@ async def _execute_parse_plan(
         await document_service.mark_parse_running(
             kb_id, plan.document.id, job_id=job_id
         )
-        parsed_data = await document_service.run_parse(rag, plan)
+        try:
+            parsed_data = await _run_parse_with_forced_cancel(
+                document_service=document_service,
+                job_service=job_service,
+                kb_id=kb_id,
+                job_id=job_id,
+                plan=plan,
+                rag=rag,
+            )
+        except asyncio.CancelledError:
+            # Force-cancelled mid-parse: release the claim as a recoverable
+            # parse_failed and report a cancelled item (not a hard failure).
+            return await _cancel_parse_item(
+                document_service, kb_id=kb_id, job_id=job_id, plan=plan
+            )
         result = await document_service.complete_parse(
             kb_id,
             plan.document.id,
@@ -1227,8 +1296,8 @@ def _validate_delete_strategy(
       ``adelete_by_doc_id`` always prunes entities/relations that lose their
       last source (source-attribution); opting out is not yet supported, so we
       fail loudly rather than silently ignore the flag.
-    - ``strategy="rebuild_kb"`` requires a configured ``IndexBuildService`` to
-      run the post-delete conservative rebuild.
+    - ``strategy="rebuild_kb"`` / ``strategy="rebuild_subgraph"`` require a
+      configured ``IndexBuildService`` to run the post-delete rebuild.
     """
     if not delete_graph_orphans:
         raise HTTPException(
@@ -1238,10 +1307,10 @@ def _validate_delete_strategy(
                 "prunes graph entities/relations that lose their last source."
             ),
         )
-    if strategy == "rebuild_kb" and index_service is None:
+    if strategy in {"rebuild_kb", "rebuild_subgraph"} and index_service is None:
         raise HTTPException(
             status_code=503,
-            detail="strategy=rebuild_kb requires the KB index build service",
+            detail=f"strategy={strategy} requires the KB index build service",
         )
 
 
@@ -1317,6 +1386,198 @@ async def _run_conservative_kb_rebuild(
     }
 
 
+async def _capture_graph_footprint(
+    *, rag: Any, lightrag_doc_id: str | None
+) -> dict[str, Any]:
+    """Snapshot the entity names + relation pairs a doc contributed to the KG.
+
+    Must be called *before* ``adelete_by_doc_id`` runs, because deletion removes
+    the per-doc ``full_entities`` / ``full_relations`` rows this reads. Returns a
+    footprint of ``{"entities": set[str], "relations": set[frozenset{src,tgt}]}``
+    used by ``strategy="rebuild_subgraph"`` to find which *surviving* documents
+    overlap the deleted document's slice of the shared graph.
+
+    Resilient by design: any missing storage / row / key yields an empty
+    footprint (→ zero affected survivors), never an exception that would break
+    the delete itself.
+    """
+    entities: set[str] = set()
+    relations: set[frozenset] = set()
+    if not lightrag_doc_id:
+        return {"entities": entities, "relations": relations}
+    full_entities = getattr(rag, "full_entities", None)
+    full_relations = getattr(rag, "full_relations", None)
+    try:
+        if full_entities is not None:
+            data = await full_entities.get_by_id(lightrag_doc_id)
+            if isinstance(data, dict):
+                for name in data.get("entity_names", []) or []:
+                    if name:
+                        entities.add(str(name))
+    except Exception as exc:  # noqa: BLE001 — footprint is best-effort
+        logger.warning(
+            "rebuild_subgraph: failed to read entities for '%s': %s",
+            lightrag_doc_id,
+            exc,
+        )
+    try:
+        if full_relations is not None:
+            data = await full_relations.get_by_id(lightrag_doc_id)
+            if isinstance(data, dict):
+                for pair in data.get("relation_pairs", []) or []:
+                    if isinstance(pair, (list, tuple)) and len(pair) == 2 and all(pair):
+                        relations.add(frozenset((str(pair[0]), str(pair[1]))))
+    except Exception as exc:  # noqa: BLE001 — footprint is best-effort
+        logger.warning(
+            "rebuild_subgraph: failed to read relations for '%s': %s",
+            lightrag_doc_id,
+            exc,
+        )
+    return {"entities": entities, "relations": relations}
+
+
+def _merge_footprints(footprints: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    entities: set[str] = set()
+    relations: set[frozenset] = set()
+    for footprint in footprints:
+        entities |= footprint.get("entities", set())
+        relations |= footprint.get("relations", set())
+    return {"entities": entities, "relations": relations}
+
+
+async def _document_overlaps_footprint(
+    *, rag: Any, lightrag_doc_id: str | None, footprint: dict[str, Any]
+) -> bool:
+    """True if a surviving document still contributes to any entity/relation in
+    the deleted document's footprint (→ its KG slice may need re-derivation)."""
+    if not lightrag_doc_id:
+        return False
+    target_entities: set[str] = footprint.get("entities", set())
+    target_relations: set[frozenset] = footprint.get("relations", set())
+    if not target_entities and not target_relations:
+        return False
+    full_entities = getattr(rag, "full_entities", None)
+    full_relations = getattr(rag, "full_relations", None)
+    try:
+        if target_entities and full_entities is not None:
+            data = await full_entities.get_by_id(lightrag_doc_id)
+            if isinstance(data, dict):
+                names = {str(n) for n in (data.get("entity_names", []) or []) if n}
+                if names & target_entities:
+                    return True
+        if target_relations and full_relations is not None:
+            data = await full_relations.get_by_id(lightrag_doc_id)
+            if isinstance(data, dict):
+                pairs = {
+                    frozenset((str(p[0]), str(p[1])))
+                    for p in (data.get("relation_pairs", []) or [])
+                    if isinstance(p, (list, tuple)) and len(p) == 2 and all(p)
+                }
+                if pairs & target_relations:
+                    return True
+    except Exception as exc:  # noqa: BLE001 — overlap check is best-effort
+        logger.warning(
+            "rebuild_subgraph: overlap check failed for '%s': %s",
+            lightrag_doc_id,
+            exc,
+        )
+    return False
+
+
+async def _run_subgraph_rebuild(
+    *,
+    document_service: DocumentLifecycleService,
+    index_service: IndexBuildService,
+    registry: LightRAGInstanceRegistry,
+    kb_id: str,
+    footprint: dict[str, Any],
+) -> dict[str, Any]:
+    """Precise shared-subgraph local rebuild for ``strategy="rebuild_subgraph"``.
+
+    Unlike ``rebuild_kb`` (which force-reindexes *every* remaining buildable
+    document), this re-derives only the *surviving* documents that actually
+    shared an entity or relation with the just-deleted document — i.e. the
+    documents whose KG slice the deletion could have perturbed. Documents that
+    never touched the deleted document's footprint are left untouched.
+
+    The engine's ``adelete_by_doc_id`` already narrows shared entities' source
+    attribution; this step rebuilds the overlapping survivors from their
+    remaining chunks so descriptions/summaries derived partly from the removed
+    source are regenerated. Falls back to reindexing nothing (not the whole KB)
+    when the footprint is empty.
+    """
+    rag = await registry.get(kb_id)
+    candidate_ids: list[str] = []
+    for status in ("parsed", "ready", "build_failed"):
+        offset = 0
+        page_size = 200
+        while True:
+            documents, total = await document_service.list_documents(
+                kb_id, status=status, limit=page_size, offset=offset
+            )
+            candidate_ids.extend(doc.id for doc in documents)
+            offset += page_size
+            if offset >= total or not documents:
+                break
+    candidate_ids = list(dict.fromkeys(candidate_ids))
+
+    affected_ids: list[str] = []
+    for document_id in candidate_ids:
+        try:
+            doc = await document_service.get_document(kb_id, document_id)
+        except Exception:  # noqa: BLE001 — skip vanished docs
+            continue
+        if await _document_overlaps_footprint(
+            rag=rag, lightrag_doc_id=doc.lightrag_doc_id, footprint=footprint
+        ):
+            affected_ids.append(document_id)
+
+    rebuilt = 0
+    failed = 0
+    for document_id in affected_ids:
+        try:
+            plan = await index_service.create_build_plan(
+                kb_id,
+                document_id,
+                rag=rag,
+                force_rechunk=True,
+                force_extract=True,
+                force_embedding=True,
+            )
+            if not plan.skipped:
+                await index_service.claim_build_queued(
+                    kb_id, job_id=f"rebuild_subgraph::{document_id}", plan=plan
+                )
+            item = await _execute_build_plan(
+                index_service=index_service,
+                kb_id=kb_id,
+                job_id=f"rebuild_subgraph::{document_id}",
+                plan=plan,
+                rag=rag,
+            )
+            if item["status"] == "succeeded":
+                rebuilt += 1
+            else:
+                failed += 1
+        except Exception as exc:  # noqa: BLE001 — isolate per-doc rebuild failures
+            failed += 1
+            logger.error(
+                "Subgraph rebuild of doc '%s' (KB '%s') failed: %s",
+                document_id,
+                kb_id,
+                exc,
+            )
+    return {
+        "strategy": "rebuild_subgraph",
+        "rebuilt_documents": rebuilt,
+        "failed_documents": failed,
+        "affected_documents": len(affected_ids),
+        "total_candidates": len(candidate_ids),
+        "footprint_entities": len(footprint.get("entities", set())),
+        "footprint_relations": len(footprint.get("relations", set())),
+    }
+
+
 def _active_job_error_code(
     exc: ActiveDocumentParseJobError
     | ActiveDocumentBuildJobError
@@ -1345,6 +1606,186 @@ def _active_job_conflict_detail(
         "message": str(exc),
     }
 
+
+
+async def _execute_replace_document(
+    *,
+    document_service: DocumentLifecycleService,
+    kb_id: str,
+    job: JobRecord,
+    document: DocumentRecord,
+    replacement: DocumentReplacementSource,
+    active_registry: LightRAGInstanceRegistry,
+    active_index_service: IndexBuildService | None,
+    delete_source_file: bool,
+    delete_artifacts: bool,
+    delete_llm_cache: bool,
+    auto_parse: bool,
+    auto_index: bool,
+    parser_engine: str | None,
+    process_options: str | None,
+    force_reparse: bool,
+) -> dict[str, Any]:
+    replace_completed = False
+    old_index_deleted = False
+    lightrag_result = None
+    try:
+        rag: Any | None = None
+        await document_service.preflight_replace_cleanup(
+            kb_id,
+            document,
+            delete_source_file=delete_source_file,
+            delete_artifacts=delete_artifacts,
+        )
+        if document.lightrag_doc_id:
+            rag_for_delete = cast(Any, await active_registry.get(kb_id))
+            if rag_for_delete is None:
+                raise RuntimeError(f"LightRAG instance unavailable for KB {kb_id}")
+            rag = rag_for_delete
+            lightrag_result = await rag_for_delete.adelete_by_doc_id(
+                document.lightrag_doc_id,
+                delete_llm_cache=delete_llm_cache,
+            )
+            if getattr(lightrag_result, "status", None) not in {
+                "success",
+                "not_found",
+            }:
+                raise RuntimeError(
+                    getattr(lightrag_result, "message", None)
+                    or f"LightRAG deletion failed for {document.lightrag_doc_id}"
+                )
+            old_index_deleted = True
+
+        (
+            replaced_document,
+            file_result,
+        ) = await document_service.replace_document_source(
+            kb_id,
+            document,
+            job_id=job.id,
+            replacement=replacement,
+            delete_source_file=delete_source_file,
+            delete_artifacts=delete_artifacts,
+            lightrag_delete_result=_deletion_result_payload(lightrag_result),
+        )
+        replace_completed = True
+        item: dict[str, Any] = {
+            "document_id": replaced_document.id,
+            "status": "succeeded",
+            "source_name": replaced_document.source_name,
+            "source_uri": replaced_document.source_uri,
+            "source_hash": replaced_document.source_hash,
+            "previous_lightrag_doc_id": document.lightrag_doc_id,
+            "lightrag_delete_result": _deletion_result_payload(lightrag_result),
+            "file_replace_result": _file_result_payload(file_result),
+        }
+
+        if auto_parse:
+            if rag is None:
+                rag = cast(Any, await active_registry.get(kb_id))
+            parse_plan = await document_service.create_parse_plan(
+                kb_id,
+                replaced_document.id,
+                parser_engine=parser_engine,
+                process_options=process_options,
+                force_reparse=force_reparse,
+                auto_index=auto_index,
+            )
+            await document_service.mark_parse_queued(
+                kb_id,
+                replaced_document.id,
+                job=job,
+                plan=parse_plan,
+            )
+            parse_item = await _execute_parse_plan(
+                document_service=document_service,
+                kb_id=kb_id,
+                job_id=job.id,
+                plan=parse_plan,
+                rag=rag,
+            )
+            item["parse_result"] = parse_item
+            if parse_item["status"] != "succeeded":
+                item.update(
+                    {
+                        "status": "failed",
+                        "error_code": parse_item.get("error_code", "parse_failed"),
+                        "error_message": parse_item.get(
+                            "error_message", "Replacement parse failed"
+                        ),
+                    }
+                )
+                return item
+
+            if auto_index:
+                if active_index_service is None:
+                    raise RuntimeError("KB index build service is not configured")
+                build_plan = await active_index_service.create_build_plan(
+                    kb_id,
+                    replaced_document.id,
+                    rag=rag,
+                )
+                await active_index_service.claim_build_queued(
+                    kb_id, job_id=job.id, plan=build_plan
+                )
+                build_item = await _execute_build_plan(
+                    index_service=active_index_service,
+                    kb_id=kb_id,
+                    job_id=job.id,
+                    plan=build_plan,
+                    rag=rag,
+                )
+                item["build_result"] = build_item
+                if build_item["status"] != "succeeded":
+                    item.update(
+                        {
+                            "status": "failed",
+                            "error_code": build_item.get(
+                                "error_code", "build_failed"
+                            ),
+                            "error_message": build_item.get(
+                                "error_message", "Replacement build failed"
+                            ),
+                        }
+                    )
+        return item
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Failed to replace document '%s' for KB '%s': %s",
+            document.id,
+            kb_id,
+            exc,
+        )
+        if not replace_completed:
+            try:
+                await document_service.fail_replace(
+                    kb_id,
+                    document.id,
+                    job_id=job.id,
+                    error_code="replace_failed",
+                    error_message=str(exc),
+                    clear_index_metadata=old_index_deleted,
+                    lightrag_delete_result=_deletion_result_payload(
+                        lightrag_result
+                    ),
+                )
+            except Exception as transition_exc:
+                logger.error(
+                    "Failed to mark document '%s' failed for replace job '%s': %s",
+                    document.id,
+                    job.id,
+                    transition_exc,
+                )
+        return {
+            "document_id": document.id,
+            "status": "failed",
+            "error_code": (
+                "replace_failed"
+                if not replace_completed
+                else "replace_followup_failed"
+            ),
+            "error_message": str(exc),
+        }
 
 def create_kb_document_routes(
     document_service: DocumentLifecycleService,
@@ -1651,183 +2092,6 @@ def create_kb_document_routes(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    async def _execute_replace_document(
-        *,
-        kb_id: str,
-        job: JobRecord,
-        document: DocumentRecord,
-        replacement: DocumentReplacementSource,
-        active_registry: LightRAGInstanceRegistry,
-        active_index_service: IndexBuildService | None,
-        delete_source_file: bool,
-        delete_artifacts: bool,
-        delete_llm_cache: bool,
-        auto_parse: bool,
-        auto_index: bool,
-        parser_engine: str | None,
-        process_options: str | None,
-        force_reparse: bool,
-    ) -> dict[str, Any]:
-        replace_completed = False
-        old_index_deleted = False
-        lightrag_result = None
-        try:
-            rag: Any | None = None
-            await document_service.preflight_replace_cleanup(
-                kb_id,
-                document,
-                delete_source_file=delete_source_file,
-                delete_artifacts=delete_artifacts,
-            )
-            if document.lightrag_doc_id:
-                rag_for_delete = cast(Any, await active_registry.get(kb_id))
-                if rag_for_delete is None:
-                    raise RuntimeError(f"LightRAG instance unavailable for KB {kb_id}")
-                rag = rag_for_delete
-                lightrag_result = await rag_for_delete.adelete_by_doc_id(
-                    document.lightrag_doc_id,
-                    delete_llm_cache=delete_llm_cache,
-                )
-                if getattr(lightrag_result, "status", None) not in {
-                    "success",
-                    "not_found",
-                }:
-                    raise RuntimeError(
-                        getattr(lightrag_result, "message", None)
-                        or f"LightRAG deletion failed for {document.lightrag_doc_id}"
-                    )
-                old_index_deleted = True
-
-            (
-                replaced_document,
-                file_result,
-            ) = await document_service.replace_document_source(
-                kb_id,
-                document,
-                job_id=job.id,
-                replacement=replacement,
-                delete_source_file=delete_source_file,
-                delete_artifacts=delete_artifacts,
-                lightrag_delete_result=_deletion_result_payload(lightrag_result),
-            )
-            replace_completed = True
-            item: dict[str, Any] = {
-                "document_id": replaced_document.id,
-                "status": "succeeded",
-                "source_name": replaced_document.source_name,
-                "source_uri": replaced_document.source_uri,
-                "source_hash": replaced_document.source_hash,
-                "previous_lightrag_doc_id": document.lightrag_doc_id,
-                "lightrag_delete_result": _deletion_result_payload(lightrag_result),
-                "file_replace_result": _file_result_payload(file_result),
-            }
-
-            if auto_parse:
-                if rag is None:
-                    rag = cast(Any, await active_registry.get(kb_id))
-                parse_plan = await document_service.create_parse_plan(
-                    kb_id,
-                    replaced_document.id,
-                    parser_engine=parser_engine,
-                    process_options=process_options,
-                    force_reparse=force_reparse,
-                    auto_index=auto_index,
-                )
-                await document_service.mark_parse_queued(
-                    kb_id,
-                    replaced_document.id,
-                    job=job,
-                    plan=parse_plan,
-                )
-                parse_item = await _execute_parse_plan(
-                    document_service=document_service,
-                    kb_id=kb_id,
-                    job_id=job.id,
-                    plan=parse_plan,
-                    rag=rag,
-                )
-                item["parse_result"] = parse_item
-                if parse_item["status"] != "succeeded":
-                    item.update(
-                        {
-                            "status": "failed",
-                            "error_code": parse_item.get("error_code", "parse_failed"),
-                            "error_message": parse_item.get(
-                                "error_message", "Replacement parse failed"
-                            ),
-                        }
-                    )
-                    return item
-
-                if auto_index:
-                    if active_index_service is None:
-                        raise RuntimeError("KB index build service is not configured")
-                    build_plan = await active_index_service.create_build_plan(
-                        kb_id,
-                        replaced_document.id,
-                        rag=rag,
-                    )
-                    await active_index_service.claim_build_queued(
-                        kb_id, job_id=job.id, plan=build_plan
-                    )
-                    build_item = await _execute_build_plan(
-                        index_service=active_index_service,
-                        kb_id=kb_id,
-                        job_id=job.id,
-                        plan=build_plan,
-                        rag=rag,
-                    )
-                    item["build_result"] = build_item
-                    if build_item["status"] != "succeeded":
-                        item.update(
-                            {
-                                "status": "failed",
-                                "error_code": build_item.get(
-                                    "error_code", "build_failed"
-                                ),
-                                "error_message": build_item.get(
-                                    "error_message", "Replacement build failed"
-                                ),
-                            }
-                        )
-            return item
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "Failed to replace document '%s' for KB '%s': %s",
-                document.id,
-                kb_id,
-                exc,
-            )
-            if not replace_completed:
-                try:
-                    await document_service.fail_replace(
-                        kb_id,
-                        document.id,
-                        job_id=job.id,
-                        error_code="replace_failed",
-                        error_message=str(exc),
-                        clear_index_metadata=old_index_deleted,
-                        lightrag_delete_result=_deletion_result_payload(
-                            lightrag_result
-                        ),
-                    )
-                except Exception as transition_exc:
-                    logger.error(
-                        "Failed to mark document '%s' failed for replace job '%s': %s",
-                        document.id,
-                        job.id,
-                        transition_exc,
-                    )
-            return {
-                "document_id": document.id,
-                "status": "failed",
-                "error_code": (
-                    "replace_failed"
-                    if not replace_completed
-                    else "replace_followup_failed"
-                ),
-                "error_message": str(exc),
-            }
 
     async def _run_sync_followups(
         *,
@@ -2041,6 +2305,7 @@ def create_kb_document_routes(
                     force_reparse=force_reparse,
                 )
                 replace_item = await _execute_replace_document(
+                    document_service=document_service,
                     kb_id=kb_id,
                     job=job,
                     document=claimed,
@@ -2490,6 +2755,15 @@ def create_kb_document_routes(
                     process_options=process_options,
                     force_reparse=force_reparse,
                 )
+                # Stage the replacement bytes to disk so a durable worker can
+                # resume this replace from disk after a crash (orphan recovery
+                # → replace_failed → :retry → queued → worker re-drive).
+                await document_service.stage_replacement_bytes(
+                    kb_id,
+                    document_id,
+                    job_id=job.id,
+                    replacement=replacement,
+                )
             except (
                 ActiveDocumentParseJobError,
                 ActiveDocumentBuildJobError,
@@ -2518,6 +2792,7 @@ def create_kb_document_routes(
                         kb_id, job.id, status="running", progress=0.1
                     )
                     item = await _execute_replace_document(
+                        document_service=document_service,
                         kb_id=kb_id,
                         job=job,
                         document=document,
@@ -2653,7 +2928,7 @@ def create_kb_document_routes(
         delete_artifacts: bool = False,
         delete_llm_cache: bool = False,
         delete_graph_orphans: bool = True,
-        strategy: Literal["safe", "rebuild_doc_scope", "rebuild_kb"] = "safe",
+        strategy: Literal["safe", "rebuild_doc_scope", "rebuild_kb", "rebuild_subgraph"] = "safe",
         idempotency_key: Optional[str] = None,
     ):
         if registry is None:
@@ -2734,6 +3009,15 @@ def create_kb_document_routes(
                     await job_service.transition_job(
                         kb_id, job.id, status="running", progress=0.1
                     )
+                    # Capture the doc's graph footprint BEFORE deletion removes
+                    # its full_entities/full_relations rows (rebuild_subgraph).
+                    pre_delete_footprint: dict[str, Any] | None = None
+                    if strategy == "rebuild_subgraph" and index_service is not None:
+                        footprint_rag = cast(Any, await active_registry.get(kb_id))
+                        pre_delete_footprint = await _capture_graph_footprint(
+                            rag=footprint_rag,
+                            lightrag_doc_id=document.lightrag_doc_id,
+                        )
                     item = await _execute_delete_document(
                         kb_id=kb_id,
                         job_id=job.id,
@@ -2751,6 +3035,18 @@ def create_kb_document_routes(
                                 index_service=index_service,
                                 registry=active_registry,
                                 kb_id=kb_id,
+                            )
+                        elif (
+                            strategy == "rebuild_subgraph"
+                            and index_service is not None
+                        ):
+                            rebuild_summary = await _run_subgraph_rebuild(
+                                document_service=document_service,
+                                index_service=index_service,
+                                registry=active_registry,
+                                kb_id=kb_id,
+                                footprint=pre_delete_footprint
+                                or {"entities": set(), "relations": set()},
                             )
                         result_payload = _delete_job_result(
                             total_items=1,
@@ -2875,6 +3171,17 @@ def create_kb_document_routes(
                             items=item_results,
                         ),
                     )
+                    # Capture footprints BEFORE deletion (rebuild_subgraph).
+                    pre_delete_footprints: list[dict[str, Any]] = []
+                    if request.strategy == "rebuild_subgraph" and index_service is not None:
+                        footprint_rag = cast(Any, await active_registry.get(kb_id))
+                        for document in documents:
+                            pre_delete_footprints.append(
+                                await _capture_graph_footprint(
+                                    rag=footprint_rag,
+                                    lightrag_doc_id=document.lightrag_doc_id,
+                                )
+                            )
                     for document in documents:
                         item = await _execute_delete_document(
                             kb_id=kb_id,
@@ -2907,6 +3214,18 @@ def create_kb_document_routes(
                             index_service=index_service,
                             registry=active_registry,
                             kb_id=kb_id,
+                        )
+                    elif (
+                        request.strategy == "rebuild_subgraph"
+                        and completed_items > 0
+                        and index_service is not None
+                    ):
+                        final_result["rebuild"] = await _run_subgraph_rebuild(
+                            document_service=document_service,
+                            index_service=index_service,
+                            registry=active_registry,
+                            kb_id=kb_id,
+                            footprint=_merge_footprints(pre_delete_footprints),
                         )
                     await job_service.transition_job(
                         kb_id,

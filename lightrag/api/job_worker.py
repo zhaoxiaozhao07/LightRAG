@@ -752,6 +752,126 @@ def build_delete_executor(
     return _run
 
 
+def build_replace_executor(
+    *,
+    document_service: Any,
+    registry: Any,
+    job_service: JobService,
+    index_service: Any | None = None,
+) -> JobExecutor:
+    """Executor that re-drives a queued single-document ``replace`` job.
+
+    Replace jobs become worker-resumable because the replacement bytes are
+    staged to disk at claim time (``stage_replacement_bytes``). After a crash,
+    orphan recovery fails the in-flight job and resets the document to
+    ``replace_failed``; a ``:retry`` puts the job back to ``queued`` and this
+    executor rebuilds the ``DocumentReplacementSource`` from the staged file,
+    re-claims the document into ``replacing`` and replays the same
+    ``_execute_replace_document`` the route uses (delete old index → swap source
+    → optional auto_parse/auto_index). If the staged bytes are missing (an older
+    job that never staged), it fails cleanly with a clear error rather than
+    guessing.
+    """
+    from lightrag.api.routers.kb_document_routes import _execute_replace_document
+
+    async def _run(job: JobRecord) -> None:
+        kb_id = job.kb_id
+        payload = job.payload or {}
+        document_id = job.document_id or payload.get("document_id")
+        if not document_id:
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                failed_items=1,
+                error_code="worker_invalid_payload",
+                error_message="replace job has no document_id",
+            )
+            return
+        document_id = str(document_id)
+        replacement = await document_service.load_staged_replacement(
+            kb_id,
+            document_id,
+            job_id=job.id,
+            source_name=str(payload.get("source_name") or "replacement"),
+            source_hash=str(payload.get("source_hash") or ""),
+            content_type=payload.get("content_type"),
+            size_bytes=int(payload.get("size_bytes") or 0),
+        )
+        if replacement is None:
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                failed_items=1,
+                error_code="replace_not_resumable",
+                error_message=(
+                    "replacement bytes were not staged for this job; "
+                    "re-submit the replace request"
+                ),
+            )
+            return
+        document = await document_service.claim_replace(
+            kb_id,
+            document_id,
+            job=job,
+            replacement=replacement,
+            delete_source_file=bool(payload.get("delete_source_file", True)),
+            delete_artifacts=bool(payload.get("delete_artifacts", True)),
+            delete_llm_cache=bool(payload.get("delete_llm_cache", False)),
+            auto_parse=bool(payload.get("auto_parse", False)),
+            auto_index=bool(payload.get("auto_index", False)),
+            parser_engine=payload.get("parser_engine"),
+            process_options=payload.get("process_options"),
+            force_reparse=bool(payload.get("force_reparse", False)),
+        )
+        item = await _execute_replace_document(
+            document_service=document_service,
+            kb_id=kb_id,
+            job=job,
+            document=document,
+            replacement=replacement,
+            active_registry=registry,
+            active_index_service=index_service,
+            delete_source_file=bool(payload.get("delete_source_file", True)),
+            delete_artifacts=bool(payload.get("delete_artifacts", True)),
+            delete_llm_cache=bool(payload.get("delete_llm_cache", False)),
+            auto_parse=bool(payload.get("auto_parse", False)),
+            auto_index=bool(payload.get("auto_index", False)),
+            parser_engine=payload.get("parser_engine"),
+            process_options=payload.get("process_options"),
+            force_reparse=bool(payload.get("force_reparse", False)),
+        )
+        await document_service.clear_staged_replacement(
+            kb_id, document_id, job_id=job.id
+        )
+        if item["status"] == "succeeded":
+            item["resumed_by_worker"] = True
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="succeeded",
+                progress=1.0,
+                completed_items=1,
+                result=item,
+            )
+        else:
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                failed_items=1,
+                error_code=item.get("error_code", "replace_failed"),
+                error_message=item.get("error_message", "replace failed"),
+                result=item,
+            )
+
+    return _run
+
+
 def build_clear_kb_executor(*, deletion_service: Any) -> JobExecutor:
     """Executor that re-drives a queued ``clear_kb`` (KB hard-delete) job.
 

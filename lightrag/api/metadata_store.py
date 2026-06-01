@@ -42,10 +42,11 @@ _T = TypeVar("_T")
 #   files are already on disk before the job runs;
 # - ``clear_kb``: carries ``kb_id`` / ``workspace``; the destructive clear is
 #   idempotent so a queued job can be re-driven after restart.
-# Single-document ``replace`` would match the ``document_id IS NOT NULL`` arm,
-# but its uploaded bytes are not persisted for resume and no durable executor
-# is registered, so it is not worker-resumable today. Batch ``sync`` likewise
-# still needs per-item request bytes and is NOT worker-resumable.
+# Single-document ``replace`` matches the ``document_id IS NOT NULL`` arm and is
+# now worker-resumable: its uploaded bytes are staged to disk at claim time
+# (``stage_replacement_bytes``) and a ``replace`` executor is registered, so a
+# queued/retried replace job can be re-driven from disk. Batch ``sync`` still
+# needs per-item request bytes for all items and is NOT worker-resumable.
 _AGGREGATE_RESUMABLE_JOB_TYPES: frozenset[str] = frozenset(
     {"delete", "parse", "build_kg", "reindex", "clear_kb"}
 )

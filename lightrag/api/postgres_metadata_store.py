@@ -26,7 +26,6 @@ from lightrag.api.metadata_store import (
     JobRecord,
     MetadataJobStatus,
     MetadataRecordNotFoundError,
-    SQLiteMetadataStore,
 )
 
 _T = TypeVar("_T")
@@ -236,7 +235,12 @@ class PostgresMetadataStore:
             clauses.append(f"status = ${len(params)}")
         if source_name is not None:
             params.append(f"%{_escape_like(source_name)}%")
-            clauses.append(f"source_name ILIKE ${len(params)} ESCAPE '\\\\'")
+            # ESCAPE must be a single character. ``_escape_like`` escapes with a
+            # single backslash, so the SQL escape string is one backslash too:
+            # the Python literal ``"\\"`` is exactly one backslash at runtime.
+            # (Using ``"\\\\"`` here sends a two-char string to Postgres, which
+            # rejects it with InvalidEscapeSequenceError.)
+            clauses.append(f"source_name ILIKE ${len(params)} ESCAPE '\\'")
         where = " AND ".join(clauses)
         async with self._pool_or_raise().acquire() as conn:
             total = await conn.fetchval(f"SELECT COUNT(*) FROM kb_documents WHERE {where}", *params)

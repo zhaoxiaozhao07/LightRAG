@@ -2241,6 +2241,7 @@ def create_app(args):
             build_clear_kb_executor,
             build_delete_executor,
             build_parse_executor,
+            build_replace_executor,
         )
 
         parse_executor = build_parse_executor(
@@ -2261,6 +2262,12 @@ def create_app(args):
             job_service=job_service,
             index_service=index_build_service,
         )
+        replace_executor = build_replace_executor(
+            document_service=document_lifecycle_service,
+            registry=kb_registry,
+            job_service=job_service,
+            index_service=index_build_service,
+        )
         clear_kb_executor = build_clear_kb_executor(
             deletion_service=kb_deletion_service,
         )
@@ -2271,6 +2278,7 @@ def create_app(args):
                 "build_kg": build_executor,
                 "reindex": build_executor,
                 "delete": delete_executor,
+                "replace": replace_executor,
                 "clear_kb": clear_kb_executor,
             },
             poll_interval_seconds=get_env_value(

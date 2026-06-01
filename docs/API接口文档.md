@@ -228,7 +228,7 @@ DELETE /kbs/{kb_id}/documents/{document_id}?delete_source_file=false&delete_arti
 行为：
 - 创建 `delete` job，并将文档原子 claim 到 `deleting`；已有 `parse_queued/parsing`、`build_queued/building`、`deleting` 或 `replacing` 时返回 `409`。
 - 若文档已有 `lightrag_doc_id`，后台任务调用 `LightRAG.adelete_by_doc_id`；底层返回 `success` 或 `not_found` 都视为删除成功，适配尚未入库或已被清理的文档。
-- **共享图谱删除策略 `strategy`**（`safe` / `rebuild_doc_scope` / `rebuild_kb`，默认 `safe`）：`safe` 与 `rebuild_doc_scope` 复用 `adelete_by_doc_id` 内建的 source-attribution（按剩余来源判定）+ 共享实体保守重建，仅清除失去最后来源的实体/关系；`rebuild_kb` 在删除成功后对 KB 内剩余可构建文档执行一次保守全量 force-reindex（重派生可能受删除影响的共享图谱），结果记录在 job `result.rebuild`。`rebuild_kb` 需路由注入 `IndexBuildService`，否则返回 `503`。
+- **共享图谱删除策略 `strategy`**（`safe` / `rebuild_doc_scope` / `rebuild_kb` / `rebuild_subgraph`，默认 `safe`）：`safe` 与 `rebuild_doc_scope` 复用 `adelete_by_doc_id` 内建的 source-attribution（按剩余来源判定）+ 共享实体保守重建，仅清除失去最后来源的实体/关系；`rebuild_kb` 在删除成功后对 KB 内剩余**全部**可构建文档执行一次保守 force-reindex；`rebuild_subgraph` 是**精确子图局部重建**：在删除前先快照被删文档贡献的实体名/关系对（`full_entities`/`full_relations`），删除成功后**只对与该足迹有交集的幸存文档**做 force-reindex，未触及被删文档子图的文档完全不动。两种 rebuild 的结果都记录在 job `result.rebuild`（`rebuild_subgraph` 额外返回 `affected_documents` / `footprint_entities` / `footprint_relations`）。`rebuild_kb` 与 `rebuild_subgraph` 都需路由注入 `IndexBuildService`，否则返回 `503`。
 - **`delete_graph_orphans`**（默认 `true`）：引擎始终修剪失去最后来源的孤立实体/关系；显式传 `false` 暂不支持，返回 `400`。
 - `delete_source_file=true` / `delete_artifacts=true` 时仅允许删除 `INPUT_DIR/<workspace>/<document_id>/...` 内的 source/artifact 文件或目录（source 与 artifact 均锚定到规范化的 `<workspace>/<document_id>` 目录做 containment 校验），路径逃逸会使 job 失败并保留文档为 `delete_failed`。启用对象存储时会同步删除 `metadata.source_object_uri`、artifact `metadata.object_uri` / `metadata.object_prefix_uri`，并在 job result 的 `file_delete_result.deleted_objects[]` 中返回已清理对象 URI/prefix。
 
@@ -483,7 +483,8 @@ POST /kbs/{kb_id}/jobs/{job_id}:cancel
 
 状态转换规则：
 - `queued` → `cancelled`，`error_code=cancelled_by_user`。
-- `running` / `retrying` → `cancelling`。parse / build_kg / reindex 执行器在进入昂贵阶段（解析 / chunk-抽取-嵌入）前会检查 `cancelling` 协作式取消检查点：命中则不调用 parser/pipeline，job 转 `cancelled`，文档释放回 `parse_failed` / `build_failed`（可经 `:retry` 重跑）。已越过检查点、正在执行单次长 await 的任务仍会跑完该阶段，尚无 await 内强制中断。
+- `running` / `retrying` → `cancelling`。parse / build_kg / reindex 执行器在进入昂贵阶段（解析 / chunk-抽取-嵌入）前会检查 `cancelling` 协作式取消检查点：命中则不调用 parser/pipeline，job 转 `cancelled`，文档释放回 `parse_failed` / `build_failed`（可经 `:retry` 重跑）。
+- **parse 阶段额外支持 await 内强制中断**：进入解析后，执行器把单次长 parse await（MinerU/Docling/native）作为独立 `asyncio.Task` 运行，并并发轮询 job 状态；一旦翻转为 `cancelling` 即 `cancel()` 该任务，**无需等待解析跑完**，文档释放回 `parse_failed`（可 `:retry`）。这是安全的，因为解析幂等——重跑只是覆盖 raw bundle/sidecar。**build_kg / 向量写入阶段刻意不做 await 内强制中断**（中途打断可能留下半合并图谱/半写入向量），仍只用阶段边界协作式取消。
 - `succeeded` / `failed` / `cancelled` 视为 no-op，原样返回当前 job。
 - `cancelling` 视为 no-op。
 
@@ -511,11 +512,12 @@ Content-Type: application/json
 > 通过环境变量 `LIGHTRAG_KB_JOB_WORKER=true` 启用。默认关闭，关闭时行为与历史一致（仅 in-process 背景任务，重启后遗留任务一律标 `failed`）。
 
 启用后：
-- 服务启动会拉起一个后台轮询 worker，原子认领（`queued → running` 单赢 CAS）以下可从持久化状态重建的任务类型并执行到终态：单文档 `parse` / `build_kg` / `reindex` / `delete`，**聚合** `parse` / `build_kg` / `reindex`（`document_id=null`、payload 携带 `document_ids`，含多文件 `upload` / `texts` 的 auto_parse 聚合 job 与 `batch-parse` / `batch-build-kg` / `batch-reindex` / `:rebuild`），`documents:batch-delete` 聚合 `delete` job，以及 `clear_kb`（KB 硬删除，payload 携带 `kb_id`/`workspace`，幂等清理可重启续跑）。聚合 parse/build 之所以可恢复，是因为其源文件 / 解析产物在 job 运行前已落盘，worker 可凭 `document_ids` 重新规划并逐个 claim 执行。
+- 服务启动会拉起一个后台轮询 worker，原子认领（`queued → running` 单赢 CAS）以下可从持久化状态重建的任务类型并执行到终态：单文档 `parse` / `build_kg` / `reindex` / `delete` / `replace`，**聚合** `parse` / `build_kg` / `reindex`（`document_id=null`、payload 携带 `document_ids`，含多文件 `upload` / `texts` 的 auto_parse 聚合 job 与 `batch-parse` / `batch-build-kg` / `batch-reindex` / `:rebuild`），`documents:batch-delete` 聚合 `delete` job，以及 `clear_kb`（KB 硬删除，payload 携带 `kb_id`/`workspace`，幂等清理可重启续跑）。聚合 parse/build 之所以可恢复，是因为其源文件 / 解析产物在 job 运行前已落盘，worker 可凭 `document_ids` 重新规划并逐个 claim 执行。
+- **单文档 `replace` 现已可恢复**：replace 创建并 claim 时会把替换源字节落盘到 `INPUT_DIR/<workspace>/<document_id>/.replace-staging-<job_id>.bin`，因此 worker 可在重启/`:retry` 后凭 staged 字节重建 `DocumentReplacementSource`，重新 claim 文档进入 `replacing`，复用与同步路径一致的执行逻辑（删旧索引 → 换 source → 可选 auto_parse/auto_index），终态后清理 staging 文件。若 staged 字节缺失（历史 job 未落盘），worker 以 `replace_not_resumable` 明确失败而非猜测。
 - **自动消费 `:retry`**：重试把任务重置回 `queued` 后，worker 在下一轮轮询中认领并重跑，客户端无需再次发起业务请求。
-- **重启续跑**：进程重启时，孤儿恢复会保留这些可恢复类型的 `queued` 任务（不再标 `failed`）交给 worker 继续执行；仍处于 `running` 的中途任务无法安全恢复，照旧标 `failed`，其文档同步重置为 `*_failed`，客户端 `:retry` 后即可被 worker 自动重跑。delete 续跑时若孤儿恢复已把文档从 `deleting` 重置为 `delete_failed`，worker 会重新 claim 回 `deleting` 再执行（`_claim_document_deleting` 接受同一 delete job id 的幂等 reclaim）。
+- **重启续跑**：进程重启时，孤儿恢复会保留这些可恢复类型的 `queued` 任务（不再标 `failed`）交给 worker 继续执行；仍处于 `running` 的中途任务无法安全恢复，照旧标 `failed`，其文档同步重置为 `*_failed`，客户端 `:retry` 后即可被 worker 自动重跑。delete 续跑时若孤儿恢复已把文档从 `deleting` 重置为 `delete_failed`，worker 会重新 claim 回 `deleting` 再执行（`_claim_document_deleting` 接受同一 delete job id 的幂等 reclaim）；replace 续跑同理从 `replace_failed` 重新 claim 回 `replacing`。
 - **不抢占新任务**：worker 只认领 `queued_at` 早于宽限窗口（`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`，默认 5s）的任务；新建任务由其 in-process 背景任务在毫秒级转入 `running`，因此不会被 worker 抢跑，避免重复执行。
-- **暂不可恢复的类型**：`replace`（单文档，匹配认领谓词但未注册 durable executor，且上传字节未持久化）、批量 `sync`（依赖 per-item 请求字节）以及多文件 `upload`（无 auto_parse 时不产生解析工作）等依赖请求级上传字节或一次性上下文的任务未纳入 worker 自动恢复；它们重启后仍标 `failed`，需要重新发起请求。
+- **暂不可恢复的类型**：批量 `sync`（一次请求多文件，需要为 *所有* item 落盘 per-item 请求字节并定义部分批次的续跑语义，属更大改造）以及多文件 `upload`（无 auto_parse 时不产生解析工作）等任务未纳入 worker 自动恢复；它们重启后仍标 `failed`，需要重新发起请求。
 - **死信**：`failed` 且 `retry_count >= max_retries` 的任务不会再被 `:retry` 或 worker 重跑，可通过 `GET /kbs/{kb_id}/jobs/dead-letter` 单独列出做人工triage。
 - 可调环境变量：`LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS`（默认 1.0s）、`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`（默认 5.0s）。
 
@@ -821,7 +823,7 @@ cancelled --> retrying --> queued
 | 409 | InvalidJobTransitionError | 任务状态不允许该转换 |
 | 400 | - | `delete_graph_orphans=false` 暂不支持 |
 | 413 | - | 上传体积超出 `MAX_UPLOAD_SIZE` 或文本超限 |
-| 503 | - | 注册表 / 构建服务未配置（含 `strategy=rebuild_kb` 缺少 IndexBuildService） |
+| 503 | - | 注册表 / 构建服务未配置（含 `strategy=rebuild_kb` / `strategy=rebuild_subgraph` 缺少 IndexBuildService） |
 
 ---
 
@@ -848,6 +850,15 @@ LIGHTRAG_KB_POSTGRES_POOL_MAX_SIZE=10
 
 启用后服务启动时会创建/迁移所需表：`kb_catalog_schema`、`kb_catalog`、`kb_metadata_schema`、`kb_documents`、`kb_jobs`、`kb_document_artifacts`、`kb_config_versions`。默认不设置或设置为 `local/json/sqlite` 时仍使用 `WORKING_DIR/metadata/knowledge_bases.json` + `metadata.sqlite3`。
 
+> 测试覆盖：`PostgresMetadataStore` 与 `SQLiteMetadataStore` 由 `tests/api/test_metadata_store_contract.py` 用同一组用例参数化校验行为等价。SQLite 参数始终运行；设置 `LIGHTRAG_KB_POSTGRES_TEST_DSN`（或 `POSTGRES_TEST_DSN`）后会对**真实 PostgreSQL** 执行同一契约（每次唯一 `kb_id` + 结束 `purge`，对共享库安全），例如：
+>
+> ```bash
+> LIGHTRAG_KB_POSTGRES_TEST_DSN=postgresql://admin:123456@<host>:5433/knowledge_base \
+>     uv run pytest tests/api/test_metadata_store_contract.py -q
+> ```
+>
+> 注：`source_name` 文档过滤在 Postgres 后端的 `ESCAPE` 子句此前误用两字符转义串（`InvalidEscapeSequenceError`），已修复为单字符并由该 live 契约测试守护。
+
 ### 11.2 MinIO / S3 source 与 artifact 存储
 
 ```env
@@ -863,3 +874,5 @@ LIGHTRAG_OBJECT_STORAGE_CREATE_BUCKET=true
 ```
 
 对象 key 组织在 `<prefix>/workspaces/<workspace>/documents/<document_id>/...` 下。`INPUT_DIR` 仍是本地 cache：parser、build、download 继续使用本地 path；当 cache 缺失时，download/parse planning 会按 metadata 中的对象 URI restore。硬删除 KB 时会按 workspace prefix 清理对象。
+
+> 测试覆盖：`tests/api/test_object_storage_s3.py` 仅在 boto3 client 边界打桩（`aioboto3` 在 `S3ObjectStorage._new_session` 内惰性 import，可注入 fake session 离线运行），直测出厂 `S3ObjectStorage` 的 key 前缀规范化、URI 构建/解析、bucket 自动创建、upload/download 往返、目录逐文件上传、`list_objects_v2` 分页与续传 token、`delete_uri`/`delete_prefix`/`delete_workspace` 与 backend 选择，不需要安装 aioboto3 或连接真实 MinIO/S3。

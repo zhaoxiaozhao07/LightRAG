@@ -123,6 +123,20 @@ def _build_plan(document: DocumentRecord) -> IndexBuildPlan:
     )
 
 
+class FakeKV:
+    """Minimal async KV store mirroring the BaseKVStorage.get_by_id surface,
+    used to model per-doc full_entities / full_relations for rebuild_subgraph."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, dict] = {}
+
+    async def get_by_id(self, key: str):
+        return self.rows.get(key)
+
+    def seed(self, key: str, value: dict) -> None:
+        self.rows[key] = value
+
+
 class FakeRAG:
     def __init__(
         self,
@@ -150,6 +164,10 @@ class FakeRAG:
 
         self.embedding_func = _EmbeddingFunc()
         self.doc_status = FakeDocStatus()
+        # Per-doc graph contributions keyed by lightrag_doc_id (rebuild_subgraph
+        # footprint source). Tests seed these explicitly after building.
+        self.full_entities = FakeKV()
+        self.full_relations = FakeKV()
         self.build_should_fail_for = build_should_fail_for or set()
         self.enqueue_calls: list[dict] = []
         self.delete_calls: list[tuple[str, bool]] = []
@@ -163,8 +181,10 @@ class FakeRAG:
         self.delete_calls.append((doc_id, delete_llm_cache))
         # Mirror the real engine: deleting a doc removes its doc_status row so a
         # subsequent enqueue of the same id is processed afresh rather than
-        # deduped away.
+        # deduped away. Also drop its per-doc entity/relation contributions.
         self.doc_status.discard(doc_id)
+        self.full_entities.rows.pop(doc_id, None)
+        self.full_relations.rows.pop(doc_id, None)
         return FakeDeletionResult(doc_id, delete_llm_cache)
 
     async def parse_native(self, doc_id, file_path, content_data):
@@ -2089,3 +2109,176 @@ def test_texts_auto_parse_auto_index_reaches_ready(tmp_path):
         f"/kbs/kb_texts_ready/documents/{document_id}", headers=_HEADERS
     ).json()
     assert detail["status"] == "ready"
+
+
+def test_delete_rebuild_kb_strategy_reindexes_survivors(tmp_path):
+    """strategy=rebuild_kb success path: after deleting one document, the
+    conservative whole-KB rebuild force-reindexes every *remaining* buildable
+    document and records a rebuild summary on the delete job.
+
+    This is the positive counterpart to
+    ``test_delete_rebuild_kb_strategy_requires_index_service`` (which only
+    covers the 503 when no IndexBuildService is wired). Here index_service IS
+    wired (the build-kg harness wires it), so the rebuild actually runs.
+    """
+    client, _kb_service, _document_service, _job_service, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_rebuild_ok")
+
+    # Two documents, both built to ready.
+    doc_drop = _upload_and_parse(client, "kb_rebuild_ok", filename="drop.pdf")
+    doc_keep = _upload_and_parse(client, "kb_rebuild_ok", filename="keep.pdf")
+    for document_id in (doc_drop, doc_keep):
+        built = client.post(
+            f"/kbs/kb_rebuild_ok/documents/{document_id}:build-kg",
+            json={},
+            headers=_HEADERS,
+        )
+        assert built.status_code == 200, built.text
+        built_job = client.get(
+            f"/kbs/kb_rebuild_ok/jobs/{built.json()['id']}", headers=_HEADERS
+        ).json()
+        assert built_job["status"] == "succeeded", built_job
+
+    rag = probe.instances[0]
+    enqueues_before = len(rag.enqueue_calls)
+    deletes_before = len(rag.delete_calls)
+
+    # Delete doc_drop with strategy=rebuild_kb.
+    response = client.delete(
+        f"/kbs/kb_rebuild_ok/documents/{doc_drop}?strategy=rebuild_kb",
+        headers=_HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    job_id = response.json()["id"]
+    job = client.get(f"/kbs/kb_rebuild_ok/jobs/{job_id}", headers=_HEADERS).json()
+    assert job["status"] == "succeeded", job
+
+    # The delete job carries a conservative rebuild summary.
+    rebuild = job["result"]["rebuild"]
+    assert rebuild["strategy"] == "rebuild_kb"
+    assert rebuild["rebuilt_documents"] >= 1
+    assert rebuild["failed_documents"] == 0
+    # Only the survivor remains as a rebuild candidate (doc_drop is deleted).
+    assert rebuild["total_candidates"] == 1
+
+    # The survivor was genuinely re-driven through the engine: the conservative
+    # rebuild forces reindex, which deletes-before-reenqueue and re-enqueues.
+    assert len(rag.delete_calls) > deletes_before
+    assert len(rag.enqueue_calls) > enqueues_before
+    keep_lightrag_id = client.get(
+        f"/kbs/kb_rebuild_ok/documents/{doc_keep}", headers=_HEADERS
+    ).json()["lightrag_doc_id"]
+    # Survivor re-enqueued and re-stamped as processed (force reindex really ran).
+    assert rag.doc_status.stamp_counts.get(keep_lightrag_id, 0) >= 2
+
+    # The deleted document is gone; the survivor is still ready.
+    drop_detail = client.get(
+        f"/kbs/kb_rebuild_ok/documents/{doc_drop}", headers=_HEADERS
+    )
+    assert drop_detail.status_code in (404, 200)
+    if drop_detail.status_code == 200:
+        assert drop_detail.json()["status"] in ("deleted", "deleting")
+    keep_detail = client.get(
+        f"/kbs/kb_rebuild_ok/documents/{doc_keep}", headers=_HEADERS
+    ).json()
+    assert keep_detail["status"] == "ready"
+
+
+def test_delete_rebuild_subgraph_reindexes_only_affected_survivors(tmp_path):
+    """strategy=rebuild_subgraph precise local rebuild: after deleting a doc,
+    only *surviving* documents that shared an entity/relation with it are
+    force-reindexed; unrelated documents are left untouched.
+
+    Contrast with rebuild_kb (force-reindexes the whole KB). Here:
+      - doc_drop  shares entity SHARED with doc_aff (affected survivor)
+      - doc_unrel contributes only entity LONELY (must NOT be rebuilt)
+    """
+    client, _kb_service, _document_service, _job_service, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_subgraph")
+
+    doc_drop = _upload_and_parse(client, "kb_subgraph", filename="drop.pdf")
+    doc_aff = _upload_and_parse(client, "kb_subgraph", filename="affected.pdf")
+    doc_unrel = _upload_and_parse(client, "kb_subgraph", filename="unrelated.pdf")
+    lightrag_ids: dict[str, str] = {}
+    for document_id in (doc_drop, doc_aff, doc_unrel):
+        built = client.post(
+            f"/kbs/kb_subgraph/documents/{document_id}:build-kg",
+            json={},
+            headers=_HEADERS,
+        )
+        assert built.status_code == 200, built.text
+        built_job = client.get(
+            f"/kbs/kb_subgraph/jobs/{built.json()['id']}", headers=_HEADERS
+        ).json()
+        assert built_job["status"] == "succeeded", built_job
+        detail = client.get(
+            f"/kbs/kb_subgraph/documents/{document_id}", headers=_HEADERS
+        ).json()
+        lightrag_ids[document_id] = detail["lightrag_doc_id"]
+
+    # Seed per-doc graph footprints on the (single, shared) FakeRAG instance.
+    rag = probe.instances[0]
+    rag.full_entities.seed(lightrag_ids[doc_drop], {"entity_names": ["SHARED", "GONE"]})
+    rag.full_entities.seed(lightrag_ids[doc_aff], {"entity_names": ["SHARED", "OTHER"]})
+    rag.full_entities.seed(lightrag_ids[doc_unrel], {"entity_names": ["LONELY"]})
+
+    affected_stamps_before = rag.doc_status.stamp_counts.get(lightrag_ids[doc_aff], 0)
+    unrelated_stamps_before = rag.doc_status.stamp_counts.get(lightrag_ids[doc_unrel], 0)
+
+    response = client.delete(
+        f"/kbs/kb_subgraph/documents/{doc_drop}?strategy=rebuild_subgraph",
+        headers=_HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    job = client.get(
+        f"/kbs/kb_subgraph/jobs/{response.json()['id']}", headers=_HEADERS
+    ).json()
+    assert job["status"] == "succeeded", job
+
+    rebuild = job["result"]["rebuild"]
+    assert rebuild["strategy"] == "rebuild_subgraph"
+    # Only the affected survivor is rebuilt; the unrelated doc is NOT a candidate
+    # for actual rebuild even though it's enumerated.
+    assert rebuild["affected_documents"] == 1
+    assert rebuild["rebuilt_documents"] == 1
+    assert rebuild["failed_documents"] == 0
+    assert rebuild["footprint_entities"] == 2  # SHARED + GONE
+
+    # The affected survivor was genuinely re-driven; the unrelated one was not.
+    assert (
+        rag.doc_status.stamp_counts.get(lightrag_ids[doc_aff], 0)
+        > affected_stamps_before
+    )
+    assert (
+        rag.doc_status.stamp_counts.get(lightrag_ids[doc_unrel], 0)
+        == unrelated_stamps_before
+    )
+
+    # Survivors remain ready; deleted doc is gone.
+    assert (
+        client.get(f"/kbs/kb_subgraph/documents/{doc_aff}", headers=_HEADERS).json()[
+            "status"
+        ]
+        == "ready"
+    )
+    assert (
+        client.get(f"/kbs/kb_subgraph/documents/{doc_unrel}", headers=_HEADERS).json()[
+            "status"
+        ]
+        == "ready"
+    )
+
+
+def test_delete_rebuild_subgraph_requires_index_service(tmp_path):
+    """strategy=rebuild_subgraph without an IndexBuildService returns 503,
+    mirroring rebuild_kb. Uses the doc-routes harness which wires no index."""
+    from tests.api.routes import test_kb_document_routes as docmod
+
+    client, *_ = docmod._build_client(tmp_path)
+    docmod._create_kb(client, "kb_subgraph_503")
+    document_id, _artifacts = docmod._upload_and_parse_document(client, "kb_subgraph_503")
+    response = client.delete(
+        f"/kbs/kb_subgraph_503/documents/{document_id}?strategy=rebuild_subgraph",
+        headers=docmod._HEADERS,
+    )
+    assert response.status_code == 503
