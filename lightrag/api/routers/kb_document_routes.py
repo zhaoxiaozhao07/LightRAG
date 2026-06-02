@@ -1300,10 +1300,14 @@ async def _run_auto_parse_batch(
 
     ``create_source_batch`` has already created the documents in
     ``parse_queued`` and the aggregate ``parse`` job in ``queued``; this task
-    parses each document (and, when ``auto_index`` is set and an index service
-    is configured, chains the KG build to ``ready``), then aggregates per-item
-    results into the single aggregate job. Mirrors ``documents:batch-parse`` but
-    skips re-claiming (the docs are already claimed at creation).
+    parses each document in parallel (bounded by ``MAX_PARALLEL_PARSE_MINERU``
+    / per-engine equivalents) and, when ``auto_index`` is set and an index
+    service is configured, bulk-enqueues all successfully-parsed documents
+    into the LightRAG pipeline in a single drain so the three worker layers
+    (parse / analyze / process) overlap docs instead of serializing them.
+    Per-item results aggregate into the single aggregate job, mirroring
+    ``documents:batch-parse`` but skipping re-claiming (the docs are already
+    claimed at creation).
     """
     item_results: list[dict[str, Any]] = []
     completed_items = 0
@@ -1323,63 +1327,135 @@ async def _run_auto_parse_batch(
             ),
         )
         rag = await registry.get(kb_id) if document_ids else None
-        for document_id in document_ids:
-            if rag is None:
-                raise RuntimeError(
-                    "KB parse service did not return a LightRAG instance"
-                )
-            try:
-                plan = await document_service.create_parse_plan(kb_id, document_id)
-            except Exception as exc:  # noqa: BLE001 — per-item planning failure
-                item_results.append(
-                    {
-                        "document_id": document_id,
-                        "status": "failed",
-                        "error_code": "parse_failed",
-                        "error_message": str(exc),
-                    }
-                )
-                failed_items += 1
-                continue
-            item = await _execute_parse_plan(
-                document_service=document_service,
-                kb_id=kb_id,
-                job_id=job.id,
-                plan=plan,
-                rag=rag,
-                job_service=job_service,
+        if rag is None or not document_ids:
+            final_status = "succeeded" if failed_items == 0 else "failed"
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status=final_status,
+                progress=1.0,
+                completed_items=completed_items,
+                failed_items=failed_items,
+                result=_batch_parse_job_result(
+                    batch_id=job.batch_id or "",
+                    total_items=len(document_ids),
+                    completed_items=completed_items,
+                    failed_items=failed_items,
+                    items=item_results,
+                ),
             )
-            # Optionally chain the index build so the doc reaches ``ready``.
-            if (
-                item["status"] == "succeeded"
-                and auto_index
-                and index_service is not None
-            ):
+            return
+
+        item_by_id: dict[str, dict[str, Any]] = {}
+
+        # ── Phase 1: concurrent parse ──────────────────────────────────────
+        parse_concurrency = max(
+            1, int(getattr(rag, "max_parallel_parse_mineru", 1) or 1)
+        )
+        parse_sem = asyncio.Semaphore(parse_concurrency)
+
+        async def _do_one_parse(document_id: str) -> tuple[str, Any, dict[str, Any]]:
+            async with parse_sem:
+                try:
+                    plan = await document_service.create_parse_plan(kb_id, document_id)
+                except Exception as exc:  # noqa: BLE001 — per-item planning failure
+                    return (
+                        document_id,
+                        None,
+                        {
+                            "document_id": document_id,
+                            "status": "failed",
+                            "error_code": "parse_failed",
+                            "error_message": str(exc),
+                        },
+                    )
+                item = await _execute_parse_plan(
+                    document_service=document_service,
+                    kb_id=kb_id,
+                    job_id=job.id,
+                    plan=plan,
+                    rag=rag,
+                    job_service=job_service,
+                )
+                return document_id, plan, item
+
+        raw_outcomes = await asyncio.gather(
+            *[_do_one_parse(d) for d in document_ids],
+            return_exceptions=True,
+        )
+        # return_exceptions=True guarantees Phase 2 always runs (and thus
+        # terminalizes / releases any doc already claimed into build_queued)
+        # even if a task raised an unexpected BaseException; map any such
+        # exception back to its doc as a failed item via positional zip.
+        parse_outcomes: list[tuple[str, Any, dict[str, Any]]] = []
+        for doc_id, outcome in zip(document_ids, raw_outcomes):
+            if isinstance(outcome, BaseException):
+                parse_outcomes.append(
+                    (
+                        doc_id,
+                        None,
+                        {
+                            "document_id": doc_id,
+                            "status": "failed",
+                            "error_code": "parse_failed",
+                            "error_message": str(outcome),
+                        },
+                    )
+                )
+            else:
+                parse_outcomes.append(outcome)
+        for doc_id, plan, item in parse_outcomes:
+            item_by_id[doc_id] = item
+
+        # ── Phase 2: bulk auto_index build ────────────────────────────────
+        build_plans: list[IndexBuildPlan] = []
+        build_plan_to_item: dict[str, dict[str, Any]] = {}
+        if auto_index and index_service is not None:
+            for doc_id, _parse_plan, item in parse_outcomes:
+                if item["status"] != "succeeded":
+                    continue
                 try:
                     build_plan = await index_service.create_build_plan(
-                        kb_id, document_id, rag=rag
+                        kb_id, doc_id, rag=rag
                     )
                     if not build_plan.skipped:
                         await index_service.claim_build_queued(
                             kb_id, job_id=job.id, plan=build_plan
                         )
-                    build_item = await _execute_build_plan(
-                        index_service=index_service,
-                        kb_id=kb_id,
-                        job_id=job.id,
-                        plan=build_plan,
-                        rag=rag,
-                        job_service=job_service,
-                    )
+                except Exception as exc:  # noqa: BLE001 — per-item plan failure
+                    item["status"] = "failed"
+                    item["error_code"] = "build_failed"
+                    item["error_message"] = str(exc)
+                    continue
+                build_plans.append(build_plan)
+                build_plan_to_item[build_plan.document.id] = item
+
+            if build_plans:
+                build_results = await _execute_build_plan_batch(
+                    index_service=index_service,
+                    kb_id=kb_id,
+                    job_id=job.id,
+                    rag=rag,
+                    plans=build_plans,
+                    job_service=job_service,
+                )
+                for plan in build_plans:
+                    item = build_plan_to_item[plan.document.id]
+                    build_item = build_results.get(plan.document.id)
+                    if build_item is None:
+                        item["status"] = "failed"
+                        item["error_code"] = "build_failed"
+                        item["error_message"] = "Build result missing from batch"
+                        continue
                     item["build_result"] = build_item
                     if build_item["status"] not in {"succeeded", "cancelled"}:
                         item["status"] = "failed"
                         item["error_code"] = build_item.get("error_code")
                         item["error_message"] = build_item.get("error_message")
-                except Exception as exc:  # noqa: BLE001
-                    item["status"] = "failed"
-                    item["error_code"] = "build_failed"
-                    item["error_message"] = str(exc)
+
+        # ── Phase 3: finalize ─────────────────────────────────────────────
+        for doc_id in document_ids:
+            item = item_by_id[doc_id]
             item_results.append(item)
             if item["status"] == "succeeded":
                 completed_items += 1
@@ -1584,6 +1660,208 @@ async def _execute_build_plan(
             "error_code": "build_failed",
             "error_message": str(exc),
         }
+
+
+async def _execute_build_plan_batch(
+    *,
+    index_service: IndexBuildService,
+    kb_id: str,
+    job_id: str,
+    rag: Any,
+    plans: list[IndexBuildPlan],
+    job_service: "JobService | None" = None,
+) -> dict[str, dict[str, Any]]:
+    """Run :meth:`IndexBuildService.run_build_batch` and finalize each doc.
+
+    This is the batched counterpart of :func:`_execute_build_plan`. It:
+
+    1. Honors a job-level ``cancelling`` request by marking every plan as
+       cancelled and returning early — same semantics as the single-doc helper.
+    2. Marks each non-skipped plan ``building`` (the single-drain pipeline call
+       does not do this itself).
+    3. Bulk-enqueues every non-skipped plan into the LightRAG pipeline through
+       ``IndexBuildService.run_build_batch`` so the three worker layers
+       (parse / analyze / process) can overlap documents instead of being
+       serialized per-document.
+    4. Per doc, calls ``complete_build`` on success or ``fail_build`` on
+       per-doc failure, then assembles the same ``build_result`` shape that
+       :func:`_execute_build_plan` produces. Returns a
+       ``{kb_document_id: build_result}`` mapping.
+
+    Failures during ``run_build_batch`` itself (e.g. a pipeline-level crash)
+    fail every plan in the batch; per-doc failures surfaced by
+    ``run_build_batch`` (missing sidecar, ``doc_status`` read errors, etc.)
+    fail only that doc.
+    """
+    if not plans:
+        return {}
+
+    results: dict[str, dict[str, Any]] = {}
+    if await _job_is_cancelling(job_service, kb_id, job_id):
+        for plan in plans:
+            results[plan.document.id] = await _cancel_build_item(
+                index_service, kb_id=kb_id, job_id=job_id, plan=plan
+            )
+        return results
+
+    # Mark every non-skipped plan ``building``. A failure here is per-doc and
+    # excludes that plan from the bulk enqueue.
+    runnable: list[IndexBuildPlan] = []
+    for plan in plans:
+        if plan.skipped:
+            runnable.append(plan)
+            continue
+        try:
+            await index_service.mark_building(kb_id, plan.document.id, job_id=job_id)
+        except Exception as exc:  # noqa: BLE001 — record per-doc failure
+            logger.error(
+                "Failed to mark document '%s' building (KB '%s'): %s",
+                plan.document.id,
+                kb_id,
+                exc,
+            )
+            try:
+                await index_service.fail_build(
+                    kb_id,
+                    plan.document.id,
+                    job_id=job_id,
+                    error_code="build_failed",
+                    error_message=str(exc),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            results[plan.document.id] = {
+                "document_id": plan.document.id,
+                "status": "failed",
+                "error_code": "build_failed",
+                "error_message": str(exc),
+            }
+            continue
+        runnable.append(plan)
+
+    if runnable:
+        try:
+            run_results = await index_service.run_build_batch(
+                rag, runnable, job_id=job_id
+            )
+        except Exception as exc:  # noqa: BLE001 — batch-level failure
+            logger.error(
+                "KG build batch failed for KB '%s' (job '%s'): %s",
+                kb_id,
+                job_id,
+                exc,
+            )
+            for plan in runnable:
+                try:
+                    await index_service.fail_build(
+                        kb_id,
+                        plan.document.id,
+                        job_id=job_id,
+                        error_code="build_failed",
+                        error_message=str(exc),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                results[plan.document.id] = {
+                    "document_id": plan.document.id,
+                    "status": "failed",
+                    "error_code": "build_failed",
+                    "error_message": str(exc),
+                }
+            return results
+
+        for plan in runnable:
+            run_result = run_results.get(plan.document.id)
+            if run_result is None:
+                msg = "Build result missing from pipeline drain"
+                try:
+                    await index_service.fail_build(
+                        kb_id,
+                        plan.document.id,
+                        job_id=job_id,
+                        error_code="build_failed",
+                        error_message=msg,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                results[plan.document.id] = {
+                    "document_id": plan.document.id,
+                    "status": "failed",
+                    "error_code": "build_failed",
+                    "error_message": msg,
+                }
+                continue
+            if run_result.get("cancelled"):
+                # The pipeline marked this doc failed with a user-cancellation
+                # marker mid-drain. Release the claim and report it as a clean
+                # cancellation (status='cancelled') rather than build_failed,
+                # matching the per-doc _execute_build_plan checkpoint behavior.
+                results[plan.document.id] = await _cancel_build_item(
+                    index_service, kb_id=kb_id, job_id=job_id, plan=plan
+                )
+                continue
+            if "error_code" in run_result:
+                err_code = str(run_result.get("error_code") or "build_failed")
+                err_msg = str(run_result.get("error_message") or "")
+                try:
+                    await index_service.fail_build(
+                        kb_id,
+                        plan.document.id,
+                        job_id=job_id,
+                        error_code=err_code,
+                        error_message=err_msg,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                results[plan.document.id] = {
+                    "document_id": plan.document.id,
+                    "status": "failed",
+                    "error_code": err_code,
+                    "error_message": err_msg,
+                }
+                continue
+            try:
+                result_record = await index_service.complete_build(
+                    kb_id,
+                    plan.document.id,
+                    job_id=job_id,
+                    plan=plan,
+                    run_result=run_result,
+                )
+                results[plan.document.id] = {
+                    "document_id": result_record.id,
+                    "status": "succeeded",
+                    "skipped": bool(plan.skipped or run_result.get("skipped")),
+                    "skip_reason": plan.skip_reason if plan.skipped else None,
+                    "index_hash": plan.index_hash,
+                    "chunks_count": result_record.chunks_count,
+                    "entity_count": result_record.entity_count,
+                    "relation_count": result_record.relation_count,
+                }
+            except Exception as exc:  # noqa: BLE001 — per-doc complete failure
+                logger.error(
+                    "Failed to finalize build for document '%s' (KB '%s'): %s",
+                    plan.document.id,
+                    kb_id,
+                    exc,
+                )
+                try:
+                    await index_service.fail_build(
+                        kb_id,
+                        plan.document.id,
+                        job_id=job_id,
+                        error_code="build_failed",
+                        error_message=str(exc),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                results[plan.document.id] = {
+                    "document_id": plan.document.id,
+                    "status": "failed",
+                    "error_code": "build_failed",
+                    "error_message": str(exc),
+                }
+    return results
 
 
 async def _execute_delete_document_impl(
@@ -2098,6 +2376,7 @@ async def _run_sync_followups(
     parser_engine: str | None,
     process_options: str | None,
     force_reparse: bool,
+    defer_build: bool = False,
 ) -> tuple[dict[str, Any], Any | None]:
     if not auto_parse:
         return item, rag
@@ -2174,6 +2453,14 @@ async def _run_sync_followups(
             job_id=job.id,
             plan=build_plan,
         )
+        if defer_build:
+            # Caller will batch-build all deferred plans through a single
+            # pipeline drain so the three worker layers (parse / analyze /
+            # process) overlap documents instead of being serialized.
+            # The plan is stashed on the item under a private key the caller
+            # pops before finalising the response.
+            item["_deferred_build_plan"] = build_plan
+            return item, rag
         build_item = await _execute_build_plan(
             index_service=active_index_service,
             kb_id=kb_id,
@@ -2397,6 +2684,7 @@ async def _execute_sync_item(
     delete_source_file: bool,
     delete_artifacts: bool,
     delete_llm_cache: bool,
+    defer_build: bool = False,
 ) -> tuple[dict[str, Any], Any | None]:
     source_key = str(prepared["source_key"])
     source = cast(DocumentSourceInput, prepared["source"])
@@ -2438,6 +2726,7 @@ async def _execute_sync_item(
                 parser_engine=parser_engine,
                 process_options=process_options,
                 force_reparse=force_reparse,
+                defer_build=defer_build,
             )
         elif existing.source_hash == source_hash:
             item.update(
@@ -2462,6 +2751,7 @@ async def _execute_sync_item(
                 parser_engine=parser_engine,
                 process_options=process_options,
                 force_reparse=force_reparse,
+                defer_build=defer_build,
             )
         else:
             replacement = document_service.prepare_replacement_source(source)
@@ -3283,27 +3573,123 @@ def create_kb_document_routes(
                             kb_id, normalized_keys
                         )
                     )
-                    for prepared in prepared_sources:
-                        item, rag = await _execute_sync_item(
-                            document_service=document_service,
-                            kb_id=kb_id,
-                            job=job,
-                            prepared=prepared,
-                            existing_by_source_key=existing_by_source_key,
-                            active_registry=cast(
-                                LightRAGInstanceRegistry, active_registry
-                            ),
-                            active_index_service=active_index_service,
-                            rag=rag,
-                            auto_parse=auto_parse,
-                            auto_index=auto_index,
-                            parser_engine=parser_engine,
-                            process_options=process_options,
-                            force_reparse=force_reparse,
-                            delete_source_file=delete_source_file,
-                            delete_artifacts=delete_artifacts,
-                            delete_llm_cache=delete_llm_cache,
-                        )
+
+                    # Phase 1: per-item sync (create/skip/replace + parse)
+                    # runs concurrently bounded by MAX_PARALLEL_PARSE_MINERU,
+                    # with auto_index builds deferred so we can drain the
+                    # pipeline once for all docs in Phase 2 (so analyze /
+                    # extract / merge stages overlap across documents).
+                    rag = cast(Any, await active_registry.get(kb_id))
+                    parse_concurrency = max(
+                        1,
+                        int(getattr(rag, "max_parallel_parse_mineru", 1) or 1),
+                    )
+                    parse_sem = asyncio.Semaphore(parse_concurrency)
+
+                    async def _do_one_sync_item(
+                        prepared_item: dict[str, Any],
+                    ) -> dict[str, Any]:
+                        async with parse_sem:
+                            item, _ = await _execute_sync_item(
+                                document_service=document_service,
+                                kb_id=kb_id,
+                                job=job,
+                                prepared=prepared_item,
+                                existing_by_source_key=existing_by_source_key,
+                                active_registry=cast(
+                                    LightRAGInstanceRegistry, active_registry
+                                ),
+                                active_index_service=active_index_service,
+                                rag=rag,
+                                auto_parse=auto_parse,
+                                auto_index=auto_index,
+                                parser_engine=parser_engine,
+                                process_options=process_options,
+                                force_reparse=force_reparse,
+                                delete_source_file=delete_source_file,
+                                delete_artifacts=delete_artifacts,
+                                delete_llm_cache=delete_llm_cache,
+                                defer_build=True,
+                            )
+                        return item
+
+                    raw_sync = await asyncio.gather(
+                        *[
+                            _do_one_sync_item(prepared)
+                            for prepared in prepared_sources
+                        ],
+                        return_exceptions=True,
+                    )
+                    # return_exceptions=True guarantees Phase 2 still runs (so
+                    # any doc already claimed into build_queued gets built /
+                    # released) even if a task raised an unexpected
+                    # BaseException; map such exceptions back to a failed item.
+                    sync_items: list[dict[str, Any]] = []
+                    for prepared, outcome in zip(prepared_sources, raw_sync):
+                        if isinstance(outcome, BaseException):
+                            source = cast(DocumentSourceInput, prepared["source"])
+                            sync_items.append(
+                                {
+                                    "source_key": str(prepared["source_key"]),
+                                    "source_name": source.source_name,
+                                    "source_hash": str(prepared["source_hash"]),
+                                    "action": "unknown",
+                                    "status": "failed",
+                                    "error_code": "sync_item_failed",
+                                    "error_message": str(outcome),
+                                }
+                            )
+                        else:
+                            sync_items.append(outcome)
+
+                    # Phase 2: batch-build for any item whose build was deferred.
+                    if active_index_service is not None:
+                        deferred_pairs: list[tuple[IndexBuildPlan, dict[str, Any]]] = []
+                        for item in sync_items:
+                            build_plan = item.pop("_deferred_build_plan", None)
+                            if build_plan is not None:
+                                deferred_pairs.append((build_plan, item))
+                        if deferred_pairs:
+                            batch_results = await _execute_build_plan_batch(
+                                index_service=active_index_service,
+                                kb_id=kb_id,
+                                job_id=job.id,
+                                rag=rag,
+                                plans=[bp for bp, _ in deferred_pairs],
+                                job_service=job_service,
+                            )
+                            for build_plan, item in deferred_pairs:
+                                build_item = batch_results.get(build_plan.document.id)
+                                if build_item is None:
+                                    item.update(
+                                        {
+                                            "status": "failed",
+                                            "error_code": "build_failed",
+                                            "error_message": (
+                                                "Build result missing from batch"
+                                            ),
+                                        }
+                                    )
+                                    continue
+                                item["build_result"] = build_item
+                                if build_item["status"] not in {
+                                    "succeeded",
+                                    "cancelled",
+                                }:
+                                    item.update(
+                                        {
+                                            "status": "failed",
+                                            "error_code": build_item.get(
+                                                "error_code", "build_failed"
+                                            ),
+                                            "error_message": build_item.get(
+                                                "error_message",
+                                                "Document sync build failed",
+                                            ),
+                                        }
+                                    )
+
+                    for item in sync_items:
                         item_results.append(item)
                         if item["status"] == "failed":
                             failed_items += 1

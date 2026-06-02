@@ -789,11 +789,14 @@ def test_upload_auto_parse_auto_index_drives_documents_to_ready(tmp_path):
         assert detail["status"] == "ready", detail
         assert detail["chunks_count"] == 5
 
-    # Corroborate at the engine boundary: parse ran for each doc and each was
-    # enqueued into the KG pipeline.
+    # Corroborate at the engine boundary: parse ran for each doc, and the
+    # auto_index build enqueues all parsed docs in ONE bulk pipeline call so
+    # the three worker layers (parse/analyze/process) overlap across docs
+    # (concurrency refactor) rather than one enqueue+drain per document.
     rag = probe.instances[0]
     assert len(rag.parse_calls) == 2
-    assert len(rag.enqueue_calls) == 2
+    assert len(rag.enqueue_calls) == 1
+    assert len(rag.enqueue_calls[0]["ids"]) == 2
 
 
 def test_build_kg_rejects_unparsed_document(tmp_path):

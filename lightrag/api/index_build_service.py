@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,31 @@ from lightrag.api.metadata_store import (
 )
 from lightrag.utils import generate_track_id, logger
 from lightrag.utils_pipeline import sidecar_uri_for
+
+# doc_status status values that mean "still being processed by the pipeline".
+# A document showing one of these has NOT reached a terminal build state yet —
+# the read-back must wait it out rather than treating it as a failure (a
+# concurrent same-KB pipeline drain may be the one that will finish it; see
+# the concurrency notes on ``run_build_batch``).
+_INFLIGHT_BUILD_STATUSES = frozenset(
+    {"pending", "parsing", "analyzing", "processing", "preprocessed"}
+)
+# Substring the pipeline writes into a doc's ``error_msg`` when a build is
+# cancelled mid-drain (see pipeline.py ``_mark_doc_cancelled_in_stage`` /
+# merge cancellation). Used to reclassify such docs as cancelled rather than
+# a hard build failure.
+_CANCEL_ERROR_MARKER = "User cancelled"
+# How long the post-drain read-back will wait for each enqueued doc to reach a
+# terminal doc_status (processed/failed) before giving up. Generous because a
+# concurrent drain that owns the pipeline ``busy`` flag may be processing a
+# large merge for many minutes; the common single-flow case returns on the
+# first poll (our own drain already finished) so this never sleeps.
+DEFAULT_BUILD_DRAIN_TIMEOUT_SECONDS = float(
+    os.getenv("KB_BUILD_DRAIN_TIMEOUT_SECONDS", "3600")
+)
+DEFAULT_BUILD_DRAIN_POLL_SECONDS = float(
+    os.getenv("KB_BUILD_DRAIN_POLL_SECONDS", "1.0")
+)
 
 
 @dataclass(slots=True)
@@ -70,6 +97,8 @@ class IndexBuildService:
         document_service: DocumentLifecycleService,
     ):
         self._document_service = document_service
+        self._build_drain_timeout = DEFAULT_BUILD_DRAIN_TIMEOUT_SECONDS
+        self._build_drain_poll = DEFAULT_BUILD_DRAIN_POLL_SECONDS
 
     async def create_build_plan(
         self,
@@ -283,6 +312,222 @@ class IndexBuildService:
         await rag.apipeline_process_enqueue_documents()
         return await _collect_doc_status(rag, plan)
 
+    async def run_build_batch(
+        self,
+        rag: Any,
+        plans: list[IndexBuildPlan],
+        *,
+        job_id: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Bulk-build multiple documents through a single pipeline drain.
+
+        Counterpart of :meth:`run_build` for the parallel-aggregate path. The
+        three-layer LightRAG pipeline (``parse → analyze → process``) is
+        designed for cross-document overlap, but ``run_build`` only ever feeds
+        it one document and waits for ``apipeline_process_enqueue_documents``
+        to drain before returning. That serializes all aggregate flows
+        (``:sync`` / ``:upload?auto_parse=true&auto_index=true`` / batch parse
+        / their resume paths). This method instead enqueues every non-skipped
+        plan in one call so the worker layers naturally overlap docs, then
+        drains the pipeline exactly once and reads back ``doc_status`` for
+        each document.
+
+        Pre-conditions (mirror :meth:`run_build`):
+          * Caller has already marked each document ``building`` (or the plan
+            is ``skipped``).
+          * ``plan.sidecar_uri`` is present for every non-skipped plan.
+          * Forced rebuilds (``plan.force``) have an existing
+            ``lightrag_doc_id`` — they are deleted from the engine first so
+            the re-enqueue is not de-duplicated.
+
+        Returns a ``{kb_document_id: run_result}`` mapping. ``run_result``
+        matches :meth:`run_build`'s return shape so callers can feed it
+        straight into :meth:`complete_build`. Failure to read back a doc's
+        status surfaces as a per-doc dict ``{"error_code": ..., "error_message": ...}``;
+        the caller decides whether to fail that doc only or the whole batch.
+        """
+        results: dict[str, dict[str, Any]] = {}
+        runnable: list[IndexBuildPlan] = []
+        for plan in plans:
+            if plan.skipped:
+                results[plan.document.id] = {
+                    "skipped": True,
+                    "skip_reason": plan.skip_reason,
+                    "chunks_count": plan.document.chunks_count,
+                    "entity_count": plan.document.entity_count,
+                    "relation_count": plan.document.relation_count,
+                }
+                continue
+            if not plan.sidecar_uri:
+                results[plan.document.id] = {
+                    "error_code": "build_failed",
+                    "error_message": (
+                        f"Document '{plan.document.id}' has no sidecar artifact for build"
+                    ),
+                }
+                continue
+            runnable.append(plan)
+
+        if not runnable:
+            return results
+
+        # Force-clear any pre-existing LightRAG rows so re-enqueue is not deduped.
+        for plan in runnable:
+            if plan.force and plan.document.lightrag_doc_id:
+                try:
+                    deletion_result = await rag.adelete_by_doc_id(
+                        plan.document.lightrag_doc_id
+                    )
+                    status = getattr(deletion_result, "status", None)
+                    if status not in {"success", "not_found"}:
+                        raise RuntimeError(
+                            getattr(deletion_result, "message", None)
+                            or (
+                                "Forced reindex could not clear existing "
+                                f"LightRAG doc '{plan.document.lightrag_doc_id}' "
+                                f"(status={status})"
+                            )
+                        )
+                except Exception as exc:  # noqa: BLE001 — record + drop from batch
+                    logger.error(
+                        "Forced pre-delete failed for doc '%s' (KB build batch): %s",
+                        plan.document.id,
+                        exc,
+                    )
+                    results[plan.document.id] = {
+                        "error_code": "build_failed",
+                        "error_message": str(exc),
+                    }
+        # Drop docs whose forced-pre-delete failed from the actual enqueue list.
+        runnable = [p for p in runnable if p.document.id not in results]
+        if not runnable:
+            return results
+
+        # Bulk-enqueue every doc in one call so the pipeline sees the whole
+        # batch up front and can overlap parse / analyze / process across
+        # docs. The track id ties the batch together for log correlation.
+        batch_track_id = generate_track_id(
+            f"build_batch_{job_id or runnable[0].document.id}"
+        )
+        ids = [p.document.lightrag_doc_id for p in runnable]
+        file_paths = [_kb_unique_basename(p) for p in runnable]
+        sidecar_uris = [p.sidecar_uri for p in runnable]
+        # Per-doc parse_engine / process_options (these drive the per-doc
+        # chunker selection F/R/V/P and the engine label). Aligned with the
+        # ``ids`` list rather than broadcasting one doc's value to the batch.
+        parse_engines = [
+            p.document.metadata.get("parse_engine") or "" for p in runnable
+        ]
+        process_options = [p.process_options or "" for p in runnable]
+        await rag.apipeline_enqueue_documents(
+            input=[""] * len(runnable),
+            ids=ids,
+            file_paths=file_paths,
+            track_id=batch_track_id,
+            docs_format="lightrag",
+            lightrag_document_paths=sidecar_uris,
+            parse_engine=parse_engines,
+            process_options=process_options,
+        )
+        await rag.apipeline_process_enqueue_documents()
+
+        # Read back each doc's outcome. apipeline_process_enqueue_documents()
+        # returns WITHOUT draining when another flow already holds the
+        # per-KB pipeline ``busy`` flag (it just sets request_pending and
+        # returns) — in that case our freshly-enqueued docs are still inflight
+        # and the owning loop will finish them shortly. So we POLL each doc's
+        # doc_status until it reaches a terminal state instead of reading once
+        # (which would spuriously mark still-PENDING docs build_failed). The
+        # common single-flow case — our own call drained everything before
+        # returning — sees terminal status on the first poll and never sleeps.
+        for plan in runnable:
+            results[plan.document.id] = await self._resolve_build_result(rag, plan)
+        return results
+
+    async def _resolve_build_result(
+        self, rag: Any, plan: IndexBuildPlan
+    ) -> dict[str, Any]:
+        """Poll doc_status for a single enqueued plan and classify its outcome.
+
+        Returns one of:
+          * success counts dict (``{"skipped": False, "chunks_count": ...}``)
+          * ``{"cancelled": True, "error_message": ...}`` when the pipeline
+            marked the doc failed with a user-cancellation marker
+          * ``{"error_code": "build_failed", "error_message": ...}`` for a
+            genuine failure, a missing row, or a drain timeout.
+        """
+        doc_status_storage = getattr(rag, "doc_status", None)
+        if doc_status_storage is None:
+            return {
+                "skipped": False,
+                "chunks_count": None,
+                "entity_count": None,
+                "relation_count": None,
+            }
+        row = await self._await_doc_terminal(rag, plan.document.lightrag_doc_id)
+        if row is None:
+            return {
+                "error_code": "build_failed",
+                "error_message": (
+                    f"Document '{plan.document.id}' build did not create a "
+                    f"doc_status row for LightRAG doc "
+                    f"'{plan.document.lightrag_doc_id}'"
+                ),
+            }
+        status = row.get("status")
+        if status == "processed":
+            return {
+                "skipped": False,
+                "chunks_count": row.get("chunks_count"),
+                "entity_count": row.get("entity_count"),
+                "relation_count": row.get("relation_count"),
+            }
+        error_msg = str(row.get("error_msg") or "")
+        if _CANCEL_ERROR_MARKER in error_msg:
+            return {"cancelled": True, "error_message": error_msg}
+        if status in _INFLIGHT_BUILD_STATUSES:
+            return {
+                "error_code": "build_failed",
+                "error_message": (
+                    f"Document '{plan.document.id}' build timed out waiting for "
+                    f"the pipeline drain (status={status})"
+                ),
+            }
+        return {
+            "error_code": "build_failed",
+            "error_message": (
+                f"Document '{plan.document.id}' build did not reach processed "
+                f"(status={status}: {error_msg})"
+            ),
+        }
+
+    async def _await_doc_terminal(
+        self, rag: Any, lightrag_doc_id: str
+    ) -> dict[str, Any] | None:
+        """Poll a doc's doc_status row until it leaves the inflight set.
+
+        Returns the final row (processed/failed), the last inflight row on
+        timeout, or None when the row is absent. Never sleeps when the row is
+        already terminal on the first read (the single-flow fast path).
+        """
+        return await _await_doc_status_terminal(
+            rag,
+            lightrag_doc_id,
+            timeout=self._build_drain_timeout,
+            poll_interval=self._build_drain_poll,
+        )
+
+    async def collect_doc_status(
+        self, rag: Any, plan: IndexBuildPlan
+    ) -> dict[str, Any]:
+        """Public read-back of LightRAG ``doc_status`` for a single plan.
+
+        Exposed for callers that drive their own pipeline (e.g., the batch
+        aggregate flow) and need to fetch the final ``chunks/entities/
+        relations`` counts after their own drain.
+        """
+        return await _collect_doc_status(rag, plan)
+
     async def complete_build(
         self,
         kb_id: str,
@@ -419,7 +664,58 @@ def _kb_unique_basename(plan: IndexBuildPlan) -> str:
     return f"{plan.document.id}__{safe_name}"
 
 
-async def _collect_doc_status(rag: Any, plan: IndexBuildPlan) -> dict[str, Any]:
+async def _await_doc_status_terminal(
+    rag: Any,
+    lightrag_doc_id: str,
+    *,
+    timeout: float,
+    poll_interval: float,
+) -> dict[str, Any] | None:
+    """Poll ``rag.doc_status`` for ``lightrag_doc_id`` until it leaves the
+    inflight set (pending/parsing/analyzing/processing/preprocessed).
+
+    Returns the terminal row (processed/failed), the last inflight row on
+    timeout, or None when the row is absent / storage is unavailable. Returns
+    on the first read when already terminal (single-flow fast path: no sleep).
+
+    The wait is what makes the read-back safe under concurrent same-KB drains:
+    ``apipeline_process_enqueue_documents`` returns immediately (setting
+    ``request_pending``) when another flow holds the pipeline ``busy`` flag, so
+    our freshly-enqueued docs may still be inflight on return; the owning loop
+    will drive them to a terminal state shortly.
+    """
+    doc_status_storage = getattr(rag, "doc_status", None)
+    if doc_status_storage is None:
+        return None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout)
+    while True:
+        try:
+            rows = await doc_status_storage.get_by_ids([lightrag_doc_id])
+        except Exception as exc:  # noqa: BLE001 — treat probe failure as terminal
+            logger.warning(
+                "Failed to read doc_status while awaiting build of '%s': %s",
+                lightrag_doc_id,
+                exc,
+            )
+            return None
+        row = rows[0] if rows else None
+        status = (row or {}).get("status")
+        if status not in _INFLIGHT_BUILD_STATUSES:
+            # processed / failed / missing → terminal enough to classify.
+            return row
+        if loop.time() >= deadline:
+            return row
+        await asyncio.sleep(poll_interval)
+
+
+async def _collect_doc_status(
+    rag: Any,
+    plan: IndexBuildPlan,
+    *,
+    timeout: float = DEFAULT_BUILD_DRAIN_TIMEOUT_SECONDS,
+    poll_interval: float = DEFAULT_BUILD_DRAIN_POLL_SECONDS,
+) -> dict[str, Any]:
     doc_status_storage = getattr(rag, "doc_status", None)
     if doc_status_storage is None:
         return {
@@ -428,16 +724,11 @@ async def _collect_doc_status(rag: Any, plan: IndexBuildPlan) -> dict[str, Any]:
             "entity_count": None,
             "relation_count": None,
         }
-    try:
-        rows = await doc_status_storage.get_by_ids([plan.document.lightrag_doc_id])
-    except Exception as exc:  # noqa: BLE001 — fallback when storage probe fails
-        logger.warning(
-            "Failed to read doc_status for build result of '%s': %s",
-            plan.document.id,
-            exc,
-        )
-        rows = []
-    row = rows[0] if rows else None
+    # Wait out a concurrent drain rather than reading once and mis-reporting a
+    # still-inflight doc as a failure (see _await_doc_status_terminal).
+    row = await _await_doc_status_terminal(
+        rag, plan.document.lightrag_doc_id, timeout=timeout, poll_interval=poll_interval
+    )
     if row is None:
         raise RuntimeError(
             f"Document '{plan.document.id}' build did not create doc_status row "

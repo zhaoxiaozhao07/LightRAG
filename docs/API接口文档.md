@@ -127,7 +127,8 @@ files: [a.pdf, b.docx]
 约束：
 - 单请求最多 32 个文件，单文件和单请求总字节数均不得超过 `MAX_UPLOAD_SIZE`，未配置或非正数时 `413`。
 - 文件扩展名必须在 `SUPPORTED_DOCUMENT_EXTENSIONS` 列表中。
-- `auto_parse=true` 会创建一个 `job_type=parse` 的聚合任务（`document_id=null`、`batch_id` 非空、payload 携带 `document_ids` 列表），并在后台**实际逐个执行解析**（每个文档 `parse_queued → parsing → parsed`），结果聚合进该 job 的 `result.items[]`；同时 `auto_index=true` 会在每个文档解析成功后串联 KG 构建到 `ready`（需路由注入 `IndexBuildService`）。`auto_parse=false` 仅落 metadata，job 立即标记 `succeeded`。
+- `auto_parse=true` 会创建一个 `job_type=parse` 的聚合任务（`document_id=null`、`batch_id` 非空、payload 携带 `document_ids` 列表），并在后台**并发执行解析**（Phase 1 受 `MAX_PARALLEL_PARSE_MINERU` 并发上限约束，每个文档 `parse_queued → parsing → parsed`），结果聚合进该 job 的 `result.items[]`；同时 `auto_index=true` 会在 Phase 2 把全部解析成功的文档**一次性批量入队、单次流水线 drain**（analyze/extract/merge 跨文档重叠）构建到 `ready`（需路由注入 `IndexBuildService`）。`auto_parse=false` 仅落 metadata，job 立即标记 `succeeded`。
+  - 行为说明：`result.items[]` 不再保证与输入 `document_ids` 顺序一致（按完成情况聚合，但每个文档恰好出现一次）；单文档失败相互隔离，不影响其它文档继续。`:sync` 的并发模型与此一致。
 - 注意：该聚合 parse/build 任务默认由创建请求的 in-process 后台任务立即执行；启用 `LIGHTRAG_KB_JOB_WORKER=true` 后，`queued` 且超过 `LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS` 的可恢复聚合任务可被 durable worker 认领，并凭 `payload.document_ids` 续跑。若未启用 durable worker，服务在执行中途重启仍需客户端重新触发或重试。`auto_parse=true` 且请求未显式传 `parser_engine/process_options` 时，会把当前 active `parser_config.engine/process_options` snapshot 到文档和 job metadata；`auto_parse=false` 不冻结这些默认值。
 - 同名文件会写入独立的 `<workspace>/<document_id>/<filename>` 目录，使用独占创建 (`O_EXCL`)。
 - 若启用对象存储，上传成功后每个 document 的 `metadata.source_object_uri` 为 `s3://<bucket>/<prefix>/workspaces/<workspace>/documents/<document_id>/source/<filename>`；本地文件仍保留，用于 parser/build/download。
@@ -166,7 +167,7 @@ Content-Type: application/json
 - 单文档文本上限 1 MB，单 metadata JSON 上限 64 KB。
 - 单请求最多 100 个文本。
 - `idempotency_key` 在 `(kb_id, job_type)` 维度唯一；指纹一致直接返回原 batch；指纹不一致返回 `409`。
-- `auto_parse=true` 与多文件 `:upload` 一致：创建 `job_type=parse` 聚合任务并在后台逐个解析；`auto_index=true` 解析成功后串联 KG 构建到 `ready`（需注入 `IndexBuildService`）。该聚合任务默认由 in-process 后台任务执行；启用 `LIGHTRAG_KB_JOB_WORKER=true` 后，`queued` 且超过 grace window 的可恢复聚合 parse job 可由 durable worker 认领并续跑。请求未显式传 `parser_engine/process_options` 时，会 snapshot 当前 active `parser_config.engine/process_options` 作为解析默认值；`auto_parse=false` 不冻结这些默认值。
+- `auto_parse=true` 与多文件 `:upload` 一致：创建 `job_type=parse` 聚合任务并在后台**并发解析**（受 `MAX_PARALLEL_PARSE_MINERU` 并发上限约束）；`auto_index=true` 在 Phase 2 把全部解析成功的文档**一次性批量入队、单次流水线 drain** 构建到 `ready`（需注入 `IndexBuildService`）。该聚合任务默认由 in-process 后台任务执行；启用 `LIGHTRAG_KB_JOB_WORKER=true` 后，`queued` 且超过 grace window 的可恢复聚合 parse job 可由 durable worker 认领并续跑（续跑同样走并发解析 + 单次 drain）。请求未显式传 `parser_engine/process_options` 时，会 snapshot 当前 active `parser_config.engine/process_options` 作为解析默认值；`auto_parse=false` 不冻结这些默认值。
 
 ### 2.3 批量增量同步
 
@@ -183,8 +184,8 @@ source_keys: ["manual/a.pdf", "manual/b.pdf"]
 - `source_key` 在同一 KB 内由 metadata store 原子唯一约束；并发 sync 不会为同一个外部文档创建两个活动 KB 文档。
 - 服务端先读取文件内容并计算 `source_hash`，再查找相同 `source_key` 的现有文档。
 - 找不到 `source_key`：创建新文档；`source_hash` 相同：跳过 source 替换，但若当前请求的 `parser_engine/process_options` 派生出的 `parser_hash` 与文档上次成功解析的值不同，仍会重解析并继续重建；`source_hash` 不同：复用单文档 replace 语义，保留原 `document_id`，先删除旧 `lightrag_doc_id` 后替换 source。
-- `auto_parse=true` 默认继续解析；请求未显式传 `parser_engine/process_options` 时，会按当前 active `parser_config.engine/process_options` 作为解析默认值；`auto_index=true` 默认在解析成功后继续构建 KG/index，使成功 item 到达 `ready` 并可直接走 KB query。
-- 返回单个聚合 `sync` job。每个 item 在 `job.result.items[]` 中记录 `source_key`、`action`（`created` / `replaced` / `skipped` / `reparsed`）、`status`、`parse_result`、`build_result` 等；单个 item 失败不会阻塞其他 item，active parse/build/delete/replace 会保留对应 `*_job_active` 错误码和 `existing_job_id`。
+- `auto_parse=true` 默认继续解析（Phase 1 受 `MAX_PARALLEL_PARSE_MINERU` 约束**并发解析**）；请求未显式传 `parser_engine/process_options` 时，会按当前 active `parser_config.engine/process_options` 作为解析默认值；`auto_index=true` 默认在 Phase 2 把全部解析成功的文档**一次性批量入队、单次流水线 drain** 构建到 `ready` 并可直接走 KB query。
+- 返回单个聚合 `sync` job。每个 item 在 `job.result.items[]` 中记录 `source_key`、`action`（`created` / `replaced` / `skipped` / `reparsed`）、`status`、`parse_result`、`build_result` 等；`result.items[]` 不再保证与输入顺序一致（按完成情况聚合，每个 `source_key` 恰好出现一次）；单个 item 失败不会阻塞其他 item，active parse/build/delete/replace 会保留对应 `*_job_active` 错误码和 `existing_job_id`。
 - `idempotency_key` 在 `(kb_id, job_type=sync)` 维度唯一；同 key 同文件和同参数复用原 job，同 key 不同请求返回 `409`。
 
 ### 2.4 URL / 本地 staged 文件 / 目录扫描导入
@@ -590,6 +591,23 @@ Content-Type: application/json
 - **需重新发起的类型**：多文件 `upload` 且 `auto_parse=false` 时不产生可重驱动解析工作；其他没有持久化请求上下文的历史/自定义任务仍会在孤儿恢复时标 `failed`，需要重新发起请求。
 - **死信**：`failed` 且 `retry_count >= max_retries` 的任务不会再被 `:retry` 或 worker 重跑，可通过 `GET /kbs/{kb_id}/jobs/dead-letter` 单独列出做人工triage。
 - 可调环境变量：`LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS`（默认 1.0s）、`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`（默认 5.0s）。
+
+### 5.5.1 聚合任务的并发执行模型
+
+> 适用于产生聚合 `parse` job 的入口：多文件 `:upload` / `:texts` 的 `auto_parse=true`、`:sync`、`:batch-parse`，以及它们的 durable worker 续跑。单文档 `:parse` / `:build-kg` / `:reindex` 不受影响（仍是单文档路径）。
+
+聚合任务内部按两阶段执行，让解析阶段（MinerU/VLM 重）与索引阶段（实体抽取 / KG merge / 向量写入）跨文档重叠，缩短整批耗时、提高 GPU/VLM 利用率：
+
+- **Phase 1 并发解析**：批内所有文档**并发**调用解析引擎，并发上限由 `MAX_PARALLEL_PARSE_MINERU` 控制（其余引擎对应 `MAX_PARALLEL_PARSE_NATIVE` / `MAX_PARALLEL_PARSE_DOCLING`）。
+- **Phase 2 单次批量构建**（仅 `auto_index=true`）：把全部解析成功的文档**一次性批量入队**到 LightRAG 流水线并**单次 drain**，使 analyze / extract / merge 三层 worker 跨文档流水线化重叠（受 `MAX_PARALLEL_ANALYZE` / `MAX_PARALLEL_INSERT` 约束），而不是每个文档独立启停一次流水线。
+
+行为约定：
+
+- **失败隔离**：单个文档解析或构建失败只标记该文档 `parse_failed` / `build_failed` 并记入 `result.items[]`，不影响同批其它文档继续；聚合 job 终态在全部成功时 `succeeded`，部分失败时 `failed` 且 `result.summary.outcome=partial_failure`。
+- **结果顺序**：`result.items[]` 不保证与请求输入顺序一致（按完成情况聚合），但每个输入文档 / `source_key` 恰好出现一次。
+- **取消**：批量构建途中触发 `:cancel`，流水线协作式取消会把在途文档标记为 `cancelled`（而非 `build_failed`）。
+- **并发 drain 安全**：当同一 KB 上有多个聚合流并发（例如两个 disjoint `:sync`、或 `:sync` 与 `:upload` auto_parse 同时进行），构建结果读取采用对 `doc_status` 终态的轮询等待，避免把仍在其它流水线 drain 中的文档误判为失败。
+- 可调环境变量：`MAX_PARALLEL_PARSE_MINERU`（聚合 Phase 1 并发解析上限，默认随部署，生产建议按 MinerU 后端可承受并发设置）、`KB_BUILD_DRAIN_TIMEOUT_SECONDS`（构建结果等待终态超时，默认 3600s）、`KB_BUILD_DRAIN_POLL_SECONDS`（轮询间隔，默认 1.0s）。
 
 ### 5.6 等待任务终态
 

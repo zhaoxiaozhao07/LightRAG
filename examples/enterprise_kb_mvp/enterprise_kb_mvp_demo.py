@@ -45,9 +45,17 @@ DEFAULT_PROCESS_OPTIONS = "iteP"
 DEFAULT_QUERY = "请总结企业知识库中这些资料的核心主题、关键材料/工艺、实体关系和可落地价值。"
 DEFAULT_ISOLATION_QUERY = "请回答：这是什么知识库？如果没有资料，请说明无法从知识库中找到答案。"
 DEFAULT_HTTP_TIMEOUT = 300.0
-DEFAULT_JOB_TIMEOUT = 3600.0
-JOB_WAIT_SERVER_WINDOW = 600.0
-JOB_WAIT_HTTP_GRACE = 10.0
+# 0 = wait indefinitely (follow the job until it reaches a terminal state). The
+# server-side parse + concurrent KG build of several PDFs can legitimately run
+# well past an hour, so a fixed client budget used to expire and "abandon" a job
+# that the server kept processing. Default to following the job; pass a positive
+# --job-timeout only when you deliberately want the client to give up early.
+DEFAULT_JOB_TIMEOUT = 0.0
+# Each :wait call blocks server-side for at most this long, then returns 408 and
+# the client immediately re-issues — a heartbeat that proves liveness and prints
+# progress without holding one HTTP connection open for the whole job.
+JOB_WAIT_SERVER_WINDOW = 120.0
+JOB_WAIT_HTTP_GRACE = 15.0
 ACTIVE_JOB_STATES = {"queued", "running", "retrying", "cancelling"}
 TERMINAL_JOB_STATES = {"succeeded", "failed", "cancelled"}
 DELETE_STRATEGIES = ("safe", "rebuild_doc_scope", "rebuild_kb", "rebuild_subgraph")
@@ -179,6 +187,26 @@ class EnterpriseKBClient:
         self._client = httpx.Client(
             base_url=base_url.rstrip("/"), headers=headers, timeout=timeout
         )
+        # In-flight ingest jobs we are currently waiting on, keyed by job_id ->
+        # {"kb_id", "document_ids"}. Used by cleanup-on-interrupt to cancel the
+        # server-side job and remove the partially-ingested documents so an
+        # aborted run does not leave half-built docs polluting the KB.
+        self._inflight_jobs: dict[str, dict[str, Any]] = {}
+
+    def register_inflight_job(
+        self, kb_id: str, job_id: str, *, document_ids: list[str] | None = None
+    ) -> None:
+        self._inflight_jobs[job_id] = {
+            "kb_id": kb_id,
+            "document_ids": list(document_ids or []),
+        }
+
+    def unregister_inflight_job(self, job_id: str) -> None:
+        self._inflight_jobs.pop(job_id, None)
+
+    @property
+    def inflight_jobs(self) -> dict[str, dict[str, Any]]:
+        return dict(self._inflight_jobs)
 
     def close(self) -> None:
         self._client.close()
@@ -343,16 +371,41 @@ class EnterpriseKBClient:
         return response.json()
 
     def wait_for_job(
-        self, kb_id: str, job_id: str, *, timeout_seconds: float
+        self,
+        kb_id: str,
+        job_id: str,
+        *,
+        timeout_seconds: float,
+        document_ids: list[str] | None = None,
     ) -> dict[str, Any]:
-        deadline = time.monotonic() + max(timeout_seconds, 0.1)
+        """Block until the job reaches a terminal state, printing a heartbeat.
+
+        ``timeout_seconds <= 0`` means "follow the job indefinitely" — the
+        server-side parse + concurrent KG build of several large PDFs can run
+        for a long time, and abandoning the wait would not stop the server, it
+        would just orphan a job that is still making progress. Each loop issues
+        a bounded server-side ``:wait`` (``JOB_WAIT_SERVER_WINDOW``); on its 408
+        heartbeat we re-query the job to print live progress and re-issue.
+
+        The job is registered as in-flight for the duration so that an interrupt
+        (Ctrl+C / SIGTERM / wait timeout) can cancel it server-side and clean up
+        the partially-ingested documents. It is unregistered only on a terminal
+        return — NOT on exception — so the interrupt handler can still see it.
+        """
+        self.register_inflight_job(kb_id, job_id, document_ids=document_ids)
+        follow_forever = timeout_seconds <= 0
+        deadline = None if follow_forever else time.monotonic() + timeout_seconds
+        started = time.monotonic()
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"job {job_id!r} did not finish within {timeout_seconds:.1f}s"
-                )
-            wait_window = min(remaining, JOB_WAIT_SERVER_WINDOW)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"job {job_id!r} did not finish within {timeout_seconds:.1f}s"
+                    )
+                wait_window = min(remaining, JOB_WAIT_SERVER_WINDOW)
+            else:
+                wait_window = JOB_WAIT_SERVER_WINDOW
             response = self._client.post(
                 f"/kbs/{kb_id}/jobs/{job_id}:wait",
                 params={"timeout_seconds": wait_window},
@@ -361,11 +414,150 @@ class EnterpriseKBClient:
             wait_detail = _wait_timeout_detail(response)
             if wait_detail is not None:
                 status = wait_detail.get("current_status")
-                if status in ACTIVE_JOB_STATES and deadline - time.monotonic() > 0:
-                    print(f"[wait] {job_id} still {status}; continuing")
+                if status in ACTIVE_JOB_STATES and (
+                    deadline is None or deadline - time.monotonic() > 0
+                ):
+                    elapsed = time.monotonic() - started
+                    self._print_job_heartbeat(kb_id, job_id, status, elapsed)
                     continue
             response.raise_for_status()
+            self.unregister_inflight_job(job_id)
             return response.json()
+
+    def _print_job_heartbeat(
+        self, kb_id: str, job_id: str, status: str, elapsed: float
+    ) -> None:
+        """Best-effort progress line so a long-running job visibly advances."""
+        detail = ""
+        try:
+            job = self.get_job(kb_id, job_id)
+            total = job.get("total_items")
+            completed = job.get("completed_items")
+            failed = job.get("failed_items")
+            progress = job.get("progress")
+            stage = job.get("stage")
+            parts = []
+            if stage:
+                parts.append(f"stage={stage}")
+            if total:
+                parts.append(f"items={completed or 0}/{total} failed={failed or 0}")
+            if isinstance(progress, (int, float)):
+                parts.append(f"progress={progress:.0%}")
+            if parts:
+                detail = " " + " ".join(parts)
+        except Exception:  # noqa: BLE001 — heartbeat must never break the wait
+            detail = ""
+        print(f"[wait] {job_id} {status} ({elapsed:.0f}s elapsed){detail}; continuing")
+
+    def get_job(self, kb_id: str, job_id: str) -> dict[str, Any]:
+        response = self._client.get(f"/kbs/{kb_id}/jobs/{job_id}")
+        response.raise_for_status()
+        return response.json()
+
+    def cancel_job(self, kb_id: str, job_id: str) -> dict[str, Any]:
+        response = self._client.post(f"/kbs/{kb_id}/jobs/{job_id}:cancel")
+        response.raise_for_status()
+        return response.json()
+
+    def _wait_job_terminal_or_released(
+        self, kb_id: str, job_id: str, *, timeout: float = 60.0, poll: float = 1.0
+    ) -> str | None:
+        """Poll a job briefly until it leaves the active set (terminal), so we
+        cancel cooperatively before deleting its documents. Returns the last
+        observed status, or None if the job could not be read."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        last_status: str | None = None
+        while True:
+            try:
+                job = self.get_job(kb_id, job_id)
+                last_status = job.get("status")
+            except Exception:  # noqa: BLE001 — best effort
+                return last_status
+            if last_status not in ACTIVE_JOB_STATES:
+                return last_status
+            if time.monotonic() >= deadline:
+                return last_status
+            time.sleep(poll)
+
+    def cleanup_interrupted_jobs(self) -> list[dict[str, Any]]:
+        """Cancel every in-flight ingest job and delete the documents it had
+        started ingesting, so an aborted run leaves no half-built docs behind.
+
+        For each registered job: (1) ``:cancel`` it (server stops at the next
+        cooperative checkpoint / aborts the in-flight parse), (2) wait briefly
+        for it to leave the active set so its per-document build/parse claims
+        are released, (3) ``:batch-delete`` the partially-ingested document ids
+        with ``delete_artifacts``/``delete_source_file`` so parser products and
+        uploaded sources are removed too. Best-effort and never raises — it runs
+        from an interrupt handler whose job is to leave the KB clean."""
+        results: list[dict[str, Any]] = []
+        for job_id, info in self.inflight_jobs.items():
+            kb_id = info["kb_id"]
+            document_ids = list(info.get("document_ids") or [])
+            entry: dict[str, Any] = {"job_id": job_id, "kb_id": kb_id}
+            try:
+                cancelled = self.cancel_job(kb_id, job_id)
+                entry["cancel_status"] = cancelled.get("status")
+            except Exception as exc:  # noqa: BLE001
+                entry["cancel_error"] = str(exc)
+            final_status = self._wait_job_terminal_or_released(kb_id, job_id)
+            entry["final_status"] = final_status
+            # Discover the docs this run created if the caller didn't record any
+            # (sync stages docs lazily server-side). Fall back to listing the KB
+            # and selecting documents still in a partial / in-progress state —
+            # safe in the demo because --reset-kb gives each run a fresh KB, so
+            # any non-ready doc belongs to the interrupted job.
+            if not document_ids:
+                document_ids = self._partial_document_ids(kb_id)
+                if document_ids:
+                    entry["cleanup_discovered_partial_docs"] = True
+            if document_ids:
+                try:
+                    deleted = self.batch_delete_documents(
+                        kb_id,
+                        document_ids,
+                        delete_source_file=True,
+                        delete_artifacts=True,
+                        delete_llm_cache=False,
+                        strategy="safe",
+                        idempotency_key=f"cleanup-{job_id}",
+                    )
+                    entry["cleanup_delete_job"] = deleted.get("id")
+                    entry["cleanup_document_ids"] = document_ids
+                except Exception as exc:  # noqa: BLE001
+                    entry["cleanup_delete_error"] = str(exc)
+            else:
+                entry["cleanup_skipped"] = "no_partial_documents_found"
+            results.append(entry)
+            self.unregister_inflight_job(job_id)
+        return results
+
+    # Document states that mean "not a clean, queryable doc" — i.e. the build
+    # never finished. Used by interrupt cleanup to find half-ingested docs.
+    _PARTIAL_DOC_STATUSES = frozenset(
+        {
+            "created",
+            "uploaded",
+            "parse_queued",
+            "parsing",
+            "parsed",
+            "parse_failed",
+            "build_queued",
+            "building",
+            "build_failed",
+        }
+    )
+
+    def _partial_document_ids(self, kb_id: str) -> list[str]:
+        try:
+            payload = self.list_documents(kb_id, limit=500)
+        except Exception:  # noqa: BLE001
+            return []
+        return [
+            str(doc["id"])
+            for doc in payload.get("documents", [])
+            if doc.get("status") in self._PARTIAL_DOC_STATUSES and doc.get("id")
+        ]
 
     def list_documents(self, kb_id: str, *, limit: int = 100) -> dict[str, Any]:
         response = self._client.get(f"/kbs/{kb_id}/documents", params={"limit": limit})
@@ -537,10 +729,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=40)
     parser.add_argument("--chunk-top-k", type=int, default=20)
     parser.add_argument("--http-timeout", type=float, default=DEFAULT_HTTP_TIMEOUT)
-    parser.add_argument("--job-timeout", type=float, default=DEFAULT_JOB_TIMEOUT)
+    parser.add_argument(
+        "--job-timeout",
+        type=float,
+        default=DEFAULT_JOB_TIMEOUT,
+        help=(
+            "Client-side budget (seconds) for waiting on a job. 0 (default) "
+            "means follow the job until it terminates — the server keeps "
+            "running regardless, so giving up early only orphans a live job. "
+            "Set a positive value only to deliberately bail out early."
+        ),
+    )
     parser.add_argument("--include-references", action="store_true", default=True)
     parser.add_argument("--no-include-references", dest="include_references", action="store_false")
     parser.add_argument("--include-chunk-content", action="store_true")
+    parser.add_argument(
+        "--interactive-query",
+        action="store_true",
+        help=(
+            "After the scripted query, drop into an interactive Q&A loop: type a "
+            "question, get an answer + references back. Each question is a fresh, "
+            "stateless query (no conversation history). Blank line / 'exit' quits."
+        ),
+    )
     parser.add_argument(
         "--manual-flow",
         action="store_true",
@@ -548,9 +759,39 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--force-rebuild", action="store_true", help="After sync, force build_kg for every discovered document.")
     parser.add_argument(
+        "--sync-wave-size",
+        type=int,
+        default=0,
+        help=(
+            "Split the discovered files into waves of this many and submit one "
+            ":sync per wave (0 = a single wave with all files). Demonstrates the "
+            "pipeline overlap: a later wave's documents start parsing while an "
+            "earlier wave's documents are still extracting/merging."
+        ),
+    )
+    parser.add_argument(
+        "--sync-wave-delay",
+        type=float,
+        default=0.0,
+        help="Seconds to pause between submitting consecutive sync waves.",
+    )
+    parser.add_argument(
         "--delete-test",
         action="store_true",
         help="After graph inspection, pause for interactive document deletion testing.",
+    )
+    parser.add_argument(
+        "--no-cleanup-on-interrupt",
+        dest="cleanup_on_interrupt",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable the default cleanup-on-interrupt behavior. By default, when "
+            "the demo is interrupted (Ctrl+C / SIGTERM) or a wait times out while "
+            "an ingest job is in flight, the demo cancels that server-side job and "
+            "removes the partially-ingested documents (artifacts + source) so the "
+            "KB is not polluted by a half-finished build."
+        ),
     )
     parser.add_argument(
         "--delete-source-file",
@@ -839,6 +1080,9 @@ def run(args: argparse.Namespace) -> int:
         else:
             print("[skip] query")
 
+        if args.interactive_query and not args.skip_query:
+            run_interactive_query(client, args, ready_documents, report)
+
         if not args.skip_isolation_check:
             isolation = run_isolation_check(client, args, report)
             report["steps"]["isolation"] = isolation
@@ -852,6 +1096,37 @@ def run(args: argparse.Namespace) -> int:
         report_path = write_report(report, output_dir, run_id)
         print(f"[done] report={report_path}")
         return 0
+    except (KeyboardInterrupt, TimeoutError) as exc:
+        # Forced termination (Ctrl+C / SIGTERM-mapped) or a wait timeout while an
+        # ingest job is still in flight. Cancel the server-side job(s) and delete
+        # the partially-ingested documents so the KB is not left polluted by a
+        # half-finished build. Best-effort; never mask the original interrupt.
+        kind = type(exc).__name__
+        print(f"[interrupt] {kind}: cleaning up in-flight ingest jobs", file=sys.stderr)
+        cleanup_summary: dict[str, Any] = {"trigger": kind}
+        if getattr(args, "cleanup_on_interrupt", True) and client.inflight_jobs:
+            try:
+                cleanup_summary["jobs"] = client.cleanup_interrupted_jobs()
+                print(
+                    f"[interrupt] cleaned up {len(cleanup_summary['jobs'])} in-flight "
+                    "job(s); partial documents removed",
+                    file=sys.stderr,
+                )
+            except Exception as cleanup_exc:  # noqa: BLE001
+                cleanup_summary["error"] = str(cleanup_exc)
+                print(f"[interrupt] cleanup failed: {cleanup_exc}", file=sys.stderr)
+        else:
+            cleanup_summary["skipped"] = (
+                "disabled" if not getattr(args, "cleanup_on_interrupt", True)
+                else "no_inflight_jobs"
+            )
+        elapsed = time.time() - started
+        report["interrupted_at"] = datetime.now(timezone.utc).isoformat()
+        report["elapsed_seconds"] = round(elapsed, 3)
+        report["interrupt_cleanup"] = cleanup_summary
+        report_path = write_report(report, output_dir, run_id)
+        print(f"[interrupt] partial report={report_path}", file=sys.stderr)
+        raise
     except Exception as exc:
         elapsed = time.time() - started
         report["failed_at"] = datetime.now(timezone.utc).isoformat()
@@ -871,23 +1146,67 @@ def run_sync_flow(
     run_id: str,
     report: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    print("[step] documents:sync auto_parse=true auto_index=true")
-    job = client.sync_documents(
-        args.kb_id,
-        files,
-        parser_engine=args.parser_engine,
-        process_options=args.process_options,
-        idempotency_key=f"enterprise-sync-{args.kb_id}-{run_id}",
-        auto_parse=True,
-        auto_index=True,
-    )
-    final = client.wait_for_job(args.kb_id, job["id"], timeout_seconds=args.job_timeout)
-    if final["status"] != "succeeded":
-        raise RuntimeError(
-            f"documents:sync failed: {final.get('error_code')} {final.get('error_message')}"
+    wave_size = args.sync_wave_size if args.sync_wave_size and args.sync_wave_size > 0 else len(files)
+    waves = [files[i : i + wave_size] for i in range(0, len(files), wave_size)] or [[]]
+    multi_wave = len(waves) > 1
+    wave_reports: list[dict[str, Any]] = []
+    total_started = time.monotonic()
+
+    for wave_index, wave_files in enumerate(waves):
+        label = (
+            f"wave {wave_index + 1}/{len(waves)} ({len(wave_files)} docs)"
+            if multi_wave
+            else "documents:sync auto_parse=true auto_index=true"
         )
-    report["steps"]["sync"] = {"created": job, "final": final}
-    print(f"[ok] sync job={job['id']} status={final['status']}")
+        print(f"[step] {label}")
+        sync_started = time.monotonic()
+        job = client.sync_documents(
+            args.kb_id,
+            wave_files,
+            parser_engine=args.parser_engine,
+            process_options=args.process_options,
+            # Distinct idempotency key per wave so each is its own aggregate job.
+            idempotency_key=f"enterprise-sync-{args.kb_id}-{run_id}-w{wave_index}",
+            auto_parse=True,
+            auto_index=True,
+        )
+        final = client.wait_for_job(
+            args.kb_id, job["id"], timeout_seconds=args.job_timeout
+        )
+        sync_elapsed = round(time.monotonic() - sync_started, 2)
+        if final["status"] != "succeeded":
+            raise RuntimeError(
+                f"documents:sync failed: {final.get('error_code')} {final.get('error_message')}"
+            )
+        wave_reports.append(
+            {
+                "wave": wave_index + 1,
+                "created": job,
+                "final": final,
+                "elapsed_seconds": sync_elapsed,
+                "documents": len(wave_files),
+            }
+        )
+        print(
+            f"[ok] sync job={job['id']} status={final['status']} "
+            f"elapsed={sync_elapsed}s ({len(wave_files)} docs)"
+        )
+        if multi_wave and wave_index < len(waves) - 1 and args.sync_wave_delay > 0:
+            time.sleep(args.sync_wave_delay)
+
+    total_elapsed = round(time.monotonic() - total_started, 2)
+    report["steps"]["sync"] = {
+        "waves": wave_reports,
+        "wave_count": len(waves),
+        "total_documents": len(files),
+        "elapsed_seconds": total_elapsed,
+        "seconds_per_document": round(total_elapsed / max(1, len(files)), 2),
+    }
+    if multi_wave:
+        print(
+            f"[ok] sync total elapsed={total_elapsed}s across {len(waves)} waves "
+            f"({len(files)} docs, {round(total_elapsed / max(1, len(files)), 2)}s/doc)"
+        )
     documents_payload = client.list_documents(args.kb_id, limit=200)
     return list(documents_payload.get("documents", []))
 
@@ -1211,6 +1530,78 @@ def write_report(report: dict[str, Any], output_dir: Path, run_id: str) -> Path:
     return report_path
 
 
+def run_interactive_query(
+    client: EnterpriseKBClient,
+    args: argparse.Namespace,
+    ready_documents: list[dict[str, Any]],
+    report: dict[str, Any],
+) -> None:
+    """Stateless interactive Q&A loop.
+
+    Each prompt is an independent ``/query`` call with NO conversation history —
+    every question stands alone. Prints the answer and its references each round.
+    Blank line, 'exit', 'quit', or EOF leaves the loop.
+    """
+    if not sys.stdin.isatty():
+        print("[interactive-query] stdin is not a TTY; skipping interactive Q&A")
+        return
+    if not ready_documents:
+        print("[interactive-query] no ready documents; skipping interactive Q&A")
+        return
+    print()
+    print("[interactive-query] 进入交互问答（每次独立提问，不含历史对话）。")
+    print("[interactive-query] 直接回车 / 输入 exit / quit 退出。")
+    rounds: list[dict[str, Any]] = []
+    while True:
+        try:
+            question = input("问> ").strip()
+        except EOFError:
+            break
+        if not question or question.lower() in {"exit", "quit", "q"}:
+            break
+        try:
+            result = client.query(
+                args.kb_id,
+                question,
+                mode=args.mode,
+                include_references=True,
+                include_chunk_content=args.include_chunk_content,
+                top_k=args.top_k,
+                chunk_top_k=args.chunk_top_k,
+            )
+        except Exception as exc:  # noqa: BLE001 — keep the loop alive on errors
+            print(f"[interactive-query] 查询失败：{exc}")
+            continue
+        answer = result.get("response") or "(no answer)"
+        references = result.get("references") or []
+        print(f"答> {answer}")
+        if references:
+            print("引用：")
+            for ref in references:
+                ref_id = ref.get("reference_id", "?")
+                file_path = ref.get("file_path", "-")
+                print(f"  [{ref_id}] {file_path}")
+                content = ref.get("content")
+                if content:
+                    snippets = content if isinstance(content, list) else [content]
+                    for snippet in snippets:
+                        text = str(snippet).replace("\n", " ")
+                        print(f"      {text[:200]}")
+        else:
+            print("引用：(无)")
+        rounds.append(
+            {
+                "question": question,
+                "answer": answer,
+                "reference_count": len(references),
+                "references": references,
+            }
+        )
+    if rounds:
+        report["steps"]["interactive_query"] = {"rounds": rounds, "count": len(rounds)}
+    print(f"[interactive-query] 结束，共 {len(rounds)} 轮问答")
+
+
 def run_isolation_check(
     client: EnterpriseKBClient, args: argparse.Namespace, report: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1516,8 +1907,25 @@ def _bool_from_snapshot(
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _install_sigterm_handler() -> None:
+    """Map SIGTERM to KeyboardInterrupt so a `kill <pid>` (or supervisor stop)
+    funnels into the same cleanup-on-interrupt path as Ctrl+C, instead of an
+    abrupt exit that would orphan the server-side job."""
+    import signal
+
+    def _raise_keyboard_interrupt(signum, frame):  # noqa: ANN001
+        raise KeyboardInterrupt()
+
+    try:
+        signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+    except (ValueError, OSError, AttributeError):
+        # Not on the main thread or platform without SIGTERM — Ctrl+C still works.
+        pass
+
+
 def main() -> int:
     args = parse_args()
+    _install_sigterm_handler()
     try:
         return run(args)
     except httpx.HTTPStatusError as exc:
