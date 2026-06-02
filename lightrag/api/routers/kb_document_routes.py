@@ -61,6 +61,7 @@ _MAX_SYNC_SOURCE_KEY_BYTES = 1024
 _MAX_TEXT_DOCUMENT_BYTES = 1024 * 1024
 _MAX_TEXT_METADATA_BYTES = 64 * 1024
 _MAX_DIRECTORY_ARTIFACT_BYTES = 512 * 1024 * 1024  # 512 MB cap on directory zip
+_MAX_PRESIGNED_URL_EXPIRES_SECONDS = 7 * 24 * 60 * 60
 
 
 def _stream_directory_as_zip(artifact_file: Any) -> StreamingResponse:
@@ -211,6 +212,15 @@ class ArtifactListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class ArtifactDownloadUrlResponse(BaseModel):
+    artifact_id: str
+    url: str
+    object_uri: str
+    expires_in_seconds: int
+    filename: str
+    media_type: str
 
 
 class ParseDocumentRequest(BaseModel):
@@ -4465,6 +4475,44 @@ def create_kb_document_routes(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.get(
+        "/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:download-url",
+        response_model=ArtifactDownloadUrlResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Create a presigned download URL for an object-backed file artifact",
+    )
+    async def create_document_artifact_download_url(
+        kb_id: str,
+        document_id: str,
+        artifact_id: str,
+        expires_in_seconds: int = 3600,
+    ):
+        try:
+            expires_in_seconds = max(
+                1,
+                min(expires_in_seconds, _MAX_PRESIGNED_URL_EXPIRES_SECONDS),
+            )
+            result = await document_service.get_document_artifact_download_url(
+                kb_id,
+                document_id,
+                artifact_id,
+                expires_in_seconds=expires_in_seconds,
+            )
+            return ArtifactDownloadUrlResponse(
+                artifact_id=result.artifact.id,
+                url=result.url,
+                object_uri=result.object_uri,
+                expires_in_seconds=result.expires_in_seconds,
+                filename=result.filename,
+                media_type=result.media_type,
+            )
+        except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 import sys
 from pathlib import Path
 
@@ -130,6 +131,7 @@ class FakeObjectStorage(ObjectStorage):
         self.deleted_uris: list[str] = []
         self.deleted_prefixes: list[str] = []
         self.deleted_workspaces: list[str] = []
+        self.presigned: list[tuple[str, int]] = []
 
     async def initialize(self) -> None:
         return None
@@ -193,6 +195,21 @@ class FakeObjectStorage(ObjectStorage):
                 self.prefix_files.pop(uri, None)
                 deleted += len(files)
         return deleted
+
+    async def presign_download_url(
+        self, object_uri: str, *, expires_in_seconds: int = 3600
+    ) -> str:
+        self.presigned.append((object_uri, expires_in_seconds))
+        return f"https://objects.example/download?uri={object_uri}&expires={expires_in_seconds}"
+
+    def validate_document_file_uri(
+        self, object_uri: str, *, workspace: str, document_id: str
+    ) -> None:
+        prefix = f"s3://fake-bucket/workspaces/{workspace}/documents/{document_id}/"
+        if not object_uri.startswith(prefix) or object_uri.endswith("/"):
+            from lightrag.api.object_storage import ObjectStorageError
+
+            raise ObjectStorageError("Object URI is outside the document object prefix")
 
 
 class BuilderProbe:
@@ -1844,6 +1861,161 @@ def test_download_document_file_artifacts_returns_bytes(tmp_path):
     )
     assert blocks_response.headers["content-type"].startswith("application/x-ndjson")
     assert object_storage.downloads[-1][0] == blocks["metadata"]["object_uri"]
+
+
+def test_create_document_file_artifact_download_url(tmp_path):
+    object_storage = FakeObjectStorage()
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path, object_storage=object_storage
+    )
+    _create_kb(client, "kb_artifact_presign")
+    document_id, artifacts = _upload_and_parse_document(
+        client,
+        "kb_artifact_presign",
+        filename="paper.pdf",
+        content=b"pdf-body",
+    )
+
+    blocks = artifacts["blocks"]
+    response = client.get(
+        f"/kbs/kb_artifact_presign/documents/{document_id}/artifacts/{blocks['id']}:download-url",
+        params={"expires_in_seconds": 900},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["artifact_id"] == blocks["id"]
+    assert payload["object_uri"] == blocks["metadata"]["object_uri"]
+    assert payload["expires_in_seconds"] == 900
+    assert payload["filename"].endswith(".blocks.jsonl")
+    assert payload["media_type"] == "application/x-ndjson"
+    assert payload["url"] == (
+        "https://objects.example/download"
+        f"?uri={blocks['metadata']['object_uri']}&expires=900"
+    )
+    assert object_storage.presigned == [(blocks["metadata"]["object_uri"], 900)]
+
+
+def test_create_document_file_artifact_download_url_clamps_ttl(tmp_path):
+    object_storage = FakeObjectStorage()
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path, object_storage=object_storage
+    )
+    _create_kb(client, "kb_artifact_presign_ttl")
+    document_id, artifacts = _upload_and_parse_document(
+        client,
+        "kb_artifact_presign_ttl",
+        filename="paper.pdf",
+        content=b"pdf-body",
+    )
+
+    blocks = artifacts["blocks"]
+    response = client.get(
+        f"/kbs/kb_artifact_presign_ttl/documents/{document_id}/artifacts/{blocks['id']}:download-url",
+        params={"expires_in_seconds": 999999999},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["expires_in_seconds"] == 604800
+    assert payload["url"].endswith("&expires=604800")
+    assert object_storage.presigned == [(blocks["metadata"]["object_uri"], 604800)]
+
+
+def test_create_document_file_artifact_download_url_rejects_untrusted_object_uri(
+    tmp_path,
+):
+    object_storage = FakeObjectStorage()
+    client, _kb_service, store, _document_service, _job_service = _build_client(
+        tmp_path, object_storage=object_storage
+    )
+    _create_kb(client, "kb_artifact_presign_scope")
+    document_id, artifacts = _upload_and_parse_document(
+        client,
+        "kb_artifact_presign_scope",
+        filename="paper.pdf",
+        content=b"pdf-body",
+    )
+
+    blocks = artifacts["blocks"]
+    metadata = dict(blocks["metadata"])
+    metadata["object_uri"] = (
+        "s3://evil-bucket/workspaces/other/documents/other/artifacts/blocks.jsonl"
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE document_artifacts SET metadata_json = ? WHERE id = ?",
+            (json.dumps(metadata), blocks["id"]),
+        )
+        conn.commit()
+
+    response = client.get(
+        f"/kbs/kb_artifact_presign_scope/documents/{document_id}/artifacts/{blocks['id']}:download-url",
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 503
+    assert "outside the document object prefix" in response.json()["detail"]
+    assert object_storage.presigned == []
+
+
+def test_create_document_file_artifact_download_url_rejects_document_prefix_collision(
+    tmp_path,
+):
+    object_storage = FakeObjectStorage()
+    client, _kb_service, store, _document_service, _job_service = _build_client(
+        tmp_path, object_storage=object_storage
+    )
+    _create_kb(client, "kb_artifact_presign_prefix")
+    document_id, artifacts = _upload_and_parse_document(
+        client,
+        "kb_artifact_presign_prefix",
+        filename="paper.pdf",
+        content=b"pdf-body",
+    )
+
+    blocks = artifacts["blocks"]
+    metadata = dict(blocks["metadata"])
+    metadata["object_uri"] = blocks["metadata"]["object_uri"].replace(
+        f"/documents/{document_id}/",
+        f"/documents/{document_id}-extra/",
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE document_artifacts SET metadata_json = ? WHERE id = ?",
+            (json.dumps(metadata), blocks["id"]),
+        )
+        conn.commit()
+
+    response = client.get(
+        f"/kbs/kb_artifact_presign_prefix/documents/{document_id}/artifacts/{blocks['id']}:download-url",
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 503
+    assert "outside the document object prefix" in response.json()["detail"]
+    assert object_storage.presigned == []
+
+
+def test_create_document_artifact_download_url_rejects_directories(tmp_path):
+    object_storage = FakeObjectStorage()
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path, object_storage=object_storage
+    )
+    _create_kb(client, "kb_artifact_presign_dir")
+    document_id, artifacts = _upload_and_parse_document(client, "kb_artifact_presign_dir")
+
+    sidecar = artifacts["sidecar"]
+    response = client.get(
+        f"/kbs/kb_artifact_presign_dir/documents/{document_id}/artifacts/{sidecar['id']}:download-url",
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 400
+    assert "only available for file artifacts" in response.json()["detail"]
+    assert object_storage.presigned == []
 
 
 def test_download_document_artifact_streams_directory_as_zip(tmp_path):

@@ -41,6 +41,13 @@ Useful repeat-run flags:
 - `--run-id stable-id`: use a stable idempotency key/report suffix. Only reuse
   the same run id for an exact retry of the same file set; use a fresh run id
   after adding or changing files.
+- `--reset-kb ask|yes|no`: optionally hard-delete the main KB and the isolation
+  control KB before the run. The default `ask` prompts only in an interactive
+  terminal and skips reset in non-interactive shells to avoid accidental data
+  loss. `yes` resets without prompting; `no` always skips. Reset calls
+  `DELETE /kbs/{kb_id}?hard=true`, so it clears the KB metadata rows,
+  LightRAG workspace files, parser input/artifact cache, and MinIO/S3 objects
+  associated with the KB workspace.
 
 ## What is persisted
 

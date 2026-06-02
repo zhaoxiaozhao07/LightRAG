@@ -214,6 +214,21 @@ class EnterpriseKBClient:
             return existing
         return self.create_kb(kb_id, name, description)
 
+    def hard_delete_kb(self, kb_id: str) -> dict[str, Any] | None:
+        """Hard-delete a KB so the next run starts from a clean slate.
+
+        Calls ``DELETE /kbs/{kb_id}?hard=true`` which drops on-disk LightRAG
+        storage, parser inputs/artifacts, MinIO objects, and metadata rows
+        (kb_documents / kb_jobs / kb_document_artifacts / kb_config_versions
+        / kb_catalog). Returns the deleted KB record on success, or ``None``
+        when the KB did not exist (404). Other HTTP errors propagate.
+        """
+        response = self._client.delete(f"/kbs/{kb_id}", params={"hard": "true"})
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
+
     def status(self, kb_id: str) -> dict[str, Any]:
         response = self._client.get(f"/kbs/{kb_id}/status")
         response.raise_for_status()
@@ -570,7 +585,77 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional stable run id for idempotency keys and report file names.",
     )
+    parser.add_argument(
+        "--reset-kb",
+        choices=("ask", "yes", "no"),
+        default="ask",
+        help=(
+            "Hard-delete the KB (and the isolation control KB unless "
+            "--skip-isolation-check) before running. 'ask' (default) prompts "
+            "interactively on stdin; 'yes' resets without asking; 'no' skips. "
+            "Reset calls DELETE /kbs/{kb_id}?hard=true and clears落盘文件、"
+            "Postgres 记录和对象存储 -- 也是检验 KB 硬删接口的端到端入口。"
+        ),
+    )
     return parser.parse_args()
+
+
+def confirm_reset_kb(args: argparse.Namespace) -> bool:
+    """Decide whether to hard-delete the demo KB(s) before the run.
+
+    Honors ``--reset-kb yes/no`` without prompting; otherwise asks once on
+    stdin. Falls back to False when stdin is not a TTY so non-interactive
+    runs cannot accidentally wipe a KB without an explicit ``yes``.
+    """
+    choice = getattr(args, "reset_kb", "ask")
+    if choice == "yes":
+        return True
+    if choice == "no":
+        return False
+    if not sys.stdin.isatty():
+        print(
+            "[warn] --reset-kb=ask but stdin is not a TTY; skipping reset. "
+            "Pass --reset-kb=yes to reset in non-interactive runs."
+        )
+        return False
+    targets = [args.kb_id]
+    if not args.skip_isolation_check:
+        targets.append(args.isolation_kb_id)
+    print()
+    print("[input] 是否全部重建知识库（硬删落盘文件、Postgres 记录和对象存储）？")
+    for kb_id in targets:
+        print(f"        - {kb_id}")
+    print("        将调用 DELETE /kbs/{kb_id}?hard=true")
+    try:
+        answer = input("        输入 yes / y 确认，其他键跳过：").strip().lower()
+    except EOFError:
+        return False
+    return answer in {"y", "yes"}
+
+
+def _hard_reset_demo_kbs(
+    client: EnterpriseKBClient, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Hard-delete the main demo KB and (when not skipped) the isolation KB.
+
+    Returns a summary dict for the run report; errors propagate so the demo
+    stops loudly rather than continuing on stale state.
+    """
+    summary: dict[str, Any] = {"performed": True, "targets": {}}
+    plan: list[tuple[str, str]] = [("main", args.kb_id)]
+    if not args.skip_isolation_check:
+        plan.append(("isolation", args.isolation_kb_id))
+    for label, kb_id in plan:
+        print(f"[reset] hard-delete {label} kb_id={kb_id!r}")
+        deleted = client.hard_delete_kb(kb_id)
+        state = "deleted" if deleted else "not_found"
+        summary["targets"][label] = {
+            "kb_id": kb_id,
+            "state": state,
+            "record": deleted,
+        }
+        print(f"[reset] {label} kb_id={kb_id!r}: {state}")
+    return summary
 
 
 def run(args: argparse.Namespace) -> int:
@@ -610,6 +695,11 @@ def run(args: argparse.Namespace) -> int:
             f"[ok] health object_storage={health.get('configuration', {}).get('object_storage')} "
             f"metadata={health.get('configuration', {}).get('kb_metadata_backend')}"
         )
+
+        if confirm_reset_kb(args):
+            report["steps"]["reset"] = _hard_reset_demo_kbs(client, args)
+        else:
+            report["steps"]["reset"] = {"performed": False}
 
         kb = client.ensure_kb(args.kb_id, args.kb_name, args.kb_description)
         report["steps"]["kb"] = kb

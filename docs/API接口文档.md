@@ -546,12 +546,14 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 | `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts` | 产物列表 |
 | `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}` | 产物元数据 |
 | `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:download` | 下载文件型产物 |
+| `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:download-url` | 为对象存储中的文件型产物生成预签名下载 URL |
 
 下载约束：
 - 文件型产物（`original` / `blocks` / `markdown` / `content_list` / `middle_json` / `model_json` / `image` / `layout_pdf`）以 `FileResponse` 直接返回。
 - 目录型产物（`sidecar` / `raw_dir`）以流式 zip 返回（`Content-Type: application/zip`），单次下载 zip 内未压缩字节上限 512 MB，超限返回 `413`。
 - 路径必须位于 `inputs/<workspace>/<document_id>` 内；跨 KB、缺失文件、路径逃逸均返回 `404` / `400`。
-- 启用对象存储时，如果本地 cache path 缺失，下载接口会先从 `metadata.object_uri` / `metadata.object_prefix_uri` restore 到原 cache path，再返回文件或 zip。当前接口仍返回服务端代理的 bytes/zip，尚未暴露预签名 URL。
+- 启用对象存储时，如果本地 cache path 缺失，`:download` 接口会先从 `metadata.object_uri` / `metadata.object_prefix_uri` restore 到原 cache path，再返回文件或 zip，保持旧客户端兼容。
+- `:download-url` 仅对 metadata 中存在 `object_uri` 的**文件型** artifact 生效，返回 `{artifact_id,url,object_uri,expires_in_seconds,filename,media_type}`；服务端使用对象存储后端生成 `GET Object` 预签名 URL，不会触发本地 cache restore。`expires_in_seconds` 默认 3600 秒，服务端限制在 `[1, 604800]`。目录型 artifact（`sidecar` / `raw_dir`，metadata 中为 `object_prefix_uri`）仍需走 `:download` 的 zip 代理下载。
 
 ---
 
@@ -888,6 +890,6 @@ LIGHTRAG_OBJECT_STORAGE_DISABLE_EXPECT_HEADER=true
 
 `LIGHTRAG_OBJECT_STORAGE_DISABLE_EXPECT_HEADER` 默认为 `true`：上传 `PutObject` / multipart `UploadPart` 前会移除 botocore 自动添加的 `Expect: 100-continue` 请求头，以兼容部分 MinIO 或反向代理组合在 100-continue 握手上挂起并最终返回 `RequestTimeout` 的场景。若生产 S3 网关明确依赖该头，可显式设置为 `false`。
 
-对象 key 组织在 `<prefix>/workspaces/<workspace>/documents/<document_id>/...` 下。`INPUT_DIR` 仍是本地 cache：parser、build、download 继续使用本地 path；当 cache 缺失时，download/parse planning 会按 metadata 中的对象 URI restore。硬删除 KB 时会按 workspace prefix 清理对象。
+对象 key 组织在 `<prefix>/workspaces/<workspace>/documents/<document_id>/...` 下。`INPUT_DIR` 仍是本地 cache：parser、build、download 继续使用本地 path；当 cache 缺失时，download/parse planning 会按 metadata 中的对象 URI restore。文件型 artifact 可通过 `:download-url` 直接获取对象存储 `GET Object` 预签名 URL，绕过 API 代理传输大文件；目录型 artifact 仍通过 API zip 代理。硬删除 KB 时会按 workspace prefix 清理对象。
 
-> 测试覆盖：`tests/api/test_object_storage_s3.py` 仅在 boto3 client 边界打桩（`aioboto3` 在 `S3ObjectStorage._new_session` 内惰性 import，可注入 fake session 离线运行），直测出厂 `S3ObjectStorage` 的 key 前缀规范化、URI 构建/解析、bucket 自动创建、upload/download 往返、目录逐文件上传、`list_objects_v2` 分页与续传 token、`delete_uri`/`delete_prefix`/`delete_workspace`、`Expect` 请求头兼容处理与 backend 选择。该测试路径不需要连接真实 MinIO/S3；生产启用 `LIGHTRAG_OBJECT_STORAGE=minio|s3` 仍需要 `aioboto3`。
+> 测试覆盖：`tests/api/test_object_storage_s3.py` 仅在 boto3 client 边界打桩（`aioboto3` 在 `S3ObjectStorage._new_session` 内惰性 import，可注入 fake session 离线运行），直测出厂 `S3ObjectStorage` 的 key 前缀规范化、URI 构建/解析、bucket 自动创建、upload/download 往返、目录逐文件上传、`list_objects_v2` 分页与续传 token、`delete_uri`/`delete_prefix`/`delete_workspace`、`GET Object` 预签名 URL、`Expect` 请求头兼容处理与 backend 选择。`tests/api/routes/test_kb_document_routes.py` 覆盖 artifact `:download-url` 对文件型 object artifact 返回 URL、目录型 artifact 拒绝预签名并继续走 zip 下载。该测试路径不需要连接真实 MinIO/S3；生产启用 `LIGHTRAG_OBJECT_STORAGE=minio|s3` 仍需要 `aioboto3`。

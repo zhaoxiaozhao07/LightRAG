@@ -303,6 +303,10 @@ class TestOpenAPISpecIntegration:
                 "/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:download"
                 in paths
             )
+            assert (
+                "/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:download-url"
+                in paths
+            )
             assert "/kbs/{kb_id}/jobs" in paths
             assert "/kbs/{kb_id}/jobs/{job_id}" in paths
             for path in paths:

@@ -99,6 +99,13 @@ class _FakeS3Client:
         for obj in Delete["Objects"]:
             self._state.objects.pop((Bucket, obj["Key"]), None)
 
+    def generate_presigned_url(self, ClientMethod, Params, ExpiresIn):
+        self._state.calls.append(("generate_presigned_url", ClientMethod, Params, ExpiresIn))
+        return (
+            f"https://objects.example/{Params['Bucket']}/{Params['Key']}"
+            f"?method={ClientMethod}&expires={ExpiresIn}"
+        )
+
 
 class _FakeS3State:
     def __init__(self) -> None:
@@ -283,6 +290,115 @@ async def test_delete_workspace_removes_all_workspace_objects(tmp_path: Path):
     assert deleted == 2
     survivors = {key for (_, key) in state.objects}
     assert survivors == {"kb/workspaces/ws_other/documents/d/source/other.pdf"}
+
+
+async def test_presign_download_url_uses_get_object_params(tmp_path: Path):
+    storage, state, _ = _make_storage()
+    await storage.initialize()
+    local = tmp_path / "source.bin"
+    local.write_bytes(b"payload")
+    uri = await storage.upload_file(local, key="workspaces/ws/doc/source.bin")
+
+    url = await storage.presign_download_url(uri, expires_in_seconds=900)
+
+    assert url == (
+        "https://objects.example/lightrag-kb/kb/workspaces/ws/doc/source.bin"
+        "?method=get_object&expires=900"
+    )
+    assert (
+        "generate_presigned_url",
+        "get_object",
+        {"Bucket": "lightrag-kb", "Key": "kb/workspaces/ws/doc/source.bin"},
+        900,
+    ) in state.calls
+
+
+async def test_presign_download_url_unquotes_encoded_s3_keys():
+    storage, state, _ = _make_storage()
+    await storage.initialize()
+    uri = (
+        "s3://lightrag-kb/"
+        "kb/workspaces/ws/documents/doc/source/report%20one.pdf"
+    )
+
+    url = await storage.presign_download_url(uri, expires_in_seconds=300)
+
+    assert url == (
+        "https://objects.example/lightrag-kb/"
+        "kb/workspaces/ws/documents/doc/source/report one.pdf"
+        "?method=get_object&expires=300"
+    )
+    assert (
+        "generate_presigned_url",
+        "get_object",
+        {
+            "Bucket": "lightrag-kb",
+            "Key": "kb/workspaces/ws/documents/doc/source/report one.pdf",
+        },
+        300,
+    ) in state.calls
+
+
+async def test_presign_download_url_rejects_empty_s3_key():
+    storage, _, _ = _make_storage()
+    with pytest.raises(ObjectStorageError, match="Object URI missing key"):
+        await storage.presign_download_url(
+            "s3://lightrag-kb/", expires_in_seconds=300
+        )
+
+
+def test_validate_document_file_uri_accepts_current_document_scope():
+    storage, _, _ = _make_storage()
+
+    storage.validate_document_file_uri(
+        "s3://lightrag-kb/kb/workspaces/ws/documents/doc/artifacts/blocks.jsonl",
+        workspace="ws",
+        document_id="doc",
+    )
+
+
+@pytest.mark.parametrize(
+    ("object_uri", "message"),
+    [
+        (
+            "s3://other-bucket/kb/workspaces/ws/documents/doc/artifacts/blocks.jsonl",
+            "bucket does not match",
+        ),
+        (
+            "s3://lightrag-kb/kb/workspaces/other/documents/doc/artifacts/blocks.jsonl",
+            "outside the document object prefix",
+        ),
+        (
+            "s3://lightrag-kb/kb/workspaces/ws/documents/other/artifacts/blocks.jsonl",
+            "outside the document object prefix",
+        ),
+        (
+            "s3://lightrag-kb/kb/workspaces/ws/documents/doc-extra/artifacts/blocks.jsonl",
+            "outside the document object prefix",
+        ),
+        (
+            "s3://lightrag-kb/kb/workspaces/ws/documents/doc/artifacts/",
+            "points to a prefix",
+        ),
+    ],
+)
+def test_validate_document_file_uri_rejects_untrusted_scope(
+    object_uri: str, message: str
+):
+    storage, _, _ = _make_storage()
+
+    with pytest.raises(ObjectStorageError, match=message):
+        storage.validate_document_file_uri(
+            object_uri,
+            workspace="ws",
+            document_id="doc",
+        )
+
+
+async def test_presign_download_url_rejects_invalid_ttl():
+    storage, _, _ = _make_storage()
+    with pytest.raises(ObjectStorageError):
+        await storage.presign_download_url("s3://lightrag-kb/k", expires_in_seconds=0)
 
 
 async def test_parse_uri_rejects_non_s3_scheme():

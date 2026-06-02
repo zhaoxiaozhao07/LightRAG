@@ -167,6 +167,16 @@ class ArtifactFileResult:
     is_directory: bool = False
 
 
+@dataclass(slots=True)
+class ArtifactDownloadUrlResult:
+    artifact: ArtifactRecord
+    url: str
+    object_uri: str
+    expires_in_seconds: int
+    filename: str
+    media_type: str
+
+
 class DocumentLifecycleService:
     def __init__(
         self,
@@ -1221,6 +1231,54 @@ class DocumentLifecycleService:
             filename=artifact_path.name + (".zip" if is_directory else ""),
             media_type=media_type,
             is_directory=is_directory,
+        )
+
+    async def get_document_artifact_download_url(
+        self,
+        kb_id: str,
+        document_id: str,
+        artifact_id: str,
+        *,
+        expires_in_seconds: int = 3600,
+    ) -> ArtifactDownloadUrlResult:
+        if expires_in_seconds <= 0:
+            raise ValueError("expires_in_seconds must be positive")
+        if self._object_storage is None:
+            raise ValueError("Object storage is not enabled")
+        record = await self._kb_service.get(kb_id)
+        document = await self._metadata_store.get_document(record.id, document_id)
+        artifact = await self._metadata_store.get_document_artifact(
+            record.id, document_id, artifact_id
+        )
+        artifact_path, is_directory = _resolve_artifact_path(
+            self._source_root, document, artifact
+        )
+        object_uri = artifact.metadata.get("object_uri")
+        object_prefix_uri = artifact.metadata.get("object_prefix_uri")
+        if is_directory or artifact.metadata.get("is_directory") or object_prefix_uri:
+            raise ValueError(
+                "Presigned download URLs are only available for file artifacts"
+            )
+        if not isinstance(object_uri, str) or not object_uri:
+            raise ValueError("Artifact is not stored as an object-storage file")
+        try:
+            self._object_storage.validate_document_file_uri(
+                object_uri,
+                workspace=document.workspace,
+                document_id=document.id,
+            )
+            url = await self._object_storage.presign_download_url(
+                object_uri, expires_in_seconds=expires_in_seconds
+            )
+        except ObjectStorageError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return ArtifactDownloadUrlResult(
+            artifact=artifact,
+            url=url,
+            object_uri=object_uri,
+            expires_in_seconds=expires_in_seconds,
+            filename=artifact_path.name,
+            media_type=_artifact_media_type(document, artifact, artifact_path, False),
         )
 
     async def _documents_for_job(

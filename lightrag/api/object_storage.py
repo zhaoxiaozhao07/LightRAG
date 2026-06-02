@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+import inspect
 import mimetypes
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +79,16 @@ class ObjectStorage:
     async def delete_workspace(self, workspace: str) -> int:
         raise NotImplementedError
 
+    async def presign_download_url(
+        self, object_uri: str, *, expires_in_seconds: int = 3600
+    ) -> str:
+        raise NotImplementedError
+
+    def validate_document_file_uri(
+        self, object_uri: str, *, workspace: str, document_id: str
+    ) -> None:
+        return None
+
 
 class DisabledObjectStorage(ObjectStorage):
     async def upload_file(
@@ -102,6 +113,16 @@ class DisabledObjectStorage(ObjectStorage):
 
     async def delete_workspace(self, workspace: str) -> int:
         return 0
+
+    async def presign_download_url(
+        self, object_uri: str, *, expires_in_seconds: int = 3600
+    ) -> str:
+        raise ObjectStorageError("Object storage is disabled")
+
+    def validate_document_file_uri(
+        self, object_uri: str, *, workspace: str, document_id: str
+    ) -> None:
+        raise ObjectStorageError("Object storage is disabled")
 
 
 class S3ObjectStorage(ObjectStorage):
@@ -229,6 +250,36 @@ class S3ObjectStorage(ObjectStorage):
             self._prefix_uri(self._normalize_key(f"workspaces/{workspace}"))
         )
 
+    async def presign_download_url(
+        self, object_uri: str, *, expires_in_seconds: int = 3600
+    ) -> str:
+        if expires_in_seconds <= 0:
+            raise ObjectStorageError("expires_in_seconds must be positive")
+        bucket, key = self._parse_uri(object_uri)
+        async with self._client() as client:
+            url = client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket, "Key": key},
+                ExpiresIn=expires_in_seconds,
+            )
+            if inspect.isawaitable(url):
+                url = await url
+        return str(url)
+
+    def validate_document_file_uri(
+        self, object_uri: str, *, workspace: str, document_id: str
+    ) -> None:
+        bucket, key = self._parse_uri(object_uri)
+        if bucket != self._config.bucket:
+            raise ObjectStorageError("Object URI bucket does not match configured bucket")
+        document_prefix = self._normalize_key(
+            f"workspaces/{workspace}/documents/{document_id}"
+        )
+        if not key.startswith(f"{document_prefix}/"):
+            raise ObjectStorageError("Object URI is outside the document object prefix")
+        if key.endswith("/"):
+            raise ObjectStorageError("Object URI points to a prefix, not a file")
+
     def _new_session(self) -> Any:
         import importlib
 
@@ -301,7 +352,10 @@ class S3ObjectStorage(ObjectStorage):
         parsed = urlparse(object_uri)
         if parsed.scheme != "s3" or not parsed.netloc:
             raise ObjectStorageError(f"Unsupported object URI: {object_uri}")
-        return parsed.netloc, parsed.path.lstrip("/")
+        key = unquote(parsed.path.lstrip("/"))
+        if not key:
+            raise ObjectStorageError(f"Object URI missing key: {object_uri}")
+        return parsed.netloc, key
 
 
 def create_object_storage_from_env() -> ObjectStorage | None:

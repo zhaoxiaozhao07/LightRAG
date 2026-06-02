@@ -4,14 +4,14 @@
 
 LightRAG Server includes a multimodal document pipeline for text, images, tables, and equations. Document parsing is handled through external MinerU or Docling services configured by endpoint, so the server no longer needs to install or import the `raganything` package locally.
 
-**Status:** the multimodal post-process hook is currently a placeholder; image, table, and equation processors are planned but not yet wired up. Ingestion via external MinerU/Docling parsers and native text indexing already work today.
+**Status:** multimodal parsing and sidecar indexing are now wired into the ingestion pipeline. MinerU/Docling/native parsers write LightRAG sidecars, the analyze stage can enrich enabled image/table/equation items with surrounding context and VLM analysis (`process_options` flags `i`/`t`/`e`), and successful multimodal analysis results are converted into dedicated chunks for graph extraction and retrieval. Deployments still need working parser endpoints and VLM role configuration for full image/table/equation understanding; if no multimodal options are enabled, ingestion falls back to normal text indexing.
 
-**Planned Capabilities:**
-- End-to-End Multimodal Pipeline: complete workflow from document ingestion to multimodal query answering
-- Universal Document Support: PDFs, Office documents (DOC/DOCX/PPT/PPTX/XLS/XLSX), images, and diverse file formats
-- Specialized Content Analysis: dedicated processors for images, tables, mathematical equations
-- Multimodal Knowledge Graph: automatic entity extraction and cross-modal relationship discovery
-- Hybrid Intelligent Retrieval: advanced search spanning textual and multimodal content
+**Current Capabilities:**
+- End-to-end parser-to-index flow for native, MinerU, and Docling sidecars
+- Universal document support through configured parser routing for PDFs, Office documents, images, and other supported suffixes
+- Opt-in image/table/equation VLM analysis via per-document `process_options`
+- Multimodal chunks that participate in entity/relation extraction and hybrid retrieval
+- Stage observability through parse/analyze metadata such as `parse_stage_skipped`, `analyzing_stage_skipped`, and `multimodal_processed`
 
 ### Quick Start
 
