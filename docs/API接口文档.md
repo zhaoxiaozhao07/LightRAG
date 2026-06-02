@@ -1,6 +1,6 @@
 # LightRAG API 接口文档
 
-> 文档版本：2026-05-31
+> 文档版本：2026-06-02
 > 适用范围：当前已经合并到 `main` 分支并通过测试的接口。
 > 路径前缀：所有路径均为相对路径；部署时通过 FastAPI `root_path` 或 `--api-prefix /api/v1` 暴露为 `/api/v1/...`。
 > 鉴权：除 `/health`、`/auth-status`、`/login` 等少数公开接口外，所有接口都受 `combined_auth` 依赖保护，需要在请求头携带 `X-API-Key: <api_key>` 或 JWT。
@@ -103,6 +103,9 @@ GET /kbs/{kb_id}/status
 | `POST` | `/kbs/{kb_id}/documents:upload` | 多文件上传，可选自动解析 |
 | `POST` | `/kbs/{kb_id}/documents:sync` | 按 `source_key` 批量增量同步，可自动解析并构建到可问答状态 |
 | `POST` | `/kbs/{kb_id}/documents:texts` | 批量文本导入 |
+| `POST` | `/kbs/{kb_id}/documents:urls` | 批量 URL 抓取导入（SSRF/大小受限） |
+| `POST` | `/kbs/{kb_id}/documents:import` | 从受控 `INPUT_DIR` staged 文件导入 |
+| `POST` | `/kbs/{kb_id}/documents:scan` | 扫描受控 `INPUT_DIR` staged 子目录导入 |
 | `GET` | `/kbs/{kb_id}/documents` | 文档列表，支持状态、文件名过滤 |
 | `GET` | `/kbs/{kb_id}/documents/{document_id}` | 文档详情 |
 | `PATCH` | `/kbs/{kb_id}/documents/{document_id}` | 更新 metadata / enabled / archived |
@@ -184,7 +187,73 @@ source_keys: ["manual/a.pdf", "manual/b.pdf"]
 - 返回单个聚合 `sync` job。每个 item 在 `job.result.items[]` 中记录 `source_key`、`action`（`created` / `replaced` / `skipped` / `reparsed`）、`status`、`parse_result`、`build_result` 等；单个 item 失败不会阻塞其他 item，active parse/build/delete/replace 会保留对应 `*_job_active` 错误码和 `existing_job_id`。
 - `idempotency_key` 在 `(kb_id, job_type=sync)` 维度唯一；同 key 同文件和同参数复用原 job，同 key 不同请求返回 `409`。
 
-### 2.4 文档列表 / 详情
+### 2.4 URL / 本地 staged 文件 / 目录扫描导入
+
+URL 导入：
+
+```http
+POST /kbs/{kb_id}/documents:urls
+Content-Type: application/json
+
+{
+  "documents": [
+    {
+      "url": "https://example.com/paper.pdf",
+      "source_name": "paper.pdf",
+      "source_key": "url:https://example.com/paper.pdf",
+      "content_type": "application/pdf",
+      "metadata": {"tenant": "demo"}
+    }
+  ],
+  "auto_parse": false,
+  "auto_index": false,
+  "parser_engine": null,
+  "process_options": null,
+  "idempotency_key": "url-import-001"
+}
+```
+
+本地 staged 文件导入：
+
+```http
+POST /kbs/{kb_id}/documents:import
+Content-Type: application/json
+
+{
+  "documents": [
+    {"path": "staged/manual.pdf", "metadata": {"kind": "manual"}}
+  ],
+  "auto_parse": false,
+  "auto_index": false,
+  "idempotency_key": "local-import-001"
+}
+```
+
+本地 staged 目录扫描：
+
+```http
+POST /kbs/{kb_id}/documents:scan
+Content-Type: application/json
+
+{
+  "directory": "incoming-batch",
+  "recursive": true,
+  "source_key_prefix": "scan",
+  "max_files": 32,
+  "auto_parse": false,
+  "auto_index": false,
+  "idempotency_key": "scan-001"
+}
+```
+
+约束：
+- 三类接口最终都调用 `DocumentLifecycleService.create_source_batch`，落 KB `documents/jobs` metadata，并写入对应 `source_type=url/import/scan`；`auto_parse/auto_index/parser_engine/process_options/idempotency_key` 语义与 `:upload` / `:texts` 一致。
+- `:urls` 仅允许 `http/https`，URL 必须有 hostname，禁止 userinfo；请求前解析 hostname 并拒绝 loopback/private/link-local/multicast/reserved/unspecified 地址；`httpx.AsyncClient` 使用 `trust_env=false`、`follow_redirects=false`、显式 timeout，并在读取响应体前复验实际连接的 peer address，防止 DNS rebinding/解析 TOCTOU 读取内网响应。`Content-Length` 会预检，流式读取时仍按 `MAX_UPLOAD_SIZE` 和请求总字节数二次截断；3xx 不自动跟随。
+- URL `source_name` 优先级：显式 `source_name` > `Content-Disposition` filename > URL path basename；最终扩展名必须在 `SUPPORTED_DOCUMENT_EXTENSIONS` 内。未显式传 `source_key` 时默认 `url:<normalized-url>`，metadata 会写入 `source_url`。
+- `:import` 仅允许读取配置的 `INPUT_DIR` 下文件；绝对路径/相对路径都会规范化并做 containment 校验，逃逸 `INPUT_DIR`、目录、symlink、空文件、不支持扩展名或超限文件均拒绝。未显式传 `source_key` 时默认 `import:<relative-path>`，metadata 写入 `staged_source_path`。
+- `:scan` 的 `directory` 必须是 `INPUT_DIR` 下 staged 子目录，不能是 `INPUT_DIR` 根；可递归扫描，跳过 `__parsed__` 与 `.sync-staging` 树，只导入支持扩展名的文件，最多 `max_files`（服务端硬上限 1000）。未显式设置时 `source_key` 为 `<source_key_prefix>:<relative-path>`，metadata 写入 `scanned_source_path`。
+
+### 2.5 文档列表 / 详情
 
 ```http
 GET /kbs/{kb_id}/documents?status=parsed&source_name=paper&limit=50&offset=0
@@ -193,7 +262,7 @@ GET /kbs/{kb_id}/documents/{document_id}
 
 `source_name` 使用 SQL `LIKE` 模糊匹配（大小写不敏感）。
 
-### 2.5 文档 PATCH
+### 2.6 文档 PATCH
 
 ```http
 PATCH /kbs/{kb_id}/documents/{document_id}
@@ -210,7 +279,7 @@ Content-Type: application/json
 - 至少要给一个字段（空请求体返回 `400`）。
 - `metadata` 中**不允许**覆盖内部控制面保留键（`batch_id` / `pending_parse_job_id` / `current_parse_job_id` / `pending_build_job_id` / `current_build_job_id` / `parser_engine` / `process_options` 等）。
 
-### 2.6 独立启用 / 禁用
+### 2.7 独立启用 / 禁用
 
 ```http
 POST /kbs/{kb_id}/documents/{document_id}:disable
@@ -219,7 +288,7 @@ POST /kbs/{kb_id}/documents/{document_id}:enable
 
 返回 `DocumentResponse`。这两个动作只更新 metadata 控制面 `enabled` 字段，不删除 source/artifact，也不触发 LightRAG storage 变更。`enabled` 现已接入检索层：禁用文档会被排除出 `QueryParam.ids` 白名单，因此不再参与 KB 级问答检索（无需删除即可临时下线一篇文档）。
 
-### 2.7 文档删除
+### 2.8 文档删除
 
 ```http
 DELETE /kbs/{kb_id}/documents/{document_id}?delete_source_file=false&delete_artifacts=false&delete_llm_cache=false&delete_graph_orphans=true&strategy=safe&idempotency_key=delete-001
@@ -249,7 +318,7 @@ Content-Type: application/json
 
 创建单个聚合 `delete` job（`document_id=null`、`batch_id` 非空）。每个 item 独立 claim 和执行；active job、缺失文档等作为 per-item failure 写入 `job.result.items[]`，不阻塞其他可删除文档。启用 durable worker 时，`documents:batch-delete` 属于可恢复聚合任务：worker 可从 job payload 的 `document_ids` 与删除选项恢复执行，服务重启后 queued batch-delete 不会被孤儿恢复直接标失败。
 
-### 2.8 文档替换
+### 2.9 文档替换
 
 ```http
 POST /kbs/{kb_id}/documents/{document_id}:replace?auto_parse=true&auto_index=false&parser_engine=mineru&process_options=iF&force_reparse=false&delete_source_file=true&delete_artifacts=true&delete_llm_cache=false&idempotency_key=replace-001
@@ -545,7 +614,8 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 |---|---|---|
 | `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts` | 产物列表 |
 | `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}` | 产物元数据 |
-| `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:download` | 下载文件型产物 |
+| `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:download` | 下载文件型产物；目录型产物以 zip 代理下载 |
+| `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:preview` | 内联预览受支持的小型文件型产物 |
 | `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:download-url` | 为对象存储中的文件型产物生成预签名下载 URL |
 
 下载约束：
@@ -553,6 +623,7 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 - 目录型产物（`sidecar` / `raw_dir`）以流式 zip 返回（`Content-Type: application/zip`），单次下载 zip 内未压缩字节上限 512 MB，超限返回 `413`。
 - 路径必须位于 `inputs/<workspace>/<document_id>` 内；跨 KB、缺失文件、路径逃逸均返回 `404` / `400`。
 - 启用对象存储时，如果本地 cache path 缺失，`:download` 接口会先从 `metadata.object_uri` / `metadata.object_prefix_uri` restore 到原 cache path，再返回文件或 zip，保持旧客户端兼容。
+- `:preview` 仅支持文件型 artifact，目录返回 `400`；支持 `text/*`、`application/json`、`application/ld+json`、`application/markdown`、`application/x-ndjson`、普通图片（不含 `image/svg+xml`）和 `application/pdf`，以 `inline` content-disposition 返回；单次 preview 上限 10 MB，超出返回 `413`，不支持的 media type 返回 `415`。本地 cache 缺失时同样按对象存储 metadata restore。
 - `:download-url` 仅对 metadata 中存在 `object_uri` 的**文件型** artifact 生效，返回 `{artifact_id,url,object_uri,expires_in_seconds,filename,media_type}`；服务端使用对象存储后端生成 `GET Object` 预签名 URL，不会触发本地 cache restore。`expires_in_seconds` 默认 3600 秒，服务端限制在 `[1, 604800]`。目录型 artifact（`sidecar` / `raw_dir`，metadata 中为 `object_prefix_uri`）仍需走 `:download` 的 zip 代理下载。
 
 ---
@@ -647,7 +718,7 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 | `POST` | `/kbs/{kb_id}/query/data` | 仅返回结构化检索数据，不调用 LLM |
 | `POST` | `/kbs/{kb_id}/retrieve` | `query/data` 的别名，语义等价 |
 
-请求体（与全局 `/query` 共用字段，新增 `filters.doc_ids`）：
+请求体（与全局 `/query` 共用字段，新增 KB scoped `filters.doc_ids` / `filters.metadata`）：
 
 ```json
 {
@@ -659,7 +730,8 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
   "include_chunk_content": false,
   "stream": false,
   "filters": {
-    "doc_ids": ["doc_xxx"]
+    "doc_ids": ["doc_xxx"],
+    "metadata": {"tenant": "demo", "tag": ["legal", "finance"]}
   },
   "conversation_history": [
     {"role": "user", "content": "上文..."}
@@ -689,9 +761,10 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 
 约束：
 - 同 KB 内的查询不会读取其他 KB 的内容（`workspace` 隔离）；已加测试覆盖。
-- 若 KB 内存在 `deleting` / `replacing` 文档，或 `filters.doc_ids` 指向此类 active 文档，查询返回 `409`，避免读到删除/替换中的旧内容。
+- 若 KB-wide 查询时 KB 内存在 `deleting` / `replacing` 文档，或显式 `filters.doc_ids` / `filters.metadata` 命中的候选文档中存在此类 active 文档，查询返回 `409`，避免读到删除/替换中的旧内容；metadata filter 未命中的 active 文档不会阻断本次 scoped 查询。
 - `mode` 支持 `local / global / hybrid / naive / mix / bypass`；建议默认 `mix`。
 - `filters.doc_ids` 会先校验 ID 必须属于本 KB（不在则 400 + `error_code=doc_ids_not_in_kb`），随后在检索层精确生效：服务端把 `filters.doc_ids` 与"可检索集合"（`enabled=true` 且 `archived=false` 且已建索引、有 `lightrag_doc_id`）取交集，映射成 `QueryParam.ids`（即 `full_doc_id` 白名单）传入 LightRAG。被禁用/归档的文档即使显式出现在 `filters.doc_ids` 里也会被静默剔除，不会进入答案。KB 边界仍由 workspace 双重保证。
+- `filters.metadata` 支持非空 key，value 为标量或标量列表（列表为 OR 语义），总 JSON 大小上限 64 KB；它会先在 KB documents metadata 上做精确匹配，再与 `filters.doc_ids`、`enabled/archived/lightrag_doc_id` 可检索集合取交集。无匹配时传入空 `QueryParam.ids=[]`，返回空检索范围而不是退回 KB-wide。
 - `include_chunk_content=true` 时 `references[].content` 返回该 reference 命中的 chunk 文本数组，便于评估与排查。
 - 非流式、结构化检索和流式首行都会在 `metadata` 中返回 active config 信息（存在时包含 `config_version_id`、`parser_hash`、`index_hash`、`query_hash`）。
 - 流式响应 `Content-Type: application/x-ndjson`：第一行是 `{kb_id, metadata}`，若 `include_references=true` 则同一行还包含 `references`；后续每行 `{response: "..."}`，错误时 `{error: "..."}`。
@@ -799,7 +872,7 @@ cancelled --> retrying --> queued
 
 | Hash | 派生因子 | 变化时的最小动作 |
 |---|---|---|
-| `source_hash` | 上传 / 文本内容字节 | 重新解析 + 重新构建 |
+| `source_hash` | 上传 / 文本 / URL / staged import / scan 内容字节 | 重新解析 + 重新构建 |
 | `parser_hash` | 解析引擎 + process options | 重新解析 + 重新构建 |
 | `index_hash` | 当前 active runtime 已实际接入的 chunk / embedding / extraction 配置（如 chunk size/overlap、tokenizer、embedding model/dim/token limit、extraction language/entity_types/抽取 caps） | 仅重新构建索引（复用解析产物） |
 
@@ -808,7 +881,7 @@ cancelled --> retrying --> queued
 ### 8.4 幂等键约定
 
 - 幂等键唯一索引：`(kb_id, job_type, idempotency_key)`。
-- 文本导入、批量增量同步、单文档 parse、批量 parse、单文档 build、批量 build、单文档 replace 都支持幂等键。
+- 文本导入、URL 导入、本地 staged 文件导入、目录扫描、批量增量同步、单文档 parse、批量 parse、单文档 build、批量 build、单文档 replace 都支持幂等键。
 - 同 key 同请求指纹返回原 job；同 key 不同请求指纹返回 `409`。
 
 ### 8.5 错误码归纳
@@ -892,4 +965,4 @@ LIGHTRAG_OBJECT_STORAGE_DISABLE_EXPECT_HEADER=true
 
 对象 key 组织在 `<prefix>/workspaces/<workspace>/documents/<document_id>/...` 下。`INPUT_DIR` 仍是本地 cache：parser、build、download 继续使用本地 path；当 cache 缺失时，download/parse planning 会按 metadata 中的对象 URI restore。文件型 artifact 可通过 `:download-url` 直接获取对象存储 `GET Object` 预签名 URL，绕过 API 代理传输大文件；目录型 artifact 仍通过 API zip 代理。硬删除 KB 时会按 workspace prefix 清理对象。
 
-> 测试覆盖：`tests/api/test_object_storage_s3.py` 仅在 boto3 client 边界打桩（`aioboto3` 在 `S3ObjectStorage._new_session` 内惰性 import，可注入 fake session 离线运行），直测出厂 `S3ObjectStorage` 的 key 前缀规范化、URI 构建/解析、bucket 自动创建、upload/download 往返、目录逐文件上传、`list_objects_v2` 分页与续传 token、`delete_uri`/`delete_prefix`/`delete_workspace`、`GET Object` 预签名 URL、`Expect` 请求头兼容处理与 backend 选择。`tests/api/routes/test_kb_document_routes.py` 覆盖 artifact `:download-url` 对文件型 object artifact 返回 URL、目录型 artifact 拒绝预签名并继续走 zip 下载。该测试路径不需要连接真实 MinIO/S3；生产启用 `LIGHTRAG_OBJECT_STORAGE=minio|s3` 仍需要 `aioboto3`。
+> 测试覆盖：`tests/api/test_object_storage_s3.py` 仅在 boto3 client 边界打桩（`aioboto3` 在 `S3ObjectStorage._new_session` 内惰性 import，可注入 fake session 离线运行），直测出厂 `S3ObjectStorage` 的 key 前缀规范化、URI 构建/解析、bucket 自动创建、upload/download 往返、目录逐文件上传、`list_objects_v2` 分页与续传 token、`delete_uri`/`delete_prefix`/`delete_workspace`、`GET Object` 预签名 URL、`Expect` 请求头兼容处理与 backend 选择。`tests/api/routes/test_kb_document_routes.py` 覆盖 artifact `:preview` 的 inline restore/size/type/directory guard，以及 `:download-url` 对文件型 object artifact 返回 URL、目录型 artifact 拒绝预签名并继续走 zip 下载。该测试路径不需要连接真实 MinIO/S3；生产启用 `LIGHTRAG_OBJECT_STORAGE=minio|s3` 仍需要 `aioboto3`。

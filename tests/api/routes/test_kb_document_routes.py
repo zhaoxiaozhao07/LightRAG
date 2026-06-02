@@ -1863,6 +1863,113 @@ def test_download_document_file_artifacts_returns_bytes(tmp_path):
     assert object_storage.downloads[-1][0] == blocks["metadata"]["object_uri"]
 
 
+def test_preview_document_artifact_returns_inline_and_restores_cache(tmp_path):
+    object_storage = FakeObjectStorage()
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path, object_storage=object_storage
+    )
+    _create_kb(client, "kb_artifact_preview")
+    document_id, artifacts = _upload_and_parse_document(client, "kb_artifact_preview")
+
+    blocks = artifacts["blocks"]
+    Path(blocks["uri"]).unlink()
+    response = client.get(
+        f"/kbs/kb_artifact_preview/documents/{document_id}/artifacts/{blocks['id']}:preview",
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.content.replace(b"\r\n", b"\n") == (
+        b'{"type":"content","text":"parsed"}\n'
+    )
+    assert response.headers["content-type"].startswith("application/x-ndjson")
+    assert response.headers["content-disposition"].startswith("inline")
+    assert object_storage.downloads[-1][0] == blocks["metadata"]["object_uri"]
+
+
+def test_preview_document_artifact_rejects_directory(tmp_path):
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_artifact_preview_dir")
+    document_id, artifacts = _upload_and_parse_document(client, "kb_artifact_preview_dir")
+
+    sidecar = artifacts["sidecar"]
+    response = client.get(
+        f"/kbs/kb_artifact_preview_dir/documents/{document_id}/artifacts/{sidecar['id']}:preview",
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 400
+    assert "directory" in response.json()["detail"].lower()
+
+
+def test_preview_document_artifact_rejects_large_file(tmp_path, monkeypatch):
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_artifact_preview_large")
+    document_id, artifacts = _upload_and_parse_document(client, "kb_artifact_preview_large")
+    monkeypatch.setattr(_kb_document_routes, "_MAX_ARTIFACT_PREVIEW_BYTES", 1)
+
+    blocks = artifacts["blocks"]
+    response = client.get(
+        f"/kbs/kb_artifact_preview_large/documents/{document_id}/artifacts/{blocks['id']}:preview",
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 413
+    assert "maximum size" in response.json()["detail"].lower()
+
+
+def test_preview_document_artifact_rejects_unsupported_media(tmp_path):
+    client, _kb_service, store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_artifact_preview_media")
+    document_id, artifacts = _upload_and_parse_document(client, "kb_artifact_preview_media")
+
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE documents SET content_type = ? WHERE id = ?",
+            ("application/octet-stream", document_id),
+        )
+        conn.commit()
+
+    original = artifacts["original"]
+    response = client.get(
+        f"/kbs/kb_artifact_preview_media/documents/{document_id}/artifacts/{original['id']}:preview",
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 415
+    assert "not supported" in response.json()["detail"]
+
+
+def test_preview_document_artifact_rejects_svg_media(tmp_path):
+    client, _kb_service, store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_artifact_preview_svg")
+    document_id, artifacts = _upload_and_parse_document(client, "kb_artifact_preview_svg")
+
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE documents SET content_type = ? WHERE id = ?",
+            ("image/svg+xml", document_id),
+        )
+        conn.commit()
+
+    original = artifacts["original"]
+    response = client.get(
+        f"/kbs/kb_artifact_preview_svg/documents/{document_id}/artifacts/{original['id']}:preview",
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 415
+    assert "not supported" in response.json()["detail"]
+
+
 def test_create_document_file_artifact_download_url(tmp_path):
     object_storage = FakeObjectStorage()
     client, _kb_service, _store, _document_service, _job_service = _build_client(
@@ -2477,6 +2584,298 @@ def test_text_import_rejects_oversized_metadata(tmp_path):
     )
     assert response.status_code == 422
     assert "metadata too large" in response.text.lower()
+
+
+class _FakeUrlNetworkStream:
+    def __init__(self, server_addr: tuple[str, int] = ("93.184.216.34", 443)):
+        self._server_addr = server_addr
+
+    def get_extra_info(self, info: str) -> tuple[str, int] | None:
+        if info == "server_addr":
+            return self._server_addr
+        return None
+
+
+class _FakeUrlResponse:
+    def __init__(
+        self,
+        *,
+        headers: dict[str, str] | None = None,
+        chunks: list[bytes],
+        server_addr: tuple[str, int] = ("93.184.216.34", 443),
+    ):
+        self.headers = headers or {}
+        self._chunks = chunks
+        self.status_code = 200
+        self.iterated = False
+        self.extensions = {"network_stream": _FakeUrlNetworkStream(server_addr)}
+
+    def raise_for_status(self):
+        return None
+
+    async def aiter_bytes(self, chunk_size: int = 65536):
+        self.iterated = True
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _FakeUrlStream:
+    def __init__(self, response: _FakeUrlResponse):
+        self.response = response
+
+    async def __aenter__(self):
+        return self.response
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+class _FakeAsyncClient:
+    requests: list[tuple[str, str]] = []
+    response = _FakeUrlResponse(chunks=[b"url content"])
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    def stream(self, method: str, url: str):
+        self.requests.append((method, url))
+        return _FakeUrlStream(self.response)
+
+
+def test_url_ingestion_success_persists_url_metadata_and_content(tmp_path, monkeypatch):
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_url")
+    _FakeAsyncClient.requests = []
+    _FakeAsyncClient.response = _FakeUrlResponse(
+        headers={"content-disposition": 'attachment; filename="remote.md"'},
+        chunks=[b"url ", b"content"],
+    )
+    monkeypatch.setattr(
+        _kb_document_routes, "_validate_public_hostname", lambda hostname: asyncio.sleep(0)
+    )
+    monkeypatch.setattr(_kb_document_routes.httpx, "AsyncClient", _FakeAsyncClient)
+
+    response = client.post(
+        "/kbs/kb_url/documents:urls",
+        json={
+            "documents": [
+                {
+                    "url": "https://Example.COM/docs/ignored",
+                    "metadata": {"tag": "url"},
+                }
+            ]
+        },
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    document = response.json()["documents"][0]
+    assert document["source_type"] == "url"
+    assert document["source_name"] == "remote.md"
+    assert document["metadata"]["tag"] == "url"
+    assert document["metadata"]["source_url"] == "https://example.com/docs/ignored"
+    assert document["metadata"]["source_key"] == "url:https://example.com/docs/ignored"
+    assert Path(document["source_uri"]).read_bytes() == b"url content"
+    assert _FakeAsyncClient.requests == [("GET", "https://example.com/docs/ignored")]
+
+
+def test_url_ingestion_rejects_localhost_before_request(tmp_path, monkeypatch):
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_url_local")
+    _FakeAsyncClient.requests = []
+    monkeypatch.setattr(_kb_document_routes.httpx, "AsyncClient", _FakeAsyncClient)
+
+    response = client.post(
+        "/kbs/kb_url_local/documents:urls",
+        json={"documents": [{"url": "http://localhost/private.txt"}]},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 400
+    assert "disallowed" in response.json()["detail"]
+    assert _FakeAsyncClient.requests == []
+
+
+def test_url_ingestion_rejects_private_peer_before_reading_body(tmp_path, monkeypatch):
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_url_rebind")
+    _FakeAsyncClient.requests = []
+    _FakeAsyncClient.response = _FakeUrlResponse(
+        chunks=[b"internal secret"], server_addr=("169.254.169.254", 80)
+    )
+    monkeypatch.setattr(
+        _kb_document_routes, "_validate_public_hostname", lambda hostname: asyncio.sleep(0)
+    )
+    monkeypatch.setattr(_kb_document_routes.httpx, "AsyncClient", _FakeAsyncClient)
+
+    response = client.post(
+        "/kbs/kb_url_rebind/documents:urls",
+        json={"documents": [{"url": "http://example.com/private.txt"}]},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 400
+    assert "disallowed" in response.json()["detail"]
+    assert _FakeAsyncClient.requests == [("GET", "http://example.com/private.txt")]
+    assert not _FakeAsyncClient.response.iterated
+
+
+def test_url_ingestion_rejects_oversized_responses(tmp_path, monkeypatch):
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_url_big")
+    monkeypatch.setattr(_kb_document_routes.global_args, "max_upload_size", 3)
+    monkeypatch.setattr(
+        _kb_document_routes, "_validate_public_hostname", lambda hostname: asyncio.sleep(0)
+    )
+    monkeypatch.setattr(_kb_document_routes.httpx, "AsyncClient", _FakeAsyncClient)
+
+    _FakeAsyncClient.response = _FakeUrlResponse(
+        headers={"content-length": "4"}, chunks=[b"tiny"]
+    )
+    length_response = client.post(
+        "/kbs/kb_url_big/documents:urls",
+        json={"documents": [{"url": "https://example.com/big.txt"}]},
+        headers=_HEADERS,
+    )
+    assert length_response.status_code == 413
+    assert "File too large" in length_response.json()["detail"]
+
+    _FakeAsyncClient.response = _FakeUrlResponse(chunks=[b"12", b"34"])
+    stream_response = client.post(
+        "/kbs/kb_url_big/documents:urls",
+        json={"documents": [{"url": "https://example.com/stream.txt"}]},
+        headers=_HEADERS,
+    )
+    assert stream_response.status_code == 413
+    assert "File too large" in stream_response.json()["detail"]
+
+
+def test_local_import_success_persists_import_metadata_and_content(tmp_path):
+    client, _kb_service, _store, document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_import")
+    staged = document_service.source_root / "staged" / "import.md"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("imported", encoding="utf-8")
+
+    response = client.post(
+        "/kbs/kb_import/documents:import",
+        json={"documents": [{"path": str(staged), "metadata": {"kind": "manual"}}]},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    document = response.json()["documents"][0]
+    assert document["source_type"] == "import"
+    assert document["source_name"] == "import.md"
+    assert document["metadata"]["kind"] == "manual"
+    assert document["metadata"]["staged_source_path"] == "staged/import.md"
+    assert document["metadata"]["source_key"] == "import:staged/import.md"
+    assert Path(document["source_uri"]).read_text(encoding="utf-8") == "imported"
+
+
+def test_local_import_rejects_escape_and_unsupported_extension(tmp_path):
+    client, _kb_service, _store, document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_import_reject")
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside", encoding="utf-8")
+    unsupported = document_service.source_root / "staged" / "bad.exe"
+    unsupported.parent.mkdir(parents=True)
+    unsupported.write_text("bad", encoding="utf-8")
+
+    escaped = client.post(
+        "/kbs/kb_import_reject/documents:import",
+        json={"documents": [{"path": str(outside)}]},
+        headers=_HEADERS,
+    )
+    assert escaped.status_code == 400
+    assert "escapes INPUT_DIR" in escaped.json()["detail"]
+
+    bad_extension = client.post(
+        "/kbs/kb_import_reject/documents:import",
+        json={"documents": [{"path": str(unsupported)}]},
+        headers=_HEADERS,
+    )
+    assert bad_extension.status_code == 400
+    assert "Unsupported file type" in bad_extension.json()["detail"]
+
+
+def test_scan_success_discovers_supported_staged_files(tmp_path):
+    client, _kb_service, _store, document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_scan")
+    staged_dir = document_service.source_root / "scan-stage"
+    nested_dir = staged_dir / "nested"
+    parsed_dir = staged_dir / "__parsed__"
+    sync_dir = staged_dir / ".sync-staging"
+    nested_dir.mkdir(parents=True)
+    parsed_dir.mkdir()
+    sync_dir.mkdir()
+    (staged_dir / "a.txt").write_text("a", encoding="utf-8")
+    (nested_dir / "b.md").write_text("b", encoding="utf-8")
+    (staged_dir / "skip.exe").write_text("skip", encoding="utf-8")
+    (parsed_dir / "old.txt").write_text("old", encoding="utf-8")
+    (sync_dir / "pending.txt").write_text("pending", encoding="utf-8")
+
+    response = client.post(
+        "/kbs/kb_scan/documents:scan",
+        json={"directory": str(staged_dir), "recursive": True},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    documents = response.json()["documents"]
+    assert len(documents) == 2
+    assert {document["source_type"] for document in documents} == {"scan"}
+    metadata_by_name = {document["source_name"]: document["metadata"] for document in documents}
+    assert metadata_by_name["a.txt"]["scanned_source_path"] == "scan-stage/a.txt"
+    assert metadata_by_name["a.txt"]["source_key"] == "scan:scan-stage/a.txt"
+    assert metadata_by_name["b.md"]["scanned_source_path"] == "scan-stage/nested/b.md"
+    assert metadata_by_name["b.md"]["source_key"] == "scan:scan-stage/nested/b.md"
+
+
+def test_scan_rejects_root_input_dir_and_no_supported_files(tmp_path):
+    client, _kb_service, _store, document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_scan_reject")
+
+    root_response = client.post(
+        "/kbs/kb_scan_reject/documents:scan",
+        json={"directory": str(document_service.source_root)},
+        headers=_HEADERS,
+    )
+    assert root_response.status_code == 400
+    assert "INPUT_DIR root" in root_response.json()["detail"]
+
+    empty_dir = document_service.source_root / "empty-scan"
+    empty_dir.mkdir(parents=True)
+    (empty_dir / "unsupported.exe").write_text("nope", encoding="utf-8")
+    empty_response = client.post(
+        "/kbs/kb_scan_reject/documents:scan",
+        json={"directory": str(empty_dir)},
+        headers=_HEADERS,
+    )
+    assert empty_response.status_code == 400
+    assert "no supported files" in empty_response.json()["detail"]
 
 
 def test_text_import_rejects_too_many_documents(tmp_path):

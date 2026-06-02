@@ -17,7 +17,7 @@ routes with a per-KB edge:
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Literal, Optional, cast
+from typing import Any, Dict, List, Literal, Optional, Protocol, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -36,10 +36,24 @@ from lightrag.base import QueryParam
 from lightrag.utils import logger
 
 QueryMode = Literal["local", "global", "hybrid", "naive", "mix", "bypass"]
+
+
+class _DocumentListService(Protocol):
+    async def list_documents(
+        self,
+        kb_id: str,
+        *,
+        status: str | None = None,
+        source_name: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[DocumentRecord], int]: ...
 _QUERY_BLOCKING_DOCUMENT_STATUSES = {
     "deleting": "delete_job_active",
     "replacing": "replace_job_active",
 }
+_MAX_METADATA_FILTER_BYTES = 64 * 1024
+_METADATA_FILTER_SCALAR_TYPES = (str, int, float, bool, type(None))
 
 
 class KBQueryFilters(BaseModel):
@@ -50,6 +64,46 @@ class KBQueryFilters(BaseModel):
             "Each id must belong to the target KB; otherwise the request is rejected."
         ),
     )
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Restrict retrieval to documents whose metadata exactly matches these "
+            "key/value filters. Values may be scalars or lists of scalar OR values."
+        ),
+    )
+
+    @field_validator("metadata", mode="after")
+    @classmethod
+    def _validate_metadata_filters(
+        cls, value: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return None
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        if len(encoded) > _MAX_METADATA_FILTER_BYTES:
+            raise ValueError(
+                "filters.metadata is too large. Maximum size: "
+                f"{_MAX_METADATA_FILTER_BYTES} bytes"
+            )
+        for key, filter_value in value.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError("filters.metadata keys must be non-empty strings")
+            if isinstance(filter_value, list):
+                if not all(
+                    isinstance(item, _METADATA_FILTER_SCALAR_TYPES)
+                    for item in filter_value
+                ):
+                    raise ValueError(
+                        "filters.metadata values must be scalars or lists of scalars"
+                    )
+                continue
+            if not isinstance(filter_value, _METADATA_FILTER_SCALAR_TYPES):
+                raise ValueError(
+                    "filters.metadata values must be scalars or lists of scalars"
+                )
+        return value
 
 
 class KBQueryRequest(BaseModel):
@@ -177,6 +231,85 @@ async def _validate_doc_ids_belong_to_kb(
     return documents
 
 
+async def _list_all_kb_documents(
+    document_service: _DocumentListService,
+    kb_id: str,
+) -> list[DocumentRecord]:
+    page_size = 200
+    offset = 0
+    all_documents: list[DocumentRecord] = []
+    while True:
+        documents, total = await document_service.list_documents(
+            kb_id, limit=page_size, offset=offset
+        )
+        all_documents.extend(documents)
+        offset += page_size
+        if offset >= total or not documents:
+            break
+    return all_documents
+
+
+def _metadata_filter_matches(document: DocumentRecord, filters: Dict[str, Any]) -> bool:
+    for key, filter_value in filters.items():
+        allowed_values = filter_value if isinstance(filter_value, list) else [filter_value]
+        document_value = document.metadata.get(key)
+        if isinstance(document_value, list):
+            if not any(item in allowed_values for item in document_value):
+                return False
+            continue
+        if document_value not in allowed_values:
+            return False
+    return True
+
+
+def _has_metadata_filters(filters: KBQueryFilters | None) -> bool:
+    return bool(filters and filters.metadata)
+
+
+def _has_doc_id_filter(filters: KBQueryFilters | None) -> bool:
+    return bool(filters and filters.doc_ids is not None)
+
+
+def _coerce_filters(
+    filters_or_doc_ids: KBQueryFilters | List[str] | None,
+) -> KBQueryFilters | None:
+    if filters_or_doc_ids is None or isinstance(filters_or_doc_ids, KBQueryFilters):
+        return filters_or_doc_ids
+    return KBQueryFilters(doc_ids=filters_or_doc_ids)
+
+
+def _effective_candidate_documents(
+    all_documents: list[DocumentRecord], filters: KBQueryFilters | None
+) -> list[DocumentRecord]:
+    candidates = all_documents
+    if _has_doc_id_filter(filters):
+        requested = set(filters.doc_ids or []) if filters else set()
+        candidates = [document for document in candidates if document.id in requested]
+    if _has_metadata_filters(filters) and filters and filters.metadata:
+        candidates = [
+            document
+            for document in candidates
+            if _metadata_filter_matches(document, filters.metadata)
+        ]
+    return candidates
+
+
+def _validate_doc_ids_from_documents(
+    all_documents: list[DocumentRecord], doc_ids: list[str]
+) -> None:
+    found = {document.id for document in all_documents}
+    missing = [doc_id for doc_id in doc_ids if doc_id not in found]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "doc_ids_not_in_kb",
+                "missing": missing,
+                "message": "filters.doc_ids reference documents outside the target KB",
+            },
+        )
+
+
 def _active_lifecycle_job_id(document: DocumentRecord) -> str:
     if document.status == "deleting":
         job_id = document.metadata.get("current_delete_job_id") or document.metadata.get(
@@ -225,10 +358,27 @@ async def _ensure_query_documents_available(
             _raise_active_lifecycle_query_conflict(documents[0])
 
 
-async def _resolve_doc_id_scope(
+async def _ensure_query_filter_documents_available(
     document_service: DocumentLifecycleService,
     kb_id: str,
-    doc_ids: List[str] | None,
+    filters: KBQueryFilters | None,
+) -> None:
+    if not (_has_doc_id_filter(filters) or _has_metadata_filters(filters)):
+        await _ensure_query_documents_available(document_service, kb_id, None)
+        return
+
+    all_documents = await _list_all_kb_documents(document_service, kb_id)
+    if _has_doc_id_filter(filters) and filters:
+        _validate_doc_ids_from_documents(all_documents, filters.doc_ids or [])
+    for document in _effective_candidate_documents(all_documents, filters):
+        if document.status in _QUERY_BLOCKING_DOCUMENT_STATUSES:
+            _raise_active_lifecycle_query_conflict(document)
+
+
+async def _resolve_doc_id_scope(
+    document_service: _DocumentListService,
+    kb_id: str,
+    filters_or_doc_ids: KBQueryFilters | List[str] | None,
 ) -> List[str] | None:
     """Compute the ``lightrag_doc_id`` allow-list to pass to ``QueryParam.ids``.
 
@@ -249,17 +399,10 @@ async def _resolve_doc_id_scope(
     Returns ``None`` for "no scoping", otherwise a (possibly empty) list of
     ``lightrag_doc_id`` values.
     """
-    page_size = 200
-    offset = 0
-    all_documents: list[DocumentRecord] = []
-    while True:
-        documents, total = await document_service.list_documents(
-            kb_id, limit=page_size, offset=offset
-        )
-        all_documents.extend(documents)
-        offset += page_size
-        if offset >= total or not documents:
-            break
+    filters = _coerce_filters(filters_or_doc_ids)
+    all_documents = await _list_all_kb_documents(document_service, kb_id)
+    if _has_doc_id_filter(filters) and filters:
+        _validate_doc_ids_from_documents(all_documents, filters.doc_ids or [])
 
     def _retrievable(document: DocumentRecord) -> bool:
         return (
@@ -269,17 +412,16 @@ async def _resolve_doc_id_scope(
         )
 
     has_excluded = any(
-        (not document.enabled or document.archived) for document in all_documents
+        (not document.enabled or document.archived or not document.lightrag_doc_id)
+        for document in all_documents
     )
 
-    if doc_ids:
-        requested = set(doc_ids)
-        scope = [
+    if _has_doc_id_filter(filters) or _has_metadata_filters(filters):
+        return [
             str(document.lightrag_doc_id)
-            for document in all_documents
-            if document.id in requested and _retrievable(document)
+            for document in _effective_candidate_documents(all_documents, filters)
+            if _retrievable(document)
         ]
-        return scope
 
     if not has_excluded:
         return None
@@ -307,10 +449,10 @@ def create_kb_query_routes(
     )
     async def kb_query(kb_id: str, request: KBQueryRequest):
         try:
-            await _ensure_query_documents_available(
+            await _ensure_query_filter_documents_available(
                 document_service,
                 kb_id,
-                request.filters.doc_ids if request.filters else None,
+                request.filters,
             )
             rag = cast(Any, await registry.get(kb_id))
             active_defaults = active_query_defaults_from_rag(rag)
@@ -327,7 +469,7 @@ def create_kb_query_routes(
             param.ids = await _resolve_doc_id_scope(
                 document_service,
                 kb_id,
-                request.filters.doc_ids if request.filters else None,
+                request.filters,
             )
             result = await rag.aquery_llm(request.query, param=param)
             llm_response = result.get("llm_response", {})
@@ -367,10 +509,10 @@ def create_kb_query_routes(
     )
     async def kb_query_stream(kb_id: str, request: KBQueryRequest):
         try:
-            await _ensure_query_documents_available(
+            await _ensure_query_filter_documents_available(
                 document_service,
                 kb_id,
-                request.filters.doc_ids if request.filters else None,
+                request.filters,
             )
             rag = cast(Any, await registry.get(kb_id))
             active_defaults = active_query_defaults_from_rag(rag)
@@ -383,7 +525,7 @@ def create_kb_query_routes(
             param.ids = await _resolve_doc_id_scope(
                 document_service,
                 kb_id,
-                request.filters.doc_ids if request.filters else None,
+                request.filters,
             )
             result = await rag.aquery_llm(request.query, param=param)
 
@@ -452,10 +594,10 @@ def create_kb_query_routes(
     )
     async def kb_query_data(kb_id: str, request: KBQueryRequest):
         try:
-            await _ensure_query_documents_available(
+            await _ensure_query_filter_documents_available(
                 document_service,
                 kb_id,
-                request.filters.doc_ids if request.filters else None,
+                request.filters,
             )
             rag = cast(Any, await registry.get(kb_id))
             active_defaults = active_query_defaults_from_rag(rag)
@@ -468,7 +610,7 @@ def create_kb_query_routes(
             param.ids = await _resolve_doc_id_scope(
                 document_service,
                 kb_id,
-                request.filters.doc_ids if request.filters else None,
+                request.filters,
             )
             result = await rag.aquery_data(request.query, param=param)
             return KBQueryDataResponse(

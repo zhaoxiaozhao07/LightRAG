@@ -726,6 +726,7 @@ class PostgresMetadataStore:
         *,
         source_name: str,
         source_uri: str,
+        source_type: str,
         source_hash: str,
         content_type: str | None,
         size_bytes: int,
@@ -739,7 +740,7 @@ class PostgresMetadataStore:
             for key in _REPLACE_DERIVED_METADATA_KEYS:
                 metadata.pop(key, None)
             metadata.update(metadata_patch)
-            document.source_type = "upload"
+            document.source_type = source_type
             document.source_name = source_name
             document.source_uri = source_uri
             document.source_hash = source_hash

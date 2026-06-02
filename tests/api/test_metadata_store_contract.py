@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 
@@ -49,7 +49,7 @@ _POSTGRES_DSN = (
 )
 
 
-async def _make_store(backend: str, tmp_path) -> AsyncIterator:
+async def _make_store(backend: str, tmp_path) -> Any:
     if backend == "sqlite":
         store = SQLiteMetadataStore(tmp_path / "metadata.sqlite3")
         await store.initialize()
@@ -379,6 +379,33 @@ async def test_complete_parse_persists_artifacts_and_replaces_on_retry(store):
     listed2, total2 = await store.list_document_artifacts(kb_id, "doc_a")
     assert total2 == 1
     assert listed2[0].artifact_type == "original"
+
+
+async def test_complete_document_replace_preserves_provided_source_type(store):
+    kb_id = _unique_kb(store)
+    await store.create_documents_and_job(
+        [_doc(kb_id, "doc_replace")],
+        _job(kb_id, "job_replace", job_type="replace", document_id="doc_replace"),
+    )
+
+    replaced = await store.complete_document_replace(
+        kb_id,
+        "doc_replace",
+        source_name="imported.pdf",
+        source_uri="/inputs/doc_replace/imported.pdf",
+        source_type="import",
+        source_hash="sha256:replacement",
+        content_type="application/pdf",
+        size_bytes=42,
+        metadata_patch={"source_key": "imports/imported.pdf"},
+    )
+
+    assert replaced.source_type == "import"
+    assert replaced.source_name == "imported.pdf"
+    assert replaced.source_hash == "sha256:replacement"
+    assert replaced.status == "uploaded"
+    fetched = await store.get_document(kb_id, "doc_replace")
+    assert fetched.source_type == "import"
 
 
 async def test_purge_kb_metadata_removes_everything(store):

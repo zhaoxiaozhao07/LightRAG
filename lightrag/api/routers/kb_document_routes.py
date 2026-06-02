@@ -3,11 +3,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import ipaddress
 import json
+import socket
 import zipfile
+from email.message import Message
 from pathlib import Path
 from typing import Any, Literal, Optional, Sequence, cast
+from urllib.parse import unquote, urlsplit, urlunsplit
 
+import httpx
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -57,11 +62,24 @@ _UPLOAD_CHUNK_SIZE = 1024 * 1024
 _MAX_KB_UPLOAD_FILES = 32
 _MAX_KB_TEXT_DOCUMENTS = 100
 _MAX_KB_BATCH_PARSE_DOCUMENTS = 100
+_MAX_KB_SCAN_FILES = 1000
 _MAX_SYNC_SOURCE_KEY_BYTES = 1024
 _MAX_TEXT_DOCUMENT_BYTES = 1024 * 1024
 _MAX_TEXT_METADATA_BYTES = 64 * 1024
 _MAX_DIRECTORY_ARTIFACT_BYTES = 512 * 1024 * 1024  # 512 MB cap on directory zip
+_MAX_ARTIFACT_PREVIEW_BYTES = 10 * 1024 * 1024
 _MAX_PRESIGNED_URL_EXPIRES_SECONDS = 7 * 24 * 60 * 60
+_URL_FETCH_TIMEOUT_SECONDS = 20.0
+_PREVIEW_TEXT_MEDIA_TYPES = {
+    "application/json",
+    "application/ld+json",
+    "application/markdown",
+    "application/x-ndjson",
+    "text/markdown",
+    "text/plain",
+}
+_PREVIEW_BINARY_MEDIA_TYPES = {"application/pdf"}
+_PREVIEW_BLOCKED_MEDIA_TYPES = {"image/svg+xml"}
 
 
 def _stream_directory_as_zip(artifact_file: Any) -> StreamingResponse:
@@ -102,6 +120,46 @@ def _stream_directory_as_zip(artifact_file: Any) -> StreamingResponse:
         "Content-Disposition": f'attachment; filename="{artifact_file.filename}"',
     }
     return StreamingResponse(buffer, media_type="application/zip", headers=headers)
+
+
+def _is_previewable_media_type(media_type: str) -> bool:
+    base_media_type = media_type.split(";", 1)[0].lower()
+    if base_media_type in _PREVIEW_BLOCKED_MEDIA_TYPES:
+        return False
+    return (
+        base_media_type in _PREVIEW_TEXT_MEDIA_TYPES
+        or base_media_type in _PREVIEW_BINARY_MEDIA_TYPES
+        or base_media_type.startswith("image/")
+    )
+
+
+def _artifact_preview_response(artifact_file: Any) -> FileResponse:
+    if artifact_file.is_directory or artifact_file.path.is_dir():
+        raise HTTPException(status_code=400, detail="Directory artifacts cannot be previewed")
+    media_type = artifact_file.media_type
+    if not _is_previewable_media_type(media_type):
+        raise HTTPException(
+            status_code=415,
+            detail=f"Artifact media type is not supported for preview: {media_type}",
+        )
+    try:
+        size = artifact_file.path.stat().st_size
+    except OSError as exc:
+        raise FileNotFoundError(f"Artifact file not found: {artifact_file.path}") from exc
+    if size > _MAX_ARTIFACT_PREVIEW_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "Artifact preview exceeds maximum size of "
+                f"{_MAX_ARTIFACT_PREVIEW_BYTES // (1024 * 1024)}MB"
+            ),
+        )
+    return FileResponse(
+        artifact_file.path,
+        media_type=media_type,
+        filename=artifact_file.filename,
+        content_disposition_type="inline",
+    )
 
 
 _RESERVED_DOCUMENT_METADATA_KEYS = {
@@ -398,6 +456,76 @@ class TextDocumentsRequest(BaseModel):
     idempotency_key: Optional[str] = None
 
 
+def _validate_user_metadata_size(value: dict[str, Any], *, label: str) -> None:
+    size = len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+    if size > _MAX_TEXT_METADATA_BYTES:
+        raise ValueError(
+            f"{label} too large. Maximum size: {_MAX_TEXT_METADATA_BYTES} bytes"
+        )
+
+
+class UrlDocumentRequest(BaseModel):
+    url: str = Field(min_length=1)
+    source_name: Optional[str] = None
+    source_key: Optional[str] = None
+    content_type: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata", mode="after")
+    @classmethod
+    def limit_metadata_size(cls, value: dict[str, Any]) -> dict[str, Any]:
+        _validate_user_metadata_size(value, label="URL document metadata")
+        return value
+
+
+class UrlDocumentsRequest(BaseModel):
+    documents: list[UrlDocumentRequest] = Field(
+        min_length=1, max_length=_MAX_KB_UPLOAD_FILES
+    )
+    auto_parse: bool = False
+    auto_index: bool = False
+    parser_engine: Optional[str] = None
+    process_options: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
+class LocalImportDocumentRequest(BaseModel):
+    path: str = Field(min_length=1)
+    source_name: Optional[str] = None
+    source_key: Optional[str] = None
+    content_type: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata", mode="after")
+    @classmethod
+    def limit_metadata_size(cls, value: dict[str, Any]) -> dict[str, Any]:
+        _validate_user_metadata_size(value, label="Import document metadata")
+        return value
+
+
+class LocalImportDocumentsRequest(BaseModel):
+    documents: list[LocalImportDocumentRequest] = Field(
+        min_length=1, max_length=_MAX_KB_UPLOAD_FILES
+    )
+    auto_parse: bool = False
+    auto_index: bool = False
+    parser_engine: Optional[str] = None
+    process_options: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
+class LocalScanDocumentsRequest(BaseModel):
+    directory: str = Field(min_length=1)
+    recursive: bool = False
+    source_key_prefix: str = "scan"
+    max_files: int = Field(default=_MAX_KB_UPLOAD_FILES, ge=1, le=_MAX_KB_SCAN_FILES)
+    auto_parse: bool = False
+    auto_index: bool = False
+    parser_engine: Optional[str] = None
+    process_options: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
 class JobResponse(BaseModel):
     id: str
     kb_id: str
@@ -474,6 +602,343 @@ def _text_too_large_detail(max_size: int, uploaded_size: int) -> str:
 
 def _is_supported_upload_name(filename: str) -> bool:
     return filename.lower().endswith(SUPPORTED_DOCUMENT_EXTENSIONS)
+
+
+def _merge_source_metadata(
+    user_metadata: dict[str, Any], required_metadata: dict[str, Any]
+) -> dict[str, Any]:
+    return {**user_metadata, **required_metadata}
+
+
+def _normalized_url(value: str) -> tuple[str, str]:
+    parsed = urlsplit(value.strip())
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="URL scheme must be http or https")
+    if not parsed.hostname:
+        raise HTTPException(status_code=400, detail="URL must include a hostname")
+    if parsed.username or parsed.password:
+        raise HTTPException(status_code=400, detail="URL userinfo is not allowed")
+    hostname = parsed.hostname.lower()
+    netloc = hostname
+    if parsed.port is not None:
+        netloc = f"{hostname}:{parsed.port}"
+    normalized = urlunsplit(
+        (parsed.scheme.lower(), netloc, parsed.path or "/", parsed.query, "")
+    )
+    return normalized, hostname
+
+
+def _is_public_ip_address(address: str) -> bool:
+    try:
+        ip_address = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return not (
+        ip_address.is_loopback
+        or ip_address.is_private
+        or ip_address.is_link_local
+        or ip_address.is_multicast
+        or ip_address.is_reserved
+        or ip_address.is_unspecified
+    )
+
+
+async def _validate_public_hostname(hostname: str) -> None:
+    try:
+        addrinfos = await asyncio.get_running_loop().getaddrinfo(
+            hostname, None, type=socket.SOCK_STREAM
+        )
+    except socket.gaierror as exc:
+        raise HTTPException(
+            status_code=400, detail="URL hostname could not be resolved"
+        ) from exc
+    addresses = {item[4][0] for item in addrinfos}
+    if not addresses or any(not _is_public_ip_address(address) for address in addresses):
+        raise HTTPException(
+            status_code=400,
+            detail="URL hostname resolves to a disallowed private or local address",
+        )
+
+
+def _validate_url_response_peer(response: httpx.Response) -> None:
+    network_stream = response.extensions.get("network_stream")
+    get_extra_info = getattr(network_stream, "get_extra_info", None)
+    peer_address: str | None = None
+    if callable(get_extra_info):
+        server_addr = get_extra_info("server_addr")
+        if isinstance(server_addr, tuple) and server_addr:
+            peer_address = str(server_addr[0])
+        elif isinstance(server_addr, str):
+            peer_address = server_addr
+    if peer_address is None:
+        raise HTTPException(
+            status_code=502,
+            detail="URL fetch peer address could not be verified",
+        )
+    if not _is_public_ip_address(peer_address):
+        raise HTTPException(
+            status_code=400,
+            detail="URL fetch peer resolves to a disallowed private or local address",
+        )
+
+
+def _filename_from_content_disposition(value: str | None) -> str | None:
+    if not value:
+        return None
+    message = Message()
+    message["content-disposition"] = value
+    filename = message.get_filename()
+    if not filename:
+        return None
+    return Path(unquote(filename)).name
+
+
+def _safe_url_source_name(
+    *, explicit_source_name: str | None, url: str, content_disposition: str | None
+) -> str:
+    candidates = [
+        explicit_source_name,
+        _filename_from_content_disposition(content_disposition),
+        Path(unquote(urlsplit(url).path)).name,
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        source_name = Path(candidate).name.strip()
+        if not source_name:
+            continue
+        if _is_supported_upload_name(source_name):
+            return source_name
+        if explicit_source_name == candidate:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Unsupported file type. Supported types: "
+                    f"{SUPPORTED_DOCUMENT_EXTENSIONS}"
+                ),
+            )
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "URL source_name is required when the URL or response filename does "
+            "not use a supported extension"
+        ),
+    )
+
+
+async def _fetch_url_document(
+    document: UrlDocumentRequest,
+    *,
+    max_upload_size: int,
+    remaining_batch_bytes: int,
+) -> tuple[DocumentSourceInput, int]:
+    normalized_url, hostname = _normalized_url(document.url)
+    await _validate_public_hostname(hostname)
+    if remaining_batch_bytes <= 0:
+        raise HTTPException(
+            status_code=413,
+            detail=_batch_too_large_detail(max_upload_size, max_upload_size + 1),
+        )
+
+    content = bytearray()
+    try:
+        async with httpx.AsyncClient(
+            trust_env=False,
+            follow_redirects=False,
+            timeout=httpx.Timeout(_URL_FETCH_TIMEOUT_SECONDS),
+        ) as client:
+            async with client.stream("GET", normalized_url) as response:
+                _validate_url_response_peer(response)
+                content_length = response.headers.get("content-length")
+                if content_length:
+                    try:
+                        declared_size = int(content_length)
+                    except ValueError as exc:
+                        raise HTTPException(
+                            status_code=400, detail="Invalid Content-Length header"
+                        ) from exc
+                    if declared_size > max_upload_size:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=_file_too_large_detail(max_upload_size, declared_size),
+                        )
+                    if declared_size > remaining_batch_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=_batch_too_large_detail(
+                                max_upload_size,
+                                max_upload_size - remaining_batch_bytes + declared_size,
+                            ),
+                        )
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    status_code = exc.response.status_code
+                    raise HTTPException(
+                        status_code=400 if 300 <= status_code < 400 else 502,
+                        detail=f"URL fetch failed with HTTP status {status_code}",
+                    ) from exc
+                source_name = _safe_url_source_name(
+                    explicit_source_name=document.source_name,
+                    url=normalized_url,
+                    content_disposition=response.headers.get("content-disposition"),
+                )
+                async for chunk in response.aiter_bytes():
+                    if not chunk:
+                        continue
+                    content.extend(chunk)
+                    if len(content) > max_upload_size:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=_file_too_large_detail(max_upload_size, len(content)),
+                        )
+                    if len(content) > remaining_batch_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=_batch_too_large_detail(
+                                max_upload_size,
+                                max_upload_size - remaining_batch_bytes + len(content),
+                            ),
+                        )
+    except HTTPException:
+        raise
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"URL fetch failed: {exc}") from exc
+
+    source_key = _normalize_sync_source_key(document.source_key or f"url:{normalized_url}")
+    return (
+        DocumentSourceInput(
+            source_name=source_name,
+            content=bytes(content),
+            source_type="url",
+            content_type=document.content_type,
+            metadata=_merge_source_metadata(
+                document.metadata,
+                {"source_url": normalized_url, "source_key": source_key},
+            ),
+        ),
+        len(content),
+    )
+
+
+def _source_root_resolved(document_service: DocumentLifecycleService) -> Path:
+    return document_service.source_root.resolve(strict=False)
+
+
+def _resolve_staged_path(source_root: Path, value: str) -> Path:
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = source_root / candidate
+    if candidate.is_symlink():
+        raise HTTPException(status_code=400, detail="Staged symlinks are not allowed")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail="Staged path does not exist") from exc
+    try:
+        resolved.relative_to(source_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Staged path escapes INPUT_DIR") from exc
+    return resolved
+
+
+def _requested_path_resolves_to_root(source_root: Path, value: str) -> bool:
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = source_root / candidate
+    return candidate.resolve(strict=False) == source_root
+
+
+def _relative_staged_path(source_root: Path, path: Path) -> str:
+    return path.relative_to(source_root).as_posix()
+
+
+def _validate_staged_file(path: Path, *, source_name: str | None = None) -> None:
+    if path.is_symlink():
+        raise HTTPException(status_code=400, detail="Staged file symlinks are not allowed")
+    if path.is_dir():
+        raise HTTPException(status_code=400, detail="Staged path must be a file")
+    if not path.is_file():
+        raise HTTPException(status_code=400, detail="Staged path must be a file")
+    if not _is_supported_upload_name(source_name or path.name):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported file type. Supported types: "
+                f"{SUPPORTED_DOCUMENT_EXTENSIONS}"
+            ),
+        )
+
+
+def _read_staged_file_content(
+    path: Path,
+    *,
+    max_upload_size: int,
+    remaining_batch_bytes: int,
+) -> bytes:
+    if remaining_batch_bytes <= 0:
+        raise HTTPException(
+            status_code=413,
+            detail=_batch_too_large_detail(max_upload_size, max_upload_size + 1),
+        )
+    size = path.stat().st_size
+    if size <= 0:
+        raise HTTPException(status_code=400, detail="Staged file cannot be empty")
+    if size > max_upload_size:
+        raise HTTPException(
+            status_code=413, detail=_file_too_large_detail(max_upload_size, size)
+        )
+    if size > remaining_batch_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=_batch_too_large_detail(
+                max_upload_size, max_upload_size - remaining_batch_bytes + size
+            ),
+        )
+    return path.read_bytes()
+
+
+def _scan_supported_files(
+    source_root: Path,
+    directory: Path,
+    *,
+    recursive: bool,
+    max_files: int,
+) -> list[Path]:
+    try:
+        directory.relative_to(source_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Scan directory escapes INPUT_DIR") from exc
+    if directory == source_root:
+        raise HTTPException(status_code=400, detail="Scan directory cannot be INPUT_DIR root")
+    if directory.is_symlink():
+        raise HTTPException(status_code=400, detail="Scan directory symlinks are not allowed")
+    if not directory.is_dir():
+        raise HTTPException(status_code=400, detail="Scan directory must be a directory")
+
+    iterator = directory.rglob("*") if recursive else directory.glob("*")
+    files: list[Path] = []
+    for path in sorted(iterator):
+        relative_parts = path.relative_to(source_root).parts
+        if "__parsed__" in relative_parts or ".sync-staging" in relative_parts:
+            continue
+        if path.is_dir():
+            if path.is_symlink():
+                raise HTTPException(status_code=400, detail="Scan directory symlinks are not allowed")
+            continue
+        if path.is_symlink() or not path.is_file():
+            continue
+        if not _is_supported_upload_name(path.name):
+            continue
+        files.append(path)
+        if len(files) > max_files:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Scan matched too many files. Maximum files: {max_files}",
+            )
+    if not files:
+        raise HTTPException(status_code=400, detail="Scan found no supported files")
+    return files
 
 
 async def _read_upload_content(
@@ -2273,6 +2738,250 @@ def create_kb_document_routes(
             logger.error("Failed to import texts for KB '%s': %s", kb_id, exc)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    @router.post(
+        "/{kb_id}/documents:urls",
+        response_model=DocumentBatchResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Ingest URL documents to a knowledge base metadata stage",
+    )
+    async def ingest_url_documents(
+        kb_id: str,
+        background_tasks: BackgroundTasks,
+        request: UrlDocumentsRequest,
+    ):
+        try:
+            max_upload_size = _required_upload_limit()
+            total_bytes = 0
+            sources: list[DocumentSourceInput] = []
+            seen_source_keys: set[str] = set()
+            for document in request.documents:
+                source, size = await _fetch_url_document(
+                    document,
+                    max_upload_size=max_upload_size,
+                    remaining_batch_bytes=max_upload_size - total_bytes,
+                )
+                source_key = str(source.metadata["source_key"])
+                if source_key in seen_source_keys:
+                    raise HTTPException(
+                        status_code=400, detail="Duplicate source_key values are not allowed"
+                    )
+                seen_source_keys.add(source_key)
+                total_bytes += size
+                sources.append(source)
+            result = await document_service.create_source_batch(
+                kb_id,
+                sources,
+                auto_parse=request.auto_parse,
+                auto_index=request.auto_index,
+                parser_engine=request.parser_engine,
+                process_options=request.process_options,
+                idempotency_key=request.idempotency_key,
+            )
+            if request.auto_parse and result.created and registry is not None:
+                _schedule_auto_parse(
+                    background_tasks,
+                    kb_id=kb_id,
+                    job=result.job,
+                    documents=result.documents,
+                    auto_index=request.auto_index,
+                )
+            return DocumentBatchResponse(
+                job_id=result.job.id,
+                batch_id=result.batch_id,
+                documents=[
+                    DocumentResponse.from_record(item) for item in result.documents
+                ],
+            )
+        except HTTPException:
+            raise
+        except IdempotencyKeyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except DuplicateDocumentSourceKeyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KnowledgeBaseNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error("Failed to ingest URLs for KB '%s': %s", kb_id, exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.post(
+        "/{kb_id}/documents:import",
+        response_model=DocumentBatchResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Import controlled local staged files to a knowledge base metadata stage",
+    )
+    async def import_local_documents(
+        kb_id: str,
+        background_tasks: BackgroundTasks,
+        request: LocalImportDocumentsRequest,
+    ):
+        try:
+            source_root = _source_root_resolved(document_service)
+            max_upload_size = _required_upload_limit()
+            total_bytes = 0
+            sources: list[DocumentSourceInput] = []
+            seen_source_keys: set[str] = set()
+            for document in request.documents:
+                path = _resolve_staged_path(source_root, document.path)
+                source_name = document.source_name or path.name
+                _validate_staged_file(path, source_name=source_name)
+                content = _read_staged_file_content(
+                    path,
+                    max_upload_size=max_upload_size,
+                    remaining_batch_bytes=max_upload_size - total_bytes,
+                )
+                total_bytes += len(content)
+                relative_path = _relative_staged_path(source_root, path)
+                source_key = _normalize_sync_source_key(
+                    document.source_key or f"import:{relative_path}"
+                )
+                if source_key in seen_source_keys:
+                    raise HTTPException(
+                        status_code=400, detail="Duplicate source_key values are not allowed"
+                    )
+                seen_source_keys.add(source_key)
+                sources.append(
+                    DocumentSourceInput(
+                        source_name=source_name,
+                        content=content,
+                        source_type="import",
+                        content_type=document.content_type,
+                        metadata=_merge_source_metadata(
+                            document.metadata,
+                            {
+                                "source_key": source_key,
+                                "staged_source_path": relative_path,
+                            },
+                        ),
+                    )
+                )
+            result = await document_service.create_source_batch(
+                kb_id,
+                sources,
+                auto_parse=request.auto_parse,
+                auto_index=request.auto_index,
+                parser_engine=request.parser_engine,
+                process_options=request.process_options,
+                idempotency_key=request.idempotency_key,
+            )
+            if request.auto_parse and result.created and registry is not None:
+                _schedule_auto_parse(
+                    background_tasks,
+                    kb_id=kb_id,
+                    job=result.job,
+                    documents=result.documents,
+                    auto_index=request.auto_index,
+                )
+            return DocumentBatchResponse(
+                job_id=result.job.id,
+                batch_id=result.batch_id,
+                documents=[
+                    DocumentResponse.from_record(item) for item in result.documents
+                ],
+            )
+        except HTTPException:
+            raise
+        except IdempotencyKeyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except DuplicateDocumentSourceKeyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KnowledgeBaseNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error("Failed to import local files for KB '%s': %s", kb_id, exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.post(
+        "/{kb_id}/documents:scan",
+        response_model=DocumentBatchResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Scan controlled local staged directories into a knowledge base metadata stage",
+    )
+    async def scan_local_documents(
+        kb_id: str,
+        background_tasks: BackgroundTasks,
+        request: LocalScanDocumentsRequest,
+    ):
+        try:
+            source_root = _source_root_resolved(document_service)
+            if _requested_path_resolves_to_root(source_root, request.directory):
+                raise HTTPException(
+                    status_code=400, detail="Scan directory cannot be INPUT_DIR root"
+                )
+            directory = _resolve_staged_path(source_root, request.directory)
+            files = _scan_supported_files(
+                source_root,
+                directory,
+                recursive=request.recursive,
+                max_files=request.max_files,
+            )
+            max_upload_size = _required_upload_limit()
+            total_bytes = 0
+            sources: list[DocumentSourceInput] = []
+            prefix = _normalize_sync_source_key(request.source_key_prefix)
+            for path in files:
+                content = _read_staged_file_content(
+                    path,
+                    max_upload_size=max_upload_size,
+                    remaining_batch_bytes=max_upload_size - total_bytes,
+                )
+                total_bytes += len(content)
+                relative_path = _relative_staged_path(source_root, path)
+                source_key = _normalize_sync_source_key(f"{prefix}:{relative_path}")
+                sources.append(
+                    DocumentSourceInput(
+                        source_name=path.name,
+                        content=content,
+                        source_type="scan",
+                        content_type=None,
+                        metadata={
+                            "source_key": source_key,
+                            "scanned_source_path": relative_path,
+                        },
+                    )
+                )
+            result = await document_service.create_source_batch(
+                kb_id,
+                sources,
+                auto_parse=request.auto_parse,
+                auto_index=request.auto_index,
+                parser_engine=request.parser_engine,
+                process_options=request.process_options,
+                idempotency_key=request.idempotency_key,
+            )
+            if request.auto_parse and result.created and registry is not None:
+                _schedule_auto_parse(
+                    background_tasks,
+                    kb_id=kb_id,
+                    job=result.job,
+                    documents=result.documents,
+                    auto_index=request.auto_index,
+                )
+            return DocumentBatchResponse(
+                job_id=result.job.id,
+                batch_id=result.batch_id,
+                documents=[
+                    DocumentResponse.from_record(item) for item in result.documents
+                ],
+            )
+        except HTTPException:
+            raise
+        except IdempotencyKeyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except DuplicateDocumentSourceKeyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KnowledgeBaseNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error("Failed to scan local files for KB '%s': %s", kb_id, exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
     @router.get(
         "/{kb_id}/documents",
         response_model=DocumentListResponse,
@@ -2508,6 +3217,9 @@ def create_kb_document_routes(
                         "source_name": cast(
                             DocumentSourceInput, item["source"]
                         ).source_name,
+                        "source_type": cast(
+                            DocumentSourceInput, item["source"]
+                        ).source_type,
                         "source_hash": item["source_hash"],
                         "content_type": item["content_type"],
                         "size_bytes": item["size_bytes"],
@@ -2772,6 +3484,7 @@ def create_kb_document_routes(
                 document_id=document_id,
                 previous_lightrag_doc_id=document.lightrag_doc_id,
                 source_name=replacement.source_name,
+                source_type=replacement.source_type,
                 source_hash=replacement.source_hash,
                 content_type=replacement.content_type,
                 size_bytes=replacement.size_bytes,
@@ -4471,6 +5184,26 @@ def create_kb_document_routes(
                 media_type=artifact_file.media_type,
                 filename=artifact_file.filename,
             )
+        except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.get(
+        "/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:preview",
+        dependencies=[Depends(combined_auth)],
+        summary="Preview a supported knowledge base document artifact inline",
+    )
+    async def preview_document_artifact(
+        kb_id: str, document_id: str, artifact_id: str
+    ):
+        try:
+            artifact_file = await document_service.get_document_artifact_file(
+                kb_id, document_id, artifact_id
+            )
+            return _artifact_preview_response(artifact_file)
         except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except FileNotFoundError as exc:

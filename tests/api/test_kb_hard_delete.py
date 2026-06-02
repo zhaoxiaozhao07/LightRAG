@@ -411,3 +411,41 @@ async def test_resume_hard_delete_drives_claimed_job_to_succeeded(tmp_path: Path
     assert not workspace_input.parent.exists()
     docs, total = await store.list_documents(record.id)
     assert total == 0 and docs == []
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_makes_kb_id_reusable(tmp_path: Path):
+    """Regression: kb_catalog row must be purged so the same kb_id (and its
+    UNIQUE workspace) can be created again right after a hard delete.
+
+    Before this guard, hard_delete left the row in ``status='deleted'`` and
+    the next ``kb_service.create`` raised ``KnowledgeBaseConflictError``."""
+    kb_service = KnowledgeBaseService(tmp_path / "kb.json")
+    await kb_service.initialize()
+    record = await kb_service.create(kb_id="kb_reuse", name="Reuse")
+
+    store = SQLiteMetadataStore(tmp_path / "metadata.sqlite3")
+    await store.initialize()
+
+    probe = BuilderProbe()
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+    await registry.get(record.id)
+
+    deletion_service = KBDeletionService(
+        kb_service,
+        store,
+        registry,
+        input_root=tmp_path / "inputs",
+        working_dir=tmp_path / "working",
+    )
+    await kb_service.delete(record.id)
+    result = await deletion_service.hard_delete(record.id)
+
+    assert result.errors == []
+    assert result.purged_catalog is True
+
+    # The same kb_id must now be re-creatable without 409.
+    recreated = await kb_service.create(kb_id="kb_reuse", name="Reuse Again")
+    assert recreated.id == "kb_reuse"
+    assert recreated.status == "active"
+    assert recreated.workspace == record.workspace

@@ -43,7 +43,8 @@ from lightrag.parser.routing import (
 )
 from lightrag.utils import compute_mdhash_id, generate_track_id, logger
 
-SourceType = Literal["upload", "text"]
+SourceType = Literal["upload", "text", "url", "import", "scan"]
+SOURCE_TYPES: tuple[SourceType, ...] = ("upload", "text", "url", "import", "scan")
 MetadataStore = SQLiteMetadataStore | PostgresMetadataStore
 
 # Sanitization rule: drop only path separators, control characters, and
@@ -153,6 +154,7 @@ class DocumentDeleteFileResult:
 class DocumentReplacementSource:
     source_name: str
     content: bytes
+    source_type: SourceType
     source_hash: str
     content_type: str | None
     size_bytes: int
@@ -197,6 +199,10 @@ class DocumentLifecycleService:
     @property
     def kb_service(self) -> KnowledgeBaseService:
         return self._kb_service
+
+    @property
+    def source_root(self) -> Path:
+        return self._source_root
 
     async def _active_parser_defaults_for_record(self, record: Any) -> dict[str, str]:
         if not record.active_config_version_id:
@@ -536,6 +542,7 @@ class DocumentLifecycleService:
         return DocumentReplacementSource(
             source_name=safe_name,
             content=source.content,
+            source_type=source.source_type,
             source_hash=_content_hash(source.content),
             content_type=source.content_type,
             size_bytes=len(source.content),
@@ -611,6 +618,7 @@ class DocumentLifecycleService:
         source_hash: str,
         content_type: str | None,
         size_bytes: int,
+        source_type: SourceType,
     ) -> DocumentReplacementSource | None:
         """Rebuild a ``DocumentReplacementSource`` from staged bytes for worker
         resume. Returns ``None`` when the staging file is absent (e.g. the
@@ -625,6 +633,7 @@ class DocumentLifecycleService:
         return DocumentReplacementSource(
             source_name=source_name,
             content=content,
+            source_type=source_type,
             source_hash=source_hash,
             content_type=content_type,
             size_bytes=size_bytes,
@@ -686,6 +695,7 @@ class DocumentLifecycleService:
         content_type: str | None,
         metadata: dict[str, Any],
         expected_hash: str,
+        source_type: SourceType,
     ) -> DocumentSourceInput | None:
         """Rebuild a sync source from staged bytes for worker resume."""
         record = await self._kb_service.get(kb_id)
@@ -704,7 +714,7 @@ class DocumentLifecycleService:
         return DocumentSourceInput(
             source_name=source_name,
             content=content,
-            source_type="upload",
+            source_type=source_type,
             content_type=content_type,
             metadata=metadata,
         )
@@ -806,6 +816,7 @@ class DocumentLifecycleService:
                 document.id,
                 source_name=replacement.source_name,
                 source_uri=str(target_path),
+                source_type=replacement.source_type,
                 source_hash=replacement.source_hash,
                 content_type=replacement.content_type,
                 size_bytes=replacement.size_bytes,

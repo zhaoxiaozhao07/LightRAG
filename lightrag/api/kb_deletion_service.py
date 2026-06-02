@@ -25,6 +25,7 @@ class KBHardDeleteResult:
     cleared_object_storage: bool = False
     deleted_objects: int = 0
     finalized_storages: bool = False
+    purged_catalog: bool = False
     errors: list[str] = field(default_factory=list)
 
 
@@ -218,6 +219,15 @@ class KBDeletionService:
                 error_code=None if not result.errors else "kb_hard_delete_failed",
                 error_message=None if not result.errors else "; ".join(result.errors),
             )
+            # Drop the kb_catalog row last so the audit trail (clear_kb job)
+            # outlives the row it audits, and the kb_id / workspace become
+            # reusable. Failures here only surface in the result, not the
+            # job — the destructive work has already succeeded by this point.
+            try:
+                purged = await self._kb_service.purge(record.id)
+                result.purged_catalog = bool(purged)
+            except Exception as exc:  # noqa: BLE001
+                result.errors.append(f"kb_catalog_purge: {exc}")
         except Exception as exc:  # noqa: BLE001
             logger.error("Hard delete failed for KB '%s': %s", record.id, exc)
             result.errors.append(str(exc))

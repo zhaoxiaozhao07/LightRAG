@@ -360,6 +360,25 @@ class KnowledgeBaseService:
                 self._write_metadata_locked()
                 return deleted_record
 
+    async def purge(self, kb_id: str) -> bool:
+        """Hard-remove the catalog entry so the kb_id becomes reusable.
+
+        Counterpart of :meth:`PostgresKnowledgeBaseService.purge` for the
+        file-backed catalog. Idempotent: returns False when the entry is
+        absent. Without this, ``hard=true`` cleanup would leave the file
+        catalog row in ``status='deleted'`` and the next ``POST /kbs``
+        with the same id would 409 on the in-memory uniqueness check.
+        """
+        normalized_id = validate_kb_id(kb_id)
+        async with self._lock:
+            with _MetadataFileLock(self.lock_path):
+                self._reload_metadata_locked()
+                if normalized_id not in self._records:
+                    return False
+                del self._records[normalized_id]
+                self._write_metadata_locked()
+                return True
+
     async def _ensure_loaded_locked(self) -> None:
         if not self._loaded:
             self._reload_metadata_locked()

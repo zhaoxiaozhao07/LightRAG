@@ -289,6 +289,9 @@ class TestOpenAPISpecIntegration:
             assert "/kbs/{kb_id}/status" in paths
             assert "/kbs/{kb_id}/documents:upload" in paths
             assert "/kbs/{kb_id}/documents:texts" in paths
+            assert "/kbs/{kb_id}/documents:urls" in paths
+            assert "/kbs/{kb_id}/documents:import" in paths
+            assert "/kbs/{kb_id}/documents:scan" in paths
             assert "/kbs/{kb_id}/documents" in paths
             assert "/kbs/{kb_id}/documents/{document_id}" in paths
             assert "patch" in paths["/kbs/{kb_id}/documents/{document_id}"]
@@ -301,6 +304,10 @@ class TestOpenAPISpecIntegration:
             )
             assert (
                 "/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:download"
+                in paths
+            )
+            assert (
+                "/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:preview"
                 in paths
             )
             assert (

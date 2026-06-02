@@ -290,8 +290,18 @@ def create_kb_routes(
     )
     async def delete_knowledge_base(kb_id: str, hard: bool = False):
         try:
-            record = await kb_service.delete(kb_id)
             if hard:
+                # Idempotent hard delete: if the KB is already soft-deleted,
+                # skip the (now failing) soft-delete step and run the destructive
+                # clear directly. Without this, a hard delete that fails midway
+                # (or any soft-delete-then-retry-with-hard flow) gets stuck with
+                # the catalog row in 'deleted' status forever.
+                try:
+                    record = await kb_service.get(kb_id, include_deleted=True)
+                except KnowledgeBaseNotFoundError as exc:
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                if record.status != "deleted":
+                    record = await kb_service.delete(kb_id)
                 if deletion_service is None:
                     raise HTTPException(
                         status_code=503,
@@ -311,6 +321,7 @@ def create_kb_routes(
                         },
                     )
             else:
+                record = await kb_service.delete(kb_id)
                 try:
                     await registry.discard(record.id)
                 except Exception as exc:  # noqa: BLE001

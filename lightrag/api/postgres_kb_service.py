@@ -292,6 +292,26 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
                 await self._save_record(conn, deleted_record)
                 return deleted_record
 
+    async def purge(self, kb_id: str) -> bool:
+        """Hard-remove the kb_catalog row so the kb_id (and its workspace)
+        become reusable. Idempotent: returns False when the row is absent.
+
+        Called from :meth:`KBDeletionService._execute_clear` at the end of a
+        ``hard=true`` flow. The shared catalog row would otherwise keep the
+        id and the UNIQUE workspace locked in ``status='deleted'`` forever,
+        and the next ``POST /kbs`` with the same id would 409.
+        """
+        await self._ensure_initialized()
+        normalized_id = validate_kb_id(kb_id)
+        async with self._pool_or_raise().acquire() as conn:
+            status = await conn.execute(
+                "DELETE FROM kb_catalog WHERE id = $1", normalized_id
+            )
+        try:
+            return int(status.rsplit(" ", 1)[-1]) > 0
+        except (ValueError, AttributeError):
+            return False
+
     async def _ensure_initialized(self) -> None:
         if not self._initialized:
             await self.initialize()

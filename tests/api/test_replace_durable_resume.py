@@ -142,7 +142,7 @@ async def test_worker_resumes_queued_replace_from_staged_bytes(tmp_path):
         DocumentSourceInput(
             source_name="paper-v2.pdf",
             content=b"replacement-bytes-v2",
-            source_type="upload",
+            source_type="url",
             content_type="application/pdf",
             metadata={},
         )
@@ -152,6 +152,7 @@ async def test_worker_resumes_queued_replace_from_staged_bytes(tmp_path):
         document_id=document_id,
         previous_lightrag_doc_id=old_lightrag_id,
         source_name=replacement.source_name,
+        source_type=replacement.source_type,
         source_hash=replacement.source_hash,
         content_type=replacement.content_type,
         size_bytes=replacement.size_bytes,
@@ -192,6 +193,7 @@ async def test_worker_resumes_queued_replace_from_staged_bytes(tmp_path):
     after = client.get(f"/kbs/{kb_id}/documents/{document_id}", headers=_HEADERS).json()
     assert after["source_hash"] != old_hash
     assert after["source_name"] == "paper-v2.pdf"
+    assert after["source_type"] == "url"
     assert after["status"] in ("parsed", "ready")
 
     # Old index was deleted on the shared FakeRAG instance.
@@ -215,6 +217,7 @@ async def test_worker_fails_replace_without_staged_bytes(tmp_path):
         document_id=document_id,
         previous_lightrag_doc_id=None,
         source_name="paper-v2.pdf",
+        source_type="upload",
         source_hash="sha256:does-not-matter",
         content_type="application/pdf",
         size_bytes=10,
@@ -267,6 +270,7 @@ async def test_worker_keeps_replace_staging_when_terminal_transition_fails(
         document_id=document_id,
         previous_lightrag_doc_id=before["lightrag_doc_id"],
         source_name=replacement.source_name,
+        source_type=replacement.source_type,
         source_hash=replacement.source_hash,
         content_type=replacement.content_type,
         size_bytes=replacement.size_bytes,
@@ -324,6 +328,7 @@ async def test_orphan_recovery_preserves_queued_replace_job(tmp_path):
         document_id=document_id,
         previous_lightrag_doc_id=None,
         source_name="paper-v2.pdf",
+        source_type="upload",
         source_hash="sha256:x",
         content_type="application/pdf",
         size_bytes=10,
@@ -346,6 +351,7 @@ async def test_orphan_recovery_preserves_queued_replace_job(tmp_path):
         document_id=document_id,
         previous_lightrag_doc_id=None,
         source_name="paper-v3.pdf",
+        source_type="upload",
         source_hash="sha256:y",
         content_type="application/pdf",
         size_bytes=10,
@@ -374,7 +380,7 @@ async def test_worker_resumes_queued_sync_from_staged_sources(tmp_path):
     source = DocumentSourceInput(
         source_name="resume.pdf",
         content=b"resumable-sync-bytes",
-        source_type="upload",
+        source_type="scan",
         content_type="application/pdf",
         metadata={"source_key": "manual/resume.pdf"},
     )
@@ -397,6 +403,7 @@ async def test_worker_resumes_queued_sync_from_staged_sources(tmp_path):
                 {
                     "source_key": "manual/resume.pdf",
                     "source_name": "resume.pdf",
+                    "source_type": "scan",
                     "source_hash": source_hash,
                     "content_type": "application/pdf",
                     "size_bytes": len(source.content),
@@ -446,6 +453,7 @@ async def test_worker_resumes_queued_sync_from_staged_sources(tmp_path):
     documents = client.get(f"/kbs/{kb_id}/documents", headers=_HEADERS).json()["documents"]
     assert len(documents) == 1
     assert documents[0]["metadata"]["source_key"] == "manual/resume.pdf"
+    assert documents[0]["source_type"] == "scan"
     assert documents[0]["status"] == "ready"
 
 
@@ -489,6 +497,7 @@ async def test_worker_keeps_sync_staging_when_terminal_transition_fails(
                 {
                     "source_key": "manual/retain.pdf",
                     "source_name": "retain.pdf",
+                    "source_type": "upload",
                     "source_hash": source_hash,
                     "content_type": "application/pdf",
                     "size_bytes": len(source.content),

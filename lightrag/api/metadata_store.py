@@ -1134,6 +1134,7 @@ class SQLiteMetadataStore:
         *,
         source_name: str,
         source_uri: str,
+        source_type: str,
         source_hash: str,
         content_type: str | None,
         size_bytes: int,
@@ -1170,7 +1171,7 @@ class SQLiteMetadataStore:
             conn.execute(
                 """
                 UPDATE documents
-                SET source_type = 'upload', source_name = ?, source_uri = ?,
+                SET source_type = ?, source_name = ?, source_uri = ?,
                     source_hash = ?, content_type = ?, size_bytes = ?,
                     lightrag_doc_id = NULL, parser_hash = NULL, index_hash = NULL,
                     status = 'uploaded', chunks_count = NULL, entity_count = NULL,
@@ -1179,6 +1180,7 @@ class SQLiteMetadataStore:
                 WHERE kb_id = ? AND id = ?
                 """,
                 (
+                    source_type,
                     source_name,
                     source_uri,
                     source_hash,

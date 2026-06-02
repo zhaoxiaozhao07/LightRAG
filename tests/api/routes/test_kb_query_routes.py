@@ -5,6 +5,7 @@ import importlib
 import json
 import sys
 from pathlib import Path
+from typing import cast
 
 import pytest
 from fastapi import FastAPI
@@ -18,7 +19,7 @@ from lightrag.api.job_service import JobService
 from lightrag.api.kb_service import KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
 from lightrag.api.metadata_store import SQLiteMetadataStore
-from lightrag.base import QueryParam
+from lightrag.base import BaseGraphStorage, BaseKVStorage, BaseVectorStorage, QueryParam
 
 _original_argv = sys.argv[:]
 sys.argv = [sys.argv[0]]
@@ -532,6 +533,100 @@ def test_kb_query_rejects_documents_in_active_replace(tmp_path):
     assert "kb_query_replace" not in probe.instances
 
 
+def test_kb_query_rejects_invalid_metadata_filters(tmp_path):
+    client, *_ = _build_client(tmp_path)
+    _create_kb(client, "kb_bad_metadata_filter")
+
+    response = client.post(
+        "/kbs/kb_bad_metadata_filter/query",
+        json={"query": "invalid metadata", "filters": {"metadata": {"nested": {"x": 1}}}},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 422
+    assert "filters.metadata values" in response.text
+
+    oversize = "x" * (64 * 1024)
+    response = client.post(
+        "/kbs/kb_bad_metadata_filter/query",
+        json={"query": "oversized metadata", "filters": {"metadata": {"k": oversize}}},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 422
+    assert "filters.metadata is too large" in response.text
+
+
+def test_kb_query_metadata_scope_ignores_nonmatching_active_replace(tmp_path):
+    client, _kb_service, document_service, _registry, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_query_replace_metadata")
+
+    async def seed_documents() -> tuple[str, str]:
+        result = await document_service.create_source_batch(
+            "kb_query_replace_metadata",
+            [
+                DocumentSourceInput(
+                    source_name="active.txt",
+                    content=b"active",
+                    source_type="upload",
+                    content_type="text/plain",
+                    metadata={"tenant": "blocked"},
+                ),
+                DocumentSourceInput(
+                    source_name="ready.txt",
+                    content=b"ready",
+                    source_type="upload",
+                    content_type="text/plain",
+                    metadata={"tenant": "allowed"},
+                ),
+            ],
+            auto_parse=False,
+            auto_index=False,
+        )
+        active, ready = result.documents
+        replacement = document_service.prepare_replacement_source(
+            DocumentSourceInput(
+                source_name="active-v2.txt",
+                content=b"replacement",
+                source_type="upload",
+                content_type="text/plain",
+                metadata={},
+            )
+        )
+        await document_service.claim_replace(
+            "kb_query_replace_metadata",
+            active.id,
+            job=result.job,
+            replacement=replacement,
+        )
+        await document_service.metadata_store.complete_document_parse(
+            "kb_query_replace_metadata",
+            ready.id,
+            parser_hash="sha256:test-parser",
+            lightrag_doc_id="lr-ready",
+            metadata_patch={},
+            artifacts=[],
+        )
+        return active.id, ready.id
+
+    active_id, _ready_id = asyncio.run(seed_documents())
+
+    scoped = client.post(
+        "/kbs/kb_query_replace_metadata/query/data",
+        json={"query": "allowed only", "filters": {"metadata": {"tenant": "allowed"}}},
+        headers=_HEADERS,
+    )
+    assert scoped.status_code == 200, scoped.text
+    param = probe.instances["kb_query_replace_metadata"].query_params[0]
+    assert param.ids == ["lr-ready"]
+
+    kb_wide = client.post(
+        "/kbs/kb_query_replace_metadata/query/data",
+        json={"query": "blocked wide"},
+        headers=_HEADERS,
+    )
+    assert kb_wide.status_code == 409
+    assert kb_wide.json()["detail"]["document_id"] == active_id
+
+
 def test_kb_query_404_when_kb_missing(tmp_path):
     client, *_ = _build_client(tmp_path)
     response = client.post(
@@ -564,6 +659,8 @@ def _doc_record(
     lightrag_doc_id: str | None,
     enabled: bool = True,
     archived: bool = False,
+    status: str = "ready",
+    metadata: dict | None = None,
 ):
     from lightrag.api.metadata_store import DocumentRecord
 
@@ -580,7 +677,7 @@ def _doc_record(
         size_bytes=1,
         parser_hash=None,
         index_hash=None,
-        status="ready",
+        status=status,
         enabled=enabled,
         archived=archived,
         chunks_count=None,
@@ -588,7 +685,7 @@ def _doc_record(
         relation_count=None,
         error_code=None,
         error_message=None,
-        metadata={},
+        metadata=metadata or {},
         created_at="2026-01-01T00:00:00Z",
         updated_at="2026-01-01T00:00:00Z",
         deleted_at=None,
@@ -661,6 +758,70 @@ def test_resolve_doc_scope_unindexed_docs_have_no_lightrag_id():
     assert scope == ["lr-a"]
 
 
+def test_resolve_doc_scope_filters_by_metadata_only():
+    from lightrag.api.routers.kb_query_routes import KBQueryFilters, _resolve_doc_id_scope
+
+    docs = [
+        _doc_record(
+            "doc_a",
+            lightrag_doc_id="lr-a",
+            metadata={"tenant": "alpha", "tags": ["legal", "draft"]},
+        ),
+        _doc_record(
+            "doc_b",
+            lightrag_doc_id="lr-b",
+            metadata={"tenant": "beta", "tags": ["finance"]},
+        ),
+        _doc_record(
+            "doc_c",
+            lightrag_doc_id="lr-c",
+            metadata={"tenant": "alpha", "tags": ["finance"]},
+        ),
+    ]
+    scope = asyncio.run(
+        _resolve_doc_id_scope(
+            _FakeDocService(docs),
+            "kb_scope",
+            KBQueryFilters(metadata={"tenant": "alpha", "tags": ["legal"]}),
+        )
+    )
+    assert scope == ["lr-a"]
+
+
+def test_resolve_doc_scope_intersects_doc_ids_and_metadata():
+    from lightrag.api.routers.kb_query_routes import KBQueryFilters, _resolve_doc_id_scope
+
+    docs = [
+        _doc_record("doc_a", lightrag_doc_id="lr-a", metadata={"tenant": "alpha"}),
+        _doc_record("doc_b", lightrag_doc_id="lr-b", metadata={"tenant": "beta"}),
+        _doc_record("doc_c", lightrag_doc_id="lr-c", metadata={"tenant": "alpha"}),
+    ]
+    scope = asyncio.run(
+        _resolve_doc_id_scope(
+            _FakeDocService(docs),
+            "kb_scope",
+            KBQueryFilters(doc_ids=["doc_a", "doc_b"], metadata={"tenant": "alpha"}),
+        )
+    )
+    assert scope == ["lr-a"]
+
+
+def test_resolve_doc_scope_metadata_no_matches_returns_empty_list():
+    from lightrag.api.routers.kb_query_routes import KBQueryFilters, _resolve_doc_id_scope
+
+    docs = [
+        _doc_record("doc_a", lightrag_doc_id="lr-a", metadata={"tenant": "alpha"}),
+    ]
+    scope = asyncio.run(
+        _resolve_doc_id_scope(
+            _FakeDocService(docs),
+            "kb_scope",
+            KBQueryFilters(metadata={"tenant": "missing"}),
+        )
+    )
+    assert scope == []
+
+
 # ---------------------------------------------------------------------------
 # Engine-level chunk filter helpers (operate.py)
 # ---------------------------------------------------------------------------
@@ -731,12 +892,12 @@ async def test_get_vector_context_filters_chunks_by_doc_id_allowlist():
     vdb = _FakeChunksVDB(results)
 
     scoped = await _get_vector_context(
-        "q", vdb, QueryParam(top_k=10, chunk_top_k=10, ids=["lr-a"])
+        "q", cast(BaseVectorStorage, vdb), QueryParam(top_k=10, chunk_top_k=10, ids=["lr-a"])
     )
     assert [chunk["chunk_id"] for chunk in scoped] == ["c1"]
 
     unscoped = await _get_vector_context(
-        "q", vdb, QueryParam(top_k=10, chunk_top_k=10, ids=None)
+        "q", cast(BaseVectorStorage, vdb), QueryParam(top_k=10, chunk_top_k=10, ids=None)
     )
     assert {chunk["chunk_id"] for chunk in unscoped} == {"c1", "c2", "c3"}
 
@@ -761,13 +922,19 @@ async def test_find_related_text_unit_from_entities_filters_by_doc_id_allowlist(
     node_datas = [{"entity_name": "E1", "source_id": f"c_in{GRAPH_FIELD_SEP}c_out"}]
 
     scoped = await _find_related_text_unit_from_entities(
-        node_datas, QueryParam(ids=["lr-a"]), text_chunks_db, knowledge_graph_inst=None
+        node_datas,
+        QueryParam(ids=["lr-a"]),
+        cast(BaseKVStorage, text_chunks_db),
+        knowledge_graph_inst=cast(BaseGraphStorage, None),
     )
     assert [chunk["chunk_id"] for chunk in scoped] == ["c_in"]
     assert all(chunk["source_type"] == "entity" for chunk in scoped)
 
     unscoped = await _find_related_text_unit_from_entities(
-        node_datas, QueryParam(ids=None), text_chunks_db, knowledge_graph_inst=None
+        node_datas,
+        QueryParam(ids=None),
+        cast(BaseKVStorage, text_chunks_db),
+        knowledge_graph_inst=cast(BaseGraphStorage, None),
     )
     assert {chunk["chunk_id"] for chunk in unscoped} == {"c_in", "c_out"}
 
@@ -792,7 +959,7 @@ async def test_find_related_text_unit_from_relations_filters_by_doc_id_allowlist
     # entity_chunks=[] mirrors the production caller (_build_query_context), which
     # always passes the already-gathered entity chunks (a list) for dedup.
     scoped = await _find_related_text_unit_from_relations(
-        edge_datas, QueryParam(ids=["lr-a"]), text_chunks_db, []
+        edge_datas, QueryParam(ids=["lr-a"]), cast(BaseKVStorage, text_chunks_db), []
     )
     assert [chunk["chunk_id"] for chunk in scoped] == ["c_in"]
     assert all(chunk["source_type"] == "relationship" for chunk in scoped)
@@ -800,6 +967,6 @@ async def test_find_related_text_unit_from_relations_filters_by_doc_id_allowlist
     # Omitting entity_chunks exercises the default (None): it must not crash the
     # debug log (regression guard), and ids=None keeps every chunk.
     unscoped = await _find_related_text_unit_from_relations(
-        edge_datas, QueryParam(ids=None), text_chunks_db
+        edge_datas, QueryParam(ids=None), cast(BaseKVStorage, text_chunks_db)
     )
     assert {chunk["chunk_id"] for chunk in unscoped} == {"c_in", "c_out"}

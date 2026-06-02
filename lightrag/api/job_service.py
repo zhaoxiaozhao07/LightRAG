@@ -580,6 +580,7 @@ class JobService:
         document_id: str,
         previous_lightrag_doc_id: str | None,
         source_name: str,
+        source_type: str,
         source_hash: str,
         content_type: str | None,
         size_bytes: int,
@@ -596,6 +597,7 @@ class JobService:
         fingerprint_payload = {
             "document_id": document_id,
             "source_name": source_name,
+            "source_type": source_type,
             "source_hash": source_hash,
             "content_type": content_type,
             "size_bytes": size_bytes,

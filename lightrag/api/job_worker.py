@@ -773,6 +773,9 @@ def build_replace_executor(
     guessing.
     """
     from lightrag.api.routers.kb_document_routes import _execute_replace_document
+    from lightrag.api.document_lifecycle_service import SOURCE_TYPES
+
+    allowed_source_types = set(SOURCE_TYPES)
 
     async def _run(job: JobRecord) -> None:
         kb_id = job.kb_id
@@ -790,6 +793,18 @@ def build_replace_executor(
             )
             return
         document_id = str(document_id)
+        source_type = payload.get("source_type")
+        if source_type not in allowed_source_types:
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                failed_items=1,
+                error_code="worker_invalid_payload",
+                error_message="replace job has invalid source_type",
+            )
+            return
         replacement = await document_service.load_staged_replacement(
             kb_id,
             document_id,
@@ -798,6 +813,7 @@ def build_replace_executor(
             source_hash=str(payload.get("source_hash") or ""),
             content_type=payload.get("content_type"),
             size_bytes=int(payload.get("size_bytes") or 0),
+            source_type=source_type,
         )
         if replacement is None:
             await job_service.transition_job(
@@ -893,6 +909,9 @@ def build_sync_executor(
         _sync_failure_message,
         _sync_job_result,
     )
+    from lightrag.api.document_lifecycle_service import SOURCE_TYPES
+
+    allowed_source_types = set(SOURCE_TYPES)
 
     def _invalid_payload_message(message: str) -> str:
         return f"sync job has invalid resumable payload: {message}"
@@ -965,6 +984,12 @@ def build_sync_executor(
                     job, "item content_type must be a string", batch_id=batch_id
                 )
                 return
+            source_type = raw_item.get("source_type")
+            if source_type not in allowed_source_types:
+                await _fail_invalid_payload(
+                    job, "item source_type is not supported", batch_id=batch_id
+                )
+                return
             try:
                 source = await document_service.load_staged_sync_source(
                     kb_id,
@@ -974,6 +999,7 @@ def build_sync_executor(
                     content_type=content_type,
                     metadata={"source_key": source_key},
                     expected_hash=source_hash,
+                    source_type=source_type,
                 )
             except ValueError as exc:
                 await job_service.transition_job(
