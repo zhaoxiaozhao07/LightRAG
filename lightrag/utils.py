@@ -4,6 +4,7 @@ import weakref
 import sys
 
 import asyncio
+import bisect
 import html
 import csv
 import inspect
@@ -40,6 +41,7 @@ from lightrag.constants import (
     DEFAULT_LOG_FILENAME,
     GRAPH_FIELD_SEP,
     DEFAULT_MAX_TOTAL_TOKENS,
+    DEFAULT_PROCESSING_PRIORITY,
     DEFAULT_SOURCE_IDS_LIMIT_METHOD,
     VALID_SOURCE_IDS_LIMIT_METHODS,
     SOURCE_IDS_LIMIT_METHOD_FIFO,
@@ -1240,7 +1242,11 @@ def priority_limit_async_func_call(
 
         @wraps(func)
         async def wait_func(
-            *args, _priority=10, _timeout=None, _queue_timeout=None, **kwargs
+            *args,
+            _priority=DEFAULT_PROCESSING_PRIORITY,
+            _timeout=None,
+            _queue_timeout=None,
+            **kwargs,
         ):
             """
             Execute function with enhanced priority-based concurrency control and timeout handling
@@ -1846,6 +1852,94 @@ def split_text_by_token_limit(
     return [x for x in out if x.strip()]
 
 
+def _normalized_child_offsets(
+    parent_content: str,
+    piece: str,
+    search_from: int,
+) -> tuple[int, int] | None:
+    """Locate ``piece`` in ``parent_content`` ignoring all whitespace.
+
+    Returns ``(start, end)`` char offsets into ``parent_content`` for the first
+    whitespace-stripped occurrence at/after ``search_from``, or ``None`` if absent.
+    Removing every whitespace char (not collapsing runs) keeps the match exact even
+    when the two sides space the same characters differently — the same monotonic
+    projection :mod:`lightrag.sidecar.backfill` uses.
+    """
+    norm_piece = "".join(piece.split())
+    if not norm_piece:
+        return None
+    norm_chars: list[str] = []
+    norm_to_orig: list[int] = []
+    for idx, ch in enumerate(parent_content):
+        if ch.isspace():
+            continue
+        norm_chars.append(ch)
+        norm_to_orig.append(idx)
+    norm_parent = "".join(norm_chars)
+    # First normalized index whose source offset is >= search_from (norm_to_orig is
+    # strictly increasing), so repeated pieces resolve forward in order.
+    norm_start = bisect.bisect_left(norm_to_orig, search_from)
+    pos = norm_parent.find(norm_piece, norm_start)
+    if pos < 0:
+        return None
+    o_start = norm_to_orig[pos]
+    o_end = norm_to_orig[pos + len(norm_piece) - 1] + 1
+    return o_start, o_end
+
+
+def _child_source_span(
+    parent_content: str,
+    parent_span: Any,
+    piece: str,
+    search_from: int,
+) -> tuple[dict[str, int] | None, int]:
+    """Locate a hard-split child ``piece`` inside its parent's source span.
+
+    Pieces are usually verbatim substrings of ``parent_content`` (token-window
+    slices), so an exact forward ``find`` resolves them precisely. But
+    :func:`split_text_by_token_limit` rejoins multiple sentence units with
+    ``"\\n\\n"``, so a multi-unit piece is *not* byte-verbatim when the source
+    separated those sentences with a single space/newline. In that case we fall
+    back to a whitespace-stripped match (the same projection sidecar backfill uses),
+    which stays exact because whitespace removal is monotonic. Without this fallback
+    the child would lose its span and sidecar backfill would wrongly FAIL the
+    document.
+
+    Returns ``(span | None, next_search_from)`` where ``next_search_from`` is a
+    ``parent_content`` offset threaded forward by the caller so repeated pieces
+    resolve in order.
+    """
+    if not isinstance(parent_span, dict):
+        return None, search_from
+    try:
+        parent_start = int(parent_span["start"])
+        parent_end = int(parent_span["end"])
+    except (KeyError, TypeError, ValueError):
+        return None, search_from
+    if parent_start < 0 or parent_end < parent_start:
+        return None, search_from
+
+    search_from = max(0, search_from)
+
+    # Exact: verbatim token-window pieces.
+    local_start = parent_content.find(piece, search_from)
+    if local_start >= 0:
+        local_end = local_start + len(piece)
+    else:
+        # Whitespace-normalized fallback: multi-unit pieces rejoined with "\n\n".
+        offsets = _normalized_child_offsets(parent_content, piece, search_from)
+        if offsets is None:
+            return None, search_from
+        local_start, local_end = offsets
+
+    if parent_start + local_end > parent_end:
+        return None, search_from
+    return (
+        {"start": parent_start + local_start, "end": parent_start + local_end},
+        local_end,
+    )
+
+
 def enforce_chunk_token_limit_before_embedding(
     chunking_result: list[dict[str, Any]] | tuple[dict[str, Any], ...],
     tokenizer: Tokenizer,
@@ -1886,6 +1980,8 @@ def enforce_chunk_token_limit_before_embedding(
             continue
 
         base_chunk_id = dp.get("chunk_id")
+        parent_span = dp.get("_source_span")
+        span_search_from = 0
         total_parts = len(pieces)
         for i, piece in enumerate(pieces, 1):
             new_dp = dict(dp)
@@ -1900,6 +1996,14 @@ def enforce_chunk_token_limit_before_embedding(
             # /chunk_id) is rewritten per split slice.
             if isinstance(base_chunk_id, str) and base_chunk_id.strip():
                 new_dp["chunk_id"] = f"{base_chunk_id}-s{i:02d}"
+
+            child_span, span_search_from = _child_source_span(
+                content, parent_span, piece, span_search_from
+            )
+            if child_span is not None:
+                new_dp["_source_span"] = child_span
+            elif "_source_span" in new_dp:
+                new_dp.pop("_source_span", None)
 
             new_dp["split_type"] = "hard_fallback"
             new_dp["split_part"] = i
@@ -3708,10 +3812,18 @@ def create_prefixed_exception(original_exception: Exception, prefix: str) -> Exc
         else:
             # Method 2: If no args, try single parameter construction.
             return type(original_exception)(f"{prefix}: {str(original_exception)}")
-    except (TypeError, ValueError, AttributeError):
-        # Method 3: If reconstruction fails, wrap it in a RuntimeError.
-        # This is the safest fallback, as attempting to create the same type
-        # with a single string can fail if the constructor requires multiple arguments.
+    except Exception:
+        # Method 3: If reconstruction fails for any reason, wrap it in a
+        # RuntimeError preserving the original type name and message. This is a
+        # defensive catch-all: most known failures already surface as TypeError
+        # (e.g. json.JSONDecodeError needs (msg, doc, pos) and
+        # openai.APIStatusError/BadRequestError need keyword-only
+        # (response, body), so rebuilding from args alone raises TypeError), but
+        # an exotic constructor could raise something else (KeyError, a
+        # validation error, ...). Catching `Exception` guarantees this helper
+        # never raises while prefixing — `KeyboardInterrupt`/`SystemExit` are
+        # BaseException and still propagate. The original exception and its full
+        # traceback are preserved by the caller's `raise ... from original`.
         return RuntimeError(
             f"{prefix}: {type(original_exception).__name__}: {str(original_exception)}"
         )

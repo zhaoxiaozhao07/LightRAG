@@ -28,6 +28,27 @@ from unittest import mock
 ENGINES = ("native", "mineru", "docling")
 
 
+def _normalize_direct_script_sys_path() -> None:
+    if __package__:
+        return
+
+    parser_dir = Path(__file__).resolve().parent
+    repo_root = parser_dir.parent.parent
+
+    # Direct execution adds lightrag/parser to sys.path, which makes the
+    # native parser's third-party ``docx`` import resolve to parser/docx.
+    sys.path[:] = [
+        entry for entry in sys.path if Path(entry or ".").resolve() != parser_dir
+    ]
+    repo_root_str = str(repo_root)
+    if repo_root_str in sys.path:
+        sys.path.remove(repo_root_str)
+    sys.path.insert(0, repo_root_str)
+
+
+_normalize_direct_script_sys_path()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="parse_sidecar",
@@ -120,6 +141,7 @@ async def _run(args: argparse.Namespace) -> int:
         PARSER_ENGINE_SUFFIX_CAPABILITIES,
     )
     from lightrag.parser.debug import build_debug_rag
+    from lightrag.parser.docx.parse_document import DocxContentError
     from lightrag.utils import compute_mdhash_id
     import lightrag.pipeline as pipeline_mod
     import lightrag.utils_pipeline as utils_pipeline_mod
@@ -222,14 +244,22 @@ async def _run(args: argparse.Namespace) -> int:
             )
         )
 
-        result = await parse_method(
-            doc_id,
-            str(source),
-            {
-                "parse_format": FULL_DOCS_FORMAT_PENDING_PARSE,
-                "content": "",
-            },
-        )
+        try:
+            result = await parse_method(
+                doc_id,
+                str(source),
+                {
+                    "parse_format": FULL_DOCS_FORMAT_PENDING_PARSE,
+                    "content": "",
+                },
+            )
+        except DocxContentError as exc:
+            # The native DOCX parser now raises (instead of sys.exit) on a
+            # content-limit violation so the server pipeline can fail just the
+            # offending document. Preserve the friendly CLI UX: print the
+            # formatted message and return a non-zero exit code, no traceback.
+            print(str(exc), file=sys.stderr)
+            return 1
 
     blocks_path = Path(result["blocks_path"])
     _print_summary(blocks_path, raw_dir, args.preview)

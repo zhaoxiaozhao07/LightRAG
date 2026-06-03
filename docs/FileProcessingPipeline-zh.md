@@ -358,6 +358,7 @@ chunker(tokenizer, content, chunk_token_size, **strategy_kwargs)   (分块时按
 |---|---|---|---|
 | `CHUNK_SIZE` | `1200` | int | legacy 顶层 `chunk_token_size` 兜底；优先级低于 strategy 特定 env 与 SDK 路径设置的 `addon_params["chunker"]["chunk_token_size"]` |
 | `CHUNK_OVERLAP_SIZE` | `100` | int | legacy overlap 兜底；当某 strategy 既无特定 env (`CHUNK_F_OVERLAP_SIZE` / `CHUNK_R_OVERLAP_SIZE` / `CHUNK_P_OVERLAP_SIZE`) 又无 SDK 路径的 `LightRAG(chunk_overlap_token_size=…)` 时填入 |
+| `CHUNK_F_SIZE` | 未设 | int | F strategy 特定 `chunk_token_size`；高于顶层 legacy 兜底（`CHUNK_SIZE` 与 SDK 路径的 `LightRAG(chunk_token_size=…)`）。未设时 F 沿用顶层解析结果 |
 | `CHUNK_F_OVERLAP_SIZE` | 未设 | int | F strategy 特定 overlap；高于 legacy 构造字段与 `CHUNK_OVERLAP_SIZE` |
 | `CHUNK_F_SPLIT_BY_CHARACTER` | （未设 = `null`） | str? | F 预切分隔符；`null` / 空串 = 仅按 token 窗 |
 | `CHUNK_F_SPLIT_BY_CHARACTER_ONLY` | `false` | bool | F 严格模式：不二次按 token 切，超长抛错 |
@@ -372,14 +373,14 @@ chunker(tokenizer, content, chunk_token_size, **strategy_kwargs)   (分块时按
 | `CHUNK_P_SIZE` | `2000`（`DEFAULT_CHUNK_P_SIZE`） | int | P strategy 特定 `chunk_token_size`。与 R/V 不同，未设时 P **不**沿用顶层 `CHUNK_SIZE` / `LightRAG(chunk_token_size=…)`——段落语义合并需要比全局默认更大的上限才能将相关段落保留在一起，因此槽位始终携带 `DEFAULT_CHUNK_P_SIZE`（2000） |
 | `CHUNK_P_OVERLAP_SIZE` | 未设 | int | P strategy 特定 overlap；高于 legacy 构造字段与 `CHUNK_OVERLAP_SIZE`。用于同一 JSONL content 行内长正文 fallback 到 R 时的文本重叠，以及相邻大表格之间桥接文字复制到前后表格块的单侧预算 |
 
-P 的内部比例常量是算法刻度，会随 `chunk_token_size` 自动按比例推导。P 始终使用独立于全局链的 `chunk_token_size`——即使 `CHUNK_P_SIZE` 未设，P 也会回退到 `DEFAULT_CHUNK_P_SIZE`（2000）而**不**沿用全局 `CHUNK_SIZE`，因为段落语义合并需要比全局默认更大的上限才能将相关段落保留在一起。需要按部署调整时通过 `CHUNK_P_SIZE` 覆盖该默认。`CHUNK_P_OVERLAP_SIZE` 只影响 P 内部普通文本 fallback 与表格桥接上下文，不会让表格行级切片互相重叠。`CHUNK_R_SIZE` / `CHUNK_V_SIZE` 行为不同——未设时**仍会**沿用顶层 `chunk_token_size`（R 偏向较小目标利于句段切分，V 作为 advisory ceiling 通常希望放大以减少过度拆分）。
+P 的内部比例常量是算法刻度，会随 `chunk_token_size` 自动按比例推导。P 始终使用独立于全局链的 `chunk_token_size`——即使 `CHUNK_P_SIZE` 未设，P 也会回退到 `DEFAULT_CHUNK_P_SIZE`（2000）而**不**沿用全局 `CHUNK_SIZE`，因为段落语义合并需要比全局默认更大的上限才能将相关段落保留在一起。需要按部署调整时通过 `CHUNK_P_SIZE` 覆盖该默认。`CHUNK_P_OVERLAP_SIZE` 只影响 P 内部普通文本 fallback 与表格桥接上下文，不会让表格行级切片互相重叠。`CHUNK_F_SIZE` / `CHUNK_R_SIZE` / `CHUNK_V_SIZE` 行为不同——未设时**仍会**沿用顶层 `chunk_token_size`（F 即默认全局窗口，R 偏向较小目标利于句段切分，V 作为 advisory ceiling 通常希望放大以减少过度拆分）。
 
 ### 3.3 优先级链
 
 每个分块槽位的最终值按 specificity-ordered 链解析（高 → 低）：
 
 1. **`addon_params["chunker"]` 显式值** —— 通过 SDK 路径运行时设置或在构造时显式写入的字段值（见 §8.3）。Server-only 部署通常不会出现这一档。最直接，赢一切。
-2. **strategy 特定 env** —— 如 `CHUNK_F_OVERLAP_SIZE` / `CHUNK_R_OVERLAP_SIZE` / `CHUNK_P_OVERLAP_SIZE` / `CHUNK_R_SIZE` / `CHUNK_V_SIZE` / `CHUNK_P_SIZE`（尚无 strategy 特定的 `CHUNK_F_SIZE`，F 复用顶层 `chunk_token_size`）。仅当槽位未被 ① 显式占用时填入。
+2. **strategy 特定 env** —— 如 `CHUNK_F_SIZE` / `CHUNK_R_SIZE` / `CHUNK_V_SIZE`（各策略 `chunk_token_size`）、`CHUNK_F_OVERLAP_SIZE` / `CHUNK_R_OVERLAP_SIZE` / `CHUNK_P_OVERLAP_SIZE`（overlap）、`CHUNK_P_SIZE`（P 专属）。未设对应 size env 时，F/R/V 沿用顶层 `chunk_token_size`。仅当槽位未被 ① 显式占用时填入。
 3. **legacy 构造字段** —— `LightRAG(chunk_token_size=…, chunk_overlap_token_size=…)`，仅 SDK 路径生效，详见 §8.2。strategy 无关，"粗粒度缺省"，只填仍空的槽位。
 4. **legacy env** —— `CHUNK_SIZE` / `CHUNK_OVERLAP_SIZE`。最终回退。
 
@@ -403,6 +404,7 @@ P 的内部比例常量是算法刻度，会随 `chunk_token_size` 自动按比�
 {
   "chunk_token_size": 1200,                                   // 通用 token 上限
   "fixed_token": {                                            // F 专属
+    "chunk_token_size": 1200,                                 // 可选;不写沿用顶层 chunk_token_size(可由 CHUNK_F_SIZE 种子化)
     "chunk_overlap_token_size": 100,
     "split_by_character": null,
     "split_by_character_only": false
@@ -719,24 +721,25 @@ PENDING ─►├─ q_mineru  ──► [mineru parser  × N2] ─┼─► q_a
 | 环境变量 | 默认值 | 作用 | 调优建议 |
 | --- | --- | --- | --- |
 | `MAX_PARALLEL_PARSE_NATIVE` | `5` | N1: native 解析（docx / pdf / txt 等纯本地处理）并发 worker 数 | 纯 CPU、内存占用低，可按 CPU 核数提高 |
-| `MAX_PARALLEL_PARSE_MINERU` | `1` | N2: MinerU 解析并发 worker 数 | MinerU 占用 GPU/CPU 显著，**默认串行最稳**。本地部署且显存充足时可设 2-3；走 MinerU 官方云端服务时可适当提高（受云端配额限制） |
-| `MAX_PARALLEL_PARSE_DOCLING` | `1` | N3: Docling 解析并发 worker 数 | Docling 同样资源敏感，**默认串行最稳**。本地部署且 CPU/GPU 充足时可设 2-3 |
+| `MAX_PARALLEL_PARSE_MINERU` | `2` | N2: MinerU 解析并发 worker 数 | MinerU 占用 GPU/CPU 显著，**默认 2 为适度并发**。资源紧张时可降到 1；本地部署且显存充足时可设 2-3；走 MinerU 官方云端服务时可适当提高（受云端配额限制） |
+| `MAX_PARALLEL_PARSE_DOCLING` | `2` | N3: Docling 解析并发 worker 数 | Docling 同样资源敏感，**默认 2 为适度并发**。资源紧张时可降到 1；本地部署且 CPU/GPU 充足时可设 2-3 |
 | `MAX_PARALLEL_ANALYZE` | `5` | N4: 多模态分析（VLM 图片 / 表格描述）并发 worker 数 | 直接消耗 VLM 配额。建议 ≤ VLM 服务并发上限 |
-| `MAX_PARALLEL_INSERT` | `2` | N5: 实体 / 关系抽取 + 入库阶段并发文档数 | 推荐 `MAX_ASYNC / 3`，区间 2~10。该阶段每个文档会触发多次 LLM 调用，过高会撞 LLM 限流。同时该值还作为 `asyncio.Semaphore` 用于二次约束（worker 数和信号量值一致） |
-| `QUEUE_SIZE_DEFAULT` | `100` | parse / analyze 阶段间的有界队列容量 | 一般无需调整。极少量大批量任务（成千上万）可适当提高，避免 enqueue 端反压；内存紧张时可调低 |
+| `MAX_PARALLEL_INSERT` | `3` | N5: 实体 / 关系抽取 + 入库阶段并发文档数 | 推荐 `MAX_ASYNC / 3`，区间 2~10。该阶段每个文档会触发多次 LLM 调用，过高会撞 LLM 限流。同时该值还作为 `asyncio.Semaphore` 用于二次约束（worker 数和信号量值一致） |
+| `QUEUE_SIZE_PARSE` | `20` | parse（native/MinerU/Docling）输入队列长度 | 一般无需调整。队列内仅为轻量 doc_id（大文档体在进入 analyze 前已剥离），仅限制 pipeline 一次预派发给 parse worker 的待处理文档数，调整影响很小 |
+| `QUEUE_SIZE_ANALYZE` | `100` | analyze 队列（parse → analyze 阶段）的有界容量 | 一般无需调整。极少量大批量任务（成千上万）可适当提高，避免 enqueue 端反压；内存紧张时可调低 |
 | `QUEUE_SIZE_INSERT` | `4` | analyze → process 阶段间的队列容量 | process 是流水线中最慢、最耗内存的阶段，队列特意做小，给上游提供反压防止内存堆积 |
 
 **几个要点：**
 
 1. **解析阶段按引擎隔离**，所以混用 native/mineru/docling 时不必担心一种引擎慢拖累另一种。
-2. **mineru / docling 默认串行（=1）**：实测两者资源占用高，并行收益不稳定（容易 OOM / 显存竞争 / 失败重试）。如果你部署了多 GPU 或专门的解析服务器，可手动调高。
+2. **mineru / docling 默认 2**：两者资源占用高，默认保持适度并发。资源紧张时可降到 1（避免 OOM / 显存竞争 / 失败重试）；如果你部署了多 GPU 或专门的解析服务器，可手动调高。
 3. **`MAX_PARALLEL_INSERT` 兼任 worker 池大小和信号量上限**：流水线创建 `Semaphore(max_parallel_insert)`，每个 process worker 在抽取入库前还要拿一次信号量。所以哪怕你把 worker 数手动改大，实际并发上限仍由这个值决定——直接调它就够了。
 4. **queue size 与背压**：`QUEUE_SIZE_INSERT=4` 这个偏小的默认值是有意为之——process 阶段慢且占内存，让 analyze 阶段在队列写满时阻塞、再反压到 parse 阶段，避免一次性把成千上万份解析结果堆在内存里。
 5. **改后生效方式**：所有参数通过 `.env`（或环境变量）传入，仅在 `LightRAG` 实例构造时读取一次；改完需要重启服务。
 
 **典型调优场景：**
 
-- 大量 PDF + 本地 MinerU 单 GPU：`MAX_PARALLEL_PARSE_MINERU=1`、`MAX_PARALLEL_ANALYZE=5`、`MAX_PARALLEL_INSERT=2`（默认即可）。
+- 大量 PDF + 本地 MinerU 单 GPU：`MAX_PARALLEL_PARSE_MINERU=2`、`MAX_PARALLEL_ANALYZE=5`、`MAX_PARALLEL_INSERT=3`（默认即可；显存紧张时把 MINERU 降到 1）。
 - 大量 PDF + MinerU 云端服务：`MAX_PARALLEL_PARSE_MINERU=3~5`（视云端配额），其它保持默认。
 - 纯 docx / txt（仅走 native）：`MAX_PARALLEL_PARSE_NATIVE=10`、`MAX_PARALLEL_INSERT` 按 `MAX_ASYNC/3` 推算。
 - LLM 限流明显：先降 `MAX_PARALLEL_INSERT`（process 阶段每文档多次 LLM 调用），再降 `MAX_PARALLEL_ANALYZE`（VLM 是独立配额）。

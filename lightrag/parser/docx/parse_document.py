@@ -9,13 +9,18 @@ import sys
 
 try:
     from docx import Document
-except ImportError:
-    print(
-        "Error: python-docx not installed. Run: pip install python-docx",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+except ImportError as exc:
+    # Raise instead of sys.exit: this module is imported in-process by the
+    # gunicorn/uvicorn worker, where a SystemExit would tear down the whole
+    # worker rather than surfacing a normal, catchable error.
+    raise ImportError(
+        "python-docx not installed. Run: pip install python-docx"
+    ) from exc
 
+from lightrag.parser._markdown import (
+    render_heading_line,
+    strip_heading_markdown_prefix,
+)
 from .numbering_resolver import NumberingResolver
 from .table_extractor import TableExtractor
 from .utils import estimate_tokens
@@ -57,22 +62,46 @@ _SKIP_COMMENT_TAGS = frozenset(
 _SKIP_PARAGRAPH_TAGS = _SKIP_REVISION_TAGS | _SKIP_COMMENT_TAGS
 
 
-def print_error(title: str, details: str, solution: str):
+class DocxContentError(ValueError):
+    """DOCX content violates a parsing constraint (heading/table/anchor limits).
+
+    Raised instead of calling ``sys.exit`` so the pipeline's per-document
+    ``except Exception`` handler marks just that document FAILED while the
+    gunicorn/uvicorn worker process keeps running. Subclasses ``ValueError``
+    (i.e. an ``Exception``, not ``BaseException``) so the existing pipeline
+    handlers catch it.
     """
-    Print a friendly, formatted error message.
+
+
+def format_error(title: str, details: str, solution: str) -> str:
+    """
+    Build a friendly, formatted error message (title / details / SOLUTION).
 
     Args:
         title: Error title
         details: Detailed error information
         solution: Suggested solution steps
+
+    Returns:
+        str: The formatted multi-line message.
     """
-    print("\n" + "=" * 80, file=sys.stderr)
-    print(f"ERROR: {title}", file=sys.stderr)
-    print("=" * 80, file=sys.stderr)
-    print(f"\n{details}", file=sys.stderr)
-    print("\nSOLUTION:", file=sys.stderr)
-    print(solution, file=sys.stderr)
-    print("\n" + "=" * 80 + "\n", file=sys.stderr)
+    return (
+        "\n"
+        + "=" * 68
+        + f"\nERROR: {title}\n"
+        + "=" * 68
+        + f"\n\n{details}"
+        + "\n\nSOLUTION:\n"
+        + solution
+        + "\n\n"
+        + "=" * 68
+        + "\n"
+    )
+
+
+def print_error(title: str, details: str, solution: str):
+    """Print a friendly, formatted error message to stderr."""
+    print(format_error(title, details, solution), file=sys.stderr)
 
 
 def truncate_heading(heading_text: str, para_id: str = None) -> str:
@@ -106,23 +135,24 @@ def validate_heading_length(heading_text: str, para_id: str):
         heading_text: The heading text to validate
         para_id: The paragraph ID for error reporting
 
-    Exits:
-        sys.exit(1) if heading exceeds maximum length
+    Raises:
+        DocxContentError: if heading exceeds maximum length
     """
     if len(heading_text) > MAX_HEADING_LENGTH:
         preview = (
             heading_text[:100] + "..." if len(heading_text) > 100 else heading_text
         )
-        print_error(
-            f"Heading too long ({len(heading_text)} characters, max {MAX_HEADING_LENGTH})",
-            f'The following heading exceeds the maximum allowed length:\n\n  "{preview}"\n\n'
-            f"Location: Paragraph ID {para_id}\n"
-            f"Actual length: {len(heading_text)} characters",
-            "  1. Open the document in Microsoft Word\n"
-            f"  2. Shorten this heading to {MAX_HEADING_LENGTH} characters or less\n"
-            "  3. Re-upload it to LightRAG",
+        raise DocxContentError(
+            format_error(
+                f"Heading too long ({len(heading_text)} characters, max {MAX_HEADING_LENGTH})",
+                f"The following heading exceeds the maximum allowed length:\n\n{preview}\n\n"
+                f"Location(para_id): {para_id}\n"
+                f"Actual length: {len(heading_text)} characters",
+                "  1. Open the document in Microsoft Word\n"
+                f"  2. Shorten this heading to {MAX_HEADING_LENGTH} characters or less\n"
+                "  3. Re-upload it to LightRAG",
+            )
         )
-        sys.exit(1)
 
 
 def validate_table_tokens(table_json: str, block_heading: str):
@@ -133,24 +163,25 @@ def validate_table_tokens(table_json: str, block_heading: str):
         table_json: The JSON representation of the table
         block_heading: The heading of the block containing this table
 
-    Exits:
-        sys.exit(1) if table exceeds maximum token limit
+    Raises:
+        DocxContentError: if table exceeds maximum token limit
     """
     table_tokens = estimate_tokens(table_json)
     if table_tokens > MAX_BLOCK_CONTENT_TOKENS:
-        print_error(
-            f"Table too large (~{table_tokens} tokens, max {MAX_BLOCK_CONTENT_TOKENS})",
-            f"A table in the document is too large for LLM processing.\n\n"
-            f'Location: Under heading "{block_heading}"\n'
-            f"Table size: ~{table_tokens} tokens ({len(table_json)} characters)\n\n"
-            "Large tables can cause issues with file chunking.",
-            "  1. Open the document in Microsoft Word\n"
-            f'  2. Locate the table under heading "{block_heading}"\n'
-            "  3. Split the table into smaller tables, or\n"
-            "  4. Simplify the table content\n"
-            "  5. Re-upload it to LightRAG",
+        raise DocxContentError(
+            format_error(
+                f"Table too large (~{table_tokens} tokens, max {MAX_BLOCK_CONTENT_TOKENS})",
+                f"A table in the document is too large for LLM processing.\n\n"
+                f'Location: Under heading "{block_heading}"\n'
+                f"Table size: ~{table_tokens} tokens ({len(table_json)} characters)\n\n"
+                "Large tables can cause issues with file chunking.",
+                "  1. Open the document in Microsoft Word\n"
+                f'  2. Locate the table under heading "{block_heading}"\n'
+                "  3. Split the table into smaller tables, or\n"
+                "  4. Simplify the table content\n"
+                "  5. Re-upload it to LightRAG",
+            )
         )
-        sys.exit(1)
 
 
 def find_first_valid_para_id(para_ids: list) -> str | None:
@@ -880,17 +911,19 @@ def split_long_block(
     Returns:
         List of block dictionaries (may be split into multiple blocks), each with 'level' field
 
-    Exits:
-        sys.exit(1) if no suitable anchor found and content exceeds limit
+    Raises:
+        DocxContentError: if no suitable anchor found and content exceeds limit
     """
     import math
 
     # Check if this block starts with a split table chunk (has _chunk_heading metadata)
     # If so, use that heading instead of block_heading
-    effective_heading = block_heading
+    effective_heading = strip_heading_markdown_prefix(block_heading)
 
     if paragraphs and paragraphs[0].get("_chunk_heading"):
-        effective_heading = paragraphs[0]["_chunk_heading"]
+        effective_heading = strip_heading_markdown_prefix(
+            paragraphs[0]["_chunk_heading"]
+        )
 
     # Calculate total content token count
     total_content = "\n".join(p["text"] for p in paragraphs)
@@ -955,20 +988,21 @@ def split_long_block(
         preview = (
             block_heading[:80] + "..." if len(block_heading) > 80 else block_heading
         )
-        print_error(
-            "Cannot split long block (no suitable anchor paragraphs found)",
-            f"A text block is too long (~{total_tokens} tokens, max {MAX_BLOCK_CONTENT_TOKENS})\n"
-            f"but no paragraphs <= {MAX_ANCHOR_CANDIDATE_LENGTH} characters were found to use as split points.\n\n"
-            f'Location: Under heading "{preview}"\n'
-            f"Block size: ~{total_tokens} tokens ({len(total_content)} characters)\n"
-            f"Number of paragraphs: {len(paragraphs)}\n"
-            f"Calculated target blocks: {target_blocks}",
-            "  1. Open the document in Microsoft Word\n"
-            f'  2. Locate the section under heading "{preview}"\n'
-            f"  3. Add short headings or paragraph breaks (≤{MAX_ANCHOR_CANDIDATE_LENGTH} chars) to divide the content\n"
-            "  4. Re-upload it to LightRAG",
+        raise DocxContentError(
+            format_error(
+                "Cannot split long block (no suitable anchor paragraphs found)",
+                f"A text block is too long (~{total_tokens} tokens, max {MAX_BLOCK_CONTENT_TOKENS})\n"
+                f"but no paragraphs <= {MAX_ANCHOR_CANDIDATE_LENGTH} characters were found to use as split points.\n\n"
+                f'Location: Under heading "{preview}"\n'
+                f"Block size: ~{total_tokens} tokens ({len(total_content)} characters)\n"
+                f"Number of paragraphs: {len(paragraphs)}\n"
+                f"Calculated target blocks: {target_blocks}",
+                "  1. Open the document in Microsoft Word\n"
+                f'  2. Locate the section under heading "{preview}"\n'
+                f"  3. Add short headings or paragraph breaks (≤{MAX_ANCHOR_CANDIDATE_LENGTH} chars) to divide the content\n"
+                "  4. Re-upload it to LightRAG",
+            )
         )
-        sys.exit(1)
 
     # Select anchors for splitting (target_blocks - 1 split points needed)
     selected_anchors = []
@@ -995,7 +1029,7 @@ def split_long_block(
     result_blocks = []
     prev_idx = 0
     current_parent_headings = parent_headings
-    current_block_heading = block_heading
+    current_block_heading = strip_heading_markdown_prefix(block_heading)
 
     for anchor in selected_anchors:
         split_idx = anchor["index"]
@@ -1024,13 +1058,16 @@ def split_long_block(
             result_blocks.append(new_block)
 
         # Validate anchor as new heading
-        validate_heading_length(anchor["text"], anchor["para_id"])
+        clean_anchor_text = strip_heading_markdown_prefix(anchor["text"])
+        validate_heading_length(clean_anchor_text, anchor["para_id"])
 
         # Update for next block
-        current_block_heading = anchor["text"]
+        current_block_heading = clean_anchor_text
         # Update parent headings: add previous heading only if not "Preface/Uncategorized"
         if block_heading != "Preface/Uncategorized":
-            current_parent_headings = parent_headings + [block_heading]
+            current_parent_headings = parent_headings + [
+                strip_heading_markdown_prefix(block_heading)
+            ]
 
         prev_idx = (
             split_idx  # Don't skip anchor - it becomes first paragraph of next block
@@ -1078,14 +1115,15 @@ def split_long_block(
                     if len(block["heading"]) > 80
                     else block["heading"]
                 )
-                print_error(
-                    "Cannot re-split oversized block (internal error)",
-                    f"A block exceeded MAX_BLOCK_CONTENT_TOKENS but paragraph metadata was lost.\n\n"
-                    f"Location: Under heading \"{preview}\"\n"
-                    f"Block size: ~{block_tokens} tokens ({len(block['content'])} characters)",
-                    "This is an internal error. Please report this issue.",
+                raise DocxContentError(
+                    format_error(
+                        "Cannot re-split oversized block (internal error)",
+                        f"A block exceeded MAX_BLOCK_CONTENT_TOKENS but paragraph metadata was lost.\n\n"
+                        f"Location: Under heading \"{preview}\"\n"
+                        f"Block size: ~{block_tokens} tokens ({len(block['content'])} characters)",
+                        "This is an internal error. Please report this issue.",
+                    )
                 )
-                sys.exit(1)
 
             # Recursively split this oversized block
             # The recursive call will either find more anchors or raise an error
@@ -1527,9 +1565,6 @@ def extract_docx_blocks(
     current_heading_stack = {}  # {level: heading_text} - Use dict to correctly track heading hierarchy
     current_parent_headings = []  # Parent headings for current block
     current_paragraphs = []  # Track paragraphs with metadata for splitting
-    has_body_content = (
-        False  # Track if current block has body content (non-heading paragraphs/tables)
-    )
     matched_fixlevel_heading = False  # Track whether --fixlevel matched any heading
     table_split_counter = (
         0  # Track cumulative table split suffix numbers within current block
@@ -1573,6 +1608,44 @@ def extract_docx_blocks(
             # Check if this is a heading using the new function
             outline_level = get_heading_level(element, styles_outline)
 
+            # A "heading" longer than MAX_HEADING_LENGTH is not a real heading.
+            # The common cause (WPS/Word): the author set an outline level on a
+            # paragraph but typed the body with soft line breaks (Shift+Enter →
+            # <w:br/> → '\n') instead of starting a new paragraph, so heading
+            # text + body live in one <w:p>. Split at the first soft break: the
+            # first line stays the heading, the remainder becomes body text. If
+            # there is no usable soft break (a genuine single-line over-long
+            # heading), demote the whole paragraph to body text. Either way we
+            # avoid crashing via validate_heading_length() and never drop content.
+            demoted_body_text = None
+            if outline_level is not None and len(full_text) > MAX_HEADING_LENGTH:
+                head, sep, rest = full_text.partition("\n")
+                if sep and len(head) <= MAX_HEADING_LENGTH:
+                    full_text = head
+                    demoted_body_text = rest.strip() or None
+                    if parse_warnings is not None:
+                        parse_warnings["heading_softbreak_split_count"] = (
+                            parse_warnings.get("heading_softbreak_split_count", 0) + 1
+                        )
+                    print(
+                        f"Warning: heading paragraph exceeded {MAX_HEADING_LENGTH} "
+                        "chars; split at soft line break — kept first line as "
+                        "heading, rest as body.",
+                        file=sys.stderr,
+                    )
+                else:
+                    outline_level = None
+                    if parse_warnings is not None:
+                        parse_warnings["demoted_oversize_heading_count"] = (
+                            parse_warnings.get("demoted_oversize_heading_count", 0) + 1
+                        )
+                    print(
+                        f"Warning: paragraph has outline level but is "
+                        f"{len(full_text)} chars (> {MAX_HEADING_LENGTH}); treating "
+                        "as body text, not a heading.",
+                        file=sys.stderr,
+                    )
+
             if outline_level is not None:
                 # This is a heading (outline level 0-8)
                 # Convert 0-based to 1-based level
@@ -1596,20 +1669,24 @@ def extract_docx_blocks(
 
                 # Truncate heading if needed before storing
                 truncated_text = truncate_heading(full_text, heading_para_id)
+                clean_heading_text = strip_heading_markdown_prefix(truncated_text)
 
                 # Record the document's first heading (any level) for meta.doc_title.
                 if not first_heading_recorded:
                     if parse_metadata is not None:
-                        parse_metadata["first_heading"] = truncated_text
+                        parse_metadata["first_heading"] = clean_heading_text
                     first_heading_recorded = True
 
                 if should_split:
                     if fixlevel is not None and fixlevel > 0:
                         matched_fixlevel_heading = True
 
-                    # This heading triggers a block split
-                    # Only save previous block if it has body content
-                    if has_body_content and current_paragraphs:
+                    # This heading triggers a block split. Always flush the
+                    # accumulated paragraphs so every recognized heading starts
+                    # its own block. A heading with no body therefore becomes a
+                    # standalone block whose content is just the heading text,
+                    # instead of being folded into the next heading's block.
+                    if current_paragraphs:
                         _flush_current_block(
                             blocks,
                             current_heading,
@@ -1622,15 +1699,17 @@ def extract_docx_blocks(
 
                         # Reset for new block
                         current_paragraphs = []
-                        has_body_content = False
                         table_split_counter = (
                             0  # Reset table split counter for new heading
                         )
 
-                    # Add heading to current_paragraphs
+                    # Add heading to current_paragraphs. The content line gets
+                    # a markdown ``#`` prefix (capped at 6) via
+                    # render_heading_line; ``clean_heading_text`` is kept
+                    # for the heading field / stack / parent_headings below.
                     current_paragraphs.append(
                         {
-                            "text": truncated_text,
+                            "text": render_heading_line(level, truncated_text),
                             "para_id": heading_para_id,
                             "is_table": False,
                         }
@@ -1639,7 +1718,7 @@ def extract_docx_blocks(
                     # Update current_heading and parent_headings for the FIRST heading in a block
                     # (when current_paragraphs just had this heading added as its first element)
                     if len(current_paragraphs) == 1:
-                        current_heading = truncated_text
+                        current_heading = clean_heading_text
                         current_heading_level = (
                             level  # Only set level when setting heading
                         )
@@ -1655,18 +1734,32 @@ def extract_docx_blocks(
                     current_heading_stack = {
                         k: v for k, v in current_heading_stack.items() if k < level
                     }
-                    current_heading_stack[level] = truncated_text
+                    current_heading_stack[level] = clean_heading_text
                 else:
                     # This heading doesn't trigger split - treat as regular paragraph
                     para_id = heading_para_id
 
-                    # Store as regular paragraph with metadata
+                    # Store as regular paragraph with metadata. Still render
+                    # the markdown ``#`` prefix so a fixlevel-demoted heading
+                    # reads as a heading line in the merged content.
                     current_paragraphs.append(
-                        {"text": truncated_text, "para_id": para_id, "is_table": False}
+                        {
+                            "text": render_heading_line(level, truncated_text),
+                            "para_id": para_id,
+                            "is_table": False,
+                        }
                     )
 
-                    # Mark that we have body content
-                    has_body_content = True
+                # Carry the body text that followed a soft break in an over-long
+                # heading paragraph as a regular body paragraph in the same block.
+                if demoted_body_text:
+                    current_paragraphs.append(
+                        {
+                            "text": demoted_body_text,
+                            "para_id": heading_para_id,
+                            "is_table": False,
+                        }
+                    )
             else:
                 # Regular paragraph content
                 para_id = extract_para_id(element)
@@ -1679,9 +1772,6 @@ def extract_docx_blocks(
                 current_paragraphs.append(
                     {"text": full_text, "para_id": para_id, "is_table": False}
                 )
-
-                # Mark that we have body content
-                has_body_content = True
 
             # Check for paragraph-level section break (after processing paragraph)
             # sectPr in pPr means this paragraph ends a section
@@ -1776,7 +1866,6 @@ def extract_docx_blocks(
                                 "_table_header": header_rows_or_none,
                             }
                         )
-                        has_body_content = True
                     else:
                         # Middle or last chunk: save current block first
                         if current_paragraphs:
@@ -1790,7 +1879,6 @@ def extract_docx_blocks(
                                 debug,
                             )
                             current_paragraphs = []
-                            has_body_content = False
 
                         # Generate heading using suffix_number from chunk
                         if chunk["suffix_number"] is not None:
@@ -1841,7 +1929,6 @@ def extract_docx_blocks(
                                     "_table_header": header_rows_or_none,
                                 }
                             )
-                            has_body_content = True
                         else:
                             # Middle chunk: output immediately as standalone block
                             blocks.append(chunk_block)
@@ -1864,9 +1951,6 @@ def extract_docx_blocks(
                         "_table_header": header_rows_or_none,
                     }
                 )
-
-                # Mark that we have body content
-                has_body_content = True
 
             # Reset numbering tracking after table (table end boundary)
             resolver.reset_tracking_state()

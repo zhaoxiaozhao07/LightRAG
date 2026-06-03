@@ -62,6 +62,8 @@ from lightrag.constants import (
     DEFAULT_MAX_EXTRACT_INPUT_TOKENS,
     DEFAULT_MAX_RELATION_TOKENS,
     DEFAULT_MAX_TOTAL_TOKENS,
+    DEFAULT_QUERY_PRIORITY,
+    DEFAULT_SUMMARY_PRIORITY,
     DEFAULT_RELATED_CHUNK_NUMBER,
     DEFAULT_KG_CHUNK_PICK_METHOD,
     DEFAULT_SUMMARY_LANGUAGE,
@@ -70,6 +72,7 @@ from lightrag.constants import (
     DEFAULT_FILE_PATH_MORE_PLACEHOLDER,
     DEFAULT_MAX_FILE_PATHS,
     DEFAULT_ENTITY_NAME_MAX_LENGTH,
+    DEFAULT_ENTITY_NAME_MAX_BYTES,
 )
 from lightrag.kg.shared_storage import get_storage_keyed_lock
 import time
@@ -107,21 +110,40 @@ def _format_relation_edge_label(edge_key: tuple[str, str] | list[str]) -> str:
 
 
 def _truncate_entity_identifier(
-    identifier: str, limit: int, chunk_key: str, identifier_role: str
+    identifier: str,
+    limit: int,
+    chunk_key: str,
+    identifier_role: str,
+    byte_limit: int = DEFAULT_ENTITY_NAME_MAX_BYTES,
 ) -> str:
-    """Truncate entity identifiers that exceed the configured length limit."""
+    """Truncate entity identifiers that exceed the configured length limit.
 
-    if len(identifier) <= limit:
+    Enforces both a character limit (``limit``) and a UTF-8 byte limit
+    (``byte_limit``). Milvus validates VARCHAR ``max_length`` in BYTES, not
+    characters, so a CJK identifier within the character limit can still
+    overflow the field (e.g. 256 Chinese chars ~= 694 bytes > 512). The byte
+    truncation cuts on a character boundary so the result stays valid UTF-8.
+    """
+
+    char_len = len(identifier)
+    byte_len = len(identifier.encode("utf-8"))
+    if char_len <= limit and byte_len <= byte_limit:
         return identifier
 
     display_value = identifier[:limit]
-    preview = identifier[:20]  # Show first 20 characters as preview
+    encoded = display_value.encode("utf-8")
+    if len(encoded) > byte_limit:
+        # Drop the partial trailing multi-byte char left by the byte slice.
+        display_value = encoded[:byte_limit].decode("utf-8", errors="ignore")
+    preview = identifier[:50]  # Show first 50 characters as preview
     logger.warning(
-        "%s: %s len %d > %d chars (Name: '%s...')",
+        "%s: %s len %d chars / %d bytes > %d chars / %d bytes (Name: '%s...')",
         chunk_key,
         identifier_role,
-        len(identifier),
+        char_len,
+        byte_len,
         limit,
+        byte_limit,
         preview,
     )
     return display_value
@@ -781,7 +803,7 @@ async def _summarize_descriptions(
     """
     use_llm_func: callable = global_config["role_llm_funcs"]["extract"]
     # Apply higher priority (8) to entity/relation summary tasks
-    use_llm_func = partial(use_llm_func, _priority=8)
+    use_llm_func = partial(use_llm_func, _priority=DEFAULT_SUMMARY_PRIORITY)
 
     addon_params = global_config.get("addon_params") or {}
     language = global_config.get("_resolved_summary_language")
@@ -4296,7 +4318,9 @@ async def kg_query(
         return QueryResult(content=PROMPTS["fail_response"])
 
     # Apply higher priority (5) to query relation LLM function
-    use_model_func = partial(global_config["role_llm_funcs"]["query"], _priority=5)
+    use_model_func = partial(
+        global_config["role_llm_funcs"]["query"], _priority=DEFAULT_QUERY_PRIORITY
+    )
     llm_cache_identity = get_llm_cache_identity(global_config, "query")
 
     hl_keywords, ll_keywords = await get_keywords_from_query(
@@ -4673,7 +4697,9 @@ async def extract_keywords_only(
 
     # 4. Call the LLM for keyword extraction
     # Apply higher priority (5) to query relation LLM function
-    use_model_func = partial(global_config["role_llm_funcs"]["keyword"], _priority=5)
+    use_model_func = partial(
+        global_config["role_llm_funcs"]["keyword"], _priority=DEFAULT_QUERY_PRIORITY
+    )
 
     result = await use_model_func(kw_prompt, response_format={"type": "json_object"})
 
@@ -4880,7 +4906,7 @@ async def _perform_kg_search(
         if texts_to_embed:
             try:
                 all_embeddings = await actual_embedding_func(
-                    texts_to_embed, context="query", _priority=5
+                    texts_to_embed, context="query", _priority=DEFAULT_QUERY_PRIORITY
                 )
                 for i, purpose in enumerate(text_purposes):
                     if purpose == "query":
@@ -5472,8 +5498,9 @@ async def _build_context_str(
         entity_id_to_original,
         relation_id_to_original,
     )
+    final_data_payload = final_data.get("data", {})
     logger.debug(
-        f"[_build_context_str] Final data after conversion: {len(final_data.get('entities', []))} entities, {len(final_data.get('relationships', []))} relationships, {len(final_data.get('chunks', []))} chunks"
+        f"[_build_context_str] Final data after conversion: {len(final_data_payload.get('entities', []))} entities, {len(final_data_payload.get('relationships', []))} relationships, {len(final_data_payload.get('chunks', []))} chunks"
     )
     return result, final_data
 
@@ -6232,7 +6259,9 @@ async def naive_query(
         return QueryResult(content=PROMPTS["fail_response"])
 
     # Apply higher priority (5) to query relation LLM function
-    use_model_func = partial(global_config["role_llm_funcs"]["query"], _priority=5)
+    use_model_func = partial(
+        global_config["role_llm_funcs"]["query"], _priority=DEFAULT_QUERY_PRIORITY
+    )
     llm_cache_identity = get_llm_cache_identity(global_config, "query")
 
     tokenizer: Tokenizer = global_config["tokenizer"]

@@ -40,7 +40,11 @@ from lightrag.constants import (
     PARSER_ENGINE_MINERU,
     PARSER_ENGINE_NATIVE,
 )
-from lightrag.exceptions import MultimodalAnalysisError, PipelineCancelledException
+from lightrag.exceptions import (
+    MultimodalAnalysisError,
+    PipelineCancelledException,
+    IndexFlushError,
+)
 from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 from lightrag.operate import merge_nodes_and_edges
 from lightrag.parser.routing import (
@@ -80,8 +84,12 @@ from lightrag.utils_pipeline import (
     load_lightrag_document_content,
     make_lightrag_doc_content,
     normalize_document_file_path,
+    doc_status_metadata_has_attempt_fields,
+    doc_status_reset_metadata,
     parsed_artifact_dir_for,
+    read_source_file_basename,
     resolve_doc_file_path,
+    resolve_doc_status_parse_engine,
     resolve_sidecar_uri,
     sidecar_blocks_path,
     sidecar_uri_for,
@@ -114,25 +122,32 @@ def _call_source_file_resolver(
     owner: Any,
     file_path: str,
     *,
-    source_file_name: str | None = None,
+    source_file: str | None = None,
     parser_engine: str | None = None,
 ) -> str:
     """Call parser source resolver while tolerating legacy test doubles."""
     resolver = owner._resolve_source_file_for_parser
     params = inspect.signature(resolver).parameters
-    supports_context = "source_file_name" in params or any(
+    supports_context = "source_file" in params or any(
         param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
     )
     if supports_context:
         return resolver(
             file_path,
-            source_file_name=source_file_name,
+            source_file=source_file,
             parser_engine=parser_engine,
         )
-    return resolver(source_file_name or file_path)
+    return resolver(source_file or file_path)
 
 
-# Map ``process_options.chunking`` selector → ``extraction_meta.chunking_method``
+# Backward-compatible source-file reader.  Implementation lives in
+# utils_pipeline so reset/normalisation helpers there can reuse it without a
+# reverse import into this module; kept as a module-level alias for the
+# existing call sites below.
+_read_source_file = read_source_file_basename
+
+
+# Map ``process_options.chunking`` selector → ``extraction_meta.chunk_method``
 # string used by the pipeline observability layer and the resume path.
 _CHUNKING_METHOD_LABELS: dict[str, str] = {
     "F": "fixed_token",
@@ -529,9 +544,9 @@ class _PipelineMixin:
             if engine := _parse_engine_at(index):
                 content_data["parse_engine"] = engine
             if doc_format == FULL_DOCS_FORMAT_PENDING_PARSE:
-                source_file_name = Path(str(file_paths[index] or "").strip()).name
-                if has_known_document_source(source_file_name):
-                    content_data["source_file_name"] = source_file_name
+                source_file = Path(str(file_paths[index] or "").strip()).name
+                if has_known_document_source(source_file):
+                    content_data["source_file"] = source_file
             options_str = _process_options_at(index)
             if options_str:
                 content_data["process_options"] = options_str
@@ -670,9 +685,9 @@ class _PipelineMixin:
                 # Mirror process_options into doc_status.metadata so admin UIs
                 # can surface the per-document strategy without a full_docs lookup.
                 metadata["process_options"] = options_str
-            source_file_name = content_data.get("source_file_name")
-            if source_file_name:
-                metadata["source_file_name"] = source_file_name
+            source_file = _read_source_file(content_data)
+            if source_file:
+                metadata["source_file"] = source_file
             if metadata:
                 base["metadata"] = metadata
             return base
@@ -1055,6 +1070,8 @@ class _PipelineMixin:
                         "cur_batch": 0,  # Number of files already processed
                         "request_pending": False,  # Clear any previous request
                         "cancellation_requested": False,  # Initialize cancellation flag
+                        "cancellation_reason": None,  # "internal_error" or None (user)
+                        "cancellation_detail": None,  # driver + root cause for internal
                         "latest_message": "",
                     }
                 )
@@ -1085,13 +1102,31 @@ class _PipelineMixin:
                 # Check for cancellation request at the start of main loop
                 async with pipeline_status_lock:
                     if pipeline_status.get("cancellation_requested", False):
+                        # Read the cause BEFORE resetting reason/detail below.
+                        is_internal = (
+                            pipeline_status.get("cancellation_reason")
+                            == "internal_error"
+                        )
+                        label = self._cancellation_label(pipeline_status)
                         pipeline_status["request_pending"] = False
                         pipeline_status["cancellation_requested"] = False
 
-                        log_message = "Pipeline cancelled by user"
-                        logger.info(log_message)
+                        if is_internal:
+                            # Unrecoverable storage error: halting is intentional
+                            # (auto-retry into a broken backend will not recover).
+                            # Surface at error level with an actionable message;
+                            # affected docs stay queued (PENDING/FAILED) and are
+                            # picked up when processing is restarted after the
+                            # storage issue is resolved.
+                            log_message = self._internal_halt_message(label)
+                            logger.error(log_message)
+                        else:
+                            log_message = f"Pipeline cancelled ({label})"
+                            logger.info(log_message)
                         pipeline_status["latest_message"] = log_message
                         pipeline_status["history_messages"].append(log_message)
+                        pipeline_status["cancellation_reason"] = None
+                        pipeline_status["cancellation_detail"] = None
 
                         # Exit directly, skipping request_pending check
                         return
@@ -1169,8 +1204,8 @@ class _PipelineMixin:
                 )
 
         finally:
-            log_message = "Enqueued document processing pipeline stopped"
-            logger.info(log_message)
+            stopped_message = "Enqueued document processing pipeline stopped"
+            logger.info(stopped_message)
             # If the loop already released ``busy`` under the atomic exit
             # check, don't clobber it here — a concurrent enqueue may have
             # observed busy=False and started a new processing pass that
@@ -1179,11 +1214,31 @@ class _PipelineMixin:
             async with pipeline_status_lock:
                 if not busy_released_in_loop:
                     pipeline_status["busy"] = False
+                # An internal-error abort normally exits via the batch's
+                # ``break`` (not the loop-top cancellation handler, which
+                # logs + clears the reason itself), so without this the only
+                # visible trace would be the generic "stopped" line. Surface
+                # the actionable halt reason here too, BEFORE clearing the
+                # reason/detail. Read it first so _cancellation_label still
+                # sees the cause.
+                internal_halt = None
+                if pipeline_status.get("cancellation_reason") == "internal_error":
+                    internal_halt = self._internal_halt_message(
+                        self._cancellation_label(pipeline_status)
+                    )
+                    logger.error(internal_halt)
                 pipeline_status["cancellation_requested"] = (
                     False  # Always reset cancellation flag
                 )
-                pipeline_status["latest_message"] = log_message
-                pipeline_status["history_messages"].append(log_message)
+                pipeline_status["cancellation_reason"] = None
+                pipeline_status["cancellation_detail"] = None
+                pipeline_status["history_messages"].append(stopped_message)
+                if internal_halt is not None:
+                    pipeline_status["history_messages"].append(internal_halt)
+                    # Prefer the actionable halt reason as the latest message.
+                    pipeline_status["latest_message"] = internal_halt
+                else:
+                    pipeline_status["latest_message"] = stopped_message
 
     # ============================================================
     # Pipeline orchestration
@@ -1214,10 +1269,10 @@ class _PipelineMixin:
             pipeline_status_lock=pipeline_status_lock,
             semaphore=asyncio.Semaphore(self.max_parallel_insert),
             total_files=total_files,
-            q_native=asyncio.Queue(maxsize=self.queue_size_default),
-            q_mineru=asyncio.Queue(maxsize=self.queue_size_default),
-            q_docling=asyncio.Queue(maxsize=self.queue_size_default),
-            q_analyze=asyncio.Queue(maxsize=self.queue_size_default),
+            q_native=asyncio.Queue(maxsize=self.queue_size_parse),
+            q_mineru=asyncio.Queue(maxsize=self.queue_size_parse),
+            q_docling=asyncio.Queue(maxsize=self.queue_size_parse),
+            q_analyze=asyncio.Queue(maxsize=self.queue_size_analyze),
             q_process=asyncio.Queue(maxsize=self.queue_size_insert),
         )
 
@@ -1239,29 +1294,77 @@ class _PipelineMixin:
         for _ in range(max(1, self.max_parallel_insert)):
             workers.append(asyncio.create_task(self._process_worker(ctx)))
 
-        # Add pending files to the correct parsing queue
-        for doc_id, status_doc in to_process_docs.items():
-            content_data = await self.full_docs.get_by_id(doc_id) or {}
-            engine = resolve_stored_document_parser_engine(
-                file_path=getattr(status_doc, "file_path", "unknown_source"),
-                content_data=content_data,
+        # The workers above are live asyncio tasks; their cancellation MUST be
+        # guaranteed even if enqueuing or a queue join raises (e.g. an orchestrator-
+        # level storage call fails during a backend outage). Without this try/finally
+        # an escape here would orphan the workers — they keep draining the queues and
+        # appending to history_messages while the caller's finally has already cleared
+        # ``busy`` — leaving busy=False while processing visibly continues.
+        try:
+            # Add pending files to the correct parsing queue
+            for current_file_number, (doc_id, status_doc) in enumerate(
+                to_process_docs.items(), start=1
+            ):
+                file_path = getattr(status_doc, "file_path", "unknown_source")
+                # Per-document isolation: the engine-routing get_by_id is the only
+                # orchestrator-level storage read in this loop. A transient/corrupt
+                # single-doc failure must FAIL just that document and continue with
+                # the rest of the batch — not escape and abort the whole batch.
+                # During a full outage _finalize_doc_failure's own doc_status write
+                # also raises; that escape is caught by the finally below (workers
+                # are cleanly cancelled) and the batch aborts as a whole.
+                try:
+                    content_data = await self.full_docs.get_by_id(doc_id) or {}
+                except Exception as e:
+                    await self._finalize_doc_failure(
+                        doc_id=doc_id,
+                        status_doc=status_doc,
+                        file_path=file_path,
+                        error=e,
+                        stage_label="parse",
+                        current_file_number=current_file_number,
+                        total_files=total_files,
+                        failed_chunks_snapshot=([], 0),
+                        pending_tasks=[],
+                        metadata_extra={},
+                        pipeline_status=pipeline_status,
+                        pipeline_status_lock=pipeline_status_lock,
+                    )
+                    continue
+                engine = resolve_stored_document_parser_engine(
+                    file_path=file_path,
+                    content_data=content_data,
+                )
+                if engine == "mineru":
+                    await ctx.q_mineru.put((doc_id, status_doc))
+                elif engine == "docling":
+                    await ctx.q_docling.put((doc_id, status_doc))
+                else:
+                    await ctx.q_native.put((doc_id, status_doc))
+
+            await asyncio.gather(
+                ctx.q_native.join(), ctx.q_mineru.join(), ctx.q_docling.join()
             )
-            if engine == "mineru":
-                await ctx.q_mineru.put((doc_id, status_doc))
-            elif engine == "docling":
-                await ctx.q_docling.put((doc_id, status_doc))
-            else:
-                await ctx.q_native.put((doc_id, status_doc))
+            await ctx.q_analyze.join()
+            await ctx.q_process.join()
+        finally:
+            for w in workers:
+                w.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
 
-        await asyncio.gather(
-            ctx.q_native.join(), ctx.q_mineru.join(), ctx.q_docling.join()
-        )
-        await ctx.q_analyze.join()
-        await ctx.q_process.join()
-
-        for w in workers:
-            w.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
+        # If the batch aborted on an internal storage error, the shared
+        # cross-file flush buffers may still hold records from the documents
+        # that were marked FAILED. Discard them now (workers are stopped, so
+        # this does not race a flush) so they are neither re-flushed nor
+        # carried into the next batch — every affected document is reprocessed
+        # on retry. See _discard_pending_index_ops / drop_pending_index_ops.
+        async with pipeline_status_lock:
+            internal_abort = (
+                pipeline_status.get("cancellation_requested", False)
+                and pipeline_status.get("cancellation_reason") == "internal_error"
+            )
+        if internal_abort:
+            await self._discard_pending_index_ops()
 
     async def _validate_and_fix_document_consistency(
         self,
@@ -1347,51 +1450,80 @@ class _PipelineMixin:
         #     pipeline_status["latest_message"] = final_message
         #     pipeline_status["history_messages"].append(final_message)
 
-        # Reset interrupted documents that pass consistency checks to PENDING status
+        # Bring every to-be-processed document into a clean PENDING state.
+        # Two cases are handled here so stale per-attempt metadata never
+        # survives into the PENDING wait window (where the WebUI would render
+        # last attempt's parse/analyze timings):
+        #   * interrupted docs (PROCESSING/PARSING/ANALYZING/FAILED) are reset
+        #     to PENDING, clearing error_msg and resetting metadata to the
+        #     enqueue-time directives only;
+        #   * docs that are ALREADY PENDING but still carry per-attempt fields
+        #     (e.g. reset by an older build that preserved them) are normalised
+        #     in place to directives-only.
+        # In BOTH cases the cleaned metadata is mirrored back onto the in-memory
+        # ``status_doc`` so the downstream parse worker — which no longer scrubs
+        # stale keys itself — carries the clean dict forward through
+        # ``doc_status_transition_metadata`` at every later transition.
         docs_to_reset = {}
         reset_count = 0
+        normalized_count = 0
 
         for doc_id, status_doc in to_process_docs.items():
             # Check if document has corresponding content in full_docs (consistency check)
             content_data = await self.full_docs.get_by_id(doc_id)
-            if content_data:  # Document passes consistency check
-                # Check if document is in interrupted status
-                if hasattr(status_doc, "status") and status_doc.status in [
-                    DocStatus.PROCESSING,
-                    DocStatus.FAILED,
-                    DocStatus.PARSING,
-                    DocStatus.ANALYZING,
-                ]:
-                    preserved_chunks_list, preserved_chunks_count = (
-                        chunk_fields_from_status_doc(status_doc)
-                    )
-                    resolved_file_path = resolve_doc_file_path(
-                        status_doc=status_doc,
-                        content_data=content_data,
-                    )
-                    # Prepare document for status reset to PENDING
-                    docs_to_reset[doc_id] = {
-                        "status": DocStatus.PENDING,
-                        "content_summary": status_doc.content_summary,
-                        "content_length": status_doc.content_length,
-                        "chunks_count": preserved_chunks_count,
-                        "chunks_list": preserved_chunks_list,
-                        "created_at": status_doc.created_at,
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                        "file_path": resolved_file_path,
-                        "track_id": getattr(status_doc, "track_id", ""),
-                        "content_hash": getattr(status_doc, "content_hash", None),
-                        # Clear transient error / processing fields but preserve
-                        # long-lived per-doc metadata (process_options) seeded
-                        # at enqueue time.
-                        "error_msg": "",
-                        "metadata": doc_status_transition_metadata(status_doc),
-                    }
+            if not content_data:  # Fails consistency check; handled above
+                continue
+            status = getattr(status_doc, "status", None)
+            is_interrupted = status in (
+                DocStatus.PROCESSING,
+                DocStatus.FAILED,
+                DocStatus.PARSING,
+                DocStatus.ANALYZING,
+            )
+            # Only normalise an already-PENDING doc when it actually carries a
+            # stale per-attempt field — a precise trigger so unrelated/custom
+            # metadata on a clean PENDING is never rewritten or dropped.
+            needs_pending_normalize = (
+                status == DocStatus.PENDING
+                and doc_status_metadata_has_attempt_fields(status_doc)
+            )
+            if not (is_interrupted or needs_pending_normalize):
+                continue
 
-                    # Update the status in to_process_docs as well
-                    status_doc.status = DocStatus.PENDING
-                    status_doc.file_path = resolved_file_path
-                    reset_count += 1
+            preserved_chunks_list, preserved_chunks_count = (
+                chunk_fields_from_status_doc(status_doc)
+            )
+            resolved_file_path = resolve_doc_file_path(
+                status_doc=status_doc,
+                content_data=content_data,
+            )
+            # Directives-only metadata: drop per-attempt timing/result fields,
+            # keep process_options / source_file (legacy source_file_name
+            # tolerant).
+            reset_metadata = doc_status_reset_metadata(status_doc)
+            docs_to_reset[doc_id] = {
+                "status": DocStatus.PENDING,
+                "content_summary": status_doc.content_summary,
+                "content_length": status_doc.content_length,
+                "chunks_count": preserved_chunks_count,
+                "chunks_list": preserved_chunks_list,
+                "created_at": status_doc.created_at,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "file_path": resolved_file_path,
+                "track_id": getattr(status_doc, "track_id", ""),
+                "content_hash": getattr(status_doc, "content_hash", None),
+                "error_msg": "",
+                "metadata": reset_metadata,
+            }
+
+            # Mirror onto the in-memory status_doc so workers carry it forward.
+            status_doc.status = DocStatus.PENDING
+            status_doc.file_path = resolved_file_path
+            status_doc.metadata = reset_metadata
+            if is_interrupted:
+                reset_count += 1
+            else:
+                normalized_count += 1
 
         # Update doc_status storage if there are documents to reset
         if docs_to_reset:
@@ -1401,6 +1533,12 @@ class _PipelineMixin:
                 reset_message = (
                     f"Reset {reset_count} documents from "
                     "PARSING/ANALYZING/PROCESSING/FAILED to PENDING status"
+                    + (
+                        f"; normalized {normalized_count} PENDING document(s) "
+                        "with stale metadata"
+                        if normalized_count
+                        else ""
+                    )
                 )
                 logger.info(reset_message)
                 pipeline_status["latest_message"] = reset_message
@@ -1499,37 +1637,30 @@ class _PipelineMixin:
                         f"Document content not found in full_docs for doc_id: {doc_id_w}"
                     )
                 if isinstance(status_doc_w.metadata, dict):
-                    source_file_name_w = status_doc_w.metadata.get("source_file_name")
-                    if source_file_name_w and not content_data_w.get(
-                        "source_file_name"
-                    ):
-                        content_data_w["source_file_name"] = source_file_name_w
-                # Stamp parsing_start_time on the in-memory status_doc so
+                    source_file_w = _read_source_file(status_doc_w.metadata)
+                    if source_file_w:
+                        # Normalize the legacy ``source_file_name`` onto the new
+                        # key in the in-memory status metadata so the carry-over
+                        # allowlist (which no longer lists ``source_file_name``)
+                        # preserves it through the PARSING upsert below. Without
+                        # this, a retry after a parse failure — before full_docs
+                        # is rewritten — would no longer resolve the hinted
+                        # source file. Idempotent when the new key already exists.
+                        status_doc_w.metadata["source_file"] = source_file_w
+                        if not _read_source_file(content_data_w):
+                            content_data_w["source_file"] = source_file_w
+                # Stamp parse_start_time on the in-memory status_doc so
                 # carry-over (_DOC_STATUS_METADATA_CARRY_OVER_KEYS) writes it
                 # into doc_status here and preserves it across every
                 # subsequent state transition for stage-duration analysis.
                 if not isinstance(status_doc_w.metadata, dict):
                     status_doc_w.metadata = {}
-                # Drop stale per-attempt fields from any prior failed/retried
-                # attempt before stamping the new parsing_start_time. All of
-                # these are written by either this worker (cache-hit /
-                # cache-miss branches below) or the downstream analyze worker,
-                # and would otherwise be carried forward via carry-over,
-                # skewing stage-duration metrics and the raw-cache-hit /
-                # skipped signals for the new attempt. The cache-hit mirror
-                # block only writes ``parse_stage_skipped`` when the parser
-                # actually returns a hit; the cache-miss branch only writes
-                # ``parsing_end_time`` when parse actually runs; the analyze
-                # worker writes its pair on re-entry.
-                for _stale_key in (
-                    "parsing_end_time",
-                    "parse_stage_skipped",
-                    "analyzing_start_time",
-                    "analyzing_end_time",
-                    "analyzing_stage_skipped",
-                ):
-                    status_doc_w.metadata.pop(_stale_key, None)
-                status_doc_w.metadata["parsing_start_time"] = int(time.time())
+                # Stale per-attempt fields (parse_end_time / *_stage_skipped /
+                # analyzing_*) from a prior failed/retried attempt are already
+                # scrubbed when the document is brought to PENDING in
+                # _validate_and_fix_document_consistency (the single cleanup
+                # point), so they are not carried into this PARSING upsert.
+                status_doc_w.metadata["parse_start_time"] = int(time.time())
                 await self._upsert_doc_status_transition(
                     doc_id=doc_id_w,
                     status=DocStatus.PARSING,
@@ -1564,18 +1695,45 @@ class _PipelineMixin:
                         status_doc_w.metadata = {}
                     status_doc_w.metadata["parse_warnings"] = parse_warnings_payload_w
 
-                # Mirror raw-bundle cache-hit flag from mineru/docling so the
-                # next upsert (ANALYZING) carries it into doc_status; cache-
+                # Mirror raw-bundle cache-hit flag from mineru/docling; cache-
                 # miss runs (including parse_native, which has no cache
-                # concept) stamp ``parsing_end_time`` instead so post-mortem
+                # concept) stamp ``parse_end_time`` instead so post-mortem
                 # can derive the parse-stage duration. The two fields are
-                # mutually exclusive per attempt.
+                # mutually exclusive per attempt. Both are persisted right
+                # below (before the doc enters q_analyze) so doc_status
+                # reflects the parse end immediately; carry-over keeps them
+                # visible across every later transition.
                 if not isinstance(status_doc_w.metadata, dict):
                     status_doc_w.metadata = {}
                 if parsed_data_w.get("parse_stage_skipped"):
                     status_doc_w.metadata["parse_stage_skipped"] = True
                 else:
-                    status_doc_w.metadata["parsing_end_time"] = int(time.time())
+                    status_doc_w.metadata["parse_end_time"] = int(time.time())
+
+                # Stamp the parse-stage extraction metadata (parse_format /
+                # parse_engine) now that the engine has run and reported its
+                # actual format/engine. These are determined here, so record
+                # them at the PARSING upsert below instead of deferring to
+                # PROCESSING; carry-over (_DOC_STATUS_METADATA_CARRY_OVER_KEYS)
+                # then preserves them across ANALYZING → PROCESSING → PROCESSED.
+                # ``resolve_doc_status_parse_engine`` is the shared resolver
+                # used by process_single_document too, so the value never jumps
+                # between the early and final writes. The engine source order
+                # mirrors the process stage's read from full_docs: the parser's
+                # own report wins, then the enqueue-time directive on
+                # content_data (raw passthrough), then the format-based default.
+                parse_format_w = (
+                    parsed_data_w.get("parse_format") or FULL_DOCS_FORMAT_RAW
+                )
+                explicit_engine_w = parsed_data_w.get("parse_engine") or (
+                    content_data_w.get("parse_engine")
+                    if isinstance(content_data_w, dict)
+                    else None
+                )
+                status_doc_w.metadata["parse_format"] = parse_format_w
+                status_doc_w.metadata["parse_engine"] = resolve_doc_status_parse_engine(
+                    parse_format_w, explicit_engine_w
+                )
 
                 # parse_* may have patched content_hash for
                 # pending_parse → raw transitions.
@@ -1601,6 +1759,35 @@ class _PipelineMixin:
                 ):
                     continue
 
+                # Compute content-derived fields here while the parse worker
+                # still holds the body, and stamp them on status_doc so they
+                # are persisted at the PARSING transition below. Downstream
+                # stages (analyze / process) re-read the body from full_docs by
+                # doc_id instead of carrying it through q_analyze / q_process,
+                # keeping large documents out of those in-memory buffers. Parse
+                # has already persisted the parsed body to full_docs (lightrag /
+                # raw), so the re-read is guaranteed to find it.
+                parsed_content_w = parsed_data_w.get("content", "") or ""
+                status_doc_w.content_summary = get_content_summary(parsed_content_w)
+                status_doc_w.content_length = len(parsed_content_w)
+
+                # Persist the parse-stage outcome to doc_status now, before the
+                # doc waits in q_analyze, so parse_end_time / parse_stage_skipped
+                # reflect the actual end of parsing instead of only landing at the
+                # ANALYZING transition via carry-over. content_hash is already
+                # refreshed and duplicates are filtered out by this point.
+                await self._upsert_doc_status_transition(
+                    doc_id=doc_id_w,
+                    status=DocStatus.PARSING,
+                    status_doc=status_doc_w,
+                    file_path=file_path_w,
+                )
+
+                # Drop the heavy body from the queue payload; q_analyze /
+                # q_process now carry only lightweight metadata (blocks_path,
+                # parse_format, flags). process_single_document re-reads the
+                # body from full_docs by doc_id.
+                parsed_data_w.pop("content", None)
                 await ctx.q_analyze.put((doc_id_w, status_doc_w, parsed_data_w))
             except PipelineCancelledException:
                 # Cancellation raised from inside the parse engine (future-
@@ -1660,11 +1847,11 @@ class _PipelineMixin:
                         pipeline_status_lock=ctx.pipeline_status_lock,
                     )
                     continue
-                refreshed_content_w = parsed_data_w.get("content", "") or ""
-                refreshed_summary_w = get_content_summary(refreshed_content_w)
-                refreshed_length_w = len(refreshed_content_w)
-                status_doc_w.content_summary = refreshed_summary_w
-                status_doc_w.content_length = refreshed_length_w
+                # content_summary / content_length were computed by the parse
+                # worker (which held the body) and are already set on this
+                # status_doc; the body is no longer carried through the queue,
+                # and analyze_multimodal works off the on-disk sidecar
+                # (blocks_path), not the body, so no re-read is needed here.
                 # Stamp analyzing_start_time so per-stage durations stay
                 # derivable from doc_status even after PROCESSED / FAILED;
                 # carry-over preserves it across later upserts.
@@ -1698,13 +1885,29 @@ class _PipelineMixin:
                 #     exception (generic ``except Exception``) or hit a
                 #     malformed/empty sidecar early return. Failure is not a
                 #     skip AND not a completion, so write neither field.
-                # The skipped/end_time pair is mutually exclusive.
+                # The skipped/end_time pair is mutually exclusive. The two
+                # outcome-bearing branches persist immediately below (before
+                # the doc enters q_process) so analyzing_end_time /
+                # analyzing_stage_skipped reflect the actual end of analysis
+                # rather than only landing at the PROCESSING transition.
                 if not isinstance(status_doc_w.metadata, dict):
                     status_doc_w.metadata = {}
+                analyze_outcome_recorded = False
                 if analyzed.pop("analyzing_stage_skipped", False):
                     status_doc_w.metadata["analyzing_stage_skipped"] = True
+                    analyze_outcome_recorded = True
                 elif analyzed.get("multimodal_processed"):
                     status_doc_w.metadata["analyzing_end_time"] = int(time.time())
+                    analyze_outcome_recorded = True
+                # Soft-failed attempts (neither flag) write nothing new, so skip
+                # the extra upsert; PROCESSING will be their next doc_status write.
+                if analyze_outcome_recorded:
+                    await self._upsert_doc_status_transition(
+                        doc_id=doc_id_w,
+                        status=DocStatus.ANALYZING,
+                        status_doc=status_doc_w,
+                        file_path=file_path_w,
+                    )
                 await ctx.q_process.put((doc_id_w, status_doc_w, analyzed))
             except PipelineCancelledException:
                 # In-flight cancellation surfaced from analyze_multimodal
@@ -1751,6 +1954,24 @@ class _PipelineMixin:
                     parsed_data=parsed_data_w,
                     ctx=ctx,
                 )
+            except Exception as e:
+                # process_single_document handles its own per-doc failures; an
+                # escape here means even the FAILED-status write failed (e.g.
+                # the doc_status backend is down). Do NOT let the worker die —
+                # that strands the remaining queued items and hangs
+                # q_process.join() forever, wedging the pipeline busy. Route it
+                # to the batch-abort path (same flag as IndexFlushError) and
+                # keep draining so the batch winds down cleanly. CancelledError
+                # is a BaseException, not caught here, so a normal worker
+                # cancellation at batch end still propagates.
+                logger.error(f"Unhandled error in process worker; aborting batch: {e}")
+                logger.error(traceback.format_exc())
+                async with ctx.pipeline_status_lock:
+                    ctx.pipeline_status["cancellation_requested"] = True
+                    ctx.pipeline_status["cancellation_reason"] = "internal_error"
+                    ctx.pipeline_status["cancellation_detail"] = (
+                        f"process worker unhandled error: {e}"
+                    )
             finally:
                 ctx.q_process.task_done()
 
@@ -1778,7 +1999,7 @@ class _PipelineMixin:
         file_path = resolve_doc_file_path(status_doc=status_doc)
         current_file_number = 0
         file_extraction_stage_ok = False
-        processing_start_time = int(time.time())
+        process_start_time = int(time.time())
         first_stage_tasks: list[asyncio.Task] = []
         entity_relation_task: asyncio.Task | None = None
         chunks: dict[str, Any] = {}
@@ -1839,7 +2060,15 @@ class _PipelineMixin:
                         )
                         del ctx.pipeline_status["history_messages"][:-5000]
 
-                content = parsed_data.get("content", "")
+                # The parsed body is no longer carried through q_analyze /
+                # q_process (it would pin large documents in memory). Re-read it
+                # from full_docs (already fetched into content_data above) and
+                # strip the lightrag marker according to the stored parse_format
+                # — parse persisted the body for every engine before enqueue.
+                content = strip_lightrag_doc_prefix(
+                    (content_data or {}).get("content"),
+                    (content_data or {}).get("parse_format"),
+                )
 
                 # Decode per-document processing options once; later stages
                 # (multimodal hook / KG extraction) re-read them from
@@ -1977,21 +2206,45 @@ class _PipelineMixin:
                             **v_opts,
                         )
                     else:  # "F"
-                        f_opts = chunk_opts.get("fixed_token") or {}
-                        chunk_opts_str = _format_chunking_params(
-                            resolved_chunk_size, f_opts
+                        # F honors its own ``chunk_token_size`` override
+                        # (``addon_params['chunker']['fixed_token']`` or a
+                        # caller-supplied ``chunk_options``) exactly like
+                        # R/V/P: pop it out of the kwargs so we don't pass it
+                        # both positionally and via ``**`` splat (which would
+                        # TypeError), falling back to the shared top-level
+                        # resolved size when unset.
+                        f_opts = dict(chunk_opts.get("fixed_token") or {})
+                        f_chunk_size = int(
+                            f_opts.pop("chunk_token_size", resolved_chunk_size)
                         )
+                        chunk_opts_str = _format_chunking_params(f_chunk_size, f_opts)
                         logger.info(f"Chunking F: {chunk_opts_str}, doc_id: {doc_id}")
                         chunking_result = chunking_by_fixed_token(
                             self.tokenizer,
                             content,
-                            resolved_chunk_size,
+                            f_chunk_size,
+                            _emit_source_span=True,
                             **f_opts,
                         )
                 else:
                     f_opts = chunk_opts.get("fixed_token") or {}
+                    # Honor the F-strategy ``chunk_token_size`` override (from
+                    # ``CHUNK_F_SIZE`` env or an explicit
+                    # ``addon_params['chunker']['fixed_token']`` / per-doc
+                    # ``chunk_options``) on this legacy path too, falling back
+                    # to the shared top-level resolved size when unset.  This
+                    # keeps ``LightRAG.ainsert`` — which intentionally does NOT
+                    # pass a ``process_options`` selector (so the user's
+                    # ``chunking_func`` still runs) — consistent with the
+                    # explicit-F branch instead of silently ignoring
+                    # ``fixed_token.chunk_token_size``.  ``f_opts`` is read
+                    # field-by-field here (not splatted), so there is no
+                    # positional/kwarg collision.
+                    legacy_chunk_size = int(
+                        f_opts.get("chunk_token_size", resolved_chunk_size)
+                    )
                     chunk_opts_str = _format_chunking_params(
-                        resolved_chunk_size,
+                        legacy_chunk_size,
                         {
                             "split_by_character": f_opts.get("split_by_character"),
                             "split_by_character_only": f_opts.get(
@@ -2006,6 +2259,14 @@ class _PipelineMixin:
                     logger.info(
                         f"Chunking F(legacy): {chunk_opts_str}, doc_id: {doc_id}"
                     )
+                    from lightrag.chunker import chunking_by_token_size
+
+                    # Only the unmodified default fixed-token chunker understands the
+                    # private ``_emit_source_span`` kwarg; a user-supplied
+                    # ``chunking_func`` must not receive it.
+                    legacy_kwargs = {}
+                    if self.chunking_func is chunking_by_token_size:
+                        legacy_kwargs["_emit_source_span"] = True
                     chunking_result = self.chunking_func(
                         self.tokenizer,
                         content,
@@ -2015,7 +2276,8 @@ class _PipelineMixin:
                             "chunk_overlap_token_size",
                             self.chunk_overlap_token_size,
                         ),
-                        resolved_chunk_size,
+                        legacy_chunk_size,
+                        **legacy_kwargs,
                     )
                 if inspect.isawaitable(chunking_result):
                     chunking_result = await chunking_result
@@ -2044,13 +2306,13 @@ class _PipelineMixin:
                 )
                 extraction_meta = {
                     "parse_format": persisted_format,
-                    "parse_engine": persisted_engine
-                    or (
-                        "native"
-                        if persisted_format == FULL_DOCS_FORMAT_LIGHTRAG
-                        else "legacy"
+                    # Shared resolver with the parse stage (_parse_worker), so a
+                    # field already stamped at PARSING re-writes to the same
+                    # value here — no value jump across the transition.
+                    "parse_engine": resolve_doc_status_parse_engine(
+                        persisted_format, persisted_engine
                     ),
-                    "chunking_method": (
+                    "chunk_method": (
                         # Explicit selector in process_options: reflect
                         # the dispatched strategy.  ``fixed_token_fallback``
                         # is preserved as a defensive label in case a
@@ -2123,6 +2385,35 @@ class _PipelineMixin:
                             f"{original_chunk_count} -> {len(chunking_result)}"
                         )
 
+                # Backfill block provenance for F/R/V chunks (P already carries
+                # sidecars; multimodal chunks too). Runs on the final, post-split
+                # chunk list so each slice maps precisely to the block(s) its
+                # content covers. Raises ChunkBlockMatchError -> doc FAILED when a
+                # chunk cannot be located in blocks.jsonl.
+                #
+                # Gated to the built-in F/R/V strategies — or the legacy path only
+                # when ``chunking_func`` is still the unmodified default fixed-token
+                # chunker. A user-supplied ``chunking_func`` may emit summaries /
+                # rewritten text that cannot be located in blocks.jsonl, which would
+                # wrongly FAIL the document.
+                if doc_process_opts.chunking_explicit:
+                    sidecar_backfill_eligible = doc_process_opts.chunking in {
+                        "F",
+                        "R",
+                        "V",
+                    }
+                else:
+                    from lightrag.chunker import chunking_by_token_size
+
+                    sidecar_backfill_eligible = (
+                        self.chunking_func is chunking_by_token_size
+                    )
+
+                if blocks_path and sidecar_backfill_eligible:
+                    from lightrag.sidecar import backfill_chunk_sidecars
+
+                    backfill_chunk_sidecars(chunking_result, blocks_path)
+
                 chunks = build_chunks_dict_from_chunking_result(
                     chunking_result, doc_id=doc_id, file_path=file_path
                 )
@@ -2130,7 +2421,7 @@ class _PipelineMixin:
                 if not chunks:
                     logger.warning("No document chunks to process")
 
-                processing_start_time = int(time.time())
+                process_start_time = int(time.time())
 
                 await self._raise_if_cancelled(
                     ctx.pipeline_status, ctx.pipeline_status_lock
@@ -2148,7 +2439,7 @@ class _PipelineMixin:
                             "chunks_list": list(chunks.keys()),
                         },
                         metadata_extra={
-                            "processing_start_time": processing_start_time,
+                            "process_start_time": process_start_time,
                             **extraction_meta,
                         },
                     )
@@ -2201,8 +2492,8 @@ class _PipelineMixin:
                     failed_chunks_snapshot=get_failed_chunk_snapshot(),
                     pending_tasks=pending_tasks,
                     metadata_extra={
-                        "processing_start_time": processing_start_time,
-                        "processing_end_time": int(time.time()),
+                        "process_start_time": process_start_time,
+                        "process_end_time": int(time.time()),
                     },
                     pipeline_status=ctx.pipeline_status,
                     pipeline_status_lock=ctx.pipeline_status_lock,
@@ -2241,7 +2532,17 @@ class _PipelineMixin:
                             file_path=file_path,
                         )
 
-                    processing_end_time = int(time.time())
+                    # If another in-flight document already triggered an abort
+                    # (e.g. a storage flush error set cancellation_requested),
+                    # do not mark PROCESSED or re-run _insert_done here: the
+                    # shared flush buffer is being torn down, so re-flushing
+                    # would just re-raise the same error. Bail out as cancelled
+                    # so this document is FAILED and retried on the next run.
+                    await self._raise_if_cancelled(
+                        ctx.pipeline_status, ctx.pipeline_status_lock
+                    )
+
+                    process_end_time = int(time.time())
                     await self._upsert_doc_status_transition(
                         doc_id=doc_id,
                         status=DocStatus.PROCESSED,
@@ -2252,8 +2553,8 @@ class _PipelineMixin:
                             "chunks_list": list(chunks.keys()),
                         },
                         metadata_extra={
-                            "processing_start_time": processing_start_time,
-                            "processing_end_time": processing_end_time,
+                            "process_start_time": process_start_time,
+                            "process_end_time": process_end_time,
                             **extraction_meta,
                         },
                     )
@@ -2271,6 +2572,26 @@ class _PipelineMixin:
                         ctx.pipeline_status["history_messages"].append(log_message)
 
                 except Exception as e:
+                    # A storage flush failure (raised by _insert_done) is not
+                    # attributable to this document: index_done_callback flushes
+                    # a buffer shared across concurrently-processed files. We
+                    # cannot tell whose record failed, so continuing risks
+                    # marking other in-flight files PROCESSED with missing data.
+                    # Abort the whole batch via the cooperative cancellation
+                    # flag, tagging it as an internal error with the driver name
+                    # and root cause so it is distinguishable from a user cancel.
+                    if isinstance(e, IndexFlushError):
+                        async with ctx.pipeline_status_lock:
+                            ctx.pipeline_status["cancellation_requested"] = True
+                            ctx.pipeline_status["cancellation_reason"] = (
+                                "internal_error"
+                            )
+                            ctx.pipeline_status["cancellation_detail"] = (
+                                f"{e.storage_name}[{e.namespace}]: {e.__cause__}"
+                            )
+                        logger.error(
+                            f"Aborting pipeline batch due to storage flush error: {e}"
+                        )
                     await self._finalize_doc_failure(
                         doc_id=doc_id,
                         status_doc=status_doc,
@@ -2282,8 +2603,8 @@ class _PipelineMixin:
                         failed_chunks_snapshot=get_failed_chunk_snapshot(),
                         pending_tasks=[],
                         metadata_extra={
-                            "processing_start_time": processing_start_time,
-                            "processing_end_time": int(time.time()),
+                            "process_start_time": process_start_time,
+                            "process_end_time": int(time.time()),
                             **extraction_meta,
                         },
                         pipeline_status=ctx.pipeline_status,
@@ -2420,6 +2741,31 @@ class _PipelineMixin:
             if pipeline_status.get("cancellation_requested", False):
                 raise PipelineCancelledException("User cancelled")
 
+    @staticmethod
+    def _cancellation_label(pipeline_status: dict) -> str:
+        """Human-readable cancel cause: internal error (with detail) vs user.
+
+        Callers building cancellation messages use this so an internal abort
+        (e.g. a storage flush failure) is not mislabeled as a user cancel.
+        """
+        if pipeline_status.get("cancellation_reason") == "internal_error":
+            detail = pipeline_status.get("cancellation_detail") or "unknown"
+            return f"Cancelled by internal error: {detail}"
+        return "User cancelled"
+
+    @staticmethod
+    def _internal_halt_message(label: str) -> str:
+        """Actionable halt message for an internal-error abort.
+
+        Shared by the loop-top cancellation handler and the finally cleanup so
+        the same wording surfaces whichever exit path the batch takes.
+        """
+        return (
+            f"Pipeline halted on internal storage error ({label}). Resolve the "
+            f"storage issue and restart processing; affected documents remain "
+            f"queued (PENDING/FAILED)."
+        )
+
     async def _cancellation_requested(
         self,
         pipeline_status: dict,
@@ -2453,7 +2799,10 @@ class _PipelineMixin:
         sibling tasks (e.g. successful multimodal items inside a doc that is
         being cancelled) survive a server restart.
         """
-        error_msg = f"User cancelled during {stage_label}: {file_path}"
+        error_msg = (
+            f"{self._cancellation_label(pipeline_status)} during "
+            f"{stage_label}: {file_path}"
+        )
         logger.warning(error_msg)
         async with pipeline_status_lock:
             pipeline_status["latest_message"] = error_msg
@@ -2497,20 +2846,35 @@ class _PipelineMixin:
         preserves the failed chunks snapshot and processing-time metadata.
         """
         if isinstance(error, PipelineCancelledException):
+            cancel_label = self._cancellation_label(pipeline_status)
+            # The cancel exceptions raised by the merge/summary stages hardcode a
+            # generic "User cancelled during <stage>" message. When the batch was
+            # actually aborted by an internal error (e.g. a storage outage), that
+            # mislabels the cause. Swap the generic prefix for the reason-aware
+            # label so doc_status records "Cancelled by internal error: <detail>
+            # during <stage>" rather than "User cancelled during <stage>".
+            raw = str(error)
+            if raw.startswith("User cancelled"):
+                doc_error_msg = f"{cancel_label}{raw[len('User cancelled'):]}"
+            elif raw:
+                doc_error_msg = f"{cancel_label}: {raw}"
+            else:
+                doc_error_msg = cancel_label
             if stage_label == "merge":
                 error_msg = (
-                    f"User cancelled during merge {current_file_number}/"
+                    f"{cancel_label} during merge {current_file_number}/"
                     f"{total_files}: {file_path}"
                 )
             else:
                 error_msg = (
-                    f"User cancelled {current_file_number}/{total_files}: {file_path}"
+                    f"{cancel_label} {current_file_number}/{total_files}: {file_path}"
                 )
             logger.warning(error_msg)
             async with pipeline_status_lock:
                 pipeline_status["latest_message"] = error_msg
                 pipeline_status["history_messages"].append(error_msg)
         else:
+            doc_error_msg = str(error)
             logger.error(traceback.format_exc())
             if stage_label == "merge":
                 error_msg = (
@@ -2545,7 +2909,7 @@ class _PipelineMixin:
             status_doc=status_doc,
             file_path=file_path,
             extra_fields={
-                "error_msg": str(error),
+                "error_msg": doc_error_msg,
                 "chunks_count": failed_chunks_count,
                 "chunks_list": failed_chunks_list,
             },
@@ -2590,7 +2954,7 @@ class _PipelineMixin:
             source_path = _call_source_file_resolver(
                 self,
                 file_path,
-                source_file_name=content_data.get("source_file_name"),
+                source_file=_read_source_file(content_data),
                 parser_engine=PARSER_ENGINE_NATIVE,
             )
             p = Path(source_path)
@@ -2727,6 +3091,7 @@ class _PipelineMixin:
                 "doc_id": doc_id,
                 "file_path": file_path,
                 "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
+                "parse_engine": PARSER_ENGINE_NATIVE,
                 "content": parsed_data["content"],
                 "blocks_path": parsed_data["blocks_path"],
             }
@@ -2784,7 +3149,7 @@ class _PipelineMixin:
             _call_source_file_resolver(
                 self,
                 file_path,
-                source_file_name=content_data.get("source_file_name"),
+                source_file=_read_source_file(content_data),
                 parser_engine=PARSER_ENGINE_MINERU,
             )
         )
@@ -2865,6 +3230,7 @@ class _PipelineMixin:
             "doc_id": doc_id,
             "file_path": file_path,
             "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
+            "parse_engine": PARSER_ENGINE_MINERU,
             "content": parsed_data["content"],
             "blocks_path": parsed_data["blocks_path"],
             "parse_stage_skipped": parse_stage_skipped,
@@ -2899,7 +3265,7 @@ class _PipelineMixin:
             _call_source_file_resolver(
                 self,
                 file_path,
-                source_file_name=content_data.get("source_file_name"),
+                source_file=_read_source_file(content_data),
                 parser_engine=PARSER_ENGINE_DOCLING,
             )
         )
@@ -2985,6 +3351,7 @@ class _PipelineMixin:
             "doc_id": doc_id,
             "file_path": file_path,
             "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
+            "parse_engine": PARSER_ENGINE_DOCLING,
             "content": parsed_data["content"],
             "blocks_path": parsed_data["blocks_path"],
             "parse_stage_skipped": parse_stage_skipped,
@@ -3114,9 +3481,7 @@ class _PipelineMixin:
         source_path = _call_source_file_resolver(
             self,
             file_path,
-            source_file_name=content_data.get("source_file_name")
-            if content_data
-            else None,
+            source_file=_read_source_file(content_data),
         )
         archived = await archive_source_after_full_docs_sync(source_path)
         archive_msg = f"; archived to {archived}" if archived else ""
@@ -3132,13 +3497,13 @@ class _PipelineMixin:
         self,
         file_path: str,
         *,
-        source_file_name: str | None = None,
+        source_file: str | None = None,
         parser_engine: str | None = None,
     ) -> str:
         """Resolve a readable source file path for parser upload.
 
         ``file_path`` is the canonical stored basename. Pending-parse records
-        may also carry ``source_file_name`` with the real uploaded/scanned
+        may also carry ``source_file`` with the real uploaded/scanned
         basename, including parser hints.
         """
         candidates: list[Path] = []
@@ -3159,7 +3524,7 @@ class _PipelineMixin:
 
         p = Path(file_path)
         name = p.name
-        source_name = Path(str(source_file_name or "").strip()).name
+        source_name = Path(str(source_file or "").strip()).name
         input_path = input_dir_path()
         # API ``DocumentManager`` scopes its input dir to
         # ``<base_input_dir>/<workspace>/`` (see DocumentManager.__init__);

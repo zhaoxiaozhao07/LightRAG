@@ -358,6 +358,7 @@ All variables in the table below are read into `addon_params["chunker"]` once wh
 |---|---|---|---|
 | `CHUNK_SIZE` | `1200` | int | Legacy top-level `chunk_token_size` fallback; lower priority than strategy-specific env and the SDK path setting of `addon_params["chunker"]["chunk_token_size"]` |
 | `CHUNK_OVERLAP_SIZE` | `100` | int | Legacy overlap fallback; filled when a strategy has neither a specific env (`CHUNK_F_OVERLAP_SIZE` / `CHUNK_R_OVERLAP_SIZE` / `CHUNK_P_OVERLAP_SIZE`) nor the SDK path's `LightRAG(chunk_overlap_token_size=…)` |
+| `CHUNK_F_SIZE` | unset | int | F strategy-specific `chunk_token_size`; higher than the top-level legacy fallback (`CHUNK_SIZE` and the SDK path's `LightRAG(chunk_token_size=…)`). When unset, F inherits the top-level resolved value. |
 | `CHUNK_F_OVERLAP_SIZE` | unset | int | F strategy-specific overlap; higher than the legacy constructor field and `CHUNK_OVERLAP_SIZE` |
 | `CHUNK_F_SPLIT_BY_CHARACTER` | (unset = `null`) | str? | F pre-split separator; `null` / empty string = split by token window only |
 | `CHUNK_F_SPLIT_BY_CHARACTER_ONLY` | `false` | bool | F strict mode: no secondary token split; raise error when oversized |
@@ -372,14 +373,14 @@ All variables in the table below are read into `addon_params["chunker"]` once wh
 | `CHUNK_P_SIZE` | `2000` (`DEFAULT_CHUNK_P_SIZE`) | int | P strategy-specific `chunk_token_size`. Unlike R/V, P does NOT inherit the top-level `CHUNK_SIZE` / `LightRAG(chunk_token_size=…)` when unset — paragraph-semantic merging needs more headroom than the global default to keep related paragraphs together, so the slot always carries `DEFAULT_CHUNK_P_SIZE` (2000) instead. |
 | `CHUNK_P_OVERLAP_SIZE` | unset | int | P strategy-specific overlap; higher than the legacy constructor field and `CHUNK_OVERLAP_SIZE`. Used for text overlap when long body text within the same JSONL content line falls back to R, and as the per-side budget for bridging text copied into the adjacent large-table chunks. |
 
-P's internal ratio constants are algorithmic scales and are automatically derived in proportion to `chunk_token_size`. P always uses an independent `chunk_token_size` decoupled from the global chain — even when `CHUNK_P_SIZE` is unset, P falls back to `DEFAULT_CHUNK_P_SIZE` (2000) rather than the global `CHUNK_SIZE`, because paragraph-semantic merging needs more headroom than the global default to keep related paragraphs together. Use `CHUNK_P_SIZE` to override that default per deployment. `CHUNK_P_OVERLAP_SIZE` only affects P's internal plain-text fallback and table bridging context; it does not let table row-level slices overlap each other. `CHUNK_R_SIZE` / `CHUNK_V_SIZE` work differently — when unset they DO fall back to the top-level `chunk_token_size` (R prefers a smaller target to better split sentences, while V — as an advisory ceiling — typically wants to be enlarged to reduce over-splitting).
+P's internal ratio constants are algorithmic scales and are automatically derived in proportion to `chunk_token_size`. P always uses an independent `chunk_token_size` decoupled from the global chain — even when `CHUNK_P_SIZE` is unset, P falls back to `DEFAULT_CHUNK_P_SIZE` (2000) rather than the global `CHUNK_SIZE`, because paragraph-semantic merging needs more headroom than the global default to keep related paragraphs together. Use `CHUNK_P_SIZE` to override that default per deployment. `CHUNK_P_OVERLAP_SIZE` only affects P's internal plain-text fallback and table bridging context; it does not let table row-level slices overlap each other. `CHUNK_F_SIZE` / `CHUNK_R_SIZE` / `CHUNK_V_SIZE` work differently — when unset they DO fall back to the top-level `chunk_token_size` (F is the default global window, R prefers a smaller target to better split sentences, while V — as an advisory ceiling — typically wants to be enlarged to reduce over-splitting).
 
 ### 3.3 Priority Chain
 
 The final value of each chunking slot is resolved by a specificity-ordered chain (high → low):
 
 1. **`addon_params["chunker"]` explicit value** — field values explicitly written at construction time or set at runtime via the SDK path (see §8.3). Server-only deployments usually don't hit this tier. Most direct; wins everything.
-2. **Strategy-specific env** — e.g., `CHUNK_F_OVERLAP_SIZE` / `CHUNK_R_OVERLAP_SIZE` / `CHUNK_P_OVERLAP_SIZE` / `CHUNK_R_SIZE` / `CHUNK_V_SIZE` / `CHUNK_P_SIZE` (there is no strategy-specific `CHUNK_F_SIZE` yet; F reuses the top-level `chunk_token_size`). Filled only when the slot is not already occupied by ①.
+2. **Strategy-specific env** — `CHUNK_F_SIZE` / `CHUNK_R_SIZE` / `CHUNK_V_SIZE` (per-strategy `chunk_token_size`), `CHUNK_F_OVERLAP_SIZE` / `CHUNK_R_OVERLAP_SIZE` / `CHUNK_P_OVERLAP_SIZE` (overlap), `CHUNK_P_SIZE` (P-specific). When the corresponding size env is unset, F/R/V inherit the top-level `chunk_token_size`. Filled only when the slot is not already occupied by ①.
 3. **Legacy constructor fields** — `LightRAG(chunk_token_size=…, chunk_overlap_token_size=…)`; only effective on the SDK path, see §8.2. Strategy-agnostic, "coarse-grained default", fills only the slots still empty.
 4. **Legacy env** — `CHUNK_SIZE` / `CHUNK_OVERLAP_SIZE`. Final fallback.
 
@@ -403,6 +404,7 @@ Three layers of semantic guarantee:
 {
   "chunk_token_size": 1200,                                   // common token cap
   "fixed_token": {                                            // F-specific
+    "chunk_token_size": 1200,                                 // optional; when omitted, inherits the top-level chunk_token_size (seedable via CHUNK_F_SIZE)
     "chunk_overlap_token_size": 100,
     "split_by_character": null,
     "split_by_character_only": false
@@ -719,24 +721,25 @@ At enqueue time, `resolve_stored_document_parser_engine` puts each document into
 | Environment variable | Default | Effect | Tuning advice |
 | --- | --- | --- | --- |
 | `MAX_PARALLEL_PARSE_NATIVE` | `5` | N1: number of concurrent workers for native parsing (docx / pdf / txt and other pure local processing) | Pure CPU, low memory usage; can be raised to CPU core count |
-| `MAX_PARALLEL_PARSE_MINERU` | `1` | N2: number of concurrent workers for MinerU parsing | MinerU has significant GPU/CPU usage; **the default of serial is most stable**. With local deployment and ample VRAM, you can set 2–3; when going through MinerU's official cloud service, you can raise it appropriately (subject to cloud quotas). |
-| `MAX_PARALLEL_PARSE_DOCLING` | `1` | N3: number of concurrent workers for Docling parsing | Docling is similarly resource-sensitive; **the default of serial is most stable**. With local deployment and ample CPU/GPU, you can set 2–3. |
+| `MAX_PARALLEL_PARSE_MINERU` | `2` | N2: number of concurrent workers for MinerU parsing | MinerU has significant GPU/CPU usage; **the default of 2 is a modest amount of parallelism**. Lower to 1 when resources are tight; with local deployment and ample VRAM, you can set 2–3; when going through MinerU's official cloud service, you can raise it appropriately (subject to cloud quotas). |
+| `MAX_PARALLEL_PARSE_DOCLING` | `2` | N3: number of concurrent workers for Docling parsing | Docling is similarly resource-sensitive; **the default of 2 is a modest amount of parallelism**. Lower to 1 when resources are tight; with local deployment and ample CPU/GPU, you can set 2–3. |
 | `MAX_PARALLEL_ANALYZE` | `5` | N4: number of concurrent workers for multimodal analysis (VLM image / table description) | Directly consumes the VLM quota. Recommended ≤ VLM service concurrency cap. |
-| `MAX_PARALLEL_INSERT` | `2` | N5: number of concurrent documents at the entity / relation extraction + ingest stage | Recommended `MAX_ASYNC / 3`, in the range 2–10. This stage triggers multiple LLM calls per document; setting it too high will hit LLM rate limits. This value also serves as the `asyncio.Semaphore` for an additional constraint (worker count and semaphore value are the same). |
-| `QUEUE_SIZE_DEFAULT` | `100` | Bounded queue capacity between the parse / analyze stages | Generally no need to tune. For very large batches (thousands or more), can be raised to avoid backpressure at the enqueue side; lower it when memory is tight. |
+| `MAX_PARALLEL_INSERT` | `3` | N5: number of concurrent documents at the entity / relation extraction + ingest stage | Recommended `MAX_ASYNC / 3`, in the range 2–10. This stage triggers multiple LLM calls per document; setting it too high will hit LLM rate limits. This value also serves as the `asyncio.Semaphore` for an additional constraint (worker count and semaphore value are the same). |
+| `QUEUE_SIZE_PARSE` | `20` | Bounded capacity of the parse-input queues (native/MinerU/Docling) | Generally no need to tune. Items here are lightweight doc_ids (the large parsed body is stripped before the analyze stage); this only bounds how many pending docs the pipeline pre-dispatches to parse workers, so tuning has little effect. |
+| `QUEUE_SIZE_ANALYZE` | `100` | Bounded capacity of the analyze queue (parse → analyze stage) | Generally no need to tune. For very large batches (thousands or more), can be raised to avoid backpressure at the enqueue side; lower it when memory is tight. |
 | `QUEUE_SIZE_INSERT` | `4` | Queue capacity between the analyze → process stage | The process stage is the slowest and most memory-hungry in the pipeline; the queue is deliberately small to provide backpressure to upstream and prevent memory bloat. |
 
 **Several key points:**
 
 1. **Parsing stage is isolated per engine**, so when mixing native/mineru/docling, you don't have to worry about a slow engine dragging another down.
-2. **mineru / docling default to serial (=1)**: in practice both have high resource usage, and concurrency benefits are unstable (prone to OOM / VRAM contention / failure retry). With multi-GPU or a dedicated parser server, you can raise them manually.
+2. **mineru / docling default to 2**: both have high resource usage, so the default keeps parallelism modest. Lower to 1 when resources are tight (OOM / VRAM contention / failure retry); with multi-GPU or a dedicated parser server, you can raise them manually.
 3. **`MAX_PARALLEL_INSERT` doubles as worker pool size and semaphore cap**: the pipeline creates a `Semaphore(max_parallel_insert)`, and each process worker also takes the semaphore before extraction and ingest. So even if you manually raise the worker count, the actual concurrency cap is still bounded by this value — just tune it directly.
 4. **Queue size and backpressure**: the small default `QUEUE_SIZE_INSERT=4` is intentional — the process stage is slow and memory-hungry; when the queue fills, analyze blocks, and backpressure reaches the parse stage, preventing thousands of parsing results from piling up in memory at once.
 5. **How changes take effect**: all parameters are passed in via `.env` (or environment variables), read once at `LightRAG` construction; restart the service after changing them.
 
 **Typical tuning scenarios:**
 
-- Large batch of PDFs + local MinerU on a single GPU: `MAX_PARALLEL_PARSE_MINERU=1`, `MAX_PARALLEL_ANALYZE=5`, `MAX_PARALLEL_INSERT=2` (defaults are fine).
+- Large batch of PDFs + local MinerU on a single GPU: `MAX_PARALLEL_PARSE_MINERU=2`, `MAX_PARALLEL_ANALYZE=5`, `MAX_PARALLEL_INSERT=3` (defaults are fine; lower MINERU to 1 if VRAM is tight).
 - Large batch of PDFs + MinerU cloud service: `MAX_PARALLEL_PARSE_MINERU=3~5` (depending on cloud quota), others at defaults.
 - Pure docx / txt (only native): `MAX_PARALLEL_PARSE_NATIVE=10`; `MAX_PARALLEL_INSERT` derived from `MAX_ASYNC/3`.
 - Heavy LLM rate-limiting: first lower `MAX_PARALLEL_INSERT` (the process stage makes multiple LLM calls per document), then lower `MAX_PARALLEL_ANALYZE` (VLM is a separate quota).
