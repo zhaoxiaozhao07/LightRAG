@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 import httpx
 import pytest
 
 from examples.enterprise_kb_mvp.enterprise_kb_mvp_demo import (
     EnterpriseKBClient,
+    SourceFile,
     _hard_reset_demo_kbs,
     confirm_reset_kb,
+    follow_job_response,
     make_delete_idempotency_key,
     normalize_run_id,
     parse_document_selection,
@@ -316,3 +319,298 @@ def test_run_delete_test_records_failed_job_before_raising(
     assert summary["requested_count"] == 2
     assert summary["deleted_count"] == 1
     assert final["id"] == "job_delete_demo"
+
+
+# --------------------------------------------------------------------------- #
+# Extended-endpoint client methods (request construction via MockTransport)
+# --------------------------------------------------------------------------- #
+
+
+def _client_with_handler(handler) -> EnterpriseKBClient:
+    """Build an EnterpriseKBClient whose transport is a MockTransport handler."""
+    client = EnterpriseKBClient("http://testserver", "", timeout=5.0)
+    client._client.close()
+    client._client = httpx.Client(
+        base_url="http://testserver",
+        transport=httpx.MockTransport(handler),
+    )
+    return client
+
+
+def test_ingest_and_batch_methods_build_expected_requests() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content) if request.content else None
+        return httpx.Response(
+            200, json={"job_id": "j1", "batch_id": "b1", "documents": []}
+        )
+
+    client = _client_with_handler(handler)
+    try:
+        client.import_texts(
+            "kb1",
+            [{"text": "hello", "source_name": "a.txt"}],
+            parser_engine="mineru",
+            process_options="iteP",
+            idempotency_key="k1",
+        )
+        assert captured["method"] == "POST"
+        assert captured["path"] == "/kbs/kb1/documents:texts"
+        body = captured["body"]
+        assert body["documents"][0]["text"] == "hello"
+        assert body["auto_parse"] is True and body["auto_index"] is True
+        assert body["parser_engine"] == "mineru"
+        assert body["idempotency_key"] == "k1"
+
+        # batch-parse uses `engine` (NOT parser_engine)
+        client.batch_parse("kb1", ["d1", "d2"], engine="mineru", force_reparse=True)
+        assert captured["path"] == "/kbs/kb1/documents:batch-parse"
+        body = captured["body"]
+        assert body["engine"] == "mineru"
+        assert "parser_engine" not in body
+        assert body["document_ids"] == ["d1", "d2"]
+        assert body["force_reparse"] is True
+
+        client.batch_build_kg("kb1", ["d1"], force_extract=True)
+        assert captured["path"] == "/kbs/kb1/documents:batch-build-kg"
+        assert captured["body"]["force_extract"] is True
+
+        client.import_urls("kb1", [{"url": "http://x", "source_key": "k"}])
+        assert captured["path"] == "/kbs/kb1/documents:urls"
+        assert captured["body"]["documents"][0]["url"] == "http://x"
+    finally:
+        client.close()
+
+
+def test_document_control_methods_build_expected_requests() -> None:
+    captured: list[tuple[str, str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        captured.append((request.method, request.url.path, body))
+        return httpx.Response(200, json={"id": "d1", "enabled": True, "metadata": {}})
+
+    client = _client_with_handler(handler)
+    try:
+        client.disable_document("kb1", "d1")
+        client.enable_document("kb1", "d1")
+        client.patch_document("kb1", "d1", metadata={"x": 1}, enabled=True)
+    finally:
+        client.close()
+
+    assert captured[0] == ("POST", "/kbs/kb1/documents/d1:disable", None)
+    assert captured[1] == ("POST", "/kbs/kb1/documents/d1:enable", None)
+    assert captured[2][0] == "PATCH"
+    assert captured[2][1] == "/kbs/kb1/documents/d1"
+    # Only explicitly-passed fields are sent (PATCH semantics).
+    assert captured[2][2] == {"metadata": {"x": 1}, "enabled": True}
+
+
+def test_reindex_rebuild_retry_methods_build_expected_requests() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content) if request.content else None
+        return httpx.Response(200, json={"id": "j1", "status": "queued"})
+
+    client = _client_with_handler(handler)
+    try:
+        client.reindex_document("kb1", "d1")
+        assert captured["path"] == "/kbs/kb1/documents/d1:reindex"
+        # reindex force_* default to True
+        assert captured["body"]["force_rechunk"] is True
+        assert captured["body"]["force_embedding"] is True
+
+        client.batch_reindex("kb1", ["d1", "d2"])
+        assert captured["path"] == "/kbs/kb1/documents:batch-reindex"
+        assert captured["body"]["document_ids"] == ["d1", "d2"]
+
+        client.rebuild_kb_index("kb1")
+        assert captured["path"] == "/kbs/kb1:rebuild"
+
+        client.retry_job("kb1", "j9", idempotency_key="r1")
+        assert captured["path"] == "/kbs/kb1/jobs/j9:retry"
+        assert captured["body"]["idempotency_key"] == "r1"
+    finally:
+        client.close()
+
+
+def test_replace_document_sends_file_multipart_and_query_params(tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["query"] = dict(request.url.params)
+        captured["content_type"] = request.headers.get("content-type", "")
+        captured["body_bytes"] = request.content
+        return httpx.Response(200, json={"id": "jr", "status": "queued"})
+
+    source_path = tmp_path / "doc.txt"
+    source_path.write_text("replacement-bytes", encoding="utf-8")
+    source = SourceFile(
+        path=source_path,
+        relative_key="enterprise-demo/replace/doc.txt",
+        sha256="abc",
+        size_bytes=source_path.stat().st_size,
+        content_type="text/plain",
+    )
+
+    client = _client_with_handler(handler)
+    try:
+        client.replace_document(
+            "kb1", "d1", source, parser_engine="mineru", idempotency_key="ir"
+        )
+    finally:
+        client.close()
+
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/kbs/kb1/documents/d1:replace"
+    # Scalar params ride in the QUERY string, not the multipart form body.
+    query = captured["query"]
+    assert query["auto_parse"] == "true"
+    assert query["auto_index"] == "true"
+    assert query["delete_source_file"] == "true"
+    assert query["delete_artifacts"] == "true"
+    assert query["parser_engine"] == "mineru"
+    assert query["idempotency_key"] == "ir"
+    # The file rides in a multipart/form-data body under field name "file".
+    assert str(captured["content_type"]).startswith("multipart/form-data")
+    assert b"replacement-bytes" in captured["body_bytes"]
+    assert b'name="file"' in captured["body_bytes"]
+
+
+def test_query_graph_config_artifact_methods_build_expected_requests() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["query"] = dict(request.url.params)
+        captured["body"] = json.loads(request.content) if request.content else None
+        return httpx.Response(200, json={"status": "success", "nodes": [], "edges": []})
+
+    client = _client_with_handler(handler)
+    try:
+        client.retrieve("kb1", "q", mode="mix", top_k=10, chunk_top_k=5)
+        assert captured["method"] == "POST"
+        assert captured["path"] == "/kbs/kb1/retrieve"
+        assert captured["body"]["query"] == "q"
+        assert captured["body"]["stream"] is False
+
+        client.subgraph("kb1", label="*", max_depth=2, max_nodes=50)
+        assert captured["method"] == "GET"
+        assert captured["path"] == "/kbs/kb1/graph"
+        assert captured["query"]["label"] == "*"
+        assert captured["query"]["max_depth"] == "2"
+        assert captured["query"]["max_nodes"] == "50"
+
+        client.update_kb("kb1", description="d")
+        assert captured["method"] == "PATCH"
+        assert captured["path"] == "/kbs/kb1"
+        assert captured["body"] == {"description": "d"}
+
+        client.get_config_version("kb1", "v1")
+        assert captured["path"] == "/kbs/kb1/configs/v1"
+
+        client.diff_config_version("kb1", "v1")
+        assert captured["method"] == "POST"
+        assert captured["path"] == "/kbs/kb1/configs/v1:diff"
+
+        client.get_artifact("kb1", "d1", "a1")
+        assert captured["path"] == "/kbs/kb1/documents/d1/artifacts/a1"
+
+        client.artifact_download_url("kb1", "d1", "a1", expires_in_seconds=120)
+        assert captured["path"] == "/kbs/kb1/documents/d1/artifacts/a1:download-url"
+        assert captured["query"]["expires_in_seconds"] == "120"
+    finally:
+        client.close()
+
+
+def test_query_stream_parses_ndjson_header_and_tokens() -> None:
+    lines = [
+        b'{"kb_id": "kb1", "metadata": {"m": 1}, "references": [{"reference_id": "r1"}]}',
+        b'{"response": "Hello"}',
+        b'{"response": ", world"}',
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/kbs/kb1/query/stream"
+        body = json.loads(request.content)
+        assert body["stream"] is True
+        return httpx.Response(200, content=b"\n".join(lines) + b"\n")
+
+    client = _client_with_handler(handler)
+    try:
+        result = client.query_stream("kb1", "q", mode="mix", top_k=10, chunk_top_k=5)
+    finally:
+        client.close()
+
+    assert result["response"] == "Hello, world"
+    assert result["token_count"] == 2
+    assert result["metadata"] == {"m": 1}
+    assert result["references"] == [{"reference_id": "r1"}]
+    assert "error" not in result
+
+
+def test_query_stream_captures_stream_error() -> None:
+    lines = [
+        b'{"kb_id": "kb1", "metadata": {}}',
+        b'{"error": "boom"}',
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"\n".join(lines) + b"\n")
+
+    client = _client_with_handler(handler)
+    try:
+        result = client.query_stream("kb1", "q", mode="mix", top_k=1, chunk_top_k=1)
+    finally:
+        client.close()
+
+    assert result.get("error") == "boom"
+
+
+def test_follow_job_response_skips_http_for_terminal_and_noop() -> None:
+    def fail_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("terminal/noop responses must not trigger an HTTP call")
+
+    client = _client_with_handler(fail_handler)
+    try:
+        terminal = follow_job_response(
+            client, "kb1", {"id": "j1", "status": "succeeded"}, 0.0
+        )
+        assert terminal["status"] == "succeeded"
+        # Empty job_id (e.g. {kb}:rebuild no-op) returns unchanged, no polling.
+        noop = follow_job_response(client, "kb1", {"job_id": "", "documents": []}, 0.0)
+        assert noop["job_id"] == ""
+    finally:
+        client.close()
+
+
+def test_follow_job_response_polls_jobresponse_and_batch_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Both an id-based job and a job_id-based batch resolve via the wait endpoint.
+        if request.url.path == "/kbs/kb1/jobs/j2:wait":
+            return httpx.Response(200, json={"id": "j2", "status": "succeeded"})
+        if request.url.path == "/kbs/kb1/jobs/jb:wait":
+            return httpx.Response(200, json={"id": "jb", "status": "succeeded"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    client = _client_with_handler(handler)
+    try:
+        from_job = follow_job_response(
+            client, "kb1", {"id": "j2", "status": "queued"}, 5.0
+        )
+        assert from_job["status"] == "succeeded"
+        from_batch = follow_job_response(
+            client, "kb1", {"job_id": "jb", "batch_id": "b", "documents": []}, 5.0
+        )
+        assert from_batch["status"] == "succeeded"
+    finally:
+        client.close()

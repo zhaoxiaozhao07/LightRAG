@@ -18,6 +18,11 @@ The script drives the KB API end-to-end:
 10. run KB-scoped RAG query and structured retrieval query;
 11. create an empty control KB to verify workspace isolation.
 
+Beyond this baseline (~26 endpoints), opt-in flags exercise many more endpoints —
+rebuild/reindex, document replace, text/URL ingest, streaming + structured
+retrieval, config get/diff, KB metadata patch, artifact metadata/download-url, and
+document enable/disable. See "Extended endpoint coverage" below.
+
 Run from the repository root:
 
 ```powershell
@@ -48,6 +53,70 @@ Useful repeat-run flags:
   `DELETE /kbs/{kb_id}?hard=true`, so it clears the KB metadata rows,
   LightRAG workspace files, parser input/artifact cache, and MinIO/S3 objects
   associated with the KB workspace.
+
+## Extended endpoint coverage (opt-in)
+
+The baseline flow already exercises ~26 KB endpoints. These flags turn on
+additional, otherwise-uncovered endpoints. They are all **off by default** so the
+baseline run is unchanged, and every job they create is followed without a client
+timeout (see "Long-running jobs never time out" below).
+
+- `--demo-extras`: read-mostly, reversible endpoints run after the main query —
+  - `POST /kbs/{id}/retrieve` — structured retrieval, no LLM generation;
+  - `POST /kbs/{id}/query/stream` — NDJSON streaming (the report records token count);
+  - `GET /kbs/{id}/graph` — subgraph export;
+  - `GET /kbs/{id}/configs/{version_id}` + `POST .../{version_id}:diff` — inspect a
+    config version and diff it against the active one;
+  - `PATCH /kbs/{id}` — description round-trip (patched, then restored);
+  - `GET .../artifacts/{artifact_id}` + `:download-url` — artifact metadata and a
+    presigned download URL;
+  - document `:disable` -> `PATCH` metadata -> `:enable` round-trip;
+  - `POST /kbs/{id}/jobs/{job_id}:retry` — retries the first dead-letter job, if any.
+- `--demo-reindex`: rebuild paths — per-document `:reindex`, `documents:batch-reindex`,
+  and `{kb}:rebuild`. These re-run chunk/extract/embedding (can be slow) and
+  end-to-end verify that vector rebuild still works after the in-house
+  `_VDBUpsertBatcher` was replaced by upstream's storage-layer delayed embedding.
+- `--demo-replace FILE`: replace the first ready document's source via
+  `POST /kbs/{id}/documents/{document_id}:replace` (multipart upload + durable
+  resume). `FILE` is the new source file.
+- `--demo-ingest-variants` (+ optional `--demo-url URL`): non-file ingest channels
+  `documents:texts` (a synthetic text doc) and `documents:urls` (only when
+  `--demo-url` is given). Both run `auto_parse` + `auto_index`.
+
+Enable everything read-mostly plus the rebuild paths and text ingest:
+
+```powershell
+$env:LIGHTRAG_API_KEY = "sk-123456"
+uv run python examples/enterprise_kb_mvp/enterprise_kb_mvp_demo.py `
+  --server "http://127.0.0.1:9621" `
+  --source-dir "E:/pycharmprojects/RAG/LightRAG/模拟文件" `
+  --kb-id enterprise_mvp_demo `
+  --reset-kb yes `
+  --demo-extras `
+  --demo-reindex `
+  --demo-ingest-variants
+```
+
+To also exercise document replacement, add `--demo-replace path/to/new_file.pdf`.
+To also fetch a URL, add `--demo-url https://example.com/page` with
+`--demo-ingest-variants`.
+
+## Long-running jobs never time out
+
+Every ingest/parse/build/reindex/rebuild/replace endpoint returns an async job.
+The client follows each job with `wait_for_job`, which issues a bounded
+server-side `:wait` (default 120s window) and, on its 408 heartbeat, re-queries
+progress and re-issues — so a slow MinerU parse or a multi-PDF KG build that runs
+for hours keeps printing progress instead of being abandoned. The default
+`--job-timeout 0` means "follow until the job terminates"; the server keeps
+running regardless, so giving up early would only orphan a live job. Pass a
+positive `--job-timeout SECONDS` only when you deliberately want the client to
+bail out early.
+
+The extended endpoints above reuse the exact same follow mechanism via
+`follow_job_response`, which transparently handles both shapes the API returns —
+a `JobResponse` (`id` + `status`) and a `DocumentBatchResponse` (`job_id`) — and
+treats an empty `{kb}:rebuild` no-op (blank `job_id`) as already done.
 
 ## What is persisted
 

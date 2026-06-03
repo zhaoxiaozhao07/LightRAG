@@ -703,6 +703,498 @@ class EnterpriseKBClient:
         response.raise_for_status()
         return response.json()
 
+    # ---- 入库变体（除文件 :sync/:upload 外的其他入库通道）----
+
+    def import_texts(
+        self,
+        kb_id: str,
+        documents: list[dict[str, Any]],
+        *,
+        parser_engine: str | None = None,
+        process_options: str | None = None,
+        idempotency_key: str | None = None,
+        auto_parse: bool = True,
+        auto_index: bool = True,
+    ) -> dict[str, Any]:
+        """POST /kbs/{kb_id}/documents:texts — 直接以文本入库（不走文件上传）。
+
+        ``documents`` 每项形如 ``{"text": ..., "source_name": ..., "metadata": {...}}``。
+        返回 ``DocumentBatchResponse``（``job_id`` + ``batch_id`` + ``documents``）；
+        当 ``auto_parse=True`` 时解析在后台执行，需用 ``job_id`` 轮询。
+        """
+        body: dict[str, Any] = {
+            "documents": documents,
+            "auto_parse": auto_parse,
+            "auto_index": auto_index,
+        }
+        if parser_engine is not None:
+            body["parser_engine"] = parser_engine
+        if process_options is not None:
+            body["process_options"] = process_options
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        response = self._client.post(f"/kbs/{kb_id}/documents:texts", json=body)
+        response.raise_for_status()
+        return response.json()
+
+    def import_urls(
+        self,
+        kb_id: str,
+        documents: list[dict[str, Any]],
+        *,
+        parser_engine: str | None = None,
+        process_options: str | None = None,
+        idempotency_key: str | None = None,
+        auto_parse: bool = True,
+        auto_index: bool = True,
+    ) -> dict[str, Any]:
+        """POST /kbs/{kb_id}/documents:urls — 以 URL 抓取入库。
+
+        ``documents`` 每项形如 ``{"url": ..., "source_name": ..., "source_key": ...}``。
+        返回 ``DocumentBatchResponse``；``auto_parse=True`` 时需用 ``job_id`` 轮询。
+        """
+        body: dict[str, Any] = {
+            "documents": documents,
+            "auto_parse": auto_parse,
+            "auto_index": auto_index,
+        }
+        if parser_engine is not None:
+            body["parser_engine"] = parser_engine
+        if process_options is not None:
+            body["process_options"] = process_options
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        response = self._client.post(f"/kbs/{kb_id}/documents:urls", json=body)
+        response.raise_for_status()
+        return response.json()
+
+    def batch_parse(
+        self,
+        kb_id: str,
+        document_ids: list[str],
+        *,
+        engine: str | None = None,
+        process_options: str | None = None,
+        force_reparse: bool = False,
+        auto_index: bool = False,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /kbs/{kb_id}/documents:batch-parse — 批量解析。
+
+        注意：解析引擎字段名是 ``engine``（不是其它端点用的 ``parser_engine``）。
+        返回 ``DocumentBatchResponse``，必须用 ``job_id`` 轮询。
+        """
+        body: dict[str, Any] = {
+            "document_ids": document_ids,
+            "force_reparse": force_reparse,
+            "auto_index": auto_index,
+        }
+        if engine is not None:
+            body["engine"] = engine
+        if process_options is not None:
+            body["process_options"] = process_options
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        response = self._client.post(f"/kbs/{kb_id}/documents:batch-parse", json=body)
+        response.raise_for_status()
+        return response.json()
+
+    def batch_build_kg(
+        self,
+        kb_id: str,
+        document_ids: list[str],
+        *,
+        force_rechunk: bool = False,
+        force_extract: bool = False,
+        force_embedding: bool = False,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /kbs/{kb_id}/documents:batch-build-kg — 批量构建 KG/索引。
+
+        返回 ``DocumentBatchResponse``，必须用 ``job_id`` 轮询。
+        """
+        body: dict[str, Any] = {
+            "document_ids": document_ids,
+            "force_rechunk": force_rechunk,
+            "force_extract": force_extract,
+            "force_embedding": force_embedding,
+        }
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        response = self._client.post(
+            f"/kbs/{kb_id}/documents:batch-build-kg", json=body
+        )
+        response.raise_for_status()
+        return response.json()
+
+    # ---- 文档启用 / 禁用 / 局部更新（同步，直接返回文档）----
+
+    def enable_document(self, kb_id: str, document_id: str) -> dict[str, Any]:
+        """POST /kbs/{kb_id}/documents/{document_id}:enable — 启用文档（纳入检索）。"""
+        response = self._client.post(f"/kbs/{kb_id}/documents/{document_id}:enable")
+        response.raise_for_status()
+        return response.json()
+
+    def disable_document(self, kb_id: str, document_id: str) -> dict[str, Any]:
+        """POST /kbs/{kb_id}/documents/{document_id}:disable — 禁用文档（排除检索）。"""
+        response = self._client.post(f"/kbs/{kb_id}/documents/{document_id}:disable")
+        response.raise_for_status()
+        return response.json()
+
+    def patch_document(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+        enabled: bool | None = None,
+        archived: bool | None = None,
+    ) -> dict[str, Any]:
+        """PATCH /kbs/{kb_id}/documents/{document_id} — 局部更新（仅显式传入字段生效）。"""
+        body: dict[str, Any] = {}
+        if metadata is not None:
+            body["metadata"] = metadata
+        if enabled is not None:
+            body["enabled"] = enabled
+        if archived is not None:
+            body["archived"] = archived
+        response = self._client.patch(
+            f"/kbs/{kb_id}/documents/{document_id}", json=body
+        )
+        response.raise_for_status()
+        return response.json()
+
+    # ---- 重建 / 重索引 / 替换 / 重试（异步 job；调用方用 wait_for_job 跟随，不超时）----
+
+    def reindex_document(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        force_rechunk: bool = True,
+        force_extract: bool = True,
+        force_embedding: bool = True,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /kbs/{kb_id}/documents/{document_id}:reindex — 单文档重索引。
+
+        返回 ``JobResponse``（含 ``id`` + ``status``）。force_* 默认全开（与服务端一致）。
+        """
+        body: dict[str, Any] = {
+            "force_rechunk": force_rechunk,
+            "force_extract": force_extract,
+            "force_embedding": force_embedding,
+        }
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        response = self._client.post(
+            f"/kbs/{kb_id}/documents/{document_id}:reindex", json=body
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def batch_reindex(
+        self,
+        kb_id: str,
+        document_ids: list[str],
+        *,
+        force_rechunk: bool = True,
+        force_extract: bool = True,
+        force_embedding: bool = True,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /kbs/{kb_id}/documents:batch-reindex — 批量重索引。
+
+        返回 ``DocumentBatchResponse``（用 ``job_id`` 轮询）。
+        """
+        body: dict[str, Any] = {
+            "document_ids": document_ids,
+            "force_rechunk": force_rechunk,
+            "force_extract": force_extract,
+            "force_embedding": force_embedding,
+        }
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        response = self._client.post(
+            f"/kbs/{kb_id}/documents:batch-reindex", json=body
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def rebuild_kb_index(
+        self,
+        kb_id: str,
+        *,
+        force_rechunk: bool = True,
+        force_extract: bool = True,
+        force_embedding: bool = True,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /kbs/{kb_id}:rebuild — 重建整库（枚举 parsed/ready/build_failed 文档）。
+
+        返回 ``DocumentBatchResponse``；空库时 ``job_id`` 为空串（no-op）。
+        """
+        body: dict[str, Any] = {
+            "force_rechunk": force_rechunk,
+            "force_extract": force_extract,
+            "force_embedding": force_embedding,
+        }
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        response = self._client.post(f"/kbs/{kb_id}:rebuild", json=body)
+        response.raise_for_status()
+        return response.json()
+
+    def replace_document(
+        self,
+        kb_id: str,
+        document_id: str,
+        source: SourceFile,
+        *,
+        auto_parse: bool = True,
+        auto_index: bool = True,
+        parser_engine: str | None = None,
+        process_options: str | None = None,
+        force_reparse: bool = False,
+        delete_source_file: bool = True,
+        delete_artifacts: bool = True,
+        delete_llm_cache: bool = False,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /kbs/{kb_id}/documents/{document_id}:replace — 用新文件替换文档。
+
+        这是 multipart 上传：只有 ``file`` 在 form-data，其余都是 query 参数。
+        返回 ``JobResponse``；服务端落盘上传字节支持崩溃后 durable resume + :retry 重驱动。
+        """
+        params: dict[str, Any] = {
+            "auto_parse": str(auto_parse).lower(),
+            "auto_index": str(auto_index).lower(),
+            "force_reparse": str(force_reparse).lower(),
+            "delete_source_file": str(delete_source_file).lower(),
+            "delete_artifacts": str(delete_artifacts).lower(),
+            "delete_llm_cache": str(delete_llm_cache).lower(),
+        }
+        if parser_engine is not None:
+            params["parser_engine"] = parser_engine
+        if process_options is not None:
+            params["process_options"] = process_options
+        if idempotency_key is not None:
+            params["idempotency_key"] = idempotency_key
+        with source.path.open("rb") as handle:
+            response = self._client.post(
+                f"/kbs/{kb_id}/documents/{document_id}:replace",
+                params=params,
+                files={"file": (source.path.name, handle, source.content_type)},
+            )
+        response.raise_for_status()
+        return response.json()
+
+    def retry_job(
+        self, kb_id: str, job_id: str, *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """POST /kbs/{kb_id}/jobs/{job_id}:retry — 重试失败/取消的 job，返回新的 JobResponse。"""
+        body: dict[str, Any] = {}
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        response = self._client.post(f"/kbs/{kb_id}/jobs/{job_id}:retry", json=body)
+        response.raise_for_status()
+        return response.json()
+
+    # ---- 查询增强：纯检索 + 流式问答 ----
+
+    def retrieve(
+        self,
+        kb_id: str,
+        question: str,
+        *,
+        mode: str,
+        top_k: int,
+        chunk_top_k: int,
+    ) -> dict[str, Any]:
+        """POST /kbs/{kb_id}/retrieve — 纯检索（不调 LLM 生成答案），返回结构化 data。"""
+        response = self._client.post(
+            f"/kbs/{kb_id}/retrieve",
+            json={
+                "query": question,
+                "mode": mode,
+                "top_k": top_k,
+                "chunk_top_k": chunk_top_k,
+                "include_references": True,
+                "include_chunk_content": False,
+                "stream": False,
+            },
+            timeout=600.0,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def query_stream(
+        self,
+        kb_id: str,
+        question: str,
+        *,
+        mode: str,
+        top_k: int,
+        chunk_top_k: int,
+        include_references: bool = True,
+        include_chunk_content: bool = False,
+    ) -> dict[str, Any]:
+        """POST /kbs/{kb_id}/query/stream — NDJSON 流式问答。
+
+        逐行解析：首行（含 ``kb_id``）携带 ``metadata``/``references``；其后每行
+        ``{"response": <chunk>}`` 为增量 token；``{"error": ...}`` 表示流内错误。
+        聚合所有 token 为完整答案，并附带 ``token_count`` 以证明确实是分块流式返回。
+        """
+        body = {
+            "query": question,
+            "mode": mode,
+            "top_k": top_k,
+            "chunk_top_k": chunk_top_k,
+            "include_references": include_references,
+            "include_chunk_content": include_chunk_content,
+            "stream": True,
+        }
+        chunks: list[str] = []
+        header: dict[str, Any] = {}
+        stream_error: str | None = None
+        with self._client.stream(
+            "POST", f"/kbs/{kb_id}/query/stream", json=body, timeout=600.0
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                if "error" in event:
+                    stream_error = str(event["error"])
+                    continue
+                if "kb_id" in event:
+                    # header line (first), or non-streaming single-line fallback
+                    header = {**header, **event}
+                    if "response" in event:
+                        chunks.append(str(event["response"]))
+                    continue
+                if "response" in event:
+                    chunks.append(str(event["response"]))
+        result: dict[str, Any] = {
+            "kb_id": header.get("kb_id", kb_id),
+            "response": "".join(chunks),
+            "metadata": header.get("metadata"),
+            "references": header.get("references"),
+            "token_count": len(chunks),
+        }
+        if stream_error is not None:
+            result["error"] = stream_error
+        return result
+
+    # ---- 图谱子图导出 ----
+
+    def subgraph(
+        self,
+        kb_id: str,
+        *,
+        label: str = "*",
+        max_depth: int = 3,
+        max_nodes: int = 1000,
+    ) -> dict[str, Any]:
+        """GET /kbs/{kb_id}/graph — 导出子图（``label='*'`` 取全图）。"""
+        response = self._client.get(
+            f"/kbs/{kb_id}/graph",
+            params={"label": label, "max_depth": max_depth, "max_nodes": max_nodes},
+        )
+        response.raise_for_status()
+        return response.json()
+
+    # ---- KB 元数据 / 配置版本 ----
+
+    def update_kb(
+        self,
+        kb_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        visibility: str | None = None,
+    ) -> dict[str, Any]:
+        """PATCH /kbs/{kb_id} — 局部更新 KB 元数据（激活配置须走 :activate，不在此处）。"""
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            body["description"] = description
+        if visibility is not None:
+            body["visibility"] = visibility
+        response = self._client.patch(f"/kbs/{kb_id}", json=body)
+        response.raise_for_status()
+        return response.json()
+
+    def get_config_version(self, kb_id: str, version_id: str) -> dict[str, Any]:
+        """GET /kbs/{kb_id}/configs/{version_id} — 取单个配置版本（含 config 内容与三类 hash）。"""
+        response = self._client.get(f"/kbs/{kb_id}/configs/{version_id}")
+        response.raise_for_status()
+        return response.json()
+
+    def diff_config_version(self, kb_id: str, version_id: str) -> dict[str, Any]:
+        """POST /kbs/{kb_id}/configs/{version_id}:diff — 与当前 active 版本比较（无 body）。
+
+        返回 ``requires_reparse``/``requires_reindex``/``requires_vector_rebuild`` 与 ``reasons``。
+        """
+        response = self._client.post(f"/kbs/{kb_id}/configs/{version_id}:diff")
+        response.raise_for_status()
+        return response.json()
+
+    # ---- 产物：元数据 / 预签名 URL / 下载 / 预览 ----
+
+    def get_artifact(
+        self, kb_id: str, document_id: str, artifact_id: str
+    ) -> dict[str, Any]:
+        """GET .../artifacts/{artifact_id} — 单个产物元数据（uri/checksum/size_bytes 等）。"""
+        response = self._client.get(
+            f"/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}"
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def artifact_download_url(
+        self,
+        kb_id: str,
+        document_id: str,
+        artifact_id: str,
+        *,
+        expires_in_seconds: int = 3600,
+    ) -> dict[str, Any]:
+        """GET .../artifacts/{artifact_id}:download-url — 预签名下载 URL（仅对象存储产物）。"""
+        response = self._client.get(
+            f"/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:download-url",
+            params={"expires_in_seconds": expires_in_seconds},
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def download_artifact(
+        self, kb_id: str, document_id: str, artifact_id: str
+    ) -> bytes:
+        """GET .../artifacts/{artifact_id}:download — 文件字节流（目录型产物为 zip）。"""
+        response = self._client.get(
+            f"/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:download"
+        )
+        response.raise_for_status()
+        return response.content
+
+    def preview_artifact(
+        self, kb_id: str, document_id: str, artifact_id: str
+    ) -> bytes:
+        """GET .../artifacts/{artifact_id}:preview — 内联预览字节流（仅白名单 media type）。"""
+        response = self._client.get(
+            f"/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:preview"
+        )
+        response.raise_for_status()
+        return response.content
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -837,6 +1329,52 @@ def parse_args() -> argparse.Namespace:
             "Reset calls DELETE /kbs/{kb_id}?hard=true and clears落盘文件、"
             "Postgres 记录和对象存储 -- 也是检验 KB 硬删接口的端到端入口。"
         ),
+    )
+    parser.add_argument(
+        "--demo-extras",
+        action="store_true",
+        help=(
+            "Exercise extra read-mostly endpoints after the main flow: /retrieve "
+            "(retrieval without generation), /query/stream (NDJSON streaming), "
+            "/kbs/{id}/graph subgraph export, config get/diff, PATCH /kbs/{id} "
+            "(metadata round-trip), artifact metadata + presigned download-url, a "
+            "document disable/patch/enable round-trip, and jobs:retry on any "
+            "dead-letter job. All safe/reversible; no extraction is re-run."
+        ),
+    )
+    parser.add_argument(
+        "--demo-reindex",
+        action="store_true",
+        help=(
+            "Exercise rebuild endpoints: per-document :reindex, documents:batch-reindex, "
+            "and {kb}:rebuild. These re-run chunk/extract/embedding and can be SLOW; "
+            "they also end-to-end verify vector rebuild after the delayed-embedding "
+            "migration. Jobs are followed without timing out."
+        ),
+    )
+    parser.add_argument(
+        "--demo-replace",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help=(
+            "Exercise documents/{id}:replace by replacing the first ready document "
+            "with FILE (multipart upload + durable resume). Followed without timing out."
+        ),
+    )
+    parser.add_argument(
+        "--demo-ingest-variants",
+        action="store_true",
+        help=(
+            "Exercise non-file ingest channels: documents:texts (a synthetic text "
+            "document) and, when --demo-url is given, documents:urls. Both run "
+            "auto_parse+auto_index and are followed without timing out."
+        ),
+    )
+    parser.add_argument(
+        "--demo-url",
+        default="",
+        help="URL to ingest via documents:urls when --demo-ingest-variants is set.",
     )
     return parser.parse_args()
 
@@ -1080,6 +1618,10 @@ def run(args: argparse.Namespace) -> int:
         else:
             print("[skip] query")
 
+        run_optional_demos(
+            client, args, ready_documents, artifact_summary, run_id, report
+        )
+
         if args.interactive_query and not args.skip_query:
             run_interactive_query(client, args, ready_documents, report)
 
@@ -1137,6 +1679,441 @@ def run(args: argparse.Namespace) -> int:
         raise
     finally:
         client.close()
+
+
+def follow_job_response(
+    client: EnterpriseKBClient,
+    kb_id: str,
+    response: dict[str, Any],
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    """Follow a JobResponse (``id``+``status``) or a DocumentBatchResponse
+    (``job_id``) to a terminal state, reusing ``wait_for_job``'s unbounded follow +
+    408 heartbeat so a long rebuild/reindex/replace never expires client-side.
+
+    Returns the response unchanged when there is nothing to wait on (e.g. an empty
+    ``{kb}:rebuild`` no-op whose ``job_id`` is an empty string, or an already
+    terminal job)."""
+    if response.get("status") in TERMINAL_JOB_STATES:
+        return response
+    job_id = response.get("id") or response.get("job_id")
+    if not job_id:
+        return response
+    return client.wait_for_job(kb_id, str(job_id), timeout_seconds=timeout_seconds)
+
+
+def _first_ready_document(
+    ready_documents: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    return ready_documents[0] if ready_documents else None
+
+
+def _first_artifact_ref(
+    artifact_summary: list[dict[str, Any]],
+) -> tuple[str, str] | None:
+    """First ``(document_id, artifact_id)`` pair across collected artifact summaries."""
+    for entry in artifact_summary:
+        document_id = entry.get("document_id")
+        artifacts = entry.get("artifacts") or {}
+        items = artifacts.get("artifacts") or artifacts.get("items") or []
+        for item in items:
+            artifact_id = item.get("id")
+            if document_id and artifact_id:
+                return str(document_id), str(artifact_id)
+    return None
+
+
+def run_optional_demos(
+    client: EnterpriseKBClient,
+    args: argparse.Namespace,
+    ready_documents: list[dict[str, Any]],
+    artifact_summary: list[dict[str, Any]],
+    run_id: str,
+    report: dict[str, Any],
+) -> None:
+    """Dispatch the opt-in extended-API demos based on CLI flags.
+
+    Every flag is off by default so the baseline demo is unchanged. Each block is
+    independent and records its own ``report["steps"][...]`` entry; jobs are
+    followed via ``follow_job_response`` so long-running work never times out."""
+    if args.demo_ingest_variants and not args.skip_ingest:
+        run_ingest_variants(client, args, run_id, report)
+        refreshed = client.list_documents(args.kb_id, limit=200)
+        report["steps"]["documents_after_ingest_variants"] = refreshed
+        ready_documents = [
+            item
+            for item in refreshed.get("documents", [])
+            if item.get("status") == "ready"
+        ]
+
+    if args.demo_extras:
+        if not args.skip_query:
+            run_query_extras(client, args, ready_documents, report)
+        run_metadata_extras(client, args, artifact_summary, report)
+        run_doc_control(client, args, ready_documents, run_id, report)
+        run_retry_demo(client, args, report)
+
+    if args.demo_replace is not None:
+        run_replace_demo(client, args, ready_documents, run_id, report)
+
+    if args.demo_reindex:
+        run_reindex_demo(client, args, ready_documents, run_id, report)
+
+
+def run_query_extras(
+    client: EnterpriseKBClient,
+    args: argparse.Namespace,
+    ready_documents: list[dict[str, Any]],
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Exercise /retrieve, /query/stream and the /graph subgraph export."""
+    summary: dict[str, Any] = {}
+    retrieve_result = client.retrieve(
+        args.kb_id,
+        args.query,
+        mode=args.mode,
+        top_k=args.top_k,
+        chunk_top_k=args.chunk_top_k,
+    )
+    summary["retrieve"] = retrieve_result
+    print(f"[ok] retrieve status={retrieve_result.get('status')}")
+
+    stream_result = client.query_stream(
+        args.kb_id,
+        args.query,
+        mode=args.mode,
+        top_k=args.top_k,
+        chunk_top_k=args.chunk_top_k,
+    )
+    summary["query_stream"] = stream_result
+    print(
+        f"[ok] query/stream tokens={stream_result.get('token_count')} "
+        f"answer_chars={len(stream_result.get('response') or '')}"
+    )
+
+    subgraph = client.subgraph(args.kb_id, label="*", max_depth=3, max_nodes=200)
+    summary["subgraph"] = {
+        "node_count": len(subgraph.get("nodes") or []),
+        "edge_count": len(subgraph.get("edges") or []),
+        "is_truncated": subgraph.get("is_truncated"),
+    }
+    print(
+        f"[ok] subgraph nodes={summary['subgraph']['node_count']} "
+        f"edges={summary['subgraph']['edge_count']}"
+    )
+    report["steps"]["query_extras"] = summary
+    return summary
+
+
+def run_metadata_extras(
+    client: EnterpriseKBClient,
+    args: argparse.Namespace,
+    artifact_summary: list[dict[str, Any]],
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Exercise config get/diff, PATCH /kbs/{id} round-trip, and artifact metadata
+    + presigned download-url. All reversible / read-mostly."""
+    summary: dict[str, Any] = {}
+
+    config_step = report["steps"].get("config")
+    if isinstance(config_step, dict):
+        activated = config_step.get("activated") or config_step.get("created") or {}
+        version_id = activated.get("id")
+        if version_id:
+            summary["config_version"] = client.get_config_version(
+                args.kb_id, version_id
+            )
+            summary["config_diff"] = client.diff_config_version(args.kb_id, version_id)
+            print(
+                f"[ok] config get+diff version={version_id} "
+                f"requires_reindex={summary['config_diff'].get('requires_reindex')}"
+            )
+    else:
+        summary["config_skipped"] = "no_active_config_in_report"
+
+    # PATCH KB description, then restore it (proves PATCH works without lasting change).
+    original_desc = args.kb_description
+    patched = client.update_kb(
+        args.kb_id, description=f"{original_desc} [demo-extras patched]"
+    )
+    restored = client.update_kb(args.kb_id, description=original_desc)
+    summary["kb_patch"] = {
+        "patched_description": patched.get("description"),
+        "restored_description": restored.get("description"),
+    }
+    print("[ok] PATCH /kbs/{id} description round-trip")
+
+    artifact_ref = _first_artifact_ref(artifact_summary)
+    if artifact_ref is not None:
+        document_id, artifact_id = artifact_ref
+        summary["artifact_metadata"] = client.get_artifact(
+            args.kb_id, document_id, artifact_id
+        )
+        try:
+            url_info = client.artifact_download_url(
+                args.kb_id, document_id, artifact_id, expires_in_seconds=600
+            )
+            summary["artifact_download_url"] = {
+                "filename": url_info.get("filename"),
+                "expires_in_seconds": url_info.get("expires_in_seconds"),
+                "has_url": bool(url_info.get("url")),
+            }
+            print("[ok] artifact metadata + presigned download-url")
+        except httpx.HTTPStatusError as exc:
+            # Presigned URL requires object storage; record the reason on 4xx/5xx.
+            summary["artifact_download_url_error"] = {
+                "status": exc.response.status_code,
+                "detail": exc.response.text[:200],
+            }
+            print(
+                "[warn] artifact download-url unavailable: "
+                f"HTTP {exc.response.status_code}"
+            )
+    else:
+        summary["artifact_skipped"] = "no_artifact_available"
+
+    report["steps"]["metadata_extras"] = summary
+    return summary
+
+
+def run_doc_control(
+    client: EnterpriseKBClient,
+    args: argparse.Namespace,
+    ready_documents: list[dict[str, Any]],
+    run_id: str,
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Disable -> patch metadata -> enable round-trip on the first ready document."""
+    document = _first_ready_document(ready_documents)
+    if document is None:
+        summary: dict[str, Any] = {"skipped": "no_ready_documents"}
+        report["steps"]["doc_control"] = summary
+        return summary
+    document_id = str(document["id"])
+    disabled = client.disable_document(args.kb_id, document_id)
+    patched = client.patch_document(
+        args.kb_id, document_id, metadata={"demo_marker": run_id}
+    )
+    enabled = client.enable_document(args.kb_id, document_id)
+    summary = {
+        "document_id": document_id,
+        "disabled_enabled_flag": disabled.get("enabled"),
+        "patched_metadata_has_marker": bool(
+            (patched.get("metadata") or {}).get("demo_marker")
+        ),
+        "re_enabled_flag": enabled.get("enabled"),
+    }
+    report["steps"]["doc_control"] = summary
+    print(
+        f"[ok] doc disable/patch/enable doc={document_id} "
+        f"re_enabled={summary['re_enabled_flag']}"
+    )
+    return summary
+
+
+def run_retry_demo(
+    client: EnterpriseKBClient,
+    args: argparse.Namespace,
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Retry the first dead-letter job, if any (jobs:retry endpoint)."""
+    dead = report["steps"].get("dead_letters") or {}
+    items = (
+        dead.get("jobs")
+        or dead.get("items")
+        or dead.get("dead_letters")
+        or []
+    )
+    if not items:
+        summary: dict[str, Any] = {"skipped": "no_dead_letter_jobs"}
+        report["steps"]["retry_demo"] = summary
+        return summary
+    job_id = str(items[0].get("id"))
+    retried = client.retry_job(
+        args.kb_id, job_id, idempotency_key=f"demo-retry-{job_id}"
+    )
+    final = follow_job_response(client, args.kb_id, retried, args.job_timeout)
+    summary = {"job_id": job_id, "retried_status": final.get("status")}
+    report["steps"]["retry_demo"] = summary
+    print(f"[ok] jobs:retry job={job_id} -> {final.get('status')}")
+    return summary
+
+
+def run_reindex_demo(
+    client: EnterpriseKBClient,
+    args: argparse.Namespace,
+    ready_documents: list[dict[str, Any]],
+    run_id: str,
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Exercise :reindex (single), documents:batch-reindex and {kb}:rebuild.
+
+    These re-run chunk/extract/embedding, end-to-end verifying that vector rebuild
+    still works after replacing the in-house _VDBUpsertBatcher with upstream's
+    storage-layer delayed embedding. Each job is followed without timing out."""
+    summary: dict[str, Any] = {}
+    document = _first_ready_document(ready_documents)
+    if document is None:
+        summary["skipped"] = "no_ready_documents"
+        report["steps"]["reindex_demo"] = summary
+        return summary
+
+    doc_id = str(document["id"])
+    print(f"[step] reindex document {doc_id}")
+    reindex_job = client.reindex_document(
+        args.kb_id, doc_id, idempotency_key=f"demo-reindex-{run_id}-{doc_id}"
+    )
+    reindex_final = follow_job_response(
+        client, args.kb_id, reindex_job, args.job_timeout
+    )
+    summary["reindex"] = {
+        "job_id": reindex_job.get("id"),
+        "status": reindex_final.get("status"),
+    }
+    if reindex_final.get("status") not in (None, "succeeded"):
+        raise RuntimeError(f"reindex failed: {reindex_final}")
+    print(f"[ok] reindex status={reindex_final.get('status')}")
+
+    doc_ids = [str(item["id"]) for item in ready_documents]
+    print(f"[step] batch-reindex {len(doc_ids)} document(s)")
+    batch_resp = client.batch_reindex(
+        args.kb_id, doc_ids, idempotency_key=f"demo-batch-reindex-{run_id}"
+    )
+    batch_final = follow_job_response(client, args.kb_id, batch_resp, args.job_timeout)
+    summary["batch_reindex"] = {
+        "job_id": batch_resp.get("job_id"),
+        "status": batch_final.get("status"),
+    }
+    print(f"[ok] batch-reindex status={batch_final.get('status')}")
+
+    print("[step] rebuild whole KB")
+    rebuild_resp = client.rebuild_kb_index(
+        args.kb_id, idempotency_key=f"demo-rebuild-{run_id}"
+    )
+    rebuild_final = follow_job_response(
+        client, args.kb_id, rebuild_resp, args.job_timeout
+    )
+    summary["rebuild"] = {
+        "job_id": rebuild_resp.get("job_id"),
+        "status": rebuild_final.get("status")
+        if rebuild_resp.get("job_id")
+        else "noop_empty",
+    }
+    print(f"[ok] rebuild status={summary['rebuild']['status']}")
+
+    report["steps"]["reindex_demo"] = summary
+    return summary
+
+
+def run_replace_demo(
+    client: EnterpriseKBClient,
+    args: argparse.Namespace,
+    ready_documents: list[dict[str, Any]],
+    run_id: str,
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Replace the first ready document's source with --demo-replace FILE."""
+    replace_path = args.demo_replace.resolve()
+    if not replace_path.is_file():
+        raise SystemExit(f"--demo-replace file not found: {replace_path}")
+    document = _first_ready_document(ready_documents)
+    if document is None:
+        summary: dict[str, Any] = {"skipped": "no_ready_documents"}
+        report["steps"]["replace_demo"] = summary
+        return summary
+    document_id = str(document["id"])
+    source = SourceFile(
+        path=replace_path,
+        relative_key=f"enterprise-demo/replace/{replace_path.name}",
+        sha256=hash_file(replace_path),
+        size_bytes=replace_path.stat().st_size,
+        content_type=mimetypes.guess_type(replace_path.name)[0]
+        or "application/octet-stream",
+    )
+    print(f"[step] replace document {document_id} with {replace_path.name}")
+    replace_job = client.replace_document(
+        args.kb_id,
+        document_id,
+        source,
+        parser_engine=args.parser_engine,
+        process_options=args.process_options,
+        idempotency_key=f"demo-replace-{run_id}-{document_id}",
+    )
+    final = follow_job_response(client, args.kb_id, replace_job, args.job_timeout)
+    summary = {
+        "document_id": document_id,
+        "replace_file": str(replace_path),
+        "job_id": replace_job.get("id"),
+        "status": final.get("status"),
+    }
+    report["steps"]["replace_demo"] = summary
+    if final.get("status") not in (None, "succeeded"):
+        raise RuntimeError(f"replace failed: {final}")
+    print(f"[ok] replace status={final.get('status')}")
+    return summary
+
+
+def run_ingest_variants(
+    client: EnterpriseKBClient,
+    args: argparse.Namespace,
+    run_id: str,
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Exercise documents:texts (synthetic text) and optionally documents:urls."""
+    summary: dict[str, Any] = {}
+    text_doc = {
+        "text": (
+            "企业知识库 MVP 文本入库测试。\n"
+            "本段文本通过 documents:texts 端点直接入库，用于验证非文件入库通道、"
+            "解析、实体关系抽取与向量化是否正常工作。"
+        ),
+        "source_name": "demo_text_ingest.txt",
+        "metadata": {"demo_channel": "texts", "run_id": run_id},
+    }
+    print("[step] ingest via documents:texts")
+    texts_resp = client.import_texts(
+        args.kb_id,
+        [text_doc],
+        parser_engine=args.parser_engine,
+        process_options=args.process_options,
+        idempotency_key=f"demo-texts-{run_id}",
+    )
+    texts_final = follow_job_response(client, args.kb_id, texts_resp, args.job_timeout)
+    summary["texts"] = {
+        "job_id": texts_resp.get("job_id"),
+        "status": texts_final.get("status"),
+        "documents": len(texts_resp.get("documents") or []),
+    }
+    print(f"[ok] documents:texts status={texts_final.get('status')}")
+
+    if args.demo_url:
+        url_doc = {
+            "url": args.demo_url,
+            "source_name": "demo_url_ingest",
+            "source_key": f"enterprise-demo/url/{run_id}",
+            "metadata": {"demo_channel": "urls", "run_id": run_id},
+        }
+        print(f"[step] ingest via documents:urls {args.demo_url}")
+        urls_resp = client.import_urls(
+            args.kb_id,
+            [url_doc],
+            parser_engine=args.parser_engine,
+            process_options=args.process_options,
+            idempotency_key=f"demo-urls-{run_id}",
+        )
+        urls_final = follow_job_response(
+            client, args.kb_id, urls_resp, args.job_timeout
+        )
+        summary["urls"] = {
+            "job_id": urls_resp.get("job_id"),
+            "status": urls_final.get("status"),
+        }
+        print(f"[ok] documents:urls status={urls_final.get('status')}")
+    else:
+        summary["urls"] = {"skipped": "no --demo-url provided"}
+
+    report["steps"]["ingest_variants"] = summary
+    return summary
 
 
 def run_sync_flow(
