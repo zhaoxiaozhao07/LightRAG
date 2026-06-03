@@ -1,12 +1,11 @@
 import asyncio
-from contextlib import suppress
 from typing import Any, cast
 
 import pytest
 
 from lightrag.constants import SOURCE_IDS_LIMIT_METHOD_KEEP
 from lightrag.kg.shared_storage import initialize_share_data
-from lightrag.operate import _MergeStageProgress, _VDBUpsertBatcher, merge_nodes_and_edges
+from lightrag.operate import _MergeStageProgress, merge_nodes_and_edges
 
 
 class FakeGraphStorage:
@@ -42,12 +41,6 @@ class CaptureVectorStorage:
 
     async def delete(self, ids):
         self.deletes.append(list(ids))
-
-
-class FailingVectorStorage(CaptureVectorStorage):
-    async def upsert(self, data):
-        await super().upsert(data)
-        raise RuntimeError("upsert boom")
 
 
 class BlockingStatusLock:
@@ -128,7 +121,8 @@ async def test_merge_nodes_and_edges_batches_phase1_entity_vdb_upserts():
         pipeline_status_lock=asyncio.Lock(),
     )
 
-    assert [len(payload) for payload in entities_vdb.upserts] == [2, 1]
+    # batcher removed: entities upsert directly per-merge — assert total/content, not batch shape
+    assert sum(len(payload) for payload in entities_vdb.upserts) == 3
     entity_names = {
         item["entity_name"]
         for payload in entities_vdb.upserts
@@ -165,7 +159,8 @@ async def test_merge_nodes_and_edges_batches_relationship_vdb_upserts_and_delete
         pipeline_status_lock=asyncio.Lock(),
     )
 
-    assert [len(payload) for payload in relationships_vdb.upserts] == [2, 1]
+    # batcher removed: relations upsert directly per-merge (each deletes its 2 old vectors first)
+    assert sum(len(payload) for payload in relationships_vdb.upserts) == 3
     assert sum(len(ids) for ids in relationships_vdb.deletes) == 6
     relation_pairs = {
         (item["src_id"], item["tgt_id"])
@@ -181,63 +176,6 @@ async def test_merge_nodes_and_edges_batches_relationship_vdb_upserts_and_delete
     assert "Phase 2 relation merge" in "\n".join(
         pipeline_status["history_messages"]
     )
-
-
-@pytest.mark.asyncio
-async def test_vdb_upsert_batcher_reschedules_after_empty_flush():
-    storage = CaptureVectorStorage()
-    batcher = _VDBUpsertBatcher(
-        cast(Any, storage),
-        "test_upsert",
-        "records",
-        {"embedding_batch_num": 2},
-        flush_interval_seconds=0,
-    )
-    keep_alive = asyncio.Event()
-    stale_flush_task = asyncio.create_task(keep_alive.wait())
-    batcher._flush_task = stale_flush_task
-
-    try:
-        await batcher._flush_pending()
-        assert batcher._flush_task is None
-
-        await asyncio.wait_for(
-            batcher.submit({"id-1": {"content": "one"}}),
-            timeout=1,
-        )
-    finally:
-        stale_flush_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await stale_flush_task
-
-    assert [list(payload) for payload in storage.upserts] == [["id-1"]]
-
-
-@pytest.mark.asyncio
-async def test_vdb_upsert_batcher_propagates_batch_upsert_failure_to_submitters():
-    storage = FailingVectorStorage()
-    batcher = _VDBUpsertBatcher(
-        cast(Any, storage),
-        "failing_upsert",
-        "records",
-        {"embedding_batch_num": 2},
-        retry_delay=0,
-        flush_interval_seconds=0.01,
-    )
-
-    submitters = [
-        asyncio.create_task(batcher.submit({"id-1": {"content": "one"}})),
-        asyncio.create_task(batcher.submit({"id-2": {"content": "two"}})),
-    ]
-    results = await asyncio.wait_for(
-        asyncio.gather(*submitters, return_exceptions=True),
-        timeout=1,
-    )
-
-    assert len(storage.upserts) == 3
-    assert all(isinstance(result, Exception) for result in results)
-    assert all("failing_upsert" in str(result) for result in results)
-    assert all("upsert boom" in str(result) for result in results)
 
 
 @pytest.mark.asyncio
