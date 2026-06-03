@@ -402,27 +402,75 @@ def test_extraction_config_changes_require_reindex_via_index_hash():
     )
 
 
-def test_active_index_hash_ignores_unsupported_runtime_sections():
+def test_storage_config_rejected_as_deployment_level(tmp_path):
+    with pytest.raises(ValueError, match="storage_config is deployment-level"):
+        ConfigVersionService._derive_hashes(
+            {
+                "chunk_config": {"chunk_size": 512},
+                "storage_config": {"graph_storage": "Neo4j"},
+            }
+        )
+    with pytest.raises(ValueError, match="storage_config is deployment-level"):
+        ConfigVersionService._derive_hashes({"storage_config": None})
+
+    client, *_ = _build_client(tmp_path)
+    _create_kb(client, "kb_storage_cfg_reject")
+
+    for config in (
+        {"storage_config": {"graph_storage": "Neo4j"}},
+        {"storage_config": None},
+    ):
+        response = client.post(
+            "/kbs/kb_storage_cfg_reject/configs",
+            json={"config": config},
+            headers=_HEADERS,
+        )
+
+        assert response.status_code == 400
+        assert "storage_config is deployment-level" in response.json()["detail"]
+
+
+def test_parser_config_rejects_deployment_service_fields(tmp_path):
+    with pytest.raises(ValueError, match="deployment-level parser service fields"):
+        ConfigVersionService._derive_hashes(
+            {
+                "parser_config": {
+                    "engine": "mineru",
+                    "endpoint": "http://mineru.internal:8000",
+                }
+            }
+        )
+
+    client, *_ = _build_client(tmp_path)
+    _create_kb(client, "kb_parser_cfg_reject")
+
+    response = client.post(
+        "/kbs/kb_parser_cfg_reject/configs",
+        json={
+            "config": {
+                "parser_config": {
+                    "engine": "docling",
+                    "api_key": "parser-service-secret",
+                }
+            }
+        },
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 400
+    assert "deployment-level parser service fields" in response.json()["detail"]
+
+
+def test_supported_index_config_changes_still_affect_index_hash():
     base_config = {
         "chunk_config": {"chunk_size": 512},
         "embedding_config": {"model": "bge-m3", "dim": 1024},
-        "storage_config": {"graph_storage": "Neo4j"},
     }
-    changed_unsupported_config = {
-        **base_config,
-        "storage_config": {"graph_storage": "NetworkX"},
-    }
-
-    assert ConfigVersionService._derive_hashes(base_config)[
-        "index_hash"
-    ] == ConfigVersionService._derive_hashes(changed_unsupported_config)[
-        "index_hash"
-    ]
-
     changed_supported_config = {
         **base_config,
         "embedding_config": {"model": "bge-large", "dim": 1024},
     }
+
     assert ConfigVersionService._derive_hashes(base_config)[
         "index_hash"
     ] != ConfigVersionService._derive_hashes(changed_supported_config)[

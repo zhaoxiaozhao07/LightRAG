@@ -54,6 +54,38 @@ _LLM_ROLE_CONFIG_KEYS = frozenset(
         "timeout",
     }
 )
+_DEPLOYMENT_LEVEL_CONFIG_SECTIONS = frozenset({"storage_config"})
+_PARSER_RUNTIME_CONFIG_KEYS = frozenset(
+    {"engine", "parser_engine", "process_options", "options"}
+)
+_PARSER_DEPLOYMENT_CONFIG_KEYS = frozenset(
+    {
+        "api_mode",
+        "endpoint",
+        "endpoint_url",
+        "host",
+        "url",
+        "base_url",
+        "api_key",
+        "api_token",
+        "token",
+        "official_endpoint",
+        "local_endpoint",
+        "mineru_endpoint",
+        "docling_endpoint",
+        "mineru_api_mode",
+        "mineru_api_token",
+        "mineru_official_endpoint",
+        "mineru_local_endpoint",
+        "docling_url",
+        "docling_api_key",
+        "timeout",
+        "poll_interval",
+        "poll_timeout",
+        "max_concurrency",
+        "workers",
+    }
+)
 # Fields that change LLM *output* (and therefore built content / answers).
 # Excludes ``api_key`` (secret, not output-affecting) and perf-only knobs
 # (``max_async`` / ``timeout``).
@@ -360,6 +392,48 @@ def _active_llm_role_runtime_config(
     return runtime
 
 
+def _validate_config_boundaries(config: dict[str, Any]) -> None:
+    """Reject KB config fields that would mutate deployed infrastructure.
+
+    KB config versions may tune per-KB runtime behavior that LightRAG can safely
+    rebuild around (parser defaults, chunking, extraction, query, embedding, and
+    role LLM overrides). They must not switch storage backends, object-store
+    endpoints, or external parser service instances; those are deployment-level
+    .env settings shared by the running service.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("config must be an object")
+
+    for section in _DEPLOYMENT_LEVEL_CONFIG_SECTIONS:
+        if section in config:
+            raise ValueError(
+                f"{section} is deployment-level and cannot be changed by a KB "
+                "config version; update service environment and migrate data "
+                "instead"
+            )
+
+    raw_parser_config = config.get("parser_config")
+    if raw_parser_config is not None and not isinstance(raw_parser_config, dict):
+        raise ValueError("parser_config must be an object")
+    parser_config = _raw_config_section(config, "parser_config")
+    unknown_parser_keys = sorted(
+        key for key in parser_config if key not in _PARSER_RUNTIME_CONFIG_KEYS
+    )
+    if unknown_parser_keys:
+        deployment_keys = [
+            key for key in unknown_parser_keys if key.lower() in _PARSER_DEPLOYMENT_CONFIG_KEYS
+        ]
+        if deployment_keys:
+            raise ValueError(
+                "parser_config contains deployment-level parser service fields "
+                f"that cannot be changed per KB: {', '.join(deployment_keys)}"
+            )
+        raise ValueError(
+            "parser_config only supports engine/parser_engine and "
+            f"process_options/options; unsupported keys: {', '.join(unknown_parser_keys)}"
+        )
+
+
 def active_llm_role_runtime_config_from_version(
     active_config_version: ConfigVersionRecord | None,
 ) -> dict[str, dict[str, Any]]:
@@ -526,10 +600,10 @@ def active_query_metadata_from_rag(rag: Any) -> dict[str, Any]:
 class ConfigVersionService:
     """Persist and activate KB-scoped configuration versions.
 
-    A config version is a frozen snapshot of parser / chunk / embedding /
-    extraction / query / storage settings, plus three derived hashes
-    (``parser_hash``, ``index_hash``, ``query_hash``). Activation simply
-    points the KB record at the new ``active_config_version_id`` and
+    A config version is a frozen snapshot of per-KB runtime defaults (parser,
+    chunking, embedding, extraction, query, and role LLM overrides), plus three
+    derived hashes (``parser_hash``, ``index_hash``, ``query_hash``). Activation
+    simply points the KB record at the new ``active_config_version_id`` and
     discards the cached LightRAG instance so the next request rebuilds it.
     """
 
@@ -551,6 +625,7 @@ class ConfigVersionService:
         created_by: str | None = None,
     ) -> ConfigVersionRecord:
         record = await self._kb_service.get(kb_id)
+        self._validate_config(config)
         derived = self._derive_hashes(config)
         version_record = ConfigVersionRecord(
             id=generate_track_id("cfg"),
@@ -647,6 +722,7 @@ class ConfigVersionService:
 
     @staticmethod
     def _derive_hashes(config: dict[str, Any]) -> dict[str, str]:
+        _validate_config_boundaries(config)
         return {
             "parser_hash": _section_hash(
                 "parser", _active_parser_runtime_config(config)
@@ -654,6 +730,19 @@ class ConfigVersionService:
             "index_hash": _active_index_runtime_hash(config),
             "query_hash": _active_query_runtime_hash(config),
         }
+
+    @staticmethod
+    def _validate_config(config: dict[str, Any]) -> None:
+        _validate_config_boundaries(config)
+        # Force validation of all runtime-applicable sections before persistence
+        # so an invalid version cannot be activated later and break instance
+        # rebuild/query planning.
+        _active_parser_runtime_config(config)
+        _active_chunk_runtime_config(config)
+        _active_embedding_runtime_config(config)
+        _active_query_runtime_config(config)
+        _active_extraction_runtime_config(config)
+        _active_llm_role_runtime_config(config)
 
     @staticmethod
     def _embedding_changed(

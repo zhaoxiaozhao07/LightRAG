@@ -648,7 +648,7 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 
 ## 七、知识库配置版本 Config Versions
 
-> 不可变的 KB 级配置快照。新建配置不会自动生效，需要显式 `:activate` 才会写入 `KnowledgeBase.active_config_version_id` 并 discard 缓存的 LightRAG 实例。当前实现会让后续实例重建或 parse planning 时读取已支持的 active config 字段；未接入的配置项仍应视为 metadata / diff 能力。
+> 不可变的 KB 级配置快照。新建配置不会自动生效，需要显式 `:activate` 才会写入 `KnowledgeBase.active_config_version_id` 并 discard 缓存的 LightRAG 实例。当前实现会让后续实例重建或 parse planning 时读取已支持的 active config 字段；部署级字段会在创建配置版本时直接拒绝，避免单个 KB 修改已经部署好的服务基础设施。
 >
 > 已接入运行时的 active config 字段：
 > - `parser_config`：`engine`/`parser_engine`、`process_options`/`options`。这些字段会在创建配置时校验并规范化，作为解析默认值参与 `parser_hash`，并按“请求 > 文档 metadata > active config > 文件路由”的优先级生效。
@@ -657,7 +657,7 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 > - `query_config`：`top_k`/`chunk_top_k`/`max_entity_tokens`/`max_relation_tokens`/`max_total_tokens`/`related_chunk_number`/`cosine_threshold` 等 QueryParam 字段。
 > - `extraction_config`：`language`（摘要/抽取语言）、`entity_types`（列表，自动渲染成 `entity_types_guidance` 并去重保序）或显式 `entity_types_guidance`（优先于 `entity_types`）、`entity_type_prompt_file`、`max_gleaning`/`max_extraction_records`/`max_extraction_entities`/`force_llm_summary_on_merge`。这些会 overlay 到 `addon_params` 与 LightRAG 抽取构造参数，并纳入 `index_hash`，因此变更会被 `:diff` 标为 `requires_reindex`。
 > - `llm_role_config`：按角色（`extract`/`keyword`/`query`/`vlm`）覆盖运行时 LLM。每个角色可为字符串（等价 `{"model": <str>}`）或对象（`model`/`binding`/`host`/`api_key`/`provider_options`/`model_kwargs`(别名 `kwargs`)/`max_async`/`timeout`）。配置创建时校验角色名与字段名（未知项报错）。实例构建后通过已注册的 role builder 调用 `aupdate_llm_role_config` 应用覆盖，因此 `binding`/`model`/`host`/`api_key` 变更会重建该角色的 LLM func。哈希影响：`extract`/`vlm` 角色的“输出身份”（`binding`/`model`/`host`/`provider_options`/`model_kwargs`，不含 `api_key` 与 `max_async`/`timeout`）纳入 `index_hash`（变更触发 `requires_reindex`）；`query`/`keyword` 角色身份纳入 `query_hash`（仅影响查询，不重建）。轮换 `api_key` 或调 `max_async`/`timeout` 不改变任何哈希、不触发重建。
-> - 仍未接入运行时（仅作 metadata/diff 保存）：parser 服务实例级参数、`storage_config`。
+> - 部署级配置不允许写入 KB config：`storage_config`，以及 `parser_config` 中的 parser 服务实例字段（如 endpoint/base_url/api_key/api_mode/token/timeout/workers/max_concurrency 等）。这些字段必须通过 `.env` / 部署编排统一管理；请求中携带会返回 `400`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -685,7 +685,7 @@ Content-Type: application/json
 }
 ```
 
-返回 `ConfigVersionResponse`，`version` 由服务端按 KB 内单调递增生成。
+返回 `ConfigVersionResponse`，`version` 由服务端按 KB 内单调递增生成。若请求体包含 `storage_config` 或 parser 服务实例级字段（例如 `parser_config.endpoint` / `api_key` / `api_mode`），返回 `400`，不会创建配置版本。
 
 ### 7.2 激活配置
 

@@ -1479,6 +1479,44 @@ class SQLiteMetadataStore:
 
         return await self._write(write)
 
+    async def update_job_payload_patch(
+        self,
+        kb_id: str,
+        job_id: str,
+        *,
+        payload_patch: dict[str, Any],
+    ) -> JobRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> JobRecord:
+            current_row = conn.execute(
+                "SELECT * FROM jobs WHERE kb_id = ? AND id = ?",
+                (kb_id, job_id),
+            ).fetchone()
+            if current_row is None:
+                raise MetadataRecordNotFoundError(f"Job '{job_id}' not found")
+            current = JobRecord.from_row(current_row)
+            payload = dict(current.payload)
+            payload.update(payload_patch)
+            now = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE jobs
+                SET payload_json = ?, updated_at = ?
+                WHERE kb_id = ? AND id = ?
+                """,
+                (_dumps_json(payload), now, kb_id, job_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE kb_id = ? AND id = ?",
+                (kb_id, job_id),
+            ).fetchone()
+            if row is None:
+                raise MetadataRecordNotFoundError(f"Job '{job_id}' not found")
+            return JobRecord.from_row(row)
+
+        return await self._write(write)
+
     async def reset_job_for_retry(
         self,
         kb_id: str,

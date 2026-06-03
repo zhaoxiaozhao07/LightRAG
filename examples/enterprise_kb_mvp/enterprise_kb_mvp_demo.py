@@ -1671,18 +1671,6 @@ def build_enterprise_config(
         "parser_config": {
             "engine": args.parser_engine,
             "process_options": args.process_options,
-            "mineru": {
-                "endpoint": env_snapshot.get("MINERU_LOCAL_ENDPOINT"),
-                "api_mode": env_snapshot.get("MINERU_API_MODE"),
-                "local_backend": env_snapshot.get("MINERU_LOCAL_BACKEND"),
-                "local_parse_method": env_snapshot.get("MINERU_LOCAL_PARSE_METHOD"),
-                "local_image_analysis": _bool_from_snapshot(
-                    env_snapshot, "MINERU_LOCAL_IMAGE_ANALYSIS"
-                ),
-                "language": env_snapshot.get("MINERU_LANGUAGE"),
-                "enable_table": _bool_from_snapshot(env_snapshot, "MINERU_ENABLE_TABLE"),
-                "enable_formula": _bool_from_snapshot(env_snapshot, "MINERU_ENABLE_FORMULA"),
-            },
         },
         "chunk_config": {
             "chunk_size": chunk_size,
@@ -1735,41 +1723,6 @@ def build_enterprise_config(
         },
         "extraction_config": {
             "language": env_snapshot.get("SUMMARY_LANGUAGE") or "Chinese",
-        },
-        "storage_config": {
-            "metadata_backend": env_snapshot.get("LIGHTRAG_KB_METADATA_BACKEND"),
-            "kv_storage": env_snapshot.get("LIGHTRAG_KV_STORAGE"),
-            "doc_status_storage": env_snapshot.get("LIGHTRAG_DOC_STATUS_STORAGE"),
-            "graph_storage": env_snapshot.get("LIGHTRAG_GRAPH_STORAGE"),
-            "vector_storage": env_snapshot.get("LIGHTRAG_VECTOR_STORAGE"),
-            "object_storage": {
-                "backend": env_snapshot.get("LIGHTRAG_OBJECT_STORAGE"),
-                "endpoint": env_snapshot.get("LIGHTRAG_OBJECT_STORAGE_ENDPOINT"),
-                "bucket": env_snapshot.get("LIGHTRAG_OBJECT_STORAGE_BUCKET"),
-                "prefix": env_snapshot.get("LIGHTRAG_OBJECT_STORAGE_PREFIX"),
-                "region": env_snapshot.get("LIGHTRAG_OBJECT_STORAGE_REGION"),
-                "create_bucket": _bool_from_snapshot(
-                    env_snapshot, "LIGHTRAG_OBJECT_STORAGE_CREATE_BUCKET"
-                ),
-                "disable_expect_header": _bool_from_snapshot(
-                    env_snapshot,
-                    "LIGHTRAG_OBJECT_STORAGE_DISABLE_EXPECT_HEADER",
-                    default=True,
-                ),
-            },
-            "milvus": {
-                "uri": env_snapshot.get("MILVUS_URI"),
-                "db_name": env_snapshot.get("MILVUS_DB_NAME"),
-                "user": env_snapshot.get("MILVUS_USER"),
-                "password": env_snapshot.get("MILVUS_PASSWORD"),
-                "token": env_snapshot.get("MILVUS_TOKEN"),
-            },
-            "env_snapshot": env_snapshot,
-        },
-        "enterprise_metadata": {
-            "scenario": "enterprise_kb_mvp_landing_simulation",
-            "source_dir": str(args.source_dir),
-            "created_by_script": "examples/enterprise_kb_mvp/enterprise_kb_mvp_demo.py",
         },
     }
 

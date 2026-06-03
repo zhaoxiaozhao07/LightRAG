@@ -70,27 +70,29 @@ The MVP intentionally exercises all production-facing storage layers:
 
 Yes. The script creates a KB config version with `POST /kbs/{kb_id}/configs` and
 activates it with `POST /kbs/{kb_id}/configs/{config_id}:activate`. The config
-snapshot includes parser options, chunk size/overlap, embedding model/dimension,
-LLM role settings, query limits, rerank settings, selected storage audit fields,
-and a sanitized `.env` snapshot. Once activated, the KB points to that config
-version, and later parse/build/query operations use the active config for the
-runtime-supported fields of that KB.
+snapshot includes only runtime-supported per-KB defaults: parser engine/options,
+chunk size/overlap, embedding model/dimension, LLM role settings, query limits,
+and rerank settings. Deployment-level infrastructure settings are recorded in the
+run report (`env_snapshot` / health output) for audit, but are not posted inside
+the KB config version.
 
 Important examples:
 
 - Chunk settings are stored in `chunk_config.chunk_size` and
   `chunk_config.chunk_overlap_size`.
-- Parser settings are stored in `parser_config`, including MinerU endpoint/mode
-  and `process_options`.
+- Parser defaults are stored in `parser_config.engine` and
+  `parser_config.process_options`. MinerU/Docling endpoints, tokens, service
+  mode, workers, and timeouts are deployment-level `.env` settings managed by
+  the running server, not per-KB config fields.
 - Embedding settings are stored in `embedding_config`; changing embedding model or
   dimension after data has been indexed still requires rebuilding/clearing
   incompatible vector data.
 - Query defaults are stored in `query_config` and are also passed explicitly by
   the demo request so the report captures exactly what was used.
-- Storage settings are stored for auditing, diffing, and report traceability.
-  Current runtime storage backends are still controlled by the running server
-  process configuration; switching KV/vector/graph/doc-status backends requires
-  server-side configuration and compatible data migration/rebuild, not just
+- Storage backends, object storage endpoint/bucket, vector DB URI, and metadata
+  backend are deployment-level settings. They remain visible in the report's
+  sanitized environment/health snapshots for traceability, but switching them
+  requires server-side configuration and compatible data migration/rebuild, not
   activating a different KB config version.
 
 ## Incremental updates from 模拟文件

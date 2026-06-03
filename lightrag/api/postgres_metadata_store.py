@@ -990,6 +990,24 @@ class PostgresMetadataStore:
 
         return await self._write(write)
 
+    async def update_job_payload_patch(
+        self,
+        kb_id: str,
+        job_id: str,
+        *,
+        payload_patch: dict[str, Any],
+    ) -> JobRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> JobRecord:
+            current = await self._get_job(conn, kb_id, job_id, for_update=True)
+            current.payload = {**current.payload, **payload_patch}
+            current.updated_at = utc_now_iso()
+            await self._save_job(conn, current)
+            return current
+
+        return await self._write(write)
+
     async def reset_job_for_retry(
         self, kb_id: str, job_id: str, *, new_idempotency_key: str | None
     ) -> JobRecord:

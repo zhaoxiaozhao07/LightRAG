@@ -377,6 +377,20 @@ class JobService:
             error_message=error_message,
         )
 
+    async def update_job_payload_patch(
+        self,
+        kb_id: str,
+        job_id: str,
+        *,
+        payload_patch: dict[str, Any],
+    ) -> JobRecord:
+        record = await self._kb_service.get(kb_id)
+        return await self._metadata_store.update_job_payload_patch(
+            record.id,
+            job_id,
+            payload_patch=payload_patch,
+        )
+
     async def recover_orphan_jobs(
         self, *, resumable_job_types: set[str] | None = None
     ) -> list[JobRecord]:

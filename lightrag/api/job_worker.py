@@ -40,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
 from lightrag.api.job_service import JobService
-from lightrag.api.metadata_store import JobRecord
+from lightrag.api.metadata_store import JobRecord, MetadataRecordNotFoundError
 from lightrag.utils import logger
 
 # Executor contract: given a freshly-claimed (already ``running``) job, drive
@@ -655,11 +655,40 @@ def build_delete_executor(
     single-document and ``documents:batch-delete`` jobs can resume after a crash.
     """
     from lightrag.api.routers.kb_document_routes import (
+        _capture_graph_footprint,
         _delete_failure_message,
         _delete_job_result,
+        _deserialize_graph_footprint,
         _execute_delete_document_impl,
+        _merge_footprints,
         _run_conservative_kb_rebuild,
+        _run_subgraph_rebuild,
+        _serialize_graph_footprint,
     )
+
+    footprint_payload_key = "rebuild_subgraph_footprints"
+
+    def _serialized_footprints(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        raw_footprints = payload.get(footprint_payload_key)
+        if not isinstance(raw_footprints, list):
+            return []
+        return [item for item in raw_footprints if isinstance(item, dict)]
+
+    def _footprints_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            _deserialize_graph_footprint(item)
+            for item in _serialized_footprints(payload)
+        ]
+
+    async def _persist_footprints(
+        *, kb_id: str, job_id: str, footprints: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        updated_job = await job_service.update_job_payload_patch(
+            kb_id,
+            job_id,
+            payload_patch={footprint_payload_key: footprints},
+        )
+        return updated_job.payload or {footprint_payload_key: footprints}
 
     async def _run_single(job: JobRecord, payload: dict[str, Any]) -> None:
         kb_id = job.kb_id
@@ -678,35 +707,107 @@ def build_delete_executor(
         delete_source_file = bool(payload.get("delete_source_file", False))
         delete_artifacts = bool(payload.get("delete_artifacts", False))
         delete_llm_cache = bool(payload.get("delete_llm_cache", False))
-        document = await document_service.claim_delete(
-            kb_id,
-            str(document_id),
-            job=job,
-            delete_source_file=delete_source_file,
-            delete_artifacts=delete_artifacts,
-        )
-        item = await _execute_delete_document_impl(
-            document_service=document_service,
-            kb_id=kb_id,
-            job_id=job.id,
-            document=document,
-            active_registry=registry,
-            delete_source_file=delete_source_file,
-            delete_artifacts=delete_artifacts,
-            delete_llm_cache=delete_llm_cache,
-        )
+        strategy = payload.get("strategy")
+        persisted_footprints = _serialized_footprints(payload)
+        pre_delete_footprint = _merge_footprints(_footprints_from_payload(payload))
+        document: Any | None = None
+        item: dict[str, Any] | None = None
+        try:
+            document = await document_service.claim_delete(
+                kb_id,
+                str(document_id),
+                job=job,
+                delete_source_file=delete_source_file,
+                delete_artifacts=delete_artifacts,
+            )
+        except MetadataRecordNotFoundError as exc:
+            if (
+                strategy != "rebuild_subgraph"
+                or index_service is None
+                or not persisted_footprints
+            ):
+                await job_service.transition_job(
+                    kb_id,
+                    job.id,
+                    status="failed",
+                    progress=1.0,
+                    failed_items=1,
+                    error_code="document_not_found",
+                    error_message=str(exc),
+                )
+                return
+            item = {
+                "document_id": str(document_id),
+                "status": "succeeded",
+                "lightrag_doc_id": persisted_footprints[0].get("lightrag_doc_id")
+                or payload.get("lightrag_doc_id"),
+                "already_deleted_by_previous_attempt": True,
+            }
+        if document is not None:
+            if strategy == "rebuild_subgraph" and index_service is not None:
+                if not persisted_footprints:
+                    footprint_rag = await registry.get(kb_id)
+                    pre_delete_footprint = await _capture_graph_footprint(
+                        rag=footprint_rag,
+                        lightrag_doc_id=document.lightrag_doc_id,
+                    )
+                    persisted_footprints = [
+                        _serialize_graph_footprint(
+                            pre_delete_footprint,
+                            document_id=document.id,
+                            lightrag_doc_id=document.lightrag_doc_id,
+                        )
+                    ]
+                    payload = await _persist_footprints(
+                        kb_id=kb_id,
+                        job_id=job.id,
+                        footprints=persisted_footprints,
+                    )
+                else:
+                    pre_delete_footprint = _merge_footprints(
+                        _footprints_from_payload(payload)
+                    )
+            item = await _execute_delete_document_impl(
+                document_service=document_service,
+                kb_id=kb_id,
+                job_id=job.id,
+                document=document,
+                active_registry=registry,
+                delete_source_file=delete_source_file,
+                delete_artifacts=delete_artifacts,
+                delete_llm_cache=delete_llm_cache,
+            )
+        if item is None:
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                failed_items=1,
+                error_code="worker_invalid_state",
+                error_message="delete worker produced no item result",
+            )
+            return
         if item["status"] == "succeeded":
             result: dict[str, Any] = {
                 "document_id": item["document_id"],
                 "lightrag_doc_id": item.get("lightrag_doc_id"),
                 "resumed_by_worker": True,
             }
-            if payload.get("strategy") == "rebuild_kb" and index_service is not None:
+            if strategy == "rebuild_kb" and index_service is not None:
                 result["rebuild"] = await _run_conservative_kb_rebuild(
                     document_service=document_service,
                     index_service=index_service,
                     registry=registry,
                     kb_id=kb_id,
+                )
+            elif strategy == "rebuild_subgraph" and index_service is not None:
+                result["rebuild"] = await _run_subgraph_rebuild(
+                    document_service=document_service,
+                    index_service=index_service,
+                    registry=registry,
+                    kb_id=kb_id,
+                    footprint=pre_delete_footprint,
                 )
             await job_service.transition_job(
                 kb_id,
@@ -747,6 +848,13 @@ def build_delete_executor(
         delete_source_file = bool(payload.get("delete_source_file", False))
         delete_artifacts = bool(payload.get("delete_artifacts", False))
         delete_llm_cache = bool(payload.get("delete_llm_cache", False))
+        strategy = payload.get("strategy")
+        persisted_footprints = _serialized_footprints(payload)
+        persisted_doc_ids = {
+            str(item["document_id"])
+            for item in persisted_footprints
+            if isinstance(item.get("document_id"), str)
+        }
         documents, claim_failures = await document_service.claim_batch_delete(
             kb_id,
             document_ids,
@@ -754,9 +862,60 @@ def build_delete_executor(
             delete_source_file=delete_source_file,
             delete_artifacts=delete_artifacts,
         )
-        item_results = [*claim_failures]
+        pre_delete_footprints: list[dict[str, Any]] = _footprints_from_payload(payload)
+        if strategy == "rebuild_subgraph" and index_service is not None:
+            footprint_rag = await registry.get(kb_id)
+            next_persisted = list(persisted_footprints)
+            for document in documents:
+                if document.id in persisted_doc_ids:
+                    continue
+                footprint = await _capture_graph_footprint(
+                    rag=footprint_rag,
+                    lightrag_doc_id=document.lightrag_doc_id,
+                )
+                pre_delete_footprints.append(footprint)
+                next_persisted.append(
+                    _serialize_graph_footprint(
+                        footprint,
+                        document_id=document.id,
+                        lightrag_doc_id=document.lightrag_doc_id,
+                    )
+                )
+            if next_persisted != persisted_footprints:
+                payload = await _persist_footprints(
+                    kb_id=kb_id,
+                    job_id=job.id,
+                    footprints=next_persisted,
+                )
+                persisted_footprints = _serialized_footprints(payload)
+                persisted_doc_ids = {
+                    str(item["document_id"])
+                    for item in persisted_footprints
+                    if isinstance(item.get("document_id"), str)
+                }
+        item_results: list[dict[str, Any]] = []
         completed_items = 0
-        failed_items = len(item_results)
+        failed_items = 0
+        for failure in claim_failures:
+            failed_document_id = failure.get("document_id")
+            if (
+                strategy == "rebuild_subgraph"
+                and index_service is not None
+                and failure.get("error_code") == "document_not_found"
+                and isinstance(failed_document_id, str)
+                and failed_document_id in persisted_doc_ids
+            ):
+                item_results.append(
+                    {
+                        "document_id": failed_document_id,
+                        "status": "succeeded",
+                        "already_deleted_by_previous_attempt": True,
+                    }
+                )
+                completed_items += 1
+                continue
+            item_results.append(failure)
+            failed_items += 1
         for document in documents:
             item = await _execute_delete_document_impl(
                 document_service=document_service,
@@ -781,12 +940,20 @@ def build_delete_executor(
             items=item_results,
         )
         final_result["resumed_by_worker"] = True
-        if payload.get("strategy") == "rebuild_kb" and completed_items > 0 and index_service is not None:
+        if strategy == "rebuild_kb" and completed_items > 0 and index_service is not None:
             final_result["rebuild"] = await _run_conservative_kb_rebuild(
                 document_service=document_service,
                 index_service=index_service,
                 registry=registry,
                 kb_id=kb_id,
+            )
+        elif strategy == "rebuild_subgraph" and completed_items > 0 and index_service is not None:
+            final_result["rebuild"] = await _run_subgraph_rebuild(
+                document_service=document_service,
+                index_service=index_service,
+                registry=registry,
+                kb_id=kb_id,
+                footprint=_merge_footprints(pre_delete_footprints),
             )
         await job_service.transition_job(
             kb_id,

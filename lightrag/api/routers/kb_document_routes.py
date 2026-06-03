@@ -2198,6 +2198,44 @@ def _merge_footprints(footprints: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return {"entities": entities, "relations": relations}
 
 
+def _serialize_graph_footprint(
+    footprint: dict[str, Any],
+    *,
+    document_id: str | None = None,
+    lightrag_doc_id: str | None = None,
+) -> dict[str, Any]:
+    entities = sorted(
+        {str(entity) for entity in footprint.get("entities", set()) if entity}
+    )
+    relations: list[list[str]] = []
+    for relation in footprint.get("relations", set()):
+        if not isinstance(relation, (frozenset, set, tuple, list)) or len(relation) != 2:
+            continue
+        pair = sorted(str(item) for item in relation if item)
+        if len(pair) == 2:
+            relations.append(pair)
+    payload: dict[str, Any] = {"entities": entities, "relations": sorted(relations)}
+    if document_id:
+        payload["document_id"] = document_id
+    if lightrag_doc_id:
+        payload["lightrag_doc_id"] = lightrag_doc_id
+    return payload
+
+
+def _deserialize_graph_footprint(value: Any) -> dict[str, Any]:
+    entities: set[str] = set()
+    relations: set[frozenset] = set()
+    if not isinstance(value, dict):
+        return {"entities": entities, "relations": relations}
+    for entity in value.get("entities", []) or []:
+        if entity:
+            entities.add(str(entity))
+    for pair in value.get("relations", []) or []:
+        if isinstance(pair, (list, tuple)) and len(pair) == 2 and all(pair):
+            relations.add(frozenset((str(pair[0]), str(pair[1]))))
+    return {"entities": entities, "relations": relations}
+
+
 async def _document_overlaps_footprint(
     *, rag: Any, lightrag_doc_id: str | None, footprint: dict[str, Any]
 ) -> bool:
@@ -3441,7 +3479,7 @@ def create_kb_document_routes(
                 detail="files and source_keys must contain the same number of items",
             )
 
-        active_registry = registry
+        active_registry = cast(LightRAGInstanceRegistry, registry)
         active_index_service = index_service
         batch_id: str | None = None
         sync_staged = False
@@ -3837,7 +3875,7 @@ def create_kb_document_routes(
                 status_code=503,
                 detail="KB index build service is not configured",
             )
-        active_registry = registry
+        active_registry = cast(LightRAGInstanceRegistry, registry)
         active_index_service = index_service
         try:
             source_name = file.filename or "uploaded_document"
@@ -4097,7 +4135,7 @@ def create_kb_document_routes(
             delete_graph_orphans=delete_graph_orphans,
             index_service=index_service,
         )
-        active_registry = registry
+        active_registry = cast(LightRAGInstanceRegistry, registry)
         try:
             if idempotency_key is not None:
                 existing_job = await job_service.get_job_by_idempotency_key(
@@ -4174,6 +4212,19 @@ def create_kb_document_routes(
                         pre_delete_footprint = await _capture_graph_footprint(
                             rag=footprint_rag,
                             lightrag_doc_id=document.lightrag_doc_id,
+                        )
+                        await job_service.update_job_payload_patch(
+                            kb_id,
+                            job.id,
+                            payload_patch={
+                                "rebuild_subgraph_footprints": [
+                                    _serialize_graph_footprint(
+                                        pre_delete_footprint,
+                                        document_id=document.id,
+                                        lightrag_doc_id=document.lightrag_doc_id,
+                                    )
+                                ]
+                            },
                         )
                     item = await _execute_delete_document(
                         kb_id=kb_id,
@@ -4285,7 +4336,7 @@ def create_kb_document_routes(
             delete_graph_orphans=request.delete_graph_orphans,
             index_service=index_service,
         )
-        active_registry = registry
+        active_registry = cast(LightRAGInstanceRegistry, registry)
         try:
             batch_id = generate_track_id("batch")
             job, created_job = await job_service.create_batch_delete_job_once(
@@ -4332,13 +4383,25 @@ def create_kb_document_routes(
                     pre_delete_footprints: list[dict[str, Any]] = []
                     if request.strategy == "rebuild_subgraph" and index_service is not None:
                         footprint_rag = cast(Any, await active_registry.get(kb_id))
+                        serialized_footprints: list[dict[str, Any]] = []
                         for document in documents:
-                            pre_delete_footprints.append(
-                                await _capture_graph_footprint(
-                                    rag=footprint_rag,
+                            footprint = await _capture_graph_footprint(
+                                rag=footprint_rag,
+                                lightrag_doc_id=document.lightrag_doc_id,
+                            )
+                            pre_delete_footprints.append(footprint)
+                            serialized_footprints.append(
+                                _serialize_graph_footprint(
+                                    footprint,
+                                    document_id=document.id,
                                     lightrag_doc_id=document.lightrag_doc_id,
                                 )
                             )
+                        await job_service.update_job_payload_patch(
+                            kb_id,
+                            job.id,
+                            payload_patch={"rebuild_subgraph_footprints": serialized_footprints},
+                        )
                     for document in documents:
                         item = await _execute_delete_document(
                             kb_id=kb_id,
@@ -4473,7 +4536,7 @@ def create_kb_document_routes(
                 status_code=503,
                 detail="KB parse service is not configured",
             )
-        active_registry = registry
+        active_registry = cast(LightRAGInstanceRegistry, registry)
         try:
             batch_plan = await document_service.create_batch_parse_plan(
                 kb_id,
@@ -4685,7 +4748,7 @@ def create_kb_document_routes(
                 status_code=503,
                 detail="KB parse service is not configured",
             )
-        active_registry = registry
+        active_registry = cast(LightRAGInstanceRegistry, registry)
         try:
             plan = await document_service.create_parse_plan(
                 kb_id,
@@ -4846,7 +4909,7 @@ def create_kb_document_routes(
                 status_code=503,
                 detail="KB index build service is not configured",
             )
-        active_registry = registry
+        active_registry = cast(LightRAGInstanceRegistry, registry)
         active_index_service = index_service
         rag = await active_registry.get(kb_id)
         plan = await active_index_service.create_build_plan(
@@ -5148,7 +5211,7 @@ def create_kb_document_routes(
                 status_code=503,
                 detail="KB index build service is not configured",
             )
-        active_registry = registry
+        active_registry = cast(LightRAGInstanceRegistry, registry)
         active_index_service = index_service
         rag = await active_registry.get(kb_id)
         batch_plan = await active_index_service.create_batch_build_plan(
