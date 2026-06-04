@@ -16,6 +16,8 @@ class LightRAGLike(Protocol):
 
     async def finalize_storages(self) -> None: ...
 
+    async def adrop_all_storages(self) -> dict: ...
+
 @dataclass(slots=True)
 class RegistryEntry:
     kb_id: str
@@ -184,6 +186,41 @@ class LightRAGInstanceRegistry:
                 return False
             await self._safe_finalize(entry.rag)
             return True
+
+    async def drop_kb_data(self, kb_id: str) -> dict:
+        """Drop ALL engine storage data for a KB via a transient instance.
+
+        Removing ``working_dir/<workspace>`` only purges file-based backends;
+        external backends (PostgreSQL / Milvus / Neo4j / Qdrant / Redis / ...)
+        keep their data in the remote service. This builds an uncached instance
+        through the registry's builder (so storages are initialized), calls
+        :meth:`LightRAGLike.adrop_all_storages`, then finalizes it.
+
+        The caller MUST already hold :meth:`destructive_lock` for ``kb_id`` so the
+        transient instance can't race a concurrent reader/rebuild. The instance is
+        never cached. Returns the drop summary
+        (``{"dropped", "failed", "errors"}``); when the instance does not expose
+        ``adrop_all_storages`` (e.g. a lightweight test fake) an empty summary is
+        returned.
+        """
+        if kb_id not in self._destructive_held:
+            raise DestructiveLockBusyError(
+                f"drop_kb_data requires destructive lock on KB '{kb_id}'"
+            )
+        record = await self._kb_service.get(kb_id, include_deleted=True)
+        rag = await self._builder(record)
+        try:
+            dropper = getattr(rag, "adrop_all_storages", None)
+            if dropper is None:
+                logger.warning(
+                    "Instance for KB '%s' has no adrop_all_storages; "
+                    "external-backend data may be orphaned",
+                    kb_id,
+                )
+                return {"dropped": 0, "failed": 0, "errors": []}
+            return await dropper()
+        finally:
+            await self._safe_finalize(rag)
 
     async def shutdown(self) -> None:
         async with self._locks_guard:

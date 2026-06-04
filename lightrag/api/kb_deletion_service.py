@@ -24,6 +24,7 @@ class KBHardDeleteResult:
     cleared_input_dir: bool = False
     cleared_object_storage: bool = False
     deleted_objects: int = 0
+    dropped_storages: int = 0
     finalized_storages: bool = False
     purged_catalog: bool = False
     errors: list[str] = field(default_factory=list)
@@ -38,11 +39,18 @@ class KBDeletionService:
        request can rebuild the instance underneath us.
     2. Force-evict the in-memory LightRAG instance (calls
        ``finalize_storages``).
-    3. If the KB workspace has on-disk LightRAG storage in
+    3. Drop ALL engine storage data via a transient instance
+       (``registry.drop_kb_data``). Step 4 only removes the on-disk
+       workspace folder, which purges file-based backends; external
+       backends (PostgreSQL / Milvus / Neo4j / Qdrant / Redis / ...) keep
+       their data in the remote service, so we must call each storage's
+       ``drop()`` or it would be orphaned (and visible to a future KB that
+       reuses the same workspace).
+    4. If the KB workspace has on-disk LightRAG storage in
        ``working_dir/<workspace>``, drop the directory.
-    4. Remove ``input_dir/<workspace>`` (uploaded sources + parse
+    5. Remove ``input_dir/<workspace>`` (uploaded sources + parse
        artifacts).
-    5. Purge SQLite control-plane state (documents / jobs / artifacts /
+    6. Purge SQLite control-plane state (documents / jobs / artifacts /
        config versions) for the KB.
 
     The clear_kb job records progress; failures are surfaced both in the
@@ -174,6 +182,20 @@ class KBDeletionService:
                 except Exception as exc:  # noqa: BLE001
                     result.errors.append(f"force_evict: {exc}")
 
+                # Drop the actual engine storage DATA. force_evict above only
+                # closed handles, and the working_dir removal below only purges
+                # file-based backends — external backends (PostgreSQL/Milvus/
+                # Neo4j/Qdrant/Redis/...) keep their data in the remote service,
+                # so we must explicitly drop every storage via a transient
+                # instance or it leaks (and a workspace-reusing KB would read it).
+                try:
+                    drop_summary = await self._registry.drop_kb_data(record.id)
+                    result.dropped_storages = int(drop_summary.get("dropped", 0))
+                    for drop_err in drop_summary.get("errors", []):
+                        result.errors.append(f"drop_storages: {drop_err}")
+                except Exception as exc:  # noqa: BLE001
+                    result.errors.append(f"drop_storages: {exc}")
+
                 if self._working_dir is not None:
                     workspace_dir = (self._working_dir / record.workspace).resolve()
                     self._safe_rmtree(workspace_dir, result, label="working_dir")
@@ -213,6 +235,7 @@ class KBDeletionService:
                     "cleared_input_dir": result.cleared_input_dir,
                     "cleared_object_storage": result.cleared_object_storage,
                     "deleted_objects": result.deleted_objects,
+                    "dropped_storages": result.dropped_storages,
                     "finalized_storages": result.finalized_storages,
                     "errors": result.errors,
                 },

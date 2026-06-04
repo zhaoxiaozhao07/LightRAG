@@ -2019,7 +2019,9 @@ wheels = [
 name = "lightrag-hku"
 source = { editable = "." }
 dependencies = [
+    { name = "aioboto3" },
     { name = "aiohttp" },
+    { name = "asyncpg" },
     { name = "configparser" },
     { name = "google-api-core" },
     { name = "google-genai" },
@@ -2284,12 +2286,14 @@ test = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aioboto3", specifier = ">=15.5.0" },
     { name = "aioboto3", marker = "extra == 'offline-llm'", specifier = ">=12.0.0,<16.0.0" },
     { name = "aiofiles", marker = "extra == 'api'" },
     { name = "aiohttp" },
     { name = "aiohttp", marker = "extra == 'api'" },
     { name = "anthropic", marker = "extra == 'offline-llm'", specifier = ">=0.18.0,<1.0.0" },
     { name = "ascii-colors", marker = "extra == 'api'" },
+    { name = "asyncpg", specifier = ">=0.31.0" },
     { name = "asyncpg", marker = "extra == 'offline-storage'", specifier = ">=0.31.0,<1.0.0" },
     { name = "bcrypt", marker = "extra == 'api'", specifier = ">=4.0.0" },
     { name = "configparser" },

@@ -41,6 +41,9 @@ class FakeRAG:
     async def finalize_storages(self) -> None:
         return None
 
+    async def adrop_all_storages(self) -> dict:
+        return {"dropped": 12, "failed": 0, "errors": []}
+
 
 class BuilderProbe:
     def __init__(self):
@@ -439,7 +442,11 @@ def test_hard_delete_route_purges_control_plane_and_files(tmp_path):
     assert payload["status"] == "deleted"
     assert payload["deleted_at"] is not None
     assert not registry.is_loaded("kb_hard_route")
-    assert probe.finalized == [workspace]
+    # force_evict finalizes the cached instance; drop_kb_data builds a transient
+    # instance to drop engine storages (reaching external backends) and finalizes
+    # it too — both for this workspace.
+    assert set(probe.finalized) == {workspace}
+    assert len(probe.finalized) == 2
     assert not input_workspace.exists()
     assert not working_workspace.exists()
 
@@ -453,6 +460,7 @@ def test_hard_delete_route_purges_control_plane_and_files(tmp_path):
     result = jobs[0].result or {}
     assert result["cleared_input_dir"] is True
     assert result["finalized_storages"] is True
+    assert result["dropped_storages"] == 12
 
 
 def test_missing_kb_returns_404(tmp_path):

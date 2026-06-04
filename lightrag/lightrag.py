@@ -1233,6 +1233,59 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
             self._storages_status = StoragesStatus.FINALIZED
 
+    async def adrop_all_storages(self) -> dict[str, Any]:
+        """Drop ALL engine storage data for this instance's workspace.
+
+        Calls ``drop()`` on every KV / vector / graph / doc-status storage plus
+        the LLM response cache. Unlike removing the on-disk ``working_dir``
+        workspace folder — which only purges file-based backends — this reaches
+        external backends (PostgreSQL / Milvus / Neo4j / Qdrant / Redis / Mongo /
+        OpenSearch) whose data lives in the remote service and would otherwise be
+        orphaned (and visible to a future KB that reuses the same workspace).
+
+        Best-effort: every storage is attempted even when one fails, and a
+        ``drop()`` that returns ``{"status": "error"}`` is counted as a failure.
+        Returns ``{"dropped": int, "failed": int, "errors": [str, ...]}``.
+        """
+        storages = [
+            ("full_docs", self.full_docs),
+            ("text_chunks", self.text_chunks),
+            ("full_entities", self.full_entities),
+            ("full_relations", self.full_relations),
+            ("entity_chunks", self.entity_chunks),
+            ("relation_chunks", self.relation_chunks),
+            ("entities_vdb", self.entities_vdb),
+            ("relationships_vdb", self.relationships_vdb),
+            ("chunks_vdb", self.chunks_vdb),
+            ("chunk_entity_relation_graph", self.chunk_entity_relation_graph),
+            ("llm_response_cache", self.llm_response_cache),
+            ("doc_status", self.doc_status),
+        ]
+        present = [(name, storage) for name, storage in storages if storage is not None]
+        results = await asyncio.gather(
+            *(storage.drop() for _name, storage in present),
+            return_exceptions=True,
+        )
+
+        dropped = 0
+        failed = 0
+        errors: list[str] = []
+        for (name, _storage), result in zip(present, results):
+            if isinstance(result, Exception):
+                failed += 1
+                errors.append(f"{name}: {result}")
+                logger.error(f"Failed to drop storage {name}: {result}")
+            elif isinstance(result, dict) and result.get("status") == "error":
+                failed += 1
+                message = result.get("message", "drop returned error status")
+                errors.append(f"{name}: {message}")
+                logger.error(f"Failed to drop storage {name}: {message}")
+            else:
+                dropped += 1
+                logger.debug(f"Dropped storage {name}")
+
+        return {"dropped": dropped, "failed": failed, "errors": errors}
+
     async def get_graph_labels(self):
         text = await self.chunk_entity_relation_graph.get_all_labels()
         return text

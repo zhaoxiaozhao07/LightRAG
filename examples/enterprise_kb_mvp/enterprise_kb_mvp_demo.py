@@ -55,7 +55,12 @@ DEFAULT_JOB_TIMEOUT = 0.0
 # the client immediately re-issues — a heartbeat that proves liveness and prints
 # progress without holding one HTTP connection open for the whole job.
 JOB_WAIT_SERVER_WINDOW = 120.0
-JOB_WAIT_HTTP_GRACE = 15.0
+# Extra client-side read budget on top of the server window. The server should
+# answer a :wait within JOB_WAIT_SERVER_WINDOW, but when it is briefly saturated
+# (e.g. several large PDFs parsing through one VLM) the response can lag; this
+# grace absorbs that jitter. If it is exceeded anyway, wait_for_job catches the
+# read timeout and re-issues instead of aborting a follow-forever wait.
+JOB_WAIT_HTTP_GRACE = 30.0
 ACTIVE_JOB_STATES = {"queued", "running", "retrying", "cancelling"}
 TERMINAL_JOB_STATES = {"succeeded", "failed", "cancelled"}
 DELETE_STRATEGIES = ("safe", "rebuild_doc_scope", "rebuild_kb", "rebuild_subgraph")
@@ -385,7 +390,10 @@ class EnterpriseKBClient:
         for a long time, and abandoning the wait would not stop the server, it
         would just orphan a job that is still making progress. Each loop issues
         a bounded server-side ``:wait`` (``JOB_WAIT_SERVER_WINDOW``); on its 408
-        heartbeat we re-query the job to print live progress and re-issue.
+        heartbeat we re-query the job to print live progress and re-issue. A
+        client-side read timeout on the ``:wait`` call (server momentarily too
+        busy to answer in time) is treated the same way — caught and re-issued —
+        so transient server saturation never aborts a follow-forever wait.
 
         The job is registered as in-flight for the duration so that an interrupt
         (Ctrl+C / SIGTERM / wait timeout) can cancel it server-side and clean up
@@ -406,11 +414,28 @@ class EnterpriseKBClient:
                 wait_window = min(remaining, JOB_WAIT_SERVER_WINDOW)
             else:
                 wait_window = JOB_WAIT_SERVER_WINDOW
-            response = self._client.post(
-                f"/kbs/{kb_id}/jobs/{job_id}:wait",
-                params={"timeout_seconds": wait_window},
-                timeout=wait_window + JOB_WAIT_HTTP_GRACE,
-            )
+            try:
+                response = self._client.post(
+                    f"/kbs/{kb_id}/jobs/{job_id}:wait",
+                    params={"timeout_seconds": wait_window},
+                    timeout=wait_window + JOB_WAIT_HTTP_GRACE,
+                )
+            except httpx.TimeoutException:
+                # The server-side :wait did not answer within our HTTP read
+                # budget. This happens when the server is briefly saturated
+                # (e.g. several large PDFs parsing through a single VLM), NOT
+                # because the job died — it is still running server-side. A
+                # client-side read timeout must never abort a follow-forever
+                # wait, so re-issue. A finite --job-timeout is still enforced at
+                # the top of the loop on the next iteration, so this cannot
+                # spin past the caller's deadline.
+                elapsed = time.monotonic() - started
+                print(
+                    f"[wait] {job_id} :wait read-timeout after "
+                    f"{wait_window + JOB_WAIT_HTTP_GRACE:.0f}s "
+                    f"({elapsed:.0f}s elapsed); server busy, re-issuing"
+                )
+                continue
             wait_detail = _wait_timeout_detail(response)
             if wait_detail is not None:
                 status = wait_detail.get("current_status")
@@ -1237,11 +1262,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-chunk-content", action="store_true")
     parser.add_argument(
         "--interactive-query",
+        dest="interactive_query",
         action="store_true",
+        default=True,
         help=(
-            "After the scripted query, drop into an interactive Q&A loop: type a "
-            "question, get an answer + references back. Each question is a fresh, "
-            "stateless query (no conversation history). Blank line / 'exit' quits."
+            "Drop into an interactive Q&A loop after the scripted query (DEFAULT: "
+            "on): type a question, get an answer + references back. Each question "
+            "is a fresh, stateless query (no conversation history). Blank line / "
+            "'exit' quits. Auto-skips when stdin is not a TTY (CI / piped runs), "
+            "so non-interactive runs still finish and write the report."
+        ),
+    )
+    parser.add_argument(
+        "--no-interactive-query",
+        dest="interactive_query",
+        action="store_false",
+        help=(
+            "Disable the interactive Q&A loop; run only the scripted query and "
+            "write the JSON report (the previous default behavior)."
         ),
     )
     parser.add_argument(

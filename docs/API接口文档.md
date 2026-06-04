@@ -62,12 +62,13 @@ Content-Type: application/json
 - `PATCH /kbs/{kb_id}`：仅更新请求体显式给出的字段；`status` 不允许直接置为 `deleted`。
 - `DELETE /kbs/{kb_id}`：默认软删除，同步从 `LightRAGInstanceRegistry` 卸载实例。
 - `DELETE /kbs/{kb_id}?hard=true`：触发同步硬删除流程。`KBDeletionService` 在 destructive lock 下依次执行：
-  1. `force_evict` 在内存中的 LightRAG 实例并调用 `finalize_storages`；
-  2. 删除 `working_dir/<workspace>`（如已配置）；
-  3. 删除 `input_dir/<workspace>`（上传文件 + 解析 artifact 的本地 cache）；
-  4. 若启用对象存储，删除该 workspace 下的 source/artifact 对象；
-  5. 清空 metadata store 控制面（documents / jobs / artifacts / config_versions；local 模式为 SQLite，PostgreSQL 模式为对应表）。
-  返回前会创建一条 `clear_kb` 类型的 job 记录最终结果，`result` 包含 `cleared_object_storage` 和 `deleted_objects`；任一步失败 HTTP 500 + `clear_kb` job 终态 `failed`。失败的 `clear_kb` job（`max_retries=3`）可经 `:retry` 重置回 `queued`；启用 durable worker（`LIGHTRAG_KB_JOB_WORKER=true`）时，queued 的 `clear_kb` job 会被孤儿恢复保留并由 worker 通过 `resume_hard_delete` 幂等续跑（`KBDeletionService.enqueue_hard_delete` 也可直接创建 queued job 交给 worker）。
+  1. `force_evict` 在内存中的 LightRAG 实例并调用 `finalize_storages`（关闭存储句柄，不删数据）；
+  2. **drop 全部引擎 storage 数据**：用 registry builder 建一个未缓存的瞬时实例并调用 `LightRAG.adrop_all_storages()`，对 full_docs / text_chunks / entities / relations / chunks / vector / graph / doc_status / llm_cache 等全部 storage 调 `drop()`。下一步删 `working_dir` 只能清文件型后端，外部后端（PostgreSQL / Milvus / Neo4j / Qdrant / Redis / Mongo / OpenSearch）数据在远端服务里，必须经此步显式清除，否则会残留并被复用同 workspace 的新 KB 读到；
+  3. 删除 `working_dir/<workspace>`（如已配置）；
+  4. 删除 `input_dir/<workspace>`（上传文件 + 解析 artifact 的本地 cache）；
+  5. 若启用对象存储，删除该 workspace 下的 source/artifact 对象；
+  6. 清空 metadata store 控制面（documents / jobs / artifacts / config_versions；local 模式为 SQLite，PostgreSQL 模式为对应表）。
+  返回前会创建一条 `clear_kb` 类型的 job 记录最终结果，`result` 包含 `dropped_storages`（成功 drop 的 storage 数）、`cleared_object_storage` 和 `deleted_objects`；任一步失败（含某个 storage `drop()` 失败）HTTP 500 + `clear_kb` job 终态 `failed`，使操作者知道可能有残留并 `:retry`。失败的 `clear_kb` job（`max_retries=3`）可经 `:retry` 重置回 `queued`；启用 durable worker（`LIGHTRAG_KB_JOB_WORKER=true`）时，queued 的 `clear_kb` job 会被孤儿恢复保留并由 worker 通过 `resume_hard_delete` 幂等续跑（`KBDeletionService.enqueue_hard_delete` 也可直接创建 queued job 交给 worker）。
 
 ### 1.3 知识库状态
 

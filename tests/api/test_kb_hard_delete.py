@@ -22,20 +22,33 @@ pytestmark = pytest.mark.offline
 
 
 class FakeRAG:
-    def __init__(self, workspace: str):
+    def __init__(self, workspace: str, *, drop_errors: list[str] | None = None):
         self.workspace = workspace
         self.finalized = False
+        self.dropped = False
+        self._drop_errors = list(drop_errors or [])
 
     async def finalize_storages(self) -> None:
         self.finalized = True
 
+    async def adrop_all_storages(self) -> dict:
+        self.dropped = True
+        if self._drop_errors:
+            return {
+                "dropped": 0,
+                "failed": len(self._drop_errors),
+                "errors": list(self._drop_errors),
+            }
+        return {"dropped": 12, "failed": 0, "errors": []}
+
 
 class BuilderProbe:
-    def __init__(self):
+    def __init__(self, *, drop_errors: list[str] | None = None):
         self.instances: list[FakeRAG] = []
+        self._drop_errors = drop_errors
 
     async def build(self, record) -> FakeRAG:
-        rag = FakeRAG(record.workspace)
+        rag = FakeRAG(record.workspace, drop_errors=self._drop_errors)
         self.instances.append(rag)
         return rag
 
@@ -164,6 +177,13 @@ async def test_hard_delete_purges_metadata_and_input(tmp_path: Path):
     assert result.finalized_storages is True
     assert result.cleared_object_storage is True
     assert result.deleted_objects == 5
+    # Engine storages were dropped via a transient instance — this is what
+    # purges external backends (PostgreSQL/Milvus/Neo4j/...) that removing the
+    # working_dir folder alone cannot reach.
+    assert result.dropped_storages == 12
+    assert any(inst.dropped for inst in probe.instances)
+    assert result.job.result is not None
+    assert result.job.result["dropped_storages"] == 12
     assert object_storage.deleted_workspaces == [record.workspace]
     assert result.job.result is not None
     assert result.job.result["cleared_object_storage"] is True
@@ -316,6 +336,47 @@ async def test_hard_delete_records_errors_when_object_storage_cleanup_fails(tmp_
     assert result.job.result is not None
     assert result.job.result["cleared_object_storage"] is False
     assert result.job.result["deleted_objects"] == 0
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_surfaces_engine_storage_drop_errors(tmp_path: Path):
+    """If dropping engine storages fails (e.g. an external Milvus/PG backend is
+    unreachable), the failure must be surfaced — not silently swallowed —
+    because the working_dir removal alone does NOT purge external backends.
+    The clear_kb job ends ``failed`` so an operator knows data may remain and
+    can ``:retry``."""
+    kb_service = KnowledgeBaseService(tmp_path / "kb.json")
+    await kb_service.initialize()
+    record = await kb_service.create(kb_id="kb_drop_fail", name="Drop Fail")
+
+    store = SQLiteMetadataStore(tmp_path / "metadata.sqlite3")
+    await store.initialize()
+    doc = _doc(record.id, "doc_drop_fail", workspace=record.workspace)
+    job = _job(record.id, record.workspace, job_id="job_drop_fail")
+    await store.create_documents_and_job([doc], job)
+
+    # The transient drop instance reports a backend drop failure.
+    probe = BuilderProbe(drop_errors=["entities_vdb: connection refused"])
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+    deletion_service = KBDeletionService(
+        kb_service,
+        store,
+        registry,
+        input_root=tmp_path / "inputs",
+    )
+
+    await kb_service.delete(record.id)
+    result = await deletion_service.hard_delete(record.id)
+
+    assert result.dropped_storages == 0
+    assert any("drop_storages" in err for err in result.errors)
+    assert any("entities_vdb" in err for err in result.errors)
+    assert result.job.status == "failed"
+    assert result.job.error_code == "kb_hard_delete_failed"
+    assert "drop_storages" in (result.job.error_message or "")
+    # The transient instance was still finalized despite the drop failure.
+    assert any(inst.dropped for inst in probe.instances)
+    assert all(inst.finalized for inst in probe.instances)
 
 
 @pytest.mark.asyncio
