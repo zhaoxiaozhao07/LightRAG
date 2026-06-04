@@ -274,23 +274,25 @@ class IndexBuildService:
             )
 
         track_id = generate_track_id(f"build_{plan.document.id}")
-        # A forced rebuild (``:reindex``, or any explicit ``force_*`` on
-        # ``:build-kg``) must actually re-run the LightRAG pipeline. LightRAG's
-        # enqueue silently drops a document whose id is already present in
-        # ``doc_status`` (``filter_keys``) or whose basename / content-hash
-        # matches an existing row. Because a KB document keeps the SAME
-        # ``lightrag_doc_id`` across rebuilds, re-enqueuing without first
-        # removing the old entry would be a no-op — the force flags would only
-        # bypass the KB-layer skip gate, not the engine-layer dedup. Delete the
-        # old LightRAG document first so the re-enqueue is processed afresh.
-        if plan.force and plan.document.lightrag_doc_id:
+        # Clear any live LightRAG row before (re-)enqueue. LightRAG's enqueue
+        # silently drops a document whose id is already present in ``doc_status``
+        # (``filter_keys``) or whose basename / content-hash matches an existing
+        # row. Because a KB document keeps the SAME ``lightrag_doc_id`` across
+        # rebuilds, re-enqueuing an already-built doc without first removing the
+        # old entry is a no-op — the pipeline does nothing, yet the read-back
+        # stamps the OLD doc_status counts as a fresh success and the new
+        # ``index_hash`` is recorded. That silently re-reports stale counts for a
+        # NON-forced rebuild (e.g. after an index-config change or a reparse).
+        # See ``_build_needs_engine_clear`` for exactly when a row is cleared.
+        if _build_needs_engine_clear(plan):
             deletion_result = await rag.adelete_by_doc_id(plan.document.lightrag_doc_id)
             status = getattr(deletion_result, "status", None)
             if status not in {"success", "not_found"}:
                 raise RuntimeError(
                     getattr(deletion_result, "message", None)
-                    or f"Forced reindex could not clear existing LightRAG doc "
-                    f"'{plan.document.lightrag_doc_id}' (status={status})"
+                    or f"Build could not clear existing LightRAG doc "
+                    f"'{plan.document.lightrag_doc_id}' before re-enqueue "
+                    f"(status={status})"
                 )
         # LightRAG's enqueue performs filename-based dedup against doc_status
         # using the basename of ``file_path``. Two KB documents that share
@@ -371,9 +373,13 @@ class IndexBuildService:
         if not runnable:
             return results
 
-        # Force-clear any pre-existing LightRAG rows so re-enqueue is not deduped.
+        # Clear any live LightRAG row so re-enqueue is not de-duplicated — for
+        # forced rebuilds AND non-forced rebuilds of already-indexed docs (see
+        # ``_build_needs_engine_clear``). Skipping this for a non-forced rebuild
+        # lets the engine dedup the re-enqueue into a no-op and re-report stale
+        # counts as success.
         for plan in runnable:
-            if plan.force and plan.document.lightrag_doc_id:
+            if _build_needs_engine_clear(plan):
                 try:
                     deletion_result = await rag.adelete_by_doc_id(
                         plan.document.lightrag_doc_id
@@ -383,14 +389,14 @@ class IndexBuildService:
                         raise RuntimeError(
                             getattr(deletion_result, "message", None)
                             or (
-                                "Forced reindex could not clear existing "
-                                f"LightRAG doc '{plan.document.lightrag_doc_id}' "
-                                f"(status={status})"
+                                "Build could not clear existing LightRAG doc "
+                                f"'{plan.document.lightrag_doc_id}' before "
+                                f"re-enqueue (status={status})"
                             )
                         )
                 except Exception as exc:  # noqa: BLE001 — record + drop from batch
                     logger.error(
-                        "Forced pre-delete failed for doc '%s' (KB build batch): %s",
+                        "Pre-build delete failed for doc '%s' (KB build batch): %s",
                         plan.document.id,
                         exc,
                     )
@@ -648,6 +654,35 @@ def compute_index_hash(rag: Any) -> str:
         "utf-8"
     )
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _build_needs_engine_clear(plan: IndexBuildPlan) -> bool:
+    """Whether the old LightRAG row must be deleted before a (re-)enqueue.
+
+    LightRAG's enqueue de-duplicates a document whose id is already present
+    (``full_docs`` / ``doc_status`` ``filter_keys``). A KB document keeps the
+    SAME ``lightrag_doc_id`` across rebuilds, so re-enqueuing an already-built
+    doc without deleting it first is a silent no-op that re-reports the stale
+    doc_status counts as success. We clear the old row whenever the document
+    already has a live engine row:
+
+    * ``plan.force`` — an explicit ``:reindex`` / ``force_*`` on ``:build-kg``
+      (unchanged behavior; a never-built id resolves to a cheap ``not_found``).
+    * ``index_hash is not None`` — the document was successfully indexed before
+      and has not since been reset. ``complete_document_build`` stamps
+      ``index_hash``; a ``replace`` clears it (and deletes the engine row
+      itself), so a post-replace first build sees ``None`` and skips the
+      delete; a ``reparse`` preserves it, so a post-reparse rebuild correctly
+      clears the stale row. This is what makes a NON-forced ``:build-kg`` of an
+      already-built document actually rebuild instead of re-reporting stale
+      counts.
+
+    A genuine first build (``index_hash is None``, not forced) has no engine
+    row to clear and is left untouched.
+    """
+    if not plan.document.lightrag_doc_id:
+        return False
+    return plan.force or plan.document.index_hash is not None
 
 
 def _kb_unique_basename(plan: IndexBuildPlan) -> str:

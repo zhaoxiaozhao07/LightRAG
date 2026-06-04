@@ -608,6 +608,7 @@ QUEUE_SIZE_INSERT=4             # 当前 4，建议提到 8（更大的批量缓
 2. **【MED】gather 异常导致 claim 泄漏**：4 处 `asyncio.gather` 缺 `return_exceptions=True`，Phase 1 抛 `BaseException` 会丢弃已 claim `build_queued` 的兄弟结果。**修复**：4 处全加 `return_exceptions=True`，异常按位转 failed item，保证 Phase 2 必达以释放 claim。
 3. **【MED】批量构建途中取消误报**：批量只在开头查一次 cancel，drain 中途取消被报 `build_failed` 而非 `cancelled`。**修复**：read-back 检测 `doc_status.error_msg` 的 `"User cancelled"` 标记，回报 `cancelled`（经 `_cancel_build_item`）。
 4. **【MED·已知/不在本次范围】非强制重建陈旧计数**：非强制重建已 `processed` 的 doc 被引擎 `filter_keys` 跳过、回报陈旧计数为成功。**该缺陷在重构前的单 doc `run_build` 已存在，本次忠实保留**，记为后续单独修复项（replace 路径因显式 `adelete_by_doc_id` 不受影响）。
+   - ✅ **2026-06-04 已修复**：`run_build` / `run_build_batch` 的引擎预删除条件由 `plan.force` 改为 `_build_needs_engine_clear(plan)`（= `lightrag_doc_id and (plan.force or plan.document.index_hash is not None)`）。文档一旦成功建过索引即 `index_hash` 非空（`reparse` 保留、`replace` 显式清空），故非强制重建已建文档时也会先 `adelete_by_doc_id` 清旧引擎行再 re-enqueue，真正重跑流水线、回填新计数；首次构建（`index_hash` 为空且非 force）无引擎行可清、不触发删除，`:reindex`/force 路径逐字节不变。回归测试见 `tests/api/routes/test_kb_build_kg_routes.py::test_run_build_nonforced_rebuild_of_built_doc_clears_stale_row`（单/批两路 + 首建不删除 + reparse 端到端，共 4 个用例）。
 
 ### D.4 配置
 

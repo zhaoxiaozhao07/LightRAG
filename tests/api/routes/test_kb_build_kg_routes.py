@@ -701,6 +701,169 @@ def test_reindex_clears_old_index_before_reenqueue(tmp_path):
     assert after["chunks_count"] == 5
 
 
+def _unit_index_service() -> IndexBuildService:
+    """IndexBuildService for directly unit-testing run_build / run_build_batch.
+
+    ``document_service`` is unused by those methods; a sentinel keeps __init__
+    happy. Fast poll keeps the (already-terminal) read-back snappy."""
+    svc = IndexBuildService(document_service=cast(Any, object()))
+    svc._build_drain_poll = 0.01
+    svc._build_drain_timeout = 5.0
+    return svc
+
+
+def _built_doc_record() -> DocumentRecord:
+    """A record that was successfully built once: ``index_hash`` set + ``ready``.
+    A subsequent NON-forced build must clear the stale engine row first."""
+    document = _document_record()
+    document.status = "ready"
+    document.index_hash = "sha256:old-index"
+    document.chunks_count = 1
+    document.entity_count = 1
+    document.relation_count = 1
+    return document
+
+
+def _nonforced_rebuild_plan(document: DocumentRecord) -> IndexBuildPlan:
+    return IndexBuildPlan(
+        document=document,
+        sidecar_uri="file:///sidecar/",
+        blocks_path=None,
+        parser_hash=document.parser_hash or "sha256:parser",
+        index_hash="sha256:new-index",  # differs from doc.index_hash => not skipped
+        process_options="",
+        force_rechunk=False,
+        force_extract=False,
+        force_embedding=False,
+        skipped=False,
+    )
+
+
+async def test_run_build_nonforced_rebuild_of_built_doc_clears_stale_row():
+    """A NON-forced :build-kg on an already-built doc (index_hash set, live engine
+    row) must delete the stale LightRAG row before re-enqueue — otherwise the
+    engine dedups the re-enqueue into a no-op and the read-back stamps the OLD
+    counts as a fresh success (the historical stale-count defect). Non-forced
+    counterpart of test_reindex_clears_old_index_before_reenqueue."""
+    rag = FakeRAG("workspace")
+    document = _built_doc_record()
+    # Live processed row from the prior build, carrying the OLD (stale) counts.
+    rag.doc_status.stamp_processed(
+        document.lightrag_doc_id, chunks_count=1, entity_count=1, relation_count=1
+    )
+    assert rag.doc_status.stamp_counts[document.lightrag_doc_id] == 1
+
+    run_result = await _unit_index_service().run_build(
+        rag, _nonforced_rebuild_plan(document)
+    )
+
+    # Old row cleared, then re-enqueued and re-processed afresh (not deduped).
+    assert (document.lightrag_doc_id, False) in rag.delete_calls
+    assert rag.doc_status.stamp_counts[document.lightrag_doc_id] == 2
+    # Fresh counts from the real rebuild, not the stale 1/1/1.
+    assert run_result == {
+        "skipped": False,
+        "chunks_count": 5,
+        "entity_count": 12,
+        "relation_count": 7,
+    }
+
+
+async def test_run_build_batch_nonforced_rebuild_of_built_doc_clears_stale_row():
+    """Batch counterpart: run_build_batch must clear the stale row before the bulk
+    enqueue for a non-forced rebuild of an already-built doc."""
+    rag = FakeRAG("workspace")
+    document = _built_doc_record()
+    rag.doc_status.stamp_processed(
+        document.lightrag_doc_id, chunks_count=1, entity_count=1, relation_count=1
+    )
+
+    results = await _unit_index_service().run_build_batch(
+        rag, [_nonforced_rebuild_plan(document)], job_id="job_rebuild"
+    )
+
+    assert (document.lightrag_doc_id, False) in rag.delete_calls
+    assert rag.doc_status.stamp_counts[document.lightrag_doc_id] == 2
+    assert results[document.id] == {
+        "skipped": False,
+        "chunks_count": 5,
+        "entity_count": 12,
+        "relation_count": 7,
+    }
+
+
+async def test_run_build_first_build_does_not_pre_delete():
+    """A genuine first build (index_hash is None, not forced) has no live engine
+    row to clear, so it must NOT issue a delete — guards against over-broadening
+    the fix into a wasted delete on every first build."""
+    rag = FakeRAG("workspace")
+    document = _document_record()  # status "parsed", index_hash None
+    assert document.index_hash is None
+
+    run_result = await _unit_index_service().run_build(
+        rag, _nonforced_rebuild_plan(document)
+    )
+
+    assert rag.delete_calls == []
+    assert rag.doc_status.stamp_counts[document.lightrag_doc_id] == 1
+    assert run_result["chunks_count"] == 5
+
+
+def test_nonforced_build_after_reparse_rebuilds_not_stale(tmp_path):
+    """End-to-end: build a doc to ready, re-parse it (index_hash is preserved and
+    the old engine row stays live), then a NON-forced :build-kg must actually
+    rebuild — clear the old row and re-run the pipeline — not dedup into a
+    stale-count no-op."""
+    client, *_, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_reparse_build")
+    document_id = _upload_and_parse(client, "kb_reparse_build")
+
+    first = client.post(
+        f"/kbs/kb_reparse_build/documents/{document_id}:build-kg",
+        json={},
+        headers=_HEADERS,
+    )
+    assert first.status_code == 200, first.text
+    rag = probe.instances[0]
+    detail = client.get(
+        f"/kbs/kb_reparse_build/documents/{document_id}", headers=_HEADERS
+    ).json()
+    lightrag_doc_id = detail["lightrag_doc_id"]
+    assert detail["status"] == "ready"
+    assert detail["index_hash"] is not None
+    assert rag.doc_status.stamp_counts[lightrag_doc_id] == 1
+    assert rag.delete_calls == []  # first build did not pre-delete
+
+    reparse = client.post(
+        f"/kbs/kb_reparse_build/documents/{document_id}:parse",
+        json={"engine": "mineru", "process_options": "iF", "force_reparse": True},
+        headers=_HEADERS,
+    )
+    assert reparse.status_code == 200, reparse.text
+    reparsed = client.get(
+        f"/kbs/kb_reparse_build/documents/{document_id}", headers=_HEADERS
+    ).json()
+    assert reparsed["status"] == "parsed"
+    # index_hash is preserved across a reparse (only replace clears it), so the
+    # non-forced rebuild below knows there is a live engine row to clear.
+    assert reparsed["index_hash"] is not None
+
+    second = client.post(
+        f"/kbs/kb_reparse_build/documents/{document_id}:build-kg",
+        json={},
+        headers=_HEADERS,
+    )
+    assert second.status_code == 200, second.text
+    second_job = client.get(
+        f"/kbs/kb_reparse_build/jobs/{second.json()['id']}", headers=_HEADERS
+    ).json()
+    assert second_job["status"] == "succeeded"
+    assert second_job["result"]["skipped"] is False
+    assert (lightrag_doc_id, False) in rag.delete_calls  # stale row cleared
+    assert rag.doc_status.stamp_counts[lightrag_doc_id] == 2  # genuinely rebuilt
+    assert len(rag.enqueue_calls) == 2
+
+
 def test_batch_reindex_rebuilds_all_documents(tmp_path):
     """Regression: ``:batch-reindex`` force-rebuilds every document (no
     index_hash skip) and re-enqueues each one through the pipeline."""
