@@ -1522,6 +1522,49 @@ def run(args: argparse.Namespace) -> int:
         report["steps"]["kb"] = kb
         print(f"[ok] kb id={kb['id']} workspace={kb['workspace']}")
 
+        # Hard-delete cleanup-consistency drill. When we just hard-deleted and
+        # re-created this KB, its workspace is reused. If the hard delete failed
+        # to purge the engine storage backends (vector / graph / doc_status / kv)
+        # — the external-backend residue the adrop_all_storages fix targets — the
+        # fresh KB would surface stale documents / nodes / edges from the previous
+        # KB mapped to the same workspace. Assert the reused workspace starts
+        # genuinely empty. Gated on an actual reset; a reused KB (no reset) is
+        # expected to still hold its data. Read failures never block the run.
+        if bool(report["steps"].get("reset", {}).get("performed")):
+            try:
+                post_reset_docs = client.list_documents(args.kb_id, limit=20)
+                post_reset_graph = client.graph_status(args.kb_id)
+            except Exception as verify_exc:  # noqa: BLE001 — never block on a read
+                report["steps"]["post_reset_verification"] = {
+                    "checked": False,
+                    "error": str(verify_exc),
+                }
+                print(f"[warn] post-reset verification skipped: {verify_exc}")
+            else:
+                residual_docs = post_reset_docs.get("total") or len(
+                    post_reset_docs.get("documents", []) or []
+                )
+                residual_nodes = post_reset_graph.get("node_count") or 0
+                residual_edges = post_reset_graph.get("edge_count") or 0
+                report["steps"]["post_reset_verification"] = {
+                    "checked": True,
+                    "documents_total": residual_docs,
+                    "graph_node_count": residual_nodes,
+                    "graph_edge_count": residual_edges,
+                }
+                if residual_docs or residual_nodes or residual_edges:
+                    raise RuntimeError(
+                        "Hard-delete cleanup-consistency violated: the reused "
+                        f"workspace still exposes documents={residual_docs} "
+                        f"graph_nodes={residual_nodes} graph_edges={residual_edges} "
+                        "after hard delete + recreate — stale engine-storage data "
+                        "leaked across the KB lifecycle (adrop_all_storages purge)"
+                    )
+                print(
+                    f"[ok] post-reset clean documents={residual_docs} "
+                    f"nodes={residual_nodes} edges={residual_edges}"
+                )
+
         if not args.skip_config:
             config_body = build_enterprise_config(args, env_snapshot)
             config = client.create_config(
@@ -2643,7 +2686,30 @@ def run_isolation_check(
     overlap = sorted(str(item) for item in primary_doc_ids & isolation_doc_ids if item)
     if overlap:
         raise RuntimeError(f"KB isolation violated; overlapping document ids: {overlap}")
-    return {"kb": isolation_kb, "documents": documents, "query": query_result, "overlap": overlap}
+    # The control KB is never ingested into, so it must stay empty across runs.
+    # An empty control KB that still lists documents — or whose query surfaces
+    # references — would mean the shared vector / graph backend leaked another
+    # KB's content across the workspace boundary, the exact isolation property
+    # this drill exists to prove. Assert both the metadata view (no documents)
+    # and the retrieval view (no references) rather than only recording them.
+    isolation_references = (query_result or {}).get("references") or []
+    if isolation_doc_ids:
+        raise RuntimeError(
+            "KB isolation control is not empty; documents present: "
+            f"{sorted(str(item) for item in isolation_doc_ids if item)}"
+        )
+    if isolation_references:
+        raise RuntimeError(
+            "KB isolation violated: querying the empty control KB returned "
+            f"{len(isolation_references)} reference(s) — cross-workspace content leak"
+        )
+    return {
+        "kb": isolation_kb,
+        "documents": documents,
+        "query": query_result,
+        "overlap": overlap,
+        "control_reference_count": len(isolation_references),
+    }
 
 
 def collect_artifacts(

@@ -58,3 +58,12 @@
 | Access Key   | `admin`                     |
 | Secret Key   | `admin123`                  |
 | 是否使用 SSL | `False`                     |
+
+
+## Neo4j 数据库
+| 配置项         | 值                         |
+| ------------   | -----                      |
+| Neo4j URI      | `bolt://192.168.1.66:7687` |
+| Neo4j 用户名   | `neo4j`                    |
+| Neo4j 密码     | `LightRag@2026`            |
+

@@ -135,6 +135,44 @@ The MVP intentionally exercises all production-facing storage layers:
 - Local input/cache paths: server-side files under the configured input/cache
   directories when the backend uses local staging or parsed artifacts.
 
+## Drill coverage and limitations
+
+This script is an end-to-end integration drill against **real backends**: it
+drives a real running API server (not a test stub / FakeRAG) and writes through
+whatever backends `.env` actually points at. What it can positively verify
+therefore depends on the server's storage configuration.
+
+External backends exercised in the reference run (see the report's
+`env_snapshot`):
+
+- ✅ PostgreSQL — KB control-plane metadata (`LIGHTRAG_KB_METADATA_BACKEND=postgres`).
+- ✅ Milvus — chunk/entity/relation vectors (`LIGHTRAG_VECTOR_STORAGE=MilvusVectorDBStorage`).
+- ✅ MinIO/S3 — source files and parser artifacts (`LIGHTRAG_OBJECT_STORAGE=minio`).
+- ✅ Real LightRAG engine + real MinerU / LLM / embedding / rerank end to end.
+
+External backends NOT yet covered by this drill (file-based in the reference run;
+re-run under the matching profile to cover them):
+
+- ⚠️ Graph backend: the reference run uses `NetworkXStorage` (file-based). For a
+  production **Neo4j**, re-run with `LIGHTRAG_GRAPH_STORAGE=Neo4JStorage` to verify
+  its hard-delete cleanup and workspace isolation.
+- ⚠️ KV / doc_status: the reference run uses `JsonKVStorage` / `JsonDocStatusStorage`
+  (file-based). For PostgreSQL / Redis / MongoDB, re-run under that profile.
+
+Built-in pass/fail assertions (any miss exits non-zero):
+
+- Isolation: the primary KB and the empty control KB share no document ids; the
+  control KB has no documents and a query against it returns **zero references**
+  (a positive check that the shared vector/graph backends honor the workspace
+  boundary).
+- Object persistence: every ready document must carry `metadata.source_object_uri`
+  (the source really landed in MinIO/S3).
+- Hard-delete cleanup consistency: when `--reset-kb` actually runs, the recreated
+  KB's reused workspace must report zero documents / graph nodes / graph edges
+  (a positive regression for the "hard-delete residue + workspace reuse reads
+  stale data" defect).
+- Every ingest/parse/build/reindex/replace step raises and aborts on failure.
+
 ## Per-KB parameter persistence
 
 Yes. The script creates a KB config version with `POST /kbs/{kb_id}/configs` and

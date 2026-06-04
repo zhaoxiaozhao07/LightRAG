@@ -90,6 +90,29 @@ uv run python examples/enterprise_kb_mvp/enterprise_kb_mvp_demo.py `
 - LightRAG 工作区存储：位于配置的 `WORKING_DIR` 下、按 KB 划分的工作区数据，包括 LightRAG 引擎所使用的 KV / doc-status / graph / cache 结构。
 - 本地输入 / 缓存路径：当后端使用本地暂存或解析产物时，位于配置的输入 / 缓存目录中的服务端文件。
 
+## 集成演练覆盖范围与局限
+
+该脚本是一次面向**真实后端**的端到端集成演练：它驱动真实运行的 API server（非测试桩 / FakeRAG），按 `.env` 实际连接的后端落数据。因此它能正面验证的范围取决于服务端 `.env` 的存储后端配置。
+
+参考运行档位（见运行报告 `env_snapshot`）实测覆盖的**外部后端**：
+
+- ✅ PostgreSQL —— KB 控制面元数据（`LIGHTRAG_KB_METADATA_BACKEND=postgres`）。
+- ✅ Milvus —— chunk / entity / relation 向量（`LIGHTRAG_VECTOR_STORAGE=MilvusVectorDBStorage`）。
+- ✅ MinIO / S3 —— 源文件与解析产物对象（`LIGHTRAG_OBJECT_STORAGE=minio`）。
+- ✅ 真实 LightRAG 引擎 + 真实 MinerU / LLM / embedding / rerank 全链路。
+
+**尚未被该演练覆盖的外部后端**（参考档位下为文件型，需切换档位后另行演练）：
+
+- ⚠️ 图后端：参考档位为 `NetworkXStorage`（文件型）。若生产使用 **Neo4j**，需以 `LIGHTRAG_GRAPH_STORAGE=Neo4JStorage` 档位重跑本演练，验证其硬删除清理与 workspace 隔离。
+- ⚠️ KV / doc_status：参考档位为 `JsonKVStorage` / `JsonDocStatusStorage`（文件型）。若生产使用 PostgreSQL / Redis / MongoDB，需切换档位后另行演练。
+
+演练内置的 pass/fail 断言（任一不满足即非零退出）：
+
+- 隔离：主 KB 与空白对照 KB 的文档 id 无重叠；空白对照 KB 确无文档，且对其查询返回**零 references**（共享向量 / 图后端尊重 workspace 边界的正面证明）。
+- 对象持久化：每个 ready 文档的 `metadata.source_object_uri` 必须存在（源文件确已落 MinIO / S3）。
+- 硬删除清理一致性：当 `--reset-kb` 实际执行后，重建同名 KB 时复用 workspace 的文档数 / 图节点数 / 图边数必须为 0（正面回归「硬删除残留 + workspace 复用读到旧数据」缺陷）。
+- 各 ingest / parse / build / reindex / replace 步骤失败即 `raise` 并终止。
+
 ## 按 KB 持久化参数
 
 可以。脚本会通过 `POST /kbs/{kb_id}/configs` 创建一个 KB 配置版本，再通过 `POST /kbs/{kb_id}/configs/{config_id}:activate` 将其激活。该配置快照只包含运行时支持的、按 KB 维度生效的默认项：解析器引擎 / 选项、chunk 大小 / overlap、embedding 模型 / 维度、LLM 角色设置、查询限制，以及 rerank 设置。部署级基础设施设置不会被写入 KB 配置版本，而是记录在运行报告（`env_snapshot` / health 输出）中，用于审计。
