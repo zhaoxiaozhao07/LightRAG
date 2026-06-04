@@ -391,6 +391,33 @@ class JobService:
             payload_patch=payload_patch,
         )
 
+    async def update_job_progress(
+        self,
+        kb_id: str,
+        job_id: str,
+        *,
+        progress: float | None = None,
+        completed_items: int | None = None,
+        stage: str | None = None,
+        result_patch: dict[str, Any] | None = None,
+    ) -> JobRecord:
+        """Patch live progress on a running job without a status transition.
+
+        Thin pass-through to the active metadata store's ``update_job_progress``
+        (see its docstring). Used by long-running job handlers to publish
+        incremental progress and the current pipeline activity message so
+        clients polling the job see live movement instead of a frozen 0%.
+        """
+        record = await self._kb_service.get(kb_id)
+        return await self._metadata_store.update_job_progress(
+            record.id,
+            job_id,
+            progress=progress,
+            completed_items=completed_items,
+            stage=stage,
+            result_patch=result_patch,
+        )
+
     async def recover_orphan_jobs(
         self, *, resumable_job_types: set[str] | None = None
     ) -> list[JobRecord]:

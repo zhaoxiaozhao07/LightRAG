@@ -142,22 +142,35 @@ drives a real running API server (not a test stub / FakeRAG) and writes through
 whatever backends `.env` actually points at. What it can positively verify
 therefore depends on the server's storage configuration.
 
-External backends exercised in the reference run (see the report's
-`env_snapshot`):
+External backends exercised under the current `.env` profile (since 2026-06-04;
+see the report's `env_snapshot`):
 
-- ✅ PostgreSQL — KB control-plane metadata (`LIGHTRAG_KB_METADATA_BACKEND=postgres`).
+- ✅ PostgreSQL (control plane) — KB metadata (`LIGHTRAG_KB_METADATA_BACKEND=postgres`).
 - ✅ Milvus — chunk/entity/relation vectors (`LIGHTRAG_VECTOR_STORAGE=MilvusVectorDBStorage`).
 - ✅ MinIO/S3 — source files and parser artifacts (`LIGHTRAG_OBJECT_STORAGE=minio`).
 - ✅ Real LightRAG engine + real MinerU / LLM / embedding / rerank end to end.
+- 🆕 PostgreSQL (engine) — KV + doc_status (`LIGHTRAG_KV_STORAGE=PGKVStorage` /
+  `LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage`), switched from the Json file
+  backend on 2026-06-04.
+- 🆕 Neo4j — knowledge graph (`LIGHTRAG_GRAPH_STORAGE=Neo4JStorage`), switched from
+  the NetworkX file backend on 2026-06-04; KBs are isolated by workspace node label.
 
-External backends NOT yet covered by this drill (file-based in the reference run;
-re-run under the matching profile to cover them):
+Prerequisites and confirmation for the 🆕 items (handle before the first run on the
+new `.env`):
 
-- ⚠️ Graph backend: the reference run uses `NetworkXStorage` (file-based). For a
-  production **Neo4j**, re-run with `LIGHTRAG_GRAPH_STORAGE=Neo4JStorage` to verify
-  its hard-delete cleanup and workspace isolation.
-- ⚠️ KV / doc_status: the reference run uses `JsonKVStorage` / `JsonDocStatusStorage`
-  (file-based). For PostgreSQL / Redis / MongoDB, re-run under that profile.
+- **Rebuild data**: switching backends does not migrate old data — the prior
+  NetworkX/Json files under `rag_storage/` are invisible to the new backends, so
+  each KB needs one full rebuild (re-ingest / `:rebuild`) to populate Neo4j + PG.
+- **Install the driver**: the Neo4j driver is an optional dependency — run
+  `uv pip install "neo4j>=5,<7"` (or `uv sync --extra offline-storage`) first, or
+  the server fails to start.
+- **Confirmation scope**: the three ✅ items (PG control plane / Milvus / MinIO) are
+  confirmed by prior runs; the 🆕 items (engine PG, Neo4j) need one full rebuild run
+  on the new `.env` to confirm their hard-delete cleanup consistency and isolation —
+  at which point the assertions below run against Neo4j + PG for real.
+
+> Other backends (Redis / MongoDB / Qdrant, or reverting to file-based
+> `JsonKVStorage` / `NetworkXStorage`) require a separate run under that profile.
 
 Built-in pass/fail assertions (any miss exits non-zero):
 

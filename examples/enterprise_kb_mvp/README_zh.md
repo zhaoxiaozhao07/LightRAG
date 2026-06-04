@@ -94,17 +94,22 @@ uv run python examples/enterprise_kb_mvp/enterprise_kb_mvp_demo.py `
 
 该脚本是一次面向**真实后端**的端到端集成演练：它驱动真实运行的 API server（非测试桩 / FakeRAG），按 `.env` 实际连接的后端落数据。因此它能正面验证的范围取决于服务端 `.env` 的存储后端配置。
 
-参考运行档位（见运行报告 `env_snapshot`）实测覆盖的**外部后端**：
+当前 `.env` 档位（2026-06-04 起）下，演练实测覆盖的**外部后端**（见运行报告 `env_snapshot`）：
 
-- ✅ PostgreSQL —— KB 控制面元数据（`LIGHTRAG_KB_METADATA_BACKEND=postgres`）。
+- ✅ PostgreSQL（控制面）—— KB 元数据（`LIGHTRAG_KB_METADATA_BACKEND=postgres`）。
 - ✅ Milvus —— chunk / entity / relation 向量（`LIGHTRAG_VECTOR_STORAGE=MilvusVectorDBStorage`）。
 - ✅ MinIO / S3 —— 源文件与解析产物对象（`LIGHTRAG_OBJECT_STORAGE=minio`）。
 - ✅ 真实 LightRAG 引擎 + 真实 MinerU / LLM / embedding / rerank 全链路。
+- 🆕 PostgreSQL（引擎）—— KV + doc_status（`LIGHTRAG_KV_STORAGE=PGKVStorage` / `LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage`），2026-06-04 由 Json 文件后端切换为外部 PG。
+- 🆕 Neo4j —— 知识图谱（`LIGHTRAG_GRAPH_STORAGE=Neo4JStorage`），2026-06-04 由 NetworkX 文件后端切换为外部 Neo4j；KB 间靠 workspace 节点 label 隔离。
 
-**尚未被该演练覆盖的外部后端**（参考档位下为文件型，需切换档位后另行演练）：
+🆕 标记项的前置条件与确认（首次以新 `.env` 跑前务必处理）：
 
-- ⚠️ 图后端：参考档位为 `NetworkXStorage`（文件型）。若生产使用 **Neo4j**，需以 `LIGHTRAG_GRAPH_STORAGE=Neo4JStorage` 档位重跑本演练，验证其硬删除清理与 workspace 隔离。
-- ⚠️ KV / doc_status：参考档位为 `JsonKVStorage` / `JsonDocStatusStorage`（文件型）。若生产使用 PostgreSQL / Redis / MongoDB，需切换档位后另行演练。
+- **重建数据**：后端切换不迁移旧数据——原 `rag_storage/` 下 NetworkX/Json 文件对新后端不可见，需对每个 KB 走一次完整重建（re-ingest / `:rebuild`）写入 Neo4j + PG。
+- **安装驱动**：Neo4j 驱动为可选依赖——先 `uv pip install "neo4j>=5,<7"`（或 `uv sync --extra offline-storage`），否则服务启动失败。
+- **确认范围**：「✅」三项（PG 控制面 / Milvus / MinIO）已由历史运行确认；「🆕」两项（引擎 PG、Neo4j）的硬删除清理一致性与隔离需以新 `.env` 完整重建一次本演练确认——届时下方的「硬删除清理一致性」与「隔离」断言会在 Neo4j + PG 上实际生效。
+
+> 若改用其它后端（Redis / MongoDB / Qdrant 等），或改回文件型（`JsonKVStorage` / `NetworkXStorage`），需切到对应档位后另行演练。
 
 演练内置的 pass/fail 断言（任一不满足即非零退出）：
 

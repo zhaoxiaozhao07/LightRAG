@@ -86,7 +86,9 @@ SENSITIVE_ENV_KEYS = {
     "LIGHTRAG_OBJECT_STORAGE_ACCESS_KEY_ID",
     "LIGHTRAG_OBJECT_STORAGE_SECRET_ACCESS_KEY",
     "LLM_BINDING_API_KEY",
+    "NEO4J_PASSWORD",
     "OPENAI_API_KEY",
+    "POSTGRES_PASSWORD",
     "RERANK_BINDING_API_KEY",
     "TOKEN_SECRET",
     "VLM_LLM_BINDING_API_KEY",
@@ -174,6 +176,14 @@ ENV_SNAPSHOT_KEYS = (
     "MILVUS_USER",
     "MILVUS_PASSWORD",
     "MILVUS_TOKEN",
+    "NEO4J_URI",
+    "NEO4J_USERNAME",
+    "NEO4J_DATABASE",
+    "POSTGRES_HOST",
+    "POSTGRES_PORT",
+    "POSTGRES_USER",
+    "POSTGRES_DATABASE",
+    "POSTGRES_MAX_CONNECTIONS",
 )
 
 
@@ -470,6 +480,13 @@ class EnterpriseKBClient:
                 parts.append(f"progress={progress:.0%}")
             if parts:
                 detail = " " + " ".join(parts)
+            # Surface the live pipeline activity the server mirrors into the job
+            # result (e.g. "Extract entities 120/340"), so a long opaque build
+            # phase shows what it is doing even when the percentage moves coarsely.
+            pipeline = (job.get("result") or {}).get("pipeline") or {}
+            message = pipeline.get("latest_message")
+            if message:
+                detail += f" :: {message}"
         except Exception:  # noqa: BLE001 — heartbeat must never break the wait
             detail = ""
         print(f"[wait] {job_id} {status} ({elapsed:.0f}s elapsed){detail}; continuing")

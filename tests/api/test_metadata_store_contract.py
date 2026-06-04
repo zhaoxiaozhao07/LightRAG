@@ -237,6 +237,56 @@ async def test_job_transition_and_invalid_transition(store):
         await store.transition_job(kb_id, "job_t", status="running")
 
 
+async def test_update_job_progress_patches_live_without_status_change(store):
+    kb_id = _unique_kb(store)
+    await store.create_documents_and_job(
+        [_doc(kb_id, "doc_a")], _job(kb_id, "job_p", document_id="doc_a")
+    )
+    await store.transition_job(
+        kb_id, "job_p", status="running", stage="building", result={"keep": 1}
+    )
+
+    # Live patch progress + completed_items + a shallow-merged result patch,
+    # all WITHOUT a status change. running -> running is not a legal transition,
+    # so this must NOT go through the state machine.
+    patched = await store.update_job_progress(
+        kb_id,
+        "job_p",
+        progress=0.5,
+        completed_items=2,
+        result_patch={"pipeline": {"latest_message": "Extract entities 1/4"}},
+    )
+    assert patched.status == "running"  # unchanged
+    assert patched.stage == "building"  # preserved (not supplied)
+    assert patched.progress == 0.5
+    assert patched.completed_items == 2
+    assert patched.result == {
+        "keep": 1,
+        "pipeline": {"latest_message": "Extract entities 1/4"},
+    }
+
+    # Omitted fields are preserved; result is left intact when no patch is given.
+    patched2 = await store.update_job_progress(kb_id, "job_p", progress=0.75)
+    assert patched2.completed_items == 2
+    assert patched2.progress == 0.75
+    assert patched2.result == {
+        "keep": 1,
+        "pipeline": {"latest_message": "Extract entities 1/4"},
+    }
+
+    # Once terminal, a late progress poll is ignored — it cannot resurrect or
+    # overwrite the job's authoritative terminal snapshot.
+    await store.transition_job(
+        kb_id, "job_p", status="succeeded", progress=1.0, completed_items=4
+    )
+    ignored = await store.update_job_progress(
+        kb_id, "job_p", progress=0.1, completed_items=0
+    )
+    assert ignored.status == "succeeded"
+    assert ignored.progress == 1.0
+    assert ignored.completed_items == 4
+
+
 async def test_retry_resets_job_and_enforces_max_retries(store):
     kb_id = _unique_kb(store)
     await store.create_documents_and_job(

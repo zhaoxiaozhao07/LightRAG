@@ -1008,6 +1008,45 @@ class PostgresMetadataStore:
 
         return await self._write(write)
 
+    async def update_job_progress(
+        self,
+        kb_id: str,
+        job_id: str,
+        *,
+        progress: float | None = None,
+        completed_items: int | None = None,
+        stage: str | None = None,
+        result_patch: dict[str, Any] | None = None,
+    ) -> JobRecord:
+        """Patch live progress on a running job WITHOUT changing its status.
+
+        Unlike :meth:`transition_job` this never touches ``status`` (so it
+        bypasses the status state-machine and can be called repeatedly while a
+        job runs) and never touches ``error_*`` / timestamps. ``result_patch``
+        is shallow-merged into the existing ``result``. Patches are silently
+        ignored once the job has left an active state, so a late progress poll
+        cannot resurrect / overwrite a finished job's terminal snapshot.
+        """
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> JobRecord:
+            current = await self._get_job(conn, kb_id, job_id, for_update=True)
+            if current.status not in {"running", "retrying", "cancelling"}:
+                return current
+            if progress is not None:
+                current.progress = progress
+            if completed_items is not None:
+                current.completed_items = completed_items
+            if stage is not None:
+                current.stage = stage
+            if result_patch is not None:
+                current.result = {**(current.result or {}), **result_patch}
+            current.updated_at = utc_now_iso()
+            await self._save_job(conn, current)
+            return current
+
+        return await self._write(write)
+
     async def reset_job_for_retry(
         self, kb_id: str, job_id: str, *, new_idempotency_key: str | None
     ) -> JobRecord:

@@ -1517,6 +1517,71 @@ class SQLiteMetadataStore:
 
         return await self._write(write)
 
+    async def update_job_progress(
+        self,
+        kb_id: str,
+        job_id: str,
+        *,
+        progress: float | None = None,
+        completed_items: int | None = None,
+        stage: str | None = None,
+        result_patch: dict[str, Any] | None = None,
+    ) -> JobRecord:
+        """Patch live progress on a running job WITHOUT changing its status.
+
+        Unlike :meth:`transition_job` this never touches ``status`` (so it
+        bypasses the status state-machine and can be called repeatedly while a
+        job runs) and never touches ``error_*`` / timestamps. ``result_patch``
+        is shallow-merged into the existing ``result``. Patches are silently
+        ignored once the job has left an active state, so a late progress poll
+        cannot resurrect / overwrite a finished job's terminal snapshot.
+        """
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> JobRecord:
+            current_row = conn.execute(
+                "SELECT * FROM jobs WHERE kb_id = ? AND id = ?",
+                (kb_id, job_id),
+            ).fetchone()
+            if current_row is None:
+                raise MetadataRecordNotFoundError(f"Job '{job_id}' not found")
+            current = JobRecord.from_row(current_row)
+            if current.status not in {"running", "retrying", "cancelling"}:
+                return current
+            merged_result = current.result
+            if result_patch is not None:
+                merged_result = {**(current.result or {}), **result_patch}
+            conn.execute(
+                """
+                UPDATE jobs
+                SET progress = ?, completed_items = ?, stage = ?,
+                    result_json = ?, updated_at = ?
+                WHERE kb_id = ? AND id = ?
+                """,
+                (
+                    progress if progress is not None else current.progress,
+                    completed_items
+                    if completed_items is not None
+                    else current.completed_items,
+                    stage if stage is not None else current.stage,
+                    _dumps_json(merged_result)
+                    if merged_result is not None
+                    else current_row["result_json"],
+                    utc_now_iso(),
+                    kb_id,
+                    job_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE kb_id = ? AND id = ?",
+                (kb_id, job_id),
+            ).fetchone()
+            if row is None:
+                raise MetadataRecordNotFoundError(f"Job '{job_id}' not found")
+            return JobRecord.from_row(row)
+
+        return await self._write(write)
+
     async def reset_job_for_retry(
         self,
         kb_id: str,

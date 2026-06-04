@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import io
 import ipaddress
@@ -1662,6 +1663,75 @@ async def _execute_build_plan(
         }
 
 
+@contextlib.asynccontextmanager
+async def _mirror_pipeline_progress(
+    *,
+    job_service: "JobService | None",
+    kb_id: str,
+    job_id: str,
+    rag: Any,
+    poll_interval: float = 3.0,
+):
+    """Mirror the KB's live LightRAG ``pipeline_status`` into the job while a
+    long parse/build drain runs, so a client polling the job sees the current
+    activity ("Extract entities 120/340") instead of a frozen snapshot.
+
+    Spawns a background task that every ``poll_interval`` seconds reads
+    ``pipeline_status`` for the KB's workspace and patches the job's
+    ``result["pipeline"]`` (``latest_message`` + ``cur_batch`` / ``batchs`` /
+    ``docs``). It deliberately does **not** write ``progress`` /
+    ``completed_items`` — those stay owned by the per-document counters in the
+    job handlers, so this mirror can wrap any drain without fighting them.
+    Fully best-effort: any read/write error is swallowed (observability must
+    never break a build) and the task is always cancelled on exit.
+    """
+    if job_service is None or rag is None:
+        yield
+        return
+
+    workspace = str(getattr(rag, "workspace", "") or "")
+    stop = asyncio.Event()
+
+    async def _poll() -> None:
+        from lightrag.kg.shared_storage import get_namespace_data
+
+        last_message: str | None = None
+        while not stop.is_set():
+            try:
+                ps = await get_namespace_data("pipeline_status", workspace=workspace)
+                latest = ps.get("latest_message")
+                message = str(latest) if latest else None
+                if message and message != last_message:
+                    last_message = message
+                    await job_service.update_job_progress(
+                        kb_id,
+                        job_id,
+                        result_patch={
+                            "pipeline": {
+                                "latest_message": message,
+                                "cur_batch": int(ps.get("cur_batch") or 0),
+                                "batchs": int(ps.get("batchs") or 0),
+                                "docs": int(ps.get("docs") or 0),
+                            }
+                        },
+                    )
+            except Exception:  # noqa: BLE001 — observability never breaks the build
+                pass
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=poll_interval)
+            except asyncio.TimeoutError:
+                pass
+
+    task = asyncio.create_task(_poll())
+    try:
+        yield
+    finally:
+        stop.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
 async def _execute_build_plan_batch(
     *,
     index_service: IndexBuildService,
@@ -1741,9 +1811,12 @@ async def _execute_build_plan_batch(
 
     if runnable:
         try:
-            run_results = await index_service.run_build_batch(
-                rag, runnable, job_id=job_id
-            )
+            async with _mirror_pipeline_progress(
+                job_service=job_service, kb_id=kb_id, job_id=job_id, rag=rag
+            ):
+                run_results = await index_service.run_build_batch(
+                    rag, runnable, job_id=job_id
+                )
         except Exception as exc:  # noqa: BLE001 — batch-level failure
             logger.error(
                 "KG build batch failed for KB '%s' (job '%s'): %s",
@@ -3624,9 +3697,13 @@ def create_kb_document_routes(
                     )
                     parse_sem = asyncio.Semaphore(parse_concurrency)
 
+                    parsed_count = 0
+                    total_sources = len(prepared_sources)
+
                     async def _do_one_sync_item(
                         prepared_item: dict[str, Any],
                     ) -> dict[str, Any]:
+                        nonlocal parsed_count
                         async with parse_sem:
                             item, _ = await _execute_sync_item(
                                 document_service=document_service,
@@ -3649,6 +3726,25 @@ def create_kb_document_routes(
                                 delete_llm_cache=delete_llm_cache,
                                 defer_build=True,
                             )
+                        parsed_count += 1
+                        done = parsed_count
+                        try:
+                            await job_service.update_job_progress(
+                                kb_id,
+                                job.id,
+                                completed_items=done,
+                                progress=0.5 * done / max(total_sources, 1),
+                                result_patch={
+                                    "pipeline": {
+                                        "latest_message": (
+                                            f"Parsed {done}/{total_sources} "
+                                            "document(s); building knowledge graph…"
+                                        )
+                                    }
+                                },
+                            )
+                        except Exception:  # noqa: BLE001 — progress is best-effort
+                            pass
                         return item
 
                     raw_sync = await asyncio.gather(
@@ -5014,14 +5110,20 @@ def create_kb_document_routes(
                     kb_id, job.id, status="running", progress=0.1
                 )
                 inner_rag = await active_registry.get(kb_id)
-                item = await _execute_build_plan(
-                    index_service=active_index_service,
+                async with _mirror_pipeline_progress(
+                    job_service=job_service,
                     kb_id=kb_id,
                     job_id=job.id,
-                    plan=plan,
                     rag=inner_rag,
-                    job_service=job_service,
-                )
+                ):
+                    item = await _execute_build_plan(
+                        index_service=active_index_service,
+                        kb_id=kb_id,
+                        job_id=job.id,
+                        plan=plan,
+                        rag=inner_rag,
+                        job_service=job_service,
+                    )
                 if item["status"] == "cancelled":
                     await job_service.transition_job(
                         kb_id,
@@ -5300,23 +5402,48 @@ def create_kb_document_routes(
                     if (execution_plans or skipped_plans)
                     else None
                 )
-                for plan in [*skipped_plans, *execution_plans]:
-                    if inner_rag is None:
-                        raise RuntimeError(
-                            "KB index build service did not return a LightRAG instance"
-                        )
-                    item = await _execute_build_plan(
-                        index_service=active_index_service,
+                total_build_items = len(request_ids)
+                progress_mirror = (
+                    _mirror_pipeline_progress(
+                        job_service=job_service,
                         kb_id=kb_id,
                         job_id=job.id,
-                        plan=plan,
                         rag=inner_rag,
                     )
-                    item_results.append(item)
-                    if item["status"] == "succeeded":
-                        completed_items += 1
-                    else:
-                        failed_items += 1
+                    if inner_rag is not None
+                    else contextlib.nullcontext()
+                )
+                async with progress_mirror:
+                    for plan in [*skipped_plans, *execution_plans]:
+                        if inner_rag is None:
+                            raise RuntimeError(
+                                "KB index build service did not return a LightRAG instance"
+                            )
+                        item = await _execute_build_plan(
+                            index_service=active_index_service,
+                            kb_id=kb_id,
+                            job_id=job.id,
+                            plan=plan,
+                            rag=inner_rag,
+                        )
+                        item_results.append(item)
+                        if item["status"] == "succeeded":
+                            completed_items += 1
+                        else:
+                            failed_items += 1
+                        # Publish per-document progress as each doc finishes so a
+                        # multi-doc rebuild/reindex visibly advances instead of
+                        # sitting at 0/N until the whole batch completes.
+                        try:
+                            await job_service.update_job_progress(
+                                kb_id,
+                                job.id,
+                                completed_items=completed_items,
+                                progress=(completed_items + failed_items)
+                                / max(total_build_items, 1),
+                            )
+                        except Exception:  # noqa: BLE001 — progress is best-effort
+                            pass
 
                 final_result = _batch_build_job_result(
                     batch_id=job.batch_id or batch_plan.batch_id,
