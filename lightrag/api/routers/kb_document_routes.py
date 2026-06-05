@@ -286,6 +286,10 @@ class ParseDocumentRequest(BaseModel):
     engine: Optional[str] = None
     process_options: Optional[str] = None
     force_reparse: bool = False
+    # Parse-only endpoint (see route summary "without building the index"):
+    # auto_index is a reserved no-op and never triggers a build, so the
+    # in-process path and a durable-worker resume behave identically. Use
+    # :build-kg / :batch-build-kg to build the index after parsing.
     auto_index: bool = False
     idempotency_key: Optional[str] = None
 
@@ -297,6 +301,10 @@ class BatchParseDocumentsRequest(BaseModel):
     engine: Optional[str] = None
     process_options: Optional[str] = None
     force_reparse: bool = False
+    # Parse-only endpoint (see route summary "without building the index"):
+    # auto_index is a reserved no-op and never triggers a build, so the
+    # in-process path and a durable-worker resume behave identically. Use
+    # :batch-build-kg to build the index after parsing.
     auto_index: bool = False
     idempotency_key: Optional[str] = None
 
@@ -4634,13 +4642,18 @@ def create_kb_document_routes(
             )
         active_registry = cast(LightRAGInstanceRegistry, registry)
         try:
+            # :batch-parse is parse-only (see route summary). Force auto_index
+            # False so the persisted payload stays parse-only: a durable-worker
+            # resume (_run_aggregate reads payload["auto_index"]) then behaves
+            # identically to the in-process path, which never builds. Clients
+            # build with :batch-build-kg.
             batch_plan = await document_service.create_batch_parse_plan(
                 kb_id,
                 request.document_ids,
                 parser_engine=request.engine,
                 process_options=request.process_options,
                 force_reparse=request.force_reparse,
-                auto_index=request.auto_index,
+                auto_index=False,
             )
             job, created_job = await job_service.create_batch_parse_job_once(
                 kb_id,
@@ -4650,7 +4663,7 @@ def create_kb_document_routes(
                 plan_items=[_parse_plan_payload(plan) for plan in batch_plan.plans],
                 planning_failures=batch_plan.failures,
                 force_reparse=request.force_reparse,
-                auto_index=request.auto_index,
+                auto_index=False,
                 idempotency_key=request.idempotency_key,
             )
             if not created_job:
@@ -4846,13 +4859,16 @@ def create_kb_document_routes(
             )
         active_registry = cast(LightRAGInstanceRegistry, registry)
         try:
+            # :parse is parse-only (see route summary). Force auto_index False
+            # so the plan/payload stay parse-only and a durable-worker resume
+            # matches the in-process path (neither builds). Build with :build-kg.
             plan = await document_service.create_parse_plan(
                 kb_id,
                 document_id,
                 parser_engine=request.engine,
                 process_options=request.process_options,
                 force_reparse=request.force_reparse,
-                auto_index=request.auto_index,
+                auto_index=False,
             )
             job, created_job = await job_service.create_parse_job_once(
                 kb_id,

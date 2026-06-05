@@ -91,7 +91,7 @@ def _sample_pdf(tmp_path: Path) -> Path:
     not _MINERU_ENDPOINT,
     reason="live MinerU integration skipped: set LIGHTRAG_MINERU_TEST_ENDPOINT to enable",
 )
-async def test_parse_mineru_live_produces_sidecar(tmp_path, monkeypatch):
+async def test_parse_mineru_live_parse_build_and_query(tmp_path, monkeypatch):
     from lightrag import LightRAG
     from lightrag.utils import EmbeddingFunc, Tokenizer
 
@@ -140,5 +140,35 @@ async def test_parse_mineru_live_produces_sidecar(tmp_path, monkeypatch):
         # Markdown is the canonical MinerU text output.
         markdowns = list(raw_dirs[0].rglob("*.md"))
         assert markdowns, f"expected markdown in raw bundle: {list(raw_dirs[0].rglob('*'))}"
+
+        # --- build: feed the live parse sidecar through the REAL index pipeline ---
+        # Mirrors IndexBuildService.run_build's enqueue call so this exercises the
+        # same parse-artifact -> chunk/extract/embed/KG-merge path a KB build uses.
+        from lightrag.base import QueryParam
+        from lightrag.utils_pipeline import sidecar_uri_for
+
+        sidecar_uri = sidecar_uri_for(Path(blocks_path).parent)
+        await rag.apipeline_enqueue_documents(
+            input=[""],
+            ids=["mineru-live-doc"],
+            file_paths=["mineru_live_sample.pdf"],
+            docs_format="lightrag",
+            lightrag_document_paths=[sidecar_uri],
+            parse_engine="mineru",
+            process_options="iF",
+        )
+        await rag.apipeline_process_enqueue_documents()
+
+        # After the build the document must be tracked in doc_status.
+        built = await rag.doc_status.get_by_id("mineru-live-doc")
+        assert built is not None, "expected a doc_status row after build"
+
+        # --- query: the built KB must retrieve the live-parsed content ---
+        data = await rag.aquery_data(
+            "Hello LightRAG MinerU",
+            param=QueryParam(mode="naive", top_k=10, chunk_top_k=10),
+        )
+        chunks = data.get("data", {}).get("chunks", [])
+        assert chunks, f"expected retrievable chunks after build+query: {data}"
     finally:
         await rag.finalize_storages()

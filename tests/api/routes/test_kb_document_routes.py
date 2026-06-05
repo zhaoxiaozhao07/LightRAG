@@ -1565,6 +1565,102 @@ def test_batch_parse_documents_succeeds_and_persists_artifacts(tmp_path):
     assert len(probe.instances[0].parse_calls) == 2
 
 
+def test_batch_parse_auto_index_true_stays_parse_only(tmp_path):
+    """Regression: :batch-parse is parse-only. Even when a client sends
+    ``auto_index=true`` the persisted job payload must stay ``auto_index=False``
+    so a durable-worker resume (``_run_aggregate`` builds only when
+    ``payload["auto_index"]`` is set) behaves identically to the in-process path
+    (which never builds). Previously the route forwarded ``auto_index=true``
+    into the payload, so the SAME job parsed-only in-process but parsed+built on
+    a worker resume — divergent behavior for one persisted job."""
+    probe = BuilderProbe()
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path, probe=probe
+    )
+    _create_kb(client, "kb_batch_parse_ai")
+    upload = client.post(
+        "/kbs/kb_batch_parse_ai/documents:upload",
+        files=[
+            ("files", ("alpha.pdf", b"alpha", "application/pdf")),
+            ("files", ("beta.pdf", b"beta", "application/pdf")),
+        ],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200
+    document_ids = [document["id"] for document in upload.json()["documents"]]
+
+    response = client.post(
+        "/kbs/kb_batch_parse_ai/documents:batch-parse",
+        json={
+            "document_ids": document_ids,
+            "engine": "mineru",
+            "process_options": "iF",
+            "force_reparse": True,
+            "auto_index": True,
+        },
+        headers=_HEADERS,
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    job = client.get(f"/kbs/kb_batch_parse_ai/jobs/{job_id}", headers=_HEADERS)
+    assert job.status_code == 200
+    job_payload = job.json()
+    # The fix: payload is parse-only regardless of the requested auto_index, so
+    # a worker resume of this job cannot build.
+    assert job_payload["payload"]["auto_index"] is False
+    assert job_payload["job_type"] == "parse"
+
+    # Documents land in `parsed` (parse-only), never `building` / `ready`.
+    for document_id in document_ids:
+        document = client.get(
+            f"/kbs/kb_batch_parse_ai/documents/{document_id}", headers=_HEADERS
+        )
+        assert document.status_code == 200
+        assert document.json()["status"] == "parsed"
+
+
+def test_single_parse_auto_index_true_stays_parse_only(tmp_path):
+    """Regression: single-document :parse is parse-only too — ``auto_index=true``
+    must not leak into the persisted payload (mirrors :batch-parse), so a worker
+    resume and the in-process path agree (neither builds)."""
+    probe = BuilderProbe()
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path, probe=probe
+    )
+    _create_kb(client, "kb_parse_ai")
+    upload = client.post(
+        "/kbs/kb_parse_ai/documents:upload",
+        files=[("files", ("alpha.pdf", b"alpha", "application/pdf"))],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200
+    document_id = upload.json()["documents"][0]["id"]
+
+    response = client.post(
+        f"/kbs/kb_parse_ai/documents/{document_id}:parse",
+        json={
+            "engine": "mineru",
+            "process_options": "iF",
+            "force_reparse": True,
+            "auto_index": True,
+        },
+        headers=_HEADERS,
+    )
+    assert response.status_code == 200
+    job_id = response.json()["id"]
+
+    job = client.get(f"/kbs/kb_parse_ai/jobs/{job_id}", headers=_HEADERS)
+    assert job.status_code == 200
+    assert job.json()["payload"]["auto_index"] is False
+
+    document = client.get(
+        f"/kbs/kb_parse_ai/documents/{document_id}", headers=_HEADERS
+    )
+    assert document.status_code == 200
+    assert document.json()["status"] == "parsed"
+
+
 def test_batch_parse_idempotency_key_reuses_existing_job(tmp_path):
     probe = BuilderProbe()
     client, _kb_service, _store, _document_service, _job_service = _build_client(
@@ -2241,6 +2337,49 @@ def test_parse_document_failure_marks_job_and_document_failed(tmp_path):
     assert document.status_code == 200
     assert document.json()["status"] == "parse_failed"
     assert document.json()["error_code"] == "parse_failed"
+
+
+def test_parse_failure_job_is_retryable(tmp_path):
+    """A failed parse job can be reset to queued via :retry — the retryability
+    path a transient MinerU/network failure relies on. The job returns to
+    ``queued`` with ``retry_count`` incremented and the error cleared, ready to
+    be re-driven (by the client or a durable worker)."""
+    probe = BuilderProbe(should_fail=True)
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path, probe=probe
+    )
+    _create_kb(client, "kb_parse_retry")
+    upload = client.post(
+        "/kbs/kb_parse_retry/documents:upload",
+        files=[("files", ("paper.pdf", b"pdf", "application/pdf"))],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200
+    document_id = upload.json()["documents"][0]["id"]
+
+    parse = client.post(
+        f"/kbs/kb_parse_retry/documents/{document_id}:parse",
+        json={"engine": "mineru"},
+        headers=_HEADERS,
+    )
+    assert parse.status_code == 200
+    job_id = parse.json()["id"]
+    assert (
+        client.get(f"/kbs/kb_parse_retry/jobs/{job_id}", headers=_HEADERS).json()[
+            "status"
+        ]
+        == "failed"
+    )
+
+    retry = client.post(
+        f"/kbs/kb_parse_retry/jobs/{job_id}:retry", json={}, headers=_HEADERS
+    )
+    assert retry.status_code == 200
+    body = retry.json()
+    assert body["status"] == "queued"
+    assert body["retry_count"] == 1
+    assert body["error_code"] is None
+    assert body["error_message"] is None
 
 
 def test_parse_document_missing_source_returns_404(tmp_path):

@@ -1569,14 +1569,9 @@ def run(args: argparse.Namespace) -> int:
                     "graph_node_count": residual_nodes,
                     "graph_edge_count": residual_edges,
                 }
-                if residual_docs or residual_nodes or residual_edges:
-                    raise RuntimeError(
-                        "Hard-delete cleanup-consistency violated: the reused "
-                        f"workspace still exposes documents={residual_docs} "
-                        f"graph_nodes={residual_nodes} graph_edges={residual_edges} "
-                        "after hard delete + recreate — stale engine-storage data "
-                        "leaked across the KB lifecycle (adrop_all_storages purge)"
-                    )
+                _assert_reset_workspace_clean(
+                    residual_docs, residual_nodes, residual_edges
+                )
                 print(
                     f"[ok] post-reset clean documents={residual_docs} "
                     f"nodes={residual_nodes} edges={residual_edges}"
@@ -2677,6 +2672,57 @@ def run_interactive_query(
     print(f"[interactive-query] 结束，共 {len(rounds)} 轮问答")
 
 
+def _assert_reset_workspace_clean(
+    residual_docs: int, residual_nodes: int, residual_edges: int
+) -> None:
+    """Raise if a KB recreated on a hard-deleted workspace still exposes engine data.
+
+    This is the cleanup-consistency / isolation property ``adrop_all_storages``
+    must guarantee: after ``DELETE ?hard=true`` + recreate, the reused workspace
+    must read back zero documents / graph nodes / edges. Pure (no I/O) so the
+    assertion logic is unit-testable offline even though the live drill needs a
+    real server + external backends.
+    """
+    if residual_docs or residual_nodes or residual_edges:
+        raise RuntimeError(
+            "Hard-delete cleanup-consistency violated: the reused "
+            f"workspace still exposes documents={residual_docs} "
+            f"graph_nodes={residual_nodes} graph_edges={residual_edges} "
+            "after hard delete + recreate — stale engine-storage data "
+            "leaked across the KB lifecycle (adrop_all_storages purge)"
+        )
+
+
+def _assert_kb_isolation(
+    primary_doc_ids: set[Any],
+    isolation_doc_ids: set[Any],
+    isolation_references: list[Any],
+) -> list[str]:
+    """Raise if the empty control KB leaked another KB's content.
+
+    Three independent leak signals across the shared vector/graph backend:
+    overlapping document ids, a non-empty control KB, or a control-KB query that
+    returns references. Returns the (empty on success) overlap list for the
+    report. Pure so the isolation assertion can be unit-tested offline.
+    """
+    overlap = sorted(str(item) for item in primary_doc_ids & isolation_doc_ids if item)
+    if overlap:
+        raise RuntimeError(
+            f"KB isolation violated; overlapping document ids: {overlap}"
+        )
+    if isolation_doc_ids:
+        raise RuntimeError(
+            "KB isolation control is not empty; documents present: "
+            f"{sorted(str(item) for item in isolation_doc_ids if item)}"
+        )
+    if isolation_references:
+        raise RuntimeError(
+            "KB isolation violated: querying the empty control KB returned "
+            f"{len(isolation_references)} reference(s) — cross-workspace content leak"
+        )
+    return overlap
+
+
 def run_isolation_check(
     client: EnterpriseKBClient, args: argparse.Namespace, report: dict[str, Any]
 ) -> dict[str, Any]:
@@ -2700,26 +2746,13 @@ def run_isolation_check(
     primary_docs = report["steps"].get("documents", {}).get("documents", [])
     primary_doc_ids = {item.get("id") for item in primary_docs}
     isolation_doc_ids = {item.get("id") for item in documents.get("documents", [])}
-    overlap = sorted(str(item) for item in primary_doc_ids & isolation_doc_ids if item)
-    if overlap:
-        raise RuntimeError(f"KB isolation violated; overlapping document ids: {overlap}")
-    # The control KB is never ingested into, so it must stay empty across runs.
-    # An empty control KB that still lists documents — or whose query surfaces
-    # references — would mean the shared vector / graph backend leaked another
-    # KB's content across the workspace boundary, the exact isolation property
-    # this drill exists to prove. Assert both the metadata view (no documents)
-    # and the retrieval view (no references) rather than only recording them.
+    # Leak signals (overlap / non-empty control / control-query references) are
+    # asserted by _assert_kb_isolation so the isolation logic is unit-testable
+    # offline; the live drill still proves it end to end against real backends.
     isolation_references = (query_result or {}).get("references") or []
-    if isolation_doc_ids:
-        raise RuntimeError(
-            "KB isolation control is not empty; documents present: "
-            f"{sorted(str(item) for item in isolation_doc_ids if item)}"
-        )
-    if isolation_references:
-        raise RuntimeError(
-            "KB isolation violated: querying the empty control KB returned "
-            f"{len(isolation_references)} reference(s) — cross-workspace content leak"
-        )
+    overlap = _assert_kb_isolation(
+        primary_doc_ids, isolation_doc_ids, isolation_references
+    )
     return {
         "kb": isolation_kb,
         "documents": documents,

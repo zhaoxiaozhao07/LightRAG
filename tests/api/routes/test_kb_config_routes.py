@@ -366,6 +366,84 @@ def test_active_config_applies_extraction_runtime_fields():
     assert updated["force_llm_summary_on_merge"] == 6
 
 
+def test_extraction_config_reaches_real_extraction_prompt():
+    """End-to-end: an active config's ``extraction_config`` (language +
+    entity_types) flows through ``apply_active_config_to_lightrag_kwargs`` into
+    ``addon_params``, and the REAL ``extract_entities`` renders them into the
+    extraction prompt the LLM actually receives.
+
+    The other config tests stop at config→kwargs, and the KB build/query tests
+    use a ``FakeRAG`` whose ``addon_params`` are hard-coded — so nothing proved
+    that activating a config actually changes the extraction *input*. This
+    drives the real ``operate.extract_entities`` with a mock LLM and asserts the
+    config's language + entity-type guidance appear in the prompt it was sent.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from lightrag.operate import extract_entities
+    from lightrag.utils import Tokenizer, TokenizerInterface
+
+    class _DummyTokenizer(TokenizerInterface):
+        def encode(self, content):
+            return [ord(ch) for ch in content]
+
+        def decode(self, tokens):
+            return "".join(chr(token) for token in tokens)
+
+    active = _config_version(
+        {
+            "extraction_config": {
+                "language": "Klingon",
+                "entity_types": ["ALIEN_SPECIES", "STARSHIP"],
+            }
+        }
+    )
+    updated = apply_active_config_to_lightrag_kwargs({}, active)
+    addon_params = updated["addon_params"]
+    # Sanity (already unit-tested above): the overlay produced these.
+    assert addon_params["language"] == "Klingon"
+    assert "ALIEN_SPECIES" in addon_params["entity_types_guidance"]
+
+    extract_func = AsyncMock(
+        return_value="(entity<|#|>X<|#|>ALIEN_SPECIES<|#|>desc)<|COMPLETE|>"
+    )
+    global_config = {
+        "llm_model_func": extract_func,
+        "role_llm_funcs": {
+            "extract": extract_func,
+            "keyword": extract_func,
+            "query": extract_func,
+            "vlm": extract_func,
+        },
+        "entity_extract_max_gleaning": 0,
+        "entity_extract_max_records": updated.get("entity_extract_max_records", 100),
+        "entity_extract_max_entities": updated.get("entity_extract_max_entities", 40),
+        "addon_params": addon_params,
+        "tokenizer": Tokenizer("dummy", _DummyTokenizer()),
+        "llm_model_max_async": 1,
+    }
+    chunks = {
+        "chunk-001": {
+            "tokens": 13,
+            "content": "Test content.",
+            "full_doc_id": "doc-001",
+            "chunk_order_index": 0,
+        }
+    }
+
+    asyncio.run(extract_entities(chunks=chunks, global_config=global_config))
+
+    assert extract_func.await_count >= 1
+    sent = " ".join(
+        f"{call.args} {call.kwargs}" for call in extract_func.call_args_list
+    )
+    # The KB config's extraction params must reach the real extraction prompt.
+    assert "Klingon" in sent, "extraction_config.language did not reach the prompt"
+    assert "ALIEN_SPECIES" in sent, "entity_types guidance did not reach the prompt"
+    assert "STARSHIP" in sent
+
+
 def test_active_config_explicit_guidance_takes_precedence_and_merges_addon():
     active = _config_version(
         {

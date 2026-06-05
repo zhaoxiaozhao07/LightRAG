@@ -2177,6 +2177,13 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             conversation_history=param.conversation_history,
             user_prompt=param.user_prompt,
             enable_rerank=param.enable_rerank,
+            # Preserve the document allow-list. filters.doc_ids / enabled /
+            # archived are mapped to QueryParam.ids upstream, and retrieval
+            # (operate.py _get_vector_context / _chunk_in_doc_scope) relies on
+            # it to scope chunks. Dropping it here silently disabled doc-id
+            # scoping for aquery_data (/query/data and /retrieve), so a scoped
+            # request returned chunks from outside the requested documents.
+            ids=param.ids,
         )
 
         query_result = None

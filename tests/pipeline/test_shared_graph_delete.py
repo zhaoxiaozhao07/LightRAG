@@ -19,6 +19,7 @@ orphan to assert pruning.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -36,7 +37,7 @@ from lightrag.utils import (
     make_relation_chunk_key,
 )
 
-pytestmark = pytest.mark.offline
+_NEO4J_ENV = ("NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD")
 
 
 class _SimpleTokenizerImpl:
@@ -55,9 +56,9 @@ async def _dummy_llm(*args, **kwargs) -> str:
     return "ok"
 
 
-async def _build_rag(tmp_path, test_name: str) -> LightRAG:
+async def _build_rag(tmp_path, test_name: str, graph_backend: str = "file") -> LightRAG:
     workspace = f"{test_name}_{uuid4().hex[:8]}"
-    rag = LightRAG(
+    kwargs = dict(
         working_dir=str(tmp_path / test_name),
         workspace=workspace,
         llm_model_func=_dummy_llm,
@@ -67,6 +68,11 @@ async def _build_rag(tmp_path, test_name: str) -> LightRAG:
         tokenizer=Tokenizer("test-tokenizer", _SimpleTokenizerImpl()),
         max_parallel_insert=1,
     )
+    if graph_backend == "neo4j":
+        # Only the graph storage is external; the rest stay file-based so the
+        # test pins down the Neo4j get_node / source_id / delete semantics.
+        kwargs["graph_storage"] = "Neo4JStorage"
+    rag = LightRAG(**kwargs)
     await rag.initialize_storages()
     return rag
 
@@ -276,8 +282,21 @@ async def _seed_shared_graph(rag: LightRAG) -> dict[str, str]:
     }
 
 
-async def test_delete_keeps_shared_entity_and_prunes_orphan(tmp_path, monkeypatch):
-    rag = await _build_rag(tmp_path, "shared_graph_delete")
+@pytest.mark.parametrize(
+    "graph_backend",
+    [
+        pytest.param("file", marks=pytest.mark.offline),
+        pytest.param(
+            "neo4j", marks=[pytest.mark.integration, pytest.mark.requires_db]
+        ),
+    ],
+)
+async def test_delete_keeps_shared_entity_and_prunes_orphan(
+    tmp_path, monkeypatch, graph_backend
+):
+    if graph_backend == "neo4j" and not all(os.getenv(v) for v in _NEO4J_ENV):
+        pytest.skip("Neo4j not configured (set NEO4J_URI/USERNAME/PASSWORD)")
+    rag = await _build_rag(tmp_path, "shared_graph_delete", graph_backend)
     monkeypatch.setattr(
         lightrag_module,
         "rebuild_knowledge_from_chunks",
@@ -336,4 +355,11 @@ async def test_delete_keeps_shared_entity_and_prunes_orphan(tmp_path, monkeypatc
             is None
         )
     finally:
+        # For Neo4j, drop the workspace subgraph so a shared service isn't
+        # left polluted if an assertion fired before the delete completed.
+        if graph_backend == "neo4j":
+            try:
+                await rag.chunk_entity_relation_graph.drop()
+            except Exception:  # noqa: BLE001
+                pass
         await rag.finalize_storages()

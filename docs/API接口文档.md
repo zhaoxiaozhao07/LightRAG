@@ -358,7 +358,7 @@ Content-Type: application/json
   "engine": "mineru",            // 可选，覆盖文档默认引擎
   "process_options": "iF",       // 可选，覆盖默认 process options
   "force_reparse": false,         // true 时绕过 MinerU/Docling raw bundle cache
-  "auto_index": false,            // 预留：解析成功后是否触发 build_kg
+  "auto_index": false,            // parse-only 接口的预留 no-op：始终不触发构建；构建用 :build-kg
   "idempotency_key": null
 }
 ```
@@ -368,6 +368,7 @@ Content-Type: application/json
 - 解析缓存命中时直接复用 artifacts：缓存有效性由 MinerU/Docling 的 `*.mineru_raw` raw bundle manifest 校验（源文件大小 + 内容 sha256 + options 签名），而非 KB 控制面的 `source_hash`/`parser_hash`（后者用于增量决策与 diff，不作为 raw bundle cache key）。`force_reparse=true` 绕过该 raw bundle cache。
 - 同一文档已有 `parse_queued` / `parsing` / `build_queued` / `building` / `deleting` / `replacing` 时返回 `409`，原 active job 保持不变，新建的 job 同步标记 `failed`。
 - 成功后写入 `original` / `sidecar` / `blocks` artifact，MinerU/Docling 还会写 `raw_dir`，并从 raw bundle 中记录细粒度文件 artifact：`markdown`、`content_list`、`middle_json`、`model_json`、`image`、`layout_pdf`。细粒度 artifact metadata 包含 `parse_engine`、`parser_hash`、`source`、`relative_path`。启用对象存储时，文件 artifact 额外写入 `metadata.object_uri`，目录 artifact 写入 `metadata.object_prefix_uri`；`original` artifact 复用 document 的 `metadata.source_object_uri`。
+- **`auto_index` 是 parse-only 预留 no-op**：`:parse` 始终只解析、不构建，持久化 job payload 固定 `auto_index=false`，因此 durable worker 续跑与 in-process 路径行为一致（都不构建）。要在解析后构建知识图谱请调用 `:build-kg`。
 
 ### 3.2 批量解析
 
@@ -380,7 +381,7 @@ Content-Type: application/json
   "engine": "mineru",
   "process_options": "iF",
   "force_reparse": false,
-  "auto_index": false,
+  "auto_index": false,           // parse-only 预留 no-op：始终不构建；构建用 :batch-build-kg
   "idempotency_key": null
 }
 ```
@@ -390,6 +391,7 @@ Content-Type: application/json
 - 每个 item 独立成功 / 失败，记录在 `result.items[]`。
 - 任一 item 失败时聚合 job 终态为 `failed`，但已成功 item 不回滚。
 - 每个 item 使用与单文档解析相同的解析指令优先级；请求级 `engine/process_options` 会覆盖文档 metadata 和 active config 默认值。
+- **`auto_index` 是 parse-only 预留 no-op**：`:batch-parse` 始终只解析、不构建，持久化的聚合 job payload 固定 `auto_index=false`，因此 durable worker 续跑（`_run_aggregate` 仅当 `payload["auto_index"]` 为真才构建）与 in-process 路径行为一致。要在解析后构建请调用 `:batch-build-kg`。
 
 ---
 

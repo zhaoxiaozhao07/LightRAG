@@ -9,6 +9,8 @@ import pytest
 from examples.enterprise_kb_mvp.enterprise_kb_mvp_demo import (
     EnterpriseKBClient,
     SourceFile,
+    _assert_kb_isolation,
+    _assert_reset_workspace_clean,
     _hard_reset_demo_kbs,
     confirm_reset_kb,
     follow_job_response,
@@ -83,6 +85,47 @@ def test_redact_value_masks_sensitive_keys() -> None:
     assert redact_value("OPENAI_API_KEY", "sk-secret-value") == "sk***ue"
     assert redact_value("MILVUS_TOKEN", "abcdef") == "ab***ef"
     assert redact_value("WORKSPACE", "demo") == "demo"
+
+
+def test_assert_reset_workspace_clean_passes_when_workspace_empty() -> None:
+    # Zero residual documents/nodes/edges = a hard-deleted workspace was truly
+    # purged before recreate (the adrop_all_storages cleanup-consistency goal).
+    _assert_reset_workspace_clean(0, 0, 0)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "docs,nodes,edges",
+    [(1, 0, 0), (0, 1, 0), (0, 0, 1), (2, 3, 4)],
+)
+def test_assert_reset_workspace_clean_raises_on_any_residual(
+    docs: int, nodes: int, edges: int
+) -> None:
+    with pytest.raises(RuntimeError, match="cleanup-consistency violated"):
+        _assert_reset_workspace_clean(docs, nodes, edges)
+
+
+def test_assert_kb_isolation_passes_when_control_empty_and_no_refs() -> None:
+    overlap = _assert_kb_isolation({"doc_a", "doc_b"}, set(), [])
+    assert overlap == []
+
+
+def test_assert_kb_isolation_raises_on_overlapping_doc_ids() -> None:
+    with pytest.raises(RuntimeError, match="overlapping document ids"):
+        _assert_kb_isolation({"doc_a", "doc_b"}, {"doc_b"}, [])
+
+
+def test_assert_kb_isolation_raises_when_control_kb_not_empty() -> None:
+    # No overlap with the primary KB, but the control KB unexpectedly holds a
+    # document — a cross-workspace leak the metadata view must catch.
+    with pytest.raises(RuntimeError, match="control is not empty"):
+        _assert_kb_isolation({"doc_a"}, {"doc_x"}, [])
+
+
+def test_assert_kb_isolation_raises_on_control_query_references() -> None:
+    # Empty control KB, but a query against it surfaced references — the
+    # retrieval view catching a vector/graph backend leak.
+    with pytest.raises(RuntimeError, match="cross-workspace content leak"):
+        _assert_kb_isolation({"doc_a"}, set(), [{"reference_id": "1"}])
 
 
 def _reset_args(**overrides: object) -> argparse.Namespace:
