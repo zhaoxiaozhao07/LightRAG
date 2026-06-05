@@ -246,6 +246,79 @@ async def test_worker_fails_replace_without_staged_bytes(tmp_path):
     assert final["error_code"] == "replace_not_resumable"
 
 
+async def test_worker_fails_replace_with_corrupted_staged_bytes(tmp_path):
+    """Staged replacement bytes whose content hash no longer matches the payload
+    ``source_hash`` (a truncated/corrupted staging file) must fail cleanly as
+    ``replace_not_resumable`` instead of replaying the replace with wrong bytes.
+    Mirrors the sync executor's hash-mismatch guard."""
+    env = _wire(tmp_path)
+    client = env["client"]
+    document_service = env["document_service"]
+    job_service = env["job_service"]
+    kb_id = "kb_replace_corrupt"
+    document_id = _ready_document(client, kb_id)
+    before = client.get(
+        f"/kbs/{kb_id}/documents/{document_id}", headers=_HEADERS
+    ).json()
+
+    replacement = document_service.prepare_replacement_source(
+        DocumentSourceInput(
+            source_name="paper-v2.pdf",
+            content=b"replacement-bytes-v2",
+            source_type="upload",
+            content_type="application/pdf",
+            metadata={},
+        )
+    )
+    job, created = await job_service.create_replace_job_once(
+        kb_id,
+        document_id=document_id,
+        previous_lightrag_doc_id=before["lightrag_doc_id"],
+        source_name=replacement.source_name,
+        source_type=replacement.source_type,
+        source_hash=replacement.source_hash,
+        content_type=replacement.content_type,
+        size_bytes=replacement.size_bytes,
+        auto_parse=False,
+        auto_index=False,
+    )
+    assert created is True
+    staged_path = await document_service.stage_replacement_bytes(
+        kb_id, document_id, job_id=job.id, replacement=replacement
+    )
+    # Corrupt the staged file so its content hash no longer matches the payload.
+    Path(staged_path).write_bytes(b"corrupted-bytes-that-do-not-match-the-hash")
+
+    worker = JobWorker(
+        job_service,
+        executors={
+            "replace": build_replace_executor(
+                document_service=document_service,
+                registry=env["registry"],
+                job_service=job_service,
+                index_service=env["index_service"],
+            )
+        },
+        claim_grace_seconds=0.0,
+    )
+    claimed = await worker.poll_once()
+    assert claimed is not None and claimed.id == job.id
+
+    final = client.get(f"/kbs/{kb_id}/jobs/{job.id}", headers=_HEADERS).json()
+    assert final["status"] == "failed", final
+    assert final["error_code"] == "replace_not_resumable"
+    assert "hash mismatch" in (final["error_message"] or "")
+
+    # The document was NOT replaced (source unchanged) and the unusable staged
+    # file was dropped.
+    after = client.get(
+        f"/kbs/{kb_id}/documents/{document_id}", headers=_HEADERS
+    ).json()
+    assert after["source_hash"] == before["source_hash"]
+    assert after["source_name"] == before["source_name"]
+    assert not Path(staged_path).is_file()
+
+
 async def test_worker_keeps_replace_staging_when_terminal_transition_fails(
     tmp_path, monkeypatch
 ):

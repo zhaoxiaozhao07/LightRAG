@@ -622,7 +622,17 @@ class DocumentLifecycleService:
     ) -> DocumentReplacementSource | None:
         """Rebuild a ``DocumentReplacementSource`` from staged bytes for worker
         resume. Returns ``None`` when the staging file is absent (e.g. the
-        original request never staged, so the job is not worker-resumable)."""
+        original request never staged, so the job is not worker-resumable).
+
+        Raises ``ValueError`` when the staged bytes are present but their content
+        hash no longer matches the ``source_hash`` persisted in the job payload
+        (e.g. a truncated/corrupted staging file). The caller turns this into a
+        clean ``replace_not_resumable`` failure instead of replaying the replace
+        with wrong bytes — mirroring :meth:`load_staged_sync_source`.
+        (``source_hash`` is always persisted for replace jobs created by the
+        current code; the guard only skips verification for legacy payloads that
+        never recorded one.)
+        """
         record = await self._kb_service.get(kb_id)
         staging_path = self._replacement_staging_path(
             record.workspace, document_id, job_id
@@ -630,6 +640,13 @@ class DocumentLifecycleService:
         if not staging_path.is_file():
             return None
         content = staging_path.read_bytes()
+        if source_hash:
+            actual_hash = _content_hash(content)
+            if actual_hash != source_hash:
+                raise ValueError(
+                    f"Staged replacement source hash mismatch for {source_name}: "
+                    f"expected {source_hash}, got {actual_hash}"
+                )
         return DocumentReplacementSource(
             source_name=source_name,
             content=content,

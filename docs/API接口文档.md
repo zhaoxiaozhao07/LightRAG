@@ -314,11 +314,13 @@ Content-Type: application/json
   "delete_source_file": false,
   "delete_artifacts": false,
   "delete_llm_cache": false,
+  "delete_graph_orphans": true,
+  "strategy": "safe",
   "idempotency_key": null
 }
 ```
 
-创建单个聚合 `delete` job（`document_id=null`、`batch_id` 非空）。每个 item 独立 claim 和执行；active job、缺失文档等作为 per-item failure 写入 `job.result.items[]`，不阻塞其他可删除文档。启用 durable worker 时，`documents:batch-delete` 属于可恢复聚合任务：worker 可从 job payload 的 `document_ids` 与删除选项恢复执行，服务重启后 queued batch-delete 不会被孤儿恢复直接标失败。
+创建单个聚合 `delete` job（`document_id=null`、`batch_id` 非空）。每个 item 独立 claim 和执行；active job、缺失文档等作为 per-item failure 写入 `job.result.items[]`，不阻塞其他可删除文档。`strategy`（`safe`/`rebuild_doc_scope`/`rebuild_kb`/`rebuild_subgraph`，默认 `safe`）与 `delete_graph_orphans`（默认 `true`，显式 `false` 返回 `400`）语义与单文档删除一致，对整批删除生效；`rebuild_kb`/`rebuild_subgraph` 同样需注入 `IndexBuildService`，否则 `503`。启用 durable worker 时，`documents:batch-delete` 属于可恢复聚合任务：worker 可从 job payload 的 `document_ids` 与删除选项恢复执行，服务重启后 queued batch-delete 不会被孤儿恢复直接标失败。
 
 ### 2.9 文档替换
 
@@ -586,7 +588,7 @@ Content-Type: application/json
 
 启用后：
 - 服务启动会拉起一个后台轮询 worker，原子认领（`queued → running` 单赢 CAS）以下可从持久化状态重建的任务类型并执行到终态：单文档 `parse` / `build_kg` / `reindex` / `delete` / `replace`，**聚合** `parse` / `build_kg` / `reindex`（`document_id=null`、payload 携带 `document_ids`，含多文件 `upload` / `texts` 的 auto_parse 聚合 job 与 `batch-parse` / `batch-build-kg` / `batch-reindex` / `:rebuild`），聚合 `sync`（payload 携带 `batch_id` 与 per-item `source_key/source_name/source_hash`，请求字节已落盘到 `.sync-staging/<batch_id>/`），`documents:batch-delete` 聚合 `delete` job，以及 `clear_kb`（KB 硬删除，payload 携带 `kb_id`/`workspace`，幂等清理可重启续跑）。聚合 parse/build 之所以可恢复，是因为其源文件 / 解析产物在 job 运行前已落盘，worker 可凭 `document_ids` 重新规划并逐个 claim 执行；聚合 sync 则凭 staged request bytes 重建 `DocumentSourceInput` 并复用同一 per-item 同步逻辑。
-- **单文档 `replace` 现已可恢复**：replace 创建并 claim 时会把替换源字节落盘到 `INPUT_DIR/<workspace>/<document_id>/.replace-staging-<job_id>.bin`，因此 worker 可在重启/`:retry` 后凭 staged 字节重建 `DocumentReplacementSource`，重新 claim 文档进入 `replacing`，复用与同步路径一致的执行逻辑（删旧索引 → 换 source → 可选 auto_parse/auto_index），终态后清理 staging 文件。若 staged 字节缺失（历史 job 未落盘），worker 以 `replace_not_resumable` 明确失败而非猜测。
+- **单文档 `replace` 现已可恢复**：replace 创建并 claim 时会把替换源字节落盘到 `INPUT_DIR/<workspace>/<document_id>/.replace-staging-<job_id>.bin`，因此 worker 可在重启/`:retry` 后凭 staged 字节重建 `DocumentReplacementSource`，重新 claim 文档进入 `replacing`，复用与同步路径一致的执行逻辑（删旧索引 → 换 source → 可选 auto_parse/auto_index），终态后清理 staging 文件。若 staged 字节缺失（历史 job 未落盘），或 staged 字节内容 hash 与 payload `source_hash` 不匹配（staging 文件被截断/损坏），worker 以 `replace_not_resumable` 明确失败，不会凭错字节续跑（与批量 `sync` 续跑的 hash 校验对齐）。
 - **批量 `sync` 现已可恢复**：sync route 在创建聚合 job 前为每个 item 落盘请求字节，并在 payload 中持久化 `batch_id`、`source_key`、`source_name`、`source_hash`、`content_type` 与同步选项；worker 重启/`:retry` 后按 staged bytes 重建每个 source，重新执行 created/replaced/skipped 与可选 parse/build。staging 只在终态 job transition 成功后 best-effort 清理；若 staged bytes 缺失或 hash 不匹配，worker 以 `sync_not_resumable` 明确失败。
 - **自动消费 `:retry`**：重试把任务重置回 `queued` 后，worker 在下一轮轮询中认领并重跑，客户端无需再次发起业务请求。
 - **重启续跑**：进程重启时，孤儿恢复会保留这些可恢复类型的 `queued` 任务（不再标 `failed`）交给 worker 继续执行；仍处于 `running` 的中途任务无法安全恢复，照旧标 `failed`，其文档同步重置为 `*_failed`，客户端 `:retry` 后即可被 worker 自动重跑。delete 续跑时若孤儿恢复已把文档从 `deleting` 重置为 `delete_failed`，worker 会重新 claim 回 `deleting` 再执行（`_claim_document_deleting` 接受同一 delete job id 的幂等 reclaim）；replace 续跑同理从 `replace_failed` 重新 claim 回 `replacing`。

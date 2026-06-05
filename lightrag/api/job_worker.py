@@ -1032,16 +1032,35 @@ def build_replace_executor(
                 error_message="replace job has invalid source_type",
             )
             return
-        replacement = await document_service.load_staged_replacement(
-            kb_id,
-            document_id,
-            job_id=job.id,
-            source_name=str(payload.get("source_name") or "replacement"),
-            source_hash=str(payload.get("source_hash") or ""),
-            content_type=payload.get("content_type"),
-            size_bytes=int(payload.get("size_bytes") or 0),
-            source_type=source_type,
-        )
+        try:
+            replacement = await document_service.load_staged_replacement(
+                kb_id,
+                document_id,
+                job_id=job.id,
+                source_name=str(payload.get("source_name") or "replacement"),
+                source_hash=str(payload.get("source_hash") or ""),
+                content_type=payload.get("content_type"),
+                size_bytes=int(payload.get("size_bytes") or 0),
+                source_type=source_type,
+            )
+        except ValueError as exc:
+            # Staged bytes are present but corrupted (content hash no longer
+            # matches the payload source_hash). Fail cleanly as not-resumable
+            # rather than replaying the replace with wrong bytes, and drop the
+            # unusable staging file. Mirrors the sync executor's guard.
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                failed_items=1,
+                error_code="replace_not_resumable",
+                error_message=str(exc),
+            )
+            await document_service.clear_staged_replacement(
+                kb_id, document_id, job_id=job.id
+            )
+            return
         if replacement is None:
             await job_service.transition_job(
                 kb_id,
