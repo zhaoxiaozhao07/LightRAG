@@ -86,6 +86,39 @@ _PARSER_DEPLOYMENT_CONFIG_KEYS = frozenset(
         "workers",
     }
 )
+# Keys accepted inside each tunable (non-parser, non-role) config section.
+# Anything outside these sets has no runtime effect, so it is rejected at create
+# time rather than silently persisted-but-ignored. (``parser_config`` and
+# ``llm_role_config`` enforce their own stricter key/role validation elsewhere.)
+_CHUNK_CONFIG_KEYS = frozenset(
+    {
+        "chunk_token_size",
+        "chunk_size",
+        "chunk_overlap_token_size",
+        "chunk_overlap_size",
+        "overlap",
+        "tiktoken_model_name",
+    }
+)
+_EMBEDDING_CONFIG_KEYS = frozenset(
+    {"model", "dim", "embedding_dim", "token_limit", "max_token_size"}
+)
+_EXTRACTION_CONFIG_KEYS = frozenset(
+    {
+        "language",
+        "entity_types",
+        "entity_types_guidance",
+        "entity_type_prompt_file",
+        "max_gleaning",
+        "max_extraction_records",
+        "max_extraction_entities",
+        "force_llm_summary_on_merge",
+    }
+)
+# ``query_config`` accepts every QueryParam field plus two non-QueryParam
+# retrieval knobs applied at construction time (``cosine_threshold`` →
+# vector store; ``related_chunk_number`` → retrieval default).
+_QUERY_CONFIG_EXTRA_KEYS = frozenset({"cosine_threshold", "related_chunk_number"})
 # Fields that change LLM *output* (and therefore built content / answers).
 # Excludes ``api_key`` (secret, not output-affecting) and perf-only knobs
 # (``max_async`` / ``timeout``).
@@ -227,8 +260,19 @@ def _active_query_runtime_config(config: dict[str, Any] | None) -> dict[str, Any
         for key, value in query_config.items()
         if key in _ACTIVE_QUERY_CONFIG_KEYS and value is not None
     }
+    # ``cosine_threshold`` and ``related_chunk_number`` are not QueryParam
+    # fields, so they are surfaced here as instance-level retrieval knobs
+    # (applied at construction time by ``apply_active_config_to_lightrag_kwargs``)
+    # rather than per-request QueryParam defaults. They still participate in the
+    # query hash so changing either re-derives ``query_hash`` (query-only, no
+    # reindex). ``active_query_defaults_from_rag`` filters them back out so they
+    # never leak into ``QueryParam(**...)``.
     if query_config.get("cosine_threshold") is not None:
         runtime["cosine_threshold"] = float(query_config["cosine_threshold"])
+    if query_config.get("related_chunk_number") is not None:
+        runtime["related_chunk_number"] = _positive_int(
+            query_config["related_chunk_number"]
+        )
     return runtime
 
 
@@ -392,6 +436,28 @@ def _active_llm_role_runtime_config(
     return runtime
 
 
+def _reject_unknown_section_keys(
+    config: dict[str, Any], section_name: str, allowed: frozenset[str] | set[str]
+) -> None:
+    """Reject keys in a config section that have no runtime effect.
+
+    Without this, a typo or unsupported key (e.g. ``chunk_config.chunk_strategy``)
+    would be silently persisted but never applied — a "stored but not effective"
+    footgun. Surfacing it as a create-time 400 keeps the config contract honest.
+    """
+    raw = config.get(section_name)
+    if raw is None:
+        return
+    if not isinstance(raw, dict):
+        raise ValueError(f"{section_name} must be an object")
+    unknown = sorted(key for key in raw if key not in allowed)
+    if unknown:
+        raise ValueError(
+            f"{section_name} has unsupported keys (no runtime effect): "
+            f"{', '.join(unknown)}"
+        )
+
+
 def _validate_config_boundaries(config: dict[str, Any]) -> None:
     """Reject KB config fields that would mutate deployed infrastructure.
 
@@ -432,6 +498,17 @@ def _validate_config_boundaries(config: dict[str, Any]) -> None:
             "parser_config only supports engine/parser_engine and "
             f"process_options/options; unsupported keys: {', '.join(unknown_parser_keys)}"
         )
+
+    # Reject unknown keys in the remaining tunable sections so a typo or
+    # unsupported field fails loudly at create time instead of being stored
+    # but silently ignored at runtime. parser_config (above) and llm_role_config
+    # (per-role/per-key) enforce their own strict validation.
+    _reject_unknown_section_keys(config, "chunk_config", _CHUNK_CONFIG_KEYS)
+    _reject_unknown_section_keys(config, "embedding_config", _EMBEDDING_CONFIG_KEYS)
+    _reject_unknown_section_keys(
+        config, "query_config", _ACTIVE_QUERY_CONFIG_KEYS | _QUERY_CONFIG_EXTRA_KEYS
+    )
+    _reject_unknown_section_keys(config, "extraction_config", _EXTRACTION_CONFIG_KEYS)
 
 
 def active_llm_role_runtime_config_from_version(

@@ -272,7 +272,6 @@ def test_active_config_runtime_helpers_apply_supported_fields():
                 "max_total_tokens": 9999,
                 "include_references": False,
                 "cosine_threshold": 0.42,
-                "unsupported_field": "ignored",
             },
             "llm_role_config": {"extract": "unsupported-runtime-role"},
         }
@@ -537,6 +536,64 @@ def test_parser_config_rejects_deployment_service_fields(tmp_path):
 
     assert response.status_code == 400
     assert "deployment-level parser service fields" in response.json()["detail"]
+
+
+def test_query_config_related_chunk_number_reaches_instance_and_query_hash():
+    """``related_chunk_number`` is a real retrieval knob (operate.py reads it from
+    global_config) but is NOT a QueryParam field. It must flow to the LightRAG
+    constructor kwarg (instance default) and participate in query_hash, without
+    leaking into per-request QueryParam defaults. Regression for the previous
+    "stored but never applied" gap (it was listed in the apply loop but read
+    from the QueryParam-filtered runtime, so it was always None)."""
+    active = _config_version({"query_config": {"related_chunk_number": 7}})
+
+    updated = apply_active_config_to_lightrag_kwargs({}, active)
+    assert updated["related_chunk_number"] == 7  # now actually reaches the kwargs
+
+    # Not a QueryParam field -> must not leak into per-request QueryParam defaults.
+    rag = SimpleNamespace()
+    attach_active_config_metadata(rag, active)
+    assert "related_chunk_number" not in active_query_defaults_from_rag(rag)
+
+    # Query-only knob: changing it moves query_hash but leaves index_hash alone.
+    base = ConfigVersionService._derive_hashes({"query_config": {}})
+    changed = ConfigVersionService._derive_hashes(
+        {"query_config": {"related_chunk_number": 7}}
+    )
+    assert changed["query_hash"] != base["query_hash"]
+    assert changed["index_hash"] == base["index_hash"]
+
+    # Non-positive values are rejected at create/derive time.
+    with pytest.raises(ValueError, match="must be positive"):
+        ConfigVersionService._derive_hashes(
+            {"query_config": {"related_chunk_number": 0}}
+        )
+
+
+def test_unknown_config_section_keys_are_rejected(tmp_path):
+    """Keys with no runtime effect must fail loudly at create time instead of
+    being silently persisted-but-ignored ("stored but not effective")."""
+    for section, payload in (
+        ("chunk_config", {"chunk_size": 512, "chunk_strategy": "recursive"}),
+        ("embedding_config", {"model": "bge-m3", "base64": True}),
+        ("query_config", {"top_k": 10, "bogus_field": 1}),
+        ("extraction_config", {"language": "English", "unknown_cap": 3}),
+    ):
+        with pytest.raises(ValueError, match="unsupported keys"):
+            ConfigVersionService._derive_hashes({section: payload})
+
+    # The same rejection surfaces as HTTP 400 through the create route.
+    client, *_ = _build_client(tmp_path)
+    _create_kb(client, "kb_unknown_keys")
+    response = client.post(
+        "/kbs/kb_unknown_keys/configs",
+        json={"config": {"chunk_config": {"chunk_token_size": 256, "typo_key": 1}}},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "unsupported keys" in detail
+    assert "typo_key" in detail
 
 
 def test_supported_index_config_changes_still_affect_index_hash():

@@ -653,7 +653,9 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 
 ## 七、知识库配置版本 Config Versions
 
-> 不可变的 KB 级配置快照。新建配置不会自动生效，需要显式 `:activate` 才会写入 `KnowledgeBase.active_config_version_id` 并 discard 缓存的 LightRAG 实例。当前实现会让后续实例重建或 parse planning 时读取已支持的 active config 字段；部署级字段会在创建配置版本时直接拒绝，避免单个 KB 修改已经部署好的服务基础设施。
+> 📌 **完整字段速查见 [`docs/KB配置项速查表.md`](KB配置项速查表.md)**（每个 section 的字段、别名、影响哪个 hash、改动后的最小动作）。
+
+> 不可变的 KB 级配置快照。新建配置不会自动生效，需要显式 `:activate` 才会写入 `KnowledgeBase.active_config_version_id` 并 discard 缓存的 LightRAG 实例。当前实现会让后续实例重建或 parse planning 时读取已支持的 active config 字段；部署级字段会在创建配置版本时直接拒绝，避免单个 KB 修改已经部署好的服务基础设施。创建时会严格校验：各 section（`parser_config`/`chunk_config`/`embedding_config`/`query_config`/`extraction_config`）出现**未知键**（无运行时效果）会直接返回 `400`，避免"存了不生效"。
 >
 > 已接入运行时的 active config 字段：
 > - `parser_config`：`engine`/`parser_engine`、`process_options`/`options`。这些字段会在创建配置时校验并规范化，作为解析默认值参与 `parser_hash`，并按“请求 > 文档 metadata > active config > 文件路由”的优先级生效。
