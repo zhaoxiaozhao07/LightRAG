@@ -4,6 +4,7 @@ Utility functions for the LightRAG API.
 
 import os
 import argparse
+from datetime import datetime, timezone
 from typing import Optional, List, Tuple
 import sys
 import time
@@ -20,6 +21,14 @@ from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from starlette.status import HTTP_403_FORBIDDEN
 from .auth import auth_handler
 from .config import ollama_server_infos, global_args, get_env_value
+from lightrag.api.enterprise_auth import (
+    enforce_enterprise_request_access,
+    enterprise_auth_enabled,
+    enterprise_legacy_api_key_superadmin_enabled,
+    get_enterprise_user_service,
+    principal_from_api_key,
+    protected_whitelist_bypass_forbidden,
+)
 
 logger = logging.getLogger("lightrag")
 
@@ -62,7 +71,7 @@ def check_env_file():
 
     is_valid, error_message = validate_runtime_target_from_env_file(env_path)
     if not is_valid:
-        for line in error_message.splitlines():
+        for line in (error_message or "").splitlines():
             ASCIIColors.red(line)
         return False
 
@@ -70,7 +79,8 @@ def check_env_file():
 
 
 # Get whitelist paths from global_args, only once during initialization
-whitelist_paths = global_args.whitelist_paths.split(",")
+whitelist_paths_value = getattr(global_args, "whitelist_paths", "/health")
+whitelist_paths = str(whitelist_paths_value).split(",")
 
 # Pre-compile path matching patterns
 whitelist_patterns: List[Tuple[str, bool]] = []
@@ -120,27 +130,33 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
     async def combined_dependency(
         request: Request,
         response: Response,  # Added: needed to return new token via response header
-        token: str = Security(oauth2_scheme),
+        token: Optional[str] = Security(oauth2_scheme),
         api_key_header_value: Optional[str] = None
         if api_key_header is None
         else Security(api_key_header),
     ):
         # 1. Check if path is in whitelist
         path = request.url.path
-        for pattern, is_prefix in whitelist_patterns:
-            if (is_prefix and path.startswith(pattern)) or (
-                not is_prefix and path == pattern
-            ):
-                return  # Whitelist path, allow access
+        if not protected_whitelist_bypass_forbidden(path):
+            for pattern, is_prefix in whitelist_patterns:
+                if (is_prefix and path.startswith(pattern)) or (
+                    not is_prefix and path == pattern
+                ):
+                    return  # Whitelist path, allow access
 
         # 2. Validate token first if provided in the request (Ensure 401 error if token is invalid)
         if token:
             try:
                 token_info = auth_handler.validate_token(token)
 
+                if enterprise_auth_enabled():
+                    user_service = get_enterprise_user_service(request)
+                    principal = await user_service.principal_from_token_info(token_info)
+                    request.state.principal = principal
+                    await enforce_enterprise_request_access(request, principal)
+                    return principal
+
                 # ========== Token Auto-Renewal Logic ==========
-                from lightrag.api.config import global_args
-                from datetime import datetime, timezone
 
                 if global_args.token_auto_renew:
                     # Check if current path should skip token renewal
@@ -166,12 +182,15 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                                     if role == "guest"
                                     else auth_handler.expire_hours
                                 )
-                                total_seconds = total_hours * 3600
+                                if not isinstance(total_hours, (int, float, str)):
+                                    raise TypeError("Token expiration hours must be numeric")
+                                total_seconds = float(total_hours) * 3600
 
                                 # Issue new token if remaining time < threshold
                                 if (
                                     remaining_seconds
-                                    < total_seconds * global_args.token_renew_threshold
+                                    < total_seconds
+                                    * float(getattr(global_args, "token_renew_threshold", 0.5))
                                 ):
                                     # ========== Rate Limiting Check ==========
                                     username = token_info["username"]
@@ -224,22 +243,39 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                     detail="Invalid token. Please login again.",
                 )
             except HTTPException as e:
+                if enterprise_auth_enabled():
+                    raise
                 # If already a 401 error, re-raise it
                 if e.status_code == status.HTTP_401_UNAUTHORIZED:
                     raise
                 # For other exceptions, continue processing
 
-        # 3. Acept all request if no API protection needed
-        if not auth_configured and not api_key_configured:
-            return
-
-        # 4. Validate API key if provided and API-Key authentication is configured
+        # 3. Validate API key if provided and API-Key authentication is configured
         if (
             api_key_configured
             and api_key_header_value
             and api_key_header_value == api_key
         ):
+            if enterprise_auth_enabled():
+                if not enterprise_legacy_api_key_superadmin_enabled():
+                    raise HTTPException(
+                        status_code=HTTP_403_FORBIDDEN,
+                        detail="API key is disabled in enterprise mode",
+                    )
+                principal = principal_from_api_key()
+                request.state.principal = principal
+                await enforce_enterprise_request_access(request, principal)
+                return principal
             return  # API key validation successful
+
+        # 4. Acept all request if no API protection needed
+        if enterprise_auth_enabled():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Enterprise login required",
+            )
+        if not auth_configured and not api_key_configured:
+            return
 
         ### Authentication failed ####
 

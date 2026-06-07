@@ -1,9 +1,9 @@
 # LightRAG API 接口文档
 
-> 文档版本：2026-06-02
+> 文档版本：2026-06-07
 > 适用范围：当前已经合并到 `main` 分支并通过测试的接口。
 > 路径前缀：所有路径均为相对路径；部署时通过 FastAPI `root_path` 或 `--api-prefix /api/v1` 暴露为 `/api/v1/...`。
-> 鉴权：除 `/health`、`/auth-status`、`/login` 等少数公开接口外，所有接口都受 `combined_auth` 依赖保护，需要在请求头携带 `X-API-Key: <api_key>` 或 JWT。
+> 鉴权：除 `/health`、`/auth-status`、`/login` 等少数公开接口外，所有接口都受 `combined_auth` 依赖保护，需要在请求头携带 `X-API-Key: <api_key>` 或 JWT。企业模式启用后，`/kbs`、legacy `/documents`/`/query`/`/graph`、Ollama `/api/*` 会额外受企业 RBAC / anti-bypass 策略约束。
 > 配套文档：`docs/生产级后端改造设计方案.md`。
 
 ---
@@ -19,8 +19,9 @@
 - [七、知识库配置版本 Config Versions](#七知识库配置版本-config-versions)
 - [八、知识库问答 Query](#八知识库问答-query)
 - [九、兼容旧版 / 全局接口](#九兼容旧版--全局接口)
-- [十、状态机与字段说明](#十状态机与字段说明)
-- [十一、生产存储配置](#十一生产存储配置)
+- [十、企业模式 Auth / Admin](#十企业模式-auth--admin)
+- [十一、状态机与字段说明](#十一状态机与字段说明)
+- [十二、生产存储配置](#十二生产存储配置)
 
 ---
 
@@ -47,9 +48,9 @@ Content-Type: application/json
   "id": "kb_research",            // 可选，省略由服务端生成 kb_<12位hex>
   "name": "Research Papers",      // 必填，去首尾空白后非空
   "description": "Optional",       // 可选
-  "owner_id": null,                // 预留多租户字段，暂不强制
-  "tenant_id": null,
-  "visibility": "private"          // 枚举：private / public / internal
+  "owner_id": null,                // 默认模式下为兼容 metadata；企业模式会忽略并由当前 principal 派生
+  "tenant_id": null,               // 默认模式下为兼容 metadata；企业模式会忽略并由当前 principal 派生
+  "visibility": "private"          // 枚举：private / public / internal；企业模式实际访问以 KB ACL 为准
 }
 ```
 
@@ -69,6 +70,13 @@ Content-Type: application/json
   5. 若启用对象存储，删除该 workspace 下的 source/artifact 对象；
   6. 清空 metadata store 控制面（documents / jobs / artifacts / config_versions；local 模式为 SQLite，PostgreSQL 模式为对应表）。
   返回前会创建一条 `clear_kb` 类型的 job 记录最终结果，`result` 包含 `dropped_storages`（成功 drop 的 storage 数）、`cleared_object_storage` 和 `deleted_objects`；任一步失败（含某个 storage `drop()` 失败）HTTP 500 + `clear_kb` job 终态 `failed`，使操作者知道可能有残留并 `:retry`。失败的 `clear_kb` job（`max_retries=3`）可经 `:retry` 重置回 `queued`；启用 durable worker（`LIGHTRAG_KB_JOB_WORKER=true`）时，queued 的 `clear_kb` job 会被孤儿恢复保留并由 worker 通过 `resume_hard_delete` 幂等续跑（`KBDeletionService.enqueue_hard_delete` 也可直接创建 queued job 交给 worker）。
+
+企业模式（`LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true`）下：
+
+- `POST /kbs` 需要 super admin 或 `can_create_kb=true`；服务端忽略请求体中的 `owner_id`/`tenant_id`，改用当前 principal，并自动授予创建者 `kb_owner` ACL。
+- `GET /kbs` 对普通用户只返回已授权 KB；super admin 返回全部。
+- `PATCH /kbs/{kb_id}` 忽略请求体中的 `owner_id`/`tenant_id`，避免客户端伪造所有权或租户。
+- `DELETE /kbs/{kb_id}` 与 `?hard=true` 仅 super admin 可执行，并写入审计事件。
 
 ### 1.3 知识库状态
 
@@ -173,7 +181,7 @@ Content-Type: application/json
 ### 2.3 批量增量同步
 
 ```http
-POST /kbs/{kb_id}/documents:sync?auto_parse=true&auto_index=true&parser_engine=mineru&process_options=iF&idempotency_key=sync-001
+POST /kbs/{kb_id}/documents:sync?auto_parse=true&auto_index=true&parser_engine=mineru&process_options=iF&force_reparse=false&delete_source_file=true&delete_artifacts=true&delete_llm_cache=false&idempotency_key=sync-001
 Content-Type: multipart/form-data
 
 files: [a.pdf, b.pdf]
@@ -186,6 +194,7 @@ source_keys: ["manual/a.pdf", "manual/b.pdf"]
 - 服务端先读取文件内容并计算 `source_hash`，再查找相同 `source_key` 的现有文档。
 - 找不到 `source_key`：创建新文档；`source_hash` 相同：跳过 source 替换，但若当前请求的 `parser_engine/process_options` 派生出的 `parser_hash` 与文档上次成功解析的值不同，仍会重解析并继续重建；`source_hash` 不同：复用单文档 replace 语义，保留原 `document_id`，先删除旧 `lightrag_doc_id` 后替换 source。
 - `auto_parse=true` 默认继续解析（Phase 1 受 `MAX_PARALLEL_PARSE_MINERU` 约束**并发解析**）；请求未显式传 `parser_engine/process_options` 时，会按当前 active `parser_config.engine/process_options` 作为解析默认值；`auto_index=true` 默认在 Phase 2 把全部解析成功的文档**一次性批量入队、单次流水线 drain** 构建到 `ready` 并可直接走 KB query。
+- `force_reparse=true` 会绕过现有 parse cache 重新解析；`delete_source_file` / `delete_artifacts` / `delete_llm_cache` 控制 changed source 走 replace 语义时的旧 source、artifact 和 LLM cache 清理策略。
 - 返回单个聚合 `sync` job。每个 item 在 `job.result.items[]` 中记录 `source_key`、`action`（`created` / `replaced` / `skipped` / `reparsed`）、`status`、`parse_result`、`build_result` 等；`result.items[]` 不再保证与输入顺序一致（按完成情况聚合，每个 `source_key` 恰好出现一次）；单个 item 失败不会阻塞其他 item，active parse/build/delete/replace 会保留对应 `*_job_active` 错误码和 `existing_job_id`。
 - `idempotency_key` 在 `(kb_id, job_type=sync)` 维度唯一；同 key 同文件和同参数复用原 job，同 key 不同请求返回 `409`。
 
@@ -407,6 +416,7 @@ Content-Type: application/json
 | `POST` | `/kbs/{kb_id}/documents:batch-build-kg` | 批量构建（聚合任务） |
 | `POST` | `/kbs/{kb_id}/documents/{document_id}:reindex` | 单文档强制重建索引（默认所有 force 标志为 true） |
 | `POST` | `/kbs/{kb_id}/documents:batch-reindex` | 批量强制重建 |
+| `POST` | `/kbs/{kb_id}:rebuild` | 全 KB 重建，枚举可构建文档并复用批量 reindex 路径 |
 
 ### 4.1 单文档构建
 
@@ -641,6 +651,8 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 | `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:preview` | 内联预览受支持的小型文件型产物 |
 | `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:download-url` | 为对象存储中的文件型产物生成预签名下载 URL |
 
+列表示例：`GET /kbs/{kb_id}/documents/{document_id}/artifacts?artifact_type=markdown&limit=50&offset=0`。
+
 下载约束：
 - 文件型产物（`original` / `blocks` / `markdown` / `content_list` / `middle_json` / `model_json` / `image` / `layout_pdf`）以 `FileResponse` 直接返回。
 - 目录型产物（`sidecar` / `raw_dir`）以流式 zip 返回（`Content-Type: application/zip`），单次下载 zip 内未压缩字节上限 512 MB，超限返回 `413`。
@@ -669,7 +681,7 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/kbs/{kb_id}/configs` | 创建配置版本（自动派生 `parser_hash` / `index_hash` / `query_hash`） |
-| `GET` | `/kbs/{kb_id}/configs` | 列出所有配置版本 |
+| `GET` | `/kbs/{kb_id}/configs` | 列出所有配置版本；支持 `?limit=50&offset=0` 分页 |
 | `GET` | `/kbs/{kb_id}/configs/{version_id}` | 获取配置版本详情 |
 | `POST` | `/kbs/{kb_id}/configs/{version_id}:activate` | 激活配置版本 |
 | `POST` | `/kbs/{kb_id}/configs/{version_id}:diff` | 与当前激活版本做 diff，预测重建影响 |
@@ -788,13 +800,13 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 - 同 KB 内的查询不会读取其他 KB 的内容（`workspace` 隔离）；已加测试覆盖。
 - 若 KB-wide 查询时 KB 内存在 `deleting` / `replacing` 文档，或显式 `filters.doc_ids` / `filters.metadata` 命中的候选文档中存在此类 active 文档，查询返回 `409`，避免读到删除/替换中的旧内容；metadata filter 未命中的 active 文档不会阻断本次 scoped 查询。
 - `mode` 支持 `local / global / hybrid / naive / mix / bypass`；建议默认 `mix`。
+- 企业模式下，`mode="bypass"` 按最终解析后的查询模式检查：请求体显式 `mode="bypass"` 或 active query config 默认值解析为 `bypass` 时，均需要 KB read ACL 加 `can_use_bypass_query=true` 或 super admin。
 - `filters.doc_ids` 会先校验 ID 必须属于本 KB（不在则 400 + `error_code=doc_ids_not_in_kb`），随后在检索层精确生效：服务端把 `filters.doc_ids` 与"可检索集合"（`enabled=true` 且 `archived=false` 且已建索引、有 `lightrag_doc_id`）取交集，映射成 `QueryParam.ids`（即 `full_doc_id` 白名单）传入 LightRAG。被禁用/归档的文档即使显式出现在 `filters.doc_ids` 里也会被静默剔除，不会进入答案。KB 边界仍由 workspace 双重保证。
 - `filters.metadata` 支持非空 key，value 为标量或标量列表（列表为 OR 语义），总 JSON 大小上限 64 KB；它会先在 KB documents metadata 上做精确匹配，再与 `filters.doc_ids`、`enabled/archived/lightrag_doc_id` 可检索集合取交集。无匹配时传入空 `QueryParam.ids=[]`，返回空检索范围而不是退回 KB-wide。
 - `include_chunk_content=true` 时 `references[].content` 返回该 reference 命中的 chunk 文本数组，便于评估与排查。
 - 非流式、结构化检索和流式首行都会在 `metadata` 中返回 active config 信息（存在时包含 `config_version_id`、`parser_hash`、`index_hash`、`query_hash`）。
-- 流式响应 `Content-Type: application/x-ndjson`：第一行是 `{kb_id, metadata}`，若 `include_references=true` 则同一行还包含 `references`；后续每行 `{response: "..."}`，错误时 `{error: "..."}`。
+- 流式响应 `Content-Type: application/x-ndjson`：第一行是 `{kb_id, metadata}`，若 `include_references=true` 则同一行还包含 `references`；后续每行 `{response: "..."}`，错误时 `{error: "..."}`。当请求体 `stream=false` 或底层返回非流式结果时，`/query/stream` 会返回单行完整 NDJSON，而不是多段 chunk。
 - 短查询（< 3 字符）返回 422；KB 不存在 404。
-- `enabled=false` / `archived=true` 的文档已接入检索层过滤：这些文档不会被纳入 `QueryParam.ids` 白名单，因此 naive 向量检索、实体派生 chunk、关系派生 chunk 三路证据都不会再命中它们。注意当全部文档均可检索时为保持全召回与零开销，服务端传入 `ids=None`（不过滤）；一旦存在任意禁用/归档文档，则改为传入可检索白名单。检索内部按 chunk 的 `full_doc_id` 做精确成员校验；过滤生效时无法确定归属的 chunk（缺 `full_doc_id`）会被保守剔除。图谱实体/关系的"结构"层若被多文档共享，仍可能在 KG 上下文里出现，但其引用的 chunk 证据已按文档白名单过滤。
 
 ---
 
@@ -802,10 +814,11 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 
 > 这些接口走全局默认 `workspace`，主要给现有 WebUI 与早期客户端使用。生产新接入建议使用 `/kbs/...` 系列。
 
-### 7.1 文档（`/documents`）
+### 9.1 文档（`/documents`）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| `GET` | `/documents` | 已弃用的文档状态列表（最多 1000 条）；新客户端使用 `POST /documents/paginated` |
 | `POST` | `/documents/scan` | 扫描 `input_dir` 并入库 |
 | `POST` | `/documents/upload` | 单文件上传（旧版） |
 | `POST` | `/documents/text` | 单文本插入 |
@@ -814,15 +827,13 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 | `GET` | `/documents/pipeline_status` | 全局 pipeline 状态 |
 | `DELETE` | `/documents/delete_document` | 按 ID 删除文档 |
 | `POST` | `/documents/clear_cache` | 清理 LLM 缓存 |
-| `DELETE` | `/documents/delete_entity` | 删除实体 |
-| `DELETE` | `/documents/delete_relation` | 删除关系 |
 | `GET` | `/documents/track_status/{track_id}` | 跟踪 ID 状态查询 |
 | `POST` | `/documents/paginated` | 分页文档状态 |
 | `GET` | `/documents/status_counts` | 状态统计 |
 | `POST` | `/documents/reprocess_failed` | 重处理失败文档 |
 | `POST` | `/documents/cancel_pipeline` | 取消运行中的 pipeline |
 
-### 7.2 查询（无前缀，挂在根路径）
+### 9.2 查询（无前缀，挂在根路径）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -830,9 +841,9 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 | `POST` | `/query/stream` | 流式问答（NDJSON，`Content-Type: application/x-ndjson`） |
 | `POST` | `/query/data` | 仅返回结构化检索数据，不调用 LLM 生成 |
 
-支持的 `mode`：`local` / `global` / `hybrid` / `naive` / `mix` / `bypass`。
+支持的 `mode`：`local` / `global` / `hybrid` / `naive` / `mix` / `bypass`。`/query/stream` 与 KB scoped stream 一样返回 NDJSON；当请求体 `stream=false` 或底层返回非流式结果时，会返回单行完整 NDJSON。
 
-### 7.3 图谱（无前缀）
+### 9.3 图谱（无前缀）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -846,16 +857,136 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 | `POST` | `/graph/entities/merge` | 合并实体 |
 | `POST` | `/graph/relation/edit` | 编辑关系 |
 | `POST` | `/graph/relation/create` | 新建关系 |
+| `DELETE` | `/graph/entity/delete` | 删除实体及其关系 |
+| `DELETE` | `/graph/relation/delete` | 删除关系 |
 
-### 7.4 Ollama 兼容（`/api`）
+### 9.4 Ollama 兼容（`/api`）
 
-挂载 `OllamaAPI`，对外提供与 Ollama 接口兼容的端点（`/api/tags`、`/api/chat` 等）。默认 `WHITELIST_PATHS` 仅放行 `/health`；如果要让 Ollama 兼容端点免 API Key，需要显式配置 `WHITELIST_PATHS=/health,/api/*`。
+挂载 `OllamaAPI`，对外提供与 Ollama 接口兼容的端点：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/version` | Ollama 兼容版本信息 |
+| `GET` | `/api/tags` | 模型列表 |
+| `GET` | `/api/ps` | 运行中模型列表 |
+| `POST` | `/api/generate` | Ollama generate 兼容接口 |
+| `POST` | `/api/chat` | Ollama chat 兼容接口 |
+
+默认 `WHITELIST_PATHS` 仅放行 `/health`；如果要让 Ollama 兼容端点免 API Key，需要显式配置 `WHITELIST_PATHS=/health,/api/*`。企业模式下 `/api/*` 属于受保护前缀，不能被 whitelist 或全局 API key 默认绕过。
+
+### 9.5 状态与认证基础接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/health` | 系统健康、配置和队列状态；默认 whitelist 放行 |
+| `GET` | `/auth-status` | 认证模式状态；非企业模式下可能签发 guest token |
+| `POST` | `/login` | 非企业模式下使用 `AUTH_ACCOUNTS`；企业模式下使用企业用户表 |
 
 ---
 
-## 十、状态机与字段说明
+## 十、企业模式 Auth / Admin
 
-### 8.1 文档状态
+本节接口仅在 `LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true` 时挂载或启用。企业模式默认禁用 guest 对受保护 API 的访问；`LIGHTRAG_API_KEY` 默认不能绕过 RBAC；`WHITELIST_PATHS` 不能放行 `/kbs`、`/documents`、`/query`、`/graph`、`/api` 等受保护前缀。
+
+### 10.1 配置项
+
+```env
+LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true
+TOKEN_SECRET=<non-default-secret>
+LIGHTRAG_SUPER_ADMIN_USERNAME=admin
+LIGHTRAG_SUPER_ADMIN_PASSWORD_HASH={bcrypt}$2b$12$...
+# 或仅首次开发引导使用：LIGHTRAG_SUPER_ADMIN_PASSWORD=change-me
+LIGHTRAG_USER_REGISTRATION_ENABLED=false
+LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES=true
+LIGHTRAG_ENTERPRISE_LEGACY_API_KEY_SUPERADMIN=false
+```
+
+### 10.2 登录与当前用户
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/auth-status` | 企业模式返回 `auth_mode=enterprise` 和当前注册开关；不签发 guest token |
+| `POST` | `/login` | 使用企业用户表认证，返回带 `user_id`、`system_role`、`token_version` metadata 的 JWT |
+| `POST` | `/auth/register` | 注册新普通用户；仅当注册开关开启时可用，新用户默认无 KB 权限且不可创建 KB |
+| `GET` | `/auth/me` | 返回当前用户与 principal 权限信息 |
+| `POST` | `/auth/change-password` | 当前用户修改密码；成功后 `token_version` 增加，旧 token 失效 |
+
+`GET /auth-status` 响应形态：企业模式返回 `auth_mode="enterprise"` 与注册开关且不签发 guest token；禁用认证时返回 guest bearer token；普通认证模式返回认证开关与登录入口信息。
+
+认证请求示例：
+
+```http
+POST /login
+Content-Type: application/x-www-form-urlencoded
+
+username=admin&password=change-me
+```
+
+```json
+// POST /auth/register
+{"username":"alice","password":"change-me"}
+
+// POST /auth/change-password
+{"current_password":"old-pass","new_password":"new-pass"}
+```
+
+### 10.3 管理接口
+
+以下接口均需 super admin：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/admin/settings/registration` | 读取实时注册开关 |
+| `PATCH` / `PUT` | `/admin/settings/registration` | 更新实时注册开关，body：`{"enabled": true}` |
+| `GET` | `/admin/users` | 列出企业用户 |
+| `POST` | `/admin/users` | 创建用户，可设置 `can_create_kb`、`can_use_bypass_query`、`tenant_id` |
+| `PATCH` | `/admin/users/{user_id}` | 更新用户状态/能力/密码；状态或密码变化会增加 `token_version` |
+| `GET` | `/admin/kbs/{kb_id}/acl` | 查看 KB ACL |
+| `PUT` | `/admin/kbs/{kb_id}/acl` | 授权 KB 角色，body：`{"user_id":"usr_...","role":"kb_viewer"}` |
+| `DELETE` | `/admin/kbs/{kb_id}/acl/{user_id}` | 撤销用户对 KB 的 ACL |
+| `GET` | `/admin/audit-events` | 查看最近审计事件；支持 `?limit=100` 限制返回条数 |
+
+KB ACL 角色使用规范名称：`kb_viewer`、`kb_editor`、`kb_admin`、`kb_owner`。第一期中 KB ACL 管理由 super admin 统一执行；普通 KB owner 不具备删除 KB 的平台权限。
+
+管理请求体示例：
+
+```json
+// PATCH /admin/settings/registration
+{"enabled": true}
+
+// POST /admin/users
+{"username":"bob","password":"bob-pass","can_create_kb":true,"can_use_bypass_query":false,"tenant_id":null}
+
+// PATCH /admin/users/{user_id}
+{"status":"active","can_create_kb":false,"can_use_bypass_query":true,"tenant_id":null,"password":"new-pass"}
+
+// PUT /admin/kbs/{kb_id}/acl
+{"user_id":"usr_...","role":"kb_viewer"}
+```
+
+### 10.4 企业模式权限边界
+
+- `mode="bypass"` 查询需要 KB read ACL 加 `can_use_bypass_query=true` 或 super admin；按最终解析后的查询模式判断，包括 active query config 默认值。
+- legacy/global `/documents`、`/query`、`/graph`、Ollama `/api/*` 在 `LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES=true` 时默认拒绝；关闭该开关后仍需 super admin。
+- super admin bootstrap 来自 `.env`，启动后同步为 active super admin；企业模式要求非默认 `TOKEN_SECRET`。
+
+KB 路由角色矩阵：
+
+| 范围 | 最低角色 / 能力 |
+|---|---|
+| `POST /kbs` | super admin 或 `can_create_kb=true` |
+| `GET /kbs` | super admin 看全部；普通用户仅看已授权 KB |
+| `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高 |
+| `/kbs/{kb_id}/query`、`/query/stream`、`/query/data`、`/retrieve` | `kb_viewer` 或更高；最终 `mode="bypass"` 额外需要 `can_use_bypass_query=true` |
+| 文档上传/解析/构建/删除/替换/sync、job wait/cancel/retry 等写操作 | `kb_editor` 或更高 |
+| KB 配置创建/激活/diff、`PATCH /kbs/{kb_id}` | `kb_admin` 或更高 |
+| `DELETE /kbs/{kb_id}`、`?hard=true`、`/admin/...` | super admin |
+
+---
+
+## 十一、状态机与字段说明
+
+### 11.1 文档状态
 
 ```
 created
@@ -877,7 +1008,7 @@ created
 
 辅助状态：`disabled` / `archived` / `deleting` / `delete_failed` / `deleted` / `replacing` / `replace_failed`。
 
-### 8.2 任务状态机（已实现部分）
+### 11.2 任务状态机（已实现部分）
 
 ```
 queued ---> running ---> succeeded
@@ -893,7 +1024,7 @@ cancelled --> retrying --> queued
 
 允许的转换由 `_allowed_next_job_statuses` 限定；非法转换返回 `409 InvalidJobTransition`。
 
-### 8.3 三段 Hash 含义
+### 11.3 三段 Hash 含义
 
 | Hash | 派生因子 | 变化时的最小动作 |
 |---|---|---|
@@ -903,13 +1034,13 @@ cancelled --> retrying --> queued
 
 `:build-kg` 命中 `index_hash` 且文档已 `ready` 时直接 skip；`:reindex` 始终绕过 skip。
 
-### 8.4 幂等键约定
+### 11.4 幂等键约定
 
 - 幂等键唯一索引：`(kb_id, job_type, idempotency_key)`。
 - 文本导入、URL 导入、本地 staged 文件导入、目录扫描、批量增量同步、单文档 parse、批量 parse、单文档 build、批量 build、单文档 replace 都支持幂等键。
 - 同 key 同请求指纹返回原 job；同 key 不同请求指纹返回 `409`。
 
-### 8.5 错误码归纳
+### 11.5 错误码归纳
 
 | HTTP | 业务错误码 | 含义 |
 |---|---|---|
@@ -928,14 +1059,14 @@ cancelled --> retrying --> queued
 
 ---
 
-## 十一、生产存储配置
+## 十二、生产存储配置
 
 KB 控制面 metadata 与 LightRAG engine storage 是两套配置：
 
 - `LIGHTRAG_KV_STORAGE` / `LIGHTRAG_VECTOR_STORAGE` / `LIGHTRAG_GRAPH_STORAGE` / `LIGHTRAG_DOC_STATUS_STORAGE` 控制底层 RAG 数据（full docs、chunks、vectors、graph、doc status）。
 - `LIGHTRAG_KB_METADATA_BACKEND` 控制 KB catalog、documents、jobs、artifacts、config versions 等业务控制面 metadata。
 
-### 11.1 PostgreSQL 控制面 metadata
+### 12.1 PostgreSQL 控制面 metadata
 
 ```env
 LIGHTRAG_KB_METADATA_BACKEND=postgres
@@ -969,7 +1100,7 @@ lightrag-migrate-kb-metadata --working-dir ./rag_storage --strategy fail --yes
 >
 > 注：`source_name` 文档过滤在 Postgres 后端的 `ESCAPE` 子句此前误用两字符转义串（`InvalidEscapeSequenceError`），已修复为单字符并由该 live 契约测试守护。
 
-### 11.2 MinIO / S3 source 与 artifact 存储
+### 12.2 MinIO / S3 source 与 artifact 存储
 
 ```env
 LIGHTRAG_OBJECT_STORAGE=minio

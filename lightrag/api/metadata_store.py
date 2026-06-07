@@ -332,6 +332,92 @@ class ConfigVersionRecord:
         return asdict(self)
 
 
+@dataclass(slots=True)
+class EnterpriseUserRecord:
+    id: str
+    username: str
+    password_hash: str
+    system_role: str
+    status: str
+    tenant_id: str | None
+    can_create_kb: bool
+    can_use_bypass_query: bool
+    token_version: int
+    metadata: dict[str, Any]
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "EnterpriseUserRecord":
+        return cls(
+            id=str(row["id"]),
+            username=str(row["username"]),
+            password_hash=str(row["password_hash"]),
+            system_role=str(row["system_role"]),
+            status=str(row["status"]),
+            tenant_id=row["tenant_id"],
+            can_create_kb=bool(row["can_create_kb"]),
+            can_use_bypass_query=bool(row["can_use_bypass_query"]),
+            token_version=int(row["token_version"]),
+            metadata=_loads_json_object(row["metadata_json"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class KBACLRecord:
+    kb_id: str
+    user_id: str
+    role: str
+    granted_by: str | None
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "KBACLRecord":
+        return cls(
+            kb_id=str(row["kb_id"]),
+            user_id=str(row["user_id"]),
+            role=str(row["role"]),
+            granted_by=row["granted_by"],
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class AuditEventRecord:
+    id: str
+    event_type: str
+    actor_user_id: str | None
+    target_type: str | None
+    target_id: str | None
+    metadata: dict[str, Any]
+    created_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "AuditEventRecord":
+        return cls(
+            id=str(row["id"]),
+            event_type=str(row["event_type"]),
+            actor_user_id=row["actor_user_id"],
+            target_type=row["target_type"],
+            target_id=row["target_id"],
+            metadata=_loads_json_object(row["metadata_json"]),
+            created_at=str(row["created_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def _dumps_json(value: dict[str, Any] | None) -> str:
     return json.dumps(value or {}, ensure_ascii=False, sort_keys=True)
 
@@ -1773,6 +1859,246 @@ class SQLiteMetadataStore:
 
         return await self._write(write)
 
+    async def get_enterprise_user_by_username(
+        self, username: str
+    ) -> EnterpriseUserRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_users WHERE username = ?",
+                (username,),
+            ).fetchone()
+        return EnterpriseUserRecord.from_row(row) if row is not None else None
+
+    async def get_enterprise_user_by_id(
+        self, user_id: str
+    ) -> EnterpriseUserRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+        return EnterpriseUserRecord.from_row(row) if row is not None else None
+
+    async def list_enterprise_users(self) -> list[EnterpriseUserRecord]:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM enterprise_users ORDER BY created_at ASC, id ASC"
+            ).fetchall()
+        return [EnterpriseUserRecord.from_row(row) for row in rows]
+
+    async def upsert_enterprise_user(
+        self, user: EnterpriseUserRecord
+    ) -> EnterpriseUserRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterpriseUserRecord:
+            conn.execute(
+                """
+                INSERT INTO enterprise_users (
+                    id, username, password_hash, system_role, status, tenant_id,
+                    can_create_kb, can_use_bypass_query, token_version,
+                    metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    username = excluded.username,
+                    password_hash = excluded.password_hash,
+                    system_role = excluded.system_role,
+                    status = excluded.status,
+                    tenant_id = excluded.tenant_id,
+                    can_create_kb = excluded.can_create_kb,
+                    can_use_bypass_query = excluded.can_use_bypass_query,
+                    token_version = excluded.token_version,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    user.id,
+                    user.username,
+                    user.password_hash,
+                    user.system_role,
+                    user.status,
+                    user.tenant_id,
+                    int(user.can_create_kb),
+                    int(user.can_use_bypass_query),
+                    user.token_version,
+                    _dumps_json(user.metadata),
+                    user.created_at,
+                    user.updated_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_users WHERE id = ?", (user.id,)
+            ).fetchone()
+            assert row is not None
+            return EnterpriseUserRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def set_enterprise_system_setting(
+        self, key: str, value: str, *, updated_by: str | None = None
+    ) -> None:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> None:
+            now = utc_now_iso()
+            conn.execute(
+                """
+                INSERT INTO enterprise_system_settings (
+                    key, value, updated_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_by = excluded.updated_by,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, updated_by, now, now),
+            )
+
+        await self._write(write)
+
+    async def get_enterprise_system_setting(
+        self, key: str, default: str | None = None
+    ) -> str | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM enterprise_system_settings WHERE key = ?", (key,)
+            ).fetchone()
+        return default if row is None else str(row["value"])
+
+    async def upsert_kb_acl(self, acl: KBACLRecord) -> KBACLRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> KBACLRecord:
+            conn.execute(
+                """
+                INSERT INTO enterprise_kb_acl (
+                    kb_id, user_id, role, granted_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(kb_id, user_id) DO UPDATE SET
+                    role = excluded.role,
+                    granted_by = excluded.granted_by,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    acl.kb_id,
+                    acl.user_id,
+                    acl.role,
+                    acl.granted_by,
+                    acl.created_at,
+                    acl.updated_at,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM enterprise_kb_acl
+                WHERE kb_id = ? AND user_id = ?
+                """,
+                (acl.kb_id, acl.user_id),
+            ).fetchone()
+            assert row is not None
+            return KBACLRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def delete_kb_acl(self, kb_id: str, user_id: str) -> bool:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute(
+                "DELETE FROM enterprise_kb_acl WHERE kb_id = ? AND user_id = ?",
+                (kb_id, user_id),
+            )
+            return bool(cursor.rowcount)
+
+        return await self._write(write)
+
+    async def list_kb_acl(self, kb_id: str) -> list[KBACLRecord]:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM enterprise_kb_acl
+                WHERE kb_id = ?
+                ORDER BY created_at ASC, user_id ASC
+                """,
+                (kb_id,),
+            ).fetchall()
+        return [KBACLRecord.from_row(row) for row in rows]
+
+    async def get_kb_acl_role(self, kb_id: str, user_id: str) -> str | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT role FROM enterprise_kb_acl
+                WHERE kb_id = ? AND user_id = ?
+                """,
+                (kb_id, user_id),
+            ).fetchone()
+        return None if row is None else str(row["role"])
+
+    async def list_kb_ids_for_user(self, user_id: str) -> list[str]:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT kb_id FROM enterprise_kb_acl
+                WHERE user_id = ?
+                ORDER BY kb_id ASC
+                """,
+                (user_id,),
+            ).fetchall()
+        return [str(row["kb_id"]) for row in rows]
+
+    async def append_audit_event(
+        self, event: AuditEventRecord
+    ) -> AuditEventRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> AuditEventRecord:
+            conn.execute(
+                """
+                INSERT INTO enterprise_audit_events (
+                    id, event_type, actor_user_id, target_type, target_id,
+                    metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.id,
+                    event.event_type,
+                    event.actor_user_id,
+                    event.target_type,
+                    event.target_id,
+                    _dumps_json(event.metadata),
+                    event.created_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_audit_events WHERE id = ?", (event.id,)
+            ).fetchone()
+            assert row is not None
+            return AuditEventRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def list_audit_events(self, *, limit: int = 100) -> list[AuditEventRecord]:
+        await self._ensure_initialized()
+        limit = max(1, min(limit, 500))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM enterprise_audit_events
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [AuditEventRecord.from_row(row) for row in rows]
+
     async def purge_kb_metadata(self, kb_id: str) -> dict[str, int]:
         """Hard delete all SQLite control-plane state for a KB.
 
@@ -2138,6 +2464,63 @@ class SQLiteMetadataStore:
                 ON kb_config_versions (kb_id, version);
             CREATE INDEX IF NOT EXISTS idx_config_versions_workspace
                 ON kb_config_versions (workspace);
+
+            CREATE TABLE IF NOT EXISTS enterprise_users (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                system_role TEXT NOT NULL,
+                status TEXT NOT NULL,
+                tenant_id TEXT,
+                can_create_kb INTEGER NOT NULL DEFAULT 0,
+                can_use_bypass_query INTEGER NOT NULL DEFAULT 0,
+                token_version INTEGER NOT NULL DEFAULT 1,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_users_status
+                ON enterprise_users (status);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_users_tenant
+                ON enterprise_users (tenant_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_system_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS enterprise_kb_acl (
+                kb_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                granted_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (kb_id, user_id),
+                FOREIGN KEY (user_id) REFERENCES enterprise_users(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_kb_acl_user
+                ON enterprise_kb_acl (user_id, kb_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_audit_events (
+                id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                actor_user_id TEXT,
+                target_type TEXT,
+                target_id TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_audit_events_created
+                ON enterprise_audit_events (created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_audit_events_actor
+                ON enterprise_audit_events (actor_user_id);
             """
         )
         conn.execute(

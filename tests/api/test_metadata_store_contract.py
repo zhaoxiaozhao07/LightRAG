@@ -32,11 +32,14 @@ import pytest
 from lightrag.api.kb_service import utc_now_iso
 from lightrag.api.metadata_store import (
     ArtifactRecord,
+    AuditEventRecord,
     ConfigVersionRecord,
     DocumentRecord,
+    EnterpriseUserRecord,
     IdempotencyKeyConflictError,
     InvalidJobTransitionError,
     JobRecord,
+    KBACLRecord,
     MetadataRecordNotFoundError,
     SQLiteMetadataStore,
 )
@@ -165,6 +168,103 @@ def _job(
         finished_at=None,
         cancelled_at=None,
     )
+
+
+def _enterprise_user(username: str) -> EnterpriseUserRecord:
+    now = utc_now_iso()
+    return EnterpriseUserRecord(
+        id=f"usr_{uuid.uuid4().hex[:10]}",
+        username=username,
+        password_hash="{bcrypt}$2b$12$placeholderplaceholderplaceholderplaceholderplace",
+        system_role="user",
+        status="active",
+        tenant_id=None,
+        can_create_kb=False,
+        can_use_bypass_query=False,
+        token_version=1,
+        metadata={},
+        created_at=now,
+        updated_at=now,
+    )
+
+
+async def test_enterprise_metadata_contract(store):
+    kb_id = _unique_kb(store)
+    user = await store.upsert_enterprise_user(_enterprise_user("alice"))
+
+    by_username = await store.get_enterprise_user_by_username("alice")
+    by_id = await store.get_enterprise_user_by_id(user.id)
+    assert by_username is not None
+    assert by_username.id == user.id
+    assert by_id is not None
+    assert by_id.username == "alice"
+
+    updated_user = EnterpriseUserRecord(
+        **{
+            **user.to_dict(),
+            "can_create_kb": True,
+            "can_use_bypass_query": True,
+            "token_version": user.token_version + 1,
+            "updated_at": utc_now_iso(),
+        }
+    )
+    saved_user = await store.upsert_enterprise_user(updated_user)
+    assert saved_user.can_create_kb is True
+    assert saved_user.can_use_bypass_query is True
+    assert saved_user.token_version == 2
+
+    await store.set_enterprise_system_setting(
+        "registration_enabled", "true", updated_by=user.id
+    )
+    assert await store.get_enterprise_system_setting("registration_enabled") == "true"
+    assert await store.get_enterprise_system_setting("missing", "fallback") == "fallback"
+
+    now = utc_now_iso()
+    acl = await store.upsert_kb_acl(
+        KBACLRecord(
+            kb_id=kb_id,
+            user_id=user.id,
+            role="viewer",
+            granted_by=user.id,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    assert acl.role == "viewer"
+    assert await store.get_kb_acl_role(kb_id, user.id) == "viewer"
+    assert await store.list_kb_ids_for_user(user.id) == [kb_id]
+    assert [item.user_id for item in await store.list_kb_acl(kb_id)] == [user.id]
+
+    updated_acl = await store.upsert_kb_acl(
+        KBACLRecord(
+            kb_id=kb_id,
+            user_id=user.id,
+            role="editor",
+            granted_by=user.id,
+            created_at=acl.created_at,
+            updated_at=utc_now_iso(),
+        )
+    )
+    assert updated_acl.role == "editor"
+    assert await store.get_kb_acl_role(kb_id, user.id) == "editor"
+
+    event = await store.append_audit_event(
+        AuditEventRecord(
+            id=f"audit_{uuid.uuid4().hex[:10]}",
+            event_type="kb_acl_granted",
+            actor_user_id=user.id,
+            target_type="kb",
+            target_id=kb_id,
+            metadata={"role": "editor"},
+            created_at=utc_now_iso(),
+        )
+    )
+    events = await store.list_audit_events(limit=10)
+    assert events[0].id == event.id
+    assert events[0].metadata == {"role": "editor"}
+
+    assert await store.delete_kb_acl(kb_id, user.id) is True
+    assert await store.get_kb_acl_role(kb_id, user.id) is None
 
 
 async def test_create_documents_and_job_then_read_back(store):

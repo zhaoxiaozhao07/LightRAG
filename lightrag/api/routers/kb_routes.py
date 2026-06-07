@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from lightrag.api.config_version_service import ConfigVersionService
@@ -23,6 +23,13 @@ from lightrag.api.metadata_store import (
     MetadataRecordNotFoundError,
 )
 from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.api.enterprise_auth import (
+    KB_ROLE_OWNER,
+    enterprise_auth_enabled,
+    get_enterprise_audit_service,
+    get_enterprise_authorization_service,
+    get_request_principal,
+)
 from lightrag.exceptions import PipelineNotInitializedError
 from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 from lightrag.utils import logger
@@ -210,16 +217,36 @@ def create_kb_routes(
         dependencies=[Depends(combined_auth)],
         summary="Create a knowledge base",
     )
-    async def create_knowledge_base(request: KnowledgeBaseCreateRequest):
+    async def create_knowledge_base(request: Request, body: KnowledgeBaseCreateRequest):
         try:
+            principal = get_request_principal(request)
+            owner_id = body.owner_id
+            tenant_id = body.tenant_id
+            if enterprise_auth_enabled():
+                if principal is None:
+                    raise HTTPException(status_code=401, detail="Login required")
+                owner_id = principal.user_id
+                tenant_id = principal.tenant_id
             record = await kb_service.create(
-                kb_id=request.id,
-                name=request.name,
-                description=request.description,
-                owner_id=request.owner_id,
-                tenant_id=request.tenant_id,
-                visibility=request.visibility,
+                kb_id=body.id,
+                name=body.name,
+                description=body.description,
+                owner_id=owner_id,
+                tenant_id=tenant_id,
+                visibility=body.visibility,
             )
+            if enterprise_auth_enabled() and principal is not None:
+                try:
+                    authz_service = get_enterprise_authorization_service(request)
+                    await authz_service.grant_kb_role(
+                        record.id,
+                        principal.user_id,
+                        KB_ROLE_OWNER,
+                        granted_by=principal.user_id,
+                    )
+                except Exception:
+                    await kb_service.delete(record.id)
+                    raise
             return KnowledgeBaseResponse.from_record(record)
         except KnowledgeBaseConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -235,8 +262,13 @@ def create_kb_routes(
         dependencies=[Depends(combined_auth)],
         summary="List knowledge bases",
     )
-    async def list_knowledge_bases(include_deleted: bool = False):
+    async def list_knowledge_bases(request: Request, include_deleted: bool = False):
         records = await kb_service.list(include_deleted=include_deleted)
+        if enterprise_auth_enabled():
+            authz_service = get_enterprise_authorization_service(request)
+            records = await authz_service.filter_kbs_for_principal(
+                get_request_principal(request), records
+            )
         items = [KnowledgeBaseResponse.from_record(record) for record in records]
         return KnowledgeBaseListResponse(knowledge_bases=items, total=len(items))
 
@@ -263,6 +295,9 @@ def create_kb_routes(
     )
     async def update_knowledge_base(kb_id: str, request: KnowledgeBaseUpdateRequest):
         data = request.model_dump(exclude_unset=True)
+        if enterprise_auth_enabled():
+            data.pop("owner_id", None)
+            data.pop("tenant_id", None)
         if "active_config_version_id" in data:
             raise HTTPException(
                 status_code=400,
@@ -288,7 +323,7 @@ def create_kb_routes(
         dependencies=[Depends(combined_auth)],
         summary="Delete a knowledge base",
     )
-    async def delete_knowledge_base(kb_id: str, hard: bool = False):
+    async def delete_knowledge_base(kb_id: str, request: Request, hard: bool = False):
         try:
             if hard:
                 # Idempotent hard delete: if the KB is already soft-deleted,
@@ -330,6 +365,16 @@ def create_kb_routes(
                         kb_id,
                         exc,
                     )
+            if enterprise_auth_enabled():
+                principal = get_request_principal(request)
+                audit_service = get_enterprise_audit_service(request)
+                await audit_service.append(
+                    "kb_hard_deleted" if hard else "kb_deleted",
+                    actor_user_id=principal.user_id if principal else None,
+                    target_type="kb",
+                    target_id=record.id,
+                    metadata={"hard": hard},
+                )
             return KnowledgeBaseResponse.from_record(record)
         except HTTPException:
             raise
@@ -390,11 +435,17 @@ def create_kb_routes(
             summary="Create a new KB configuration version",
         )
         async def create_config_version(
-            kb_id: str, request: ConfigVersionCreateRequest
+            kb_id: str, request: Request, body: ConfigVersionCreateRequest
         ):
             try:
+                created_by = body.created_by
+                if enterprise_auth_enabled():
+                    principal = get_request_principal(request)
+                    if principal is None:
+                        raise HTTPException(status_code=401, detail="Login required")
+                    created_by = principal.user_id
                 record = await active_config_service.create(
-                    kb_id, config=request.config, created_by=request.created_by
+                    kb_id, config=body.config, created_by=created_by
                 )
                 return ConfigVersionResponse.from_record(record)
             except KnowledgeBaseNotFoundError as exc:

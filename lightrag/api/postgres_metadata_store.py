@@ -17,13 +17,16 @@ from lightrag.api.metadata_store import (
     ActiveDocumentParseJobError,
     ActiveDocumentReplaceJobError,
     ArtifactRecord,
+    AuditEventRecord,
     ConfigVersionRecord,
     DocumentNotParsedError,
     DocumentRecord,
     DuplicateDocumentSourceKeyError,
+    EnterpriseUserRecord,
     IdempotencyKeyConflictError,
     InvalidJobTransitionError,
     JobRecord,
+    KBACLRecord,
     MetadataJobStatus,
     MetadataRecordNotFoundError,
 )
@@ -75,6 +78,21 @@ def _artifact_from_row(row: Any) -> ArtifactRecord:
 def _config_from_row(row: Any) -> ConfigVersionRecord:
     data = _loads_json_object(row["data_json"])
     return ConfigVersionRecord(**data)
+
+
+def _enterprise_user_from_row(row: Any) -> EnterpriseUserRecord:
+    data = _loads_json_object(row["data_json"])
+    return EnterpriseUserRecord(**data)
+
+
+def _kb_acl_from_row(row: Any) -> KBACLRecord:
+    data = _loads_json_object(row["data_json"])
+    return KBACLRecord(**data)
+
+
+def _audit_event_from_row(row: Any) -> AuditEventRecord:
+    data = _loads_json_object(row["data_json"])
+    return AuditEventRecord(**data)
 
 
 def _record_json(record: Any) -> str:
@@ -1182,6 +1200,245 @@ class PostgresMetadataStore:
 
         return await self._write(write)
 
+    async def get_enterprise_user_by_username(
+        self, username: str
+    ) -> EnterpriseUserRecord | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_users WHERE username = $1",
+                username,
+            )
+        return _enterprise_user_from_row(row) if row is not None else None
+
+    async def get_enterprise_user_by_id(
+        self, user_id: str
+    ) -> EnterpriseUserRecord | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_users WHERE id = $1",
+                user_id,
+            )
+        return _enterprise_user_from_row(row) if row is not None else None
+
+    async def list_enterprise_users(self) -> list[EnterpriseUserRecord]:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT data_json FROM enterprise_users
+                ORDER BY created_at ASC, id ASC
+                """
+            )
+        return [_enterprise_user_from_row(row) for row in rows]
+
+    async def upsert_enterprise_user(
+        self, user: EnterpriseUserRecord
+    ) -> EnterpriseUserRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> EnterpriseUserRecord:
+            await conn.execute(
+                """
+                INSERT INTO enterprise_users (
+                    id, username, status, tenant_id, created_at, updated_at, data_json
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                ON CONFLICT (id) DO UPDATE SET
+                    username = excluded.username,
+                    status = excluded.status,
+                    tenant_id = excluded.tenant_id,
+                    updated_at = excluded.updated_at,
+                    data_json = excluded.data_json
+                """,
+                user.id,
+                user.username,
+                user.status,
+                user.tenant_id,
+                user.created_at,
+                user.updated_at,
+                _record_json(user),
+            )
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_users WHERE id = $1", user.id
+            )
+            if row is None:
+                raise MetadataRecordNotFoundError(f"User '{user.id}' not found")
+            return _enterprise_user_from_row(row)
+
+        return await self._write(write)
+
+    async def set_enterprise_system_setting(
+        self, key: str, value: str, *, updated_by: str | None = None
+    ) -> None:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> None:
+            now = utc_now_iso()
+            await conn.execute(
+                """
+                INSERT INTO enterprise_system_settings (
+                    key, value, updated_by, created_at, updated_at
+                ) VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_by = excluded.updated_by,
+                    updated_at = excluded.updated_at
+                """,
+                key,
+                value,
+                updated_by,
+                now,
+                now,
+            )
+
+        await self._write(write)
+
+    async def get_enterprise_system_setting(
+        self, key: str, default: str | None = None
+    ) -> str | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            value = await conn.fetchval(
+                "SELECT value FROM enterprise_system_settings WHERE key = $1",
+                key,
+            )
+        return default if value is None else str(value)
+
+    async def upsert_kb_acl(self, acl: KBACLRecord) -> KBACLRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> KBACLRecord:
+            await conn.execute(
+                """
+                INSERT INTO enterprise_kb_acl (
+                    kb_id, user_id, role, granted_by, created_at, updated_at, data_json
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                ON CONFLICT (kb_id, user_id) DO UPDATE SET
+                    role = excluded.role,
+                    granted_by = excluded.granted_by,
+                    updated_at = excluded.updated_at,
+                    data_json = excluded.data_json
+                """,
+                acl.kb_id,
+                acl.user_id,
+                acl.role,
+                acl.granted_by,
+                acl.created_at,
+                acl.updated_at,
+                _record_json(acl),
+            )
+            row = await conn.fetchrow(
+                """
+                SELECT data_json FROM enterprise_kb_acl
+                WHERE kb_id = $1 AND user_id = $2
+                """,
+                acl.kb_id,
+                acl.user_id,
+            )
+            if row is None:
+                raise MetadataRecordNotFoundError("KB ACL grant not found")
+            return _kb_acl_from_row(row)
+
+        return await self._write(write)
+
+    async def delete_kb_acl(self, kb_id: str, user_id: str) -> bool:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> bool:
+            status = await conn.execute(
+                "DELETE FROM enterprise_kb_acl WHERE kb_id = $1 AND user_id = $2",
+                kb_id,
+                user_id,
+            )
+            return _rowcount(status) > 0
+
+        return await self._write(write)
+
+    async def list_kb_acl(self, kb_id: str) -> list[KBACLRecord]:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT data_json FROM enterprise_kb_acl
+                WHERE kb_id = $1
+                ORDER BY created_at ASC, user_id ASC
+                """,
+                kb_id,
+            )
+        return [_kb_acl_from_row(row) for row in rows]
+
+    async def get_kb_acl_role(self, kb_id: str, user_id: str) -> str | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            role = await conn.fetchval(
+                """
+                SELECT role FROM enterprise_kb_acl
+                WHERE kb_id = $1 AND user_id = $2
+                """,
+                kb_id,
+                user_id,
+            )
+        return None if role is None else str(role)
+
+    async def list_kb_ids_for_user(self, user_id: str) -> list[str]:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT kb_id FROM enterprise_kb_acl
+                WHERE user_id = $1
+                ORDER BY kb_id ASC
+                """,
+                user_id,
+            )
+        return [str(row["kb_id"]) for row in rows]
+
+    async def append_audit_event(
+        self, event: AuditEventRecord
+    ) -> AuditEventRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> AuditEventRecord:
+            await conn.execute(
+                """
+                INSERT INTO enterprise_audit_events (
+                    id, event_type, actor_user_id, target_type, target_id,
+                    created_at, data_json
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                """,
+                event.id,
+                event.event_type,
+                event.actor_user_id,
+                event.target_type,
+                event.target_id,
+                event.created_at,
+                _record_json(event),
+            )
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_audit_events WHERE id = $1",
+                event.id,
+            )
+            if row is None:
+                raise MetadataRecordNotFoundError(f"Audit event '{event.id}' not found")
+            return _audit_event_from_row(row)
+
+        return await self._write(write)
+
+    async def list_audit_events(self, *, limit: int = 100) -> list[AuditEventRecord]:
+        await self._ensure_initialized()
+        limit = max(1, min(limit, 500))
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT data_json FROM enterprise_audit_events
+                ORDER BY created_at DESC, id DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [_audit_event_from_row(row) for row in rows]
+
     async def purge_kb_metadata(self, kb_id: str) -> dict[str, int]:
         await self._ensure_initialized()
 
@@ -1409,6 +1666,56 @@ class PostgresMetadataStore:
                 ON kb_config_versions (kb_id, version);
             CREATE INDEX IF NOT EXISTS idx_kb_config_versions_workspace
                 ON kb_config_versions (workspace);
+
+            CREATE TABLE IF NOT EXISTS enterprise_users (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                tenant_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                data_json JSONB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_enterprise_users_status
+                ON enterprise_users (status);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_users_tenant
+                ON enterprise_users (tenant_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_system_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS enterprise_kb_acl (
+                kb_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                granted_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                data_json JSONB NOT NULL,
+                PRIMARY KEY (kb_id, user_id),
+                FOREIGN KEY (user_id) REFERENCES enterprise_users(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_enterprise_kb_acl_user
+                ON enterprise_kb_acl (user_id, kb_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_audit_events (
+                id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                actor_user_id TEXT,
+                target_type TEXT,
+                target_id TEXT,
+                created_at TEXT NOT NULL,
+                data_json JSONB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_enterprise_audit_events_created
+                ON enterprise_audit_events (created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_audit_events_actor
+                ON enterprise_audit_events (actor_user_id);
             """
         )
         await conn.execute(

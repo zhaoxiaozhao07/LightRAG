@@ -373,7 +373,7 @@ async def test_pipeline_enqueue_docx_plain_text_extracts_before_enqueue(
 async def test_pipeline_enqueue_md_moves_after_enqueue(tmp_path, monkeypatch):
     monkeypatch.delenv("LIGHTRAG_PARSER", raising=False)
     file_path = tmp_path / "notes.md"
-    file_path.write_text("# Notes\n\nmarkdown content", encoding="utf-8")
+    file_path.write_text("# Notes\n\nmarkdown content", encoding="utf-8", newline="\n")
     rag = _FakeRag()
 
     success, returned_track_id = await pipeline_enqueue_file(rag, file_path, "track-md")

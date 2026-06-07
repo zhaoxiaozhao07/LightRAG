@@ -91,6 +91,13 @@ from lightrag.kg.shared_storage import (
 )
 from fastapi.security import OAuth2PasswordRequestForm
 from lightrag.api.auth import auth_handler
+from lightrag.api.enterprise_auth import (
+    AuditService,
+    AuthorizationService,
+    SystemSettingsService,
+    UserService,
+)
+from lightrag.api.routers.enterprise_routes import create_enterprise_routes
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -898,6 +905,21 @@ def create_app(args):
     )
     job_service = JobService(kb_service, metadata_store)
     index_build_service = IndexBuildService(document_lifecycle_service)
+    enterprise_enabled = bool(getattr(args, "enterprise_auth_enabled", False))
+    enterprise_audit_service = AuditService(metadata_store) if enterprise_enabled else None
+    enterprise_user_service = (
+        UserService(metadata_store, enterprise_audit_service)
+        if enterprise_enabled
+        else None
+    )
+    enterprise_settings_service = (
+        SystemSettingsService(metadata_store) if enterprise_enabled else None
+    )
+    enterprise_authorization_service = (
+        AuthorizationService(metadata_store, enterprise_audit_service)
+        if enterprise_enabled
+        else None
+    )
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """Lifespan context manager for startup and shutdown events"""
@@ -907,6 +929,17 @@ def create_app(args):
         try:
             await kb_service.initialize()
             await metadata_store.initialize()
+            if enterprise_enabled:
+                if enterprise_settings_service is None or enterprise_user_service is None:
+                    raise RuntimeError("Enterprise services were not initialized")
+                await enterprise_settings_service.initialize_registration_setting(
+                    bool(getattr(args, "user_registration_enabled", False))
+                )
+                await enterprise_user_service.bootstrap_super_admin(
+                    username=str(getattr(args, "super_admin_username", "admin")),
+                    password=getattr(args, "super_admin_password", None),
+                    password_hash=getattr(args, "super_admin_password_hash", None),
+                )
             if object_storage is not None:
                 await object_storage.initialize()
 
@@ -999,6 +1032,12 @@ def create_app(args):
     }
 
     app = FastAPI(**app_kwargs)
+    app.state.enterprise_enabled = enterprise_enabled
+    if enterprise_enabled:
+        app.state.enterprise_user_service = enterprise_user_service
+        app.state.enterprise_settings_service = enterprise_settings_service
+        app.state.enterprise_authorization_service = enterprise_authorization_service
+        app.state.enterprise_audit_service = enterprise_audit_service
 
     # Add custom validation error handler for /query/data endpoint
     @app.exception_handler(RequestValidationError)
@@ -2333,6 +2372,8 @@ def create_app(args):
             api_key=api_key,
         )
     )
+    if enterprise_enabled:
+        app.include_router(create_enterprise_routes(api_key=api_key))
     app.include_router(create_document_routes(rag, doc_manager, api_key))
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
@@ -2383,6 +2424,20 @@ def create_app(args):
     async def get_auth_status():
         """Get authentication status and guest token if auth is not configured"""
 
+        if enterprise_enabled:
+            registration_enabled = False
+            if enterprise_settings_service is not None:
+                registration_enabled = await enterprise_settings_service.registration_enabled()
+            return {
+                "auth_configured": True,
+                "auth_mode": "enterprise",
+                "registration_enabled": registration_enabled,
+                "core_version": core_version,
+                "api_version": api_version_display,
+                "webui_title": webui_title,
+                "webui_description": webui_description,
+            }
+
         if not auth_handler.accounts:
             # Authentication not configured, return guest token
             guest_token = auth_handler.create_token(
@@ -2411,6 +2466,53 @@ def create_app(args):
 
     @app.post("/login")
     async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+        if enterprise_enabled:
+            if enterprise_user_service is None:
+                raise HTTPException(
+                    status_code=500, detail="Enterprise user service unavailable"
+                )
+            user = await enterprise_user_service.authenticate(
+                form_data.username, form_data.password
+            )
+            if user is None:
+                if enterprise_audit_service is not None:
+                    await enterprise_audit_service.append(
+                        "login_failed",
+                        target_type="user",
+                        target_id=form_data.username,
+                    )
+                raise HTTPException(status_code=401, detail="Incorrect credentials")
+            if enterprise_audit_service is not None:
+                await enterprise_audit_service.append(
+                    "login_success", actor_user_id=user.id
+                )
+            token = auth_handler.create_token(
+                username=user.username,
+                role=user.system_role,
+                metadata=enterprise_user_service.token_metadata_for_user(user),
+            )
+            return {
+                "access_token": token,
+                "token_type": "bearer",
+                "auth_mode": "enterprise",
+                "user": {
+                    "id": user.id,
+                    "username": user.username,
+                    "system_role": user.system_role,
+                    "status": user.status,
+                    "tenant_id": user.tenant_id,
+                    "can_create_kb": user.can_create_kb,
+                    "can_use_bypass_query": user.can_use_bypass_query,
+                    "token_version": user.token_version,
+                    "created_at": user.created_at,
+                    "updated_at": user.updated_at,
+                },
+                "core_version": core_version,
+                "api_version": api_version_display,
+                "webui_title": webui_title,
+                "webui_description": webui_description,
+            }
+
         if not auth_handler.accounts:
             # Authentication not configured, return guest token
             guest_token = auth_handler.create_token(

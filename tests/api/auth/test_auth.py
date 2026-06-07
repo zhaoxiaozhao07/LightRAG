@@ -114,6 +114,55 @@ def test_initialize_config_allows_custom_token_secret_with_auth_accounts():
     assert initialized is secure_args
 
 
+def test_initialize_config_rejects_enterprise_with_default_token_secret():
+    config = import_real_api_module("lightrag.api.config")
+
+    insecure_args = SimpleNamespace(
+        auth_accounts="",
+        token_secret=config.DEFAULT_TOKEN_SECRET,
+        enterprise_auth_enabled=True,
+        super_admin_username="admin",
+        super_admin_password="secret",
+        super_admin_password_hash=None,
+    )
+
+    with pytest.raises(ValueError, match="LIGHTRAG_ENTERPRISE_AUTH_ENABLED"):
+        config.initialize_config(insecure_args, force=True)
+
+
+def test_initialize_config_rejects_enterprise_without_super_admin_secret():
+    config = import_real_api_module("lightrag.api.config")
+
+    insecure_args = SimpleNamespace(
+        auth_accounts="",
+        token_secret="custom-enterprise-secret",
+        enterprise_auth_enabled=True,
+        super_admin_username="admin",
+        super_admin_password=None,
+        super_admin_password_hash=None,
+    )
+
+    with pytest.raises(ValueError, match="LIGHTRAG_SUPER_ADMIN_PASSWORD"):
+        config.initialize_config(insecure_args, force=True)
+
+
+def test_initialize_config_allows_enterprise_with_hash_and_custom_secret():
+    config = import_real_api_module("lightrag.api.config")
+
+    secure_args = SimpleNamespace(
+        auth_accounts="",
+        token_secret="custom-enterprise-secret",
+        enterprise_auth_enabled=True,
+        super_admin_username="admin",
+        super_admin_password=None,
+        super_admin_password_hash="{bcrypt}hash",
+    )
+
+    initialized = config.initialize_config(secure_args, force=True)
+
+    assert initialized is secure_args
+
+
 def test_guest_tokens_fall_back_to_default_secret_when_token_secret_missing(
     monkeypatch,
 ):

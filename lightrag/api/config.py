@@ -161,11 +161,35 @@ def validate_auth_configuration(args: argparse.Namespace) -> None:
     """Reject insecure JWT auth settings before the API starts."""
     auth_accounts = (getattr(args, "auth_accounts", "") or "").strip()
     token_secret = (getattr(args, "token_secret", "") or "").strip()
+    enterprise_enabled = bool(getattr(args, "enterprise_auth_enabled", False))
+    super_admin_username = (
+        getattr(args, "super_admin_username", "") or ""
+    ).strip()
+    super_admin_password = (
+        getattr(args, "super_admin_password", "") or ""
+    ).strip()
+    super_admin_password_hash = (
+        getattr(args, "super_admin_password_hash", "") or ""
+    ).strip()
 
     if auth_accounts and (not token_secret or token_secret == DEFAULT_TOKEN_SECRET):
         raise ValueError(
             "TOKEN_SECRET must be explicitly set to a non-default value when AUTH_ACCOUNTS is configured."
         )
+
+    if enterprise_enabled:
+        if not token_secret or token_secret == DEFAULT_TOKEN_SECRET:
+            raise ValueError(
+                "TOKEN_SECRET must be explicitly set to a non-default value when LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true."
+            )
+        if not super_admin_username:
+            raise ValueError(
+                "LIGHTRAG_SUPER_ADMIN_USERNAME is required when enterprise auth is enabled."
+            )
+        if not super_admin_password and not super_admin_password_hash:
+            raise ValueError(
+                "LIGHTRAG_SUPER_ADMIN_PASSWORD or LIGHTRAG_SUPER_ADMIN_PASSWORD_HASH is required when enterprise auth is enabled."
+            )
 
 
 def _is_set(value: str | None) -> bool:
@@ -647,6 +671,28 @@ def parse_args() -> argparse.Namespace:
     args.token_expire_hours = get_env_value("TOKEN_EXPIRE_HOURS", 48, float)
     args.guest_token_expire_hours = get_env_value("GUEST_TOKEN_EXPIRE_HOURS", 24, float)
     args.jwt_algorithm = get_env_value("JWT_ALGORITHM", "HS256")
+
+    # Enterprise multi-user/RBAC mode. These flags are opt-in and must not
+    # change legacy guest/API-key/AUTH_ACCOUNTS behavior unless explicitly set.
+    args.enterprise_auth_enabled = get_env_value(
+        "LIGHTRAG_ENTERPRISE_AUTH_ENABLED", False, bool
+    )
+    args.super_admin_username = get_env_value(
+        "LIGHTRAG_SUPER_ADMIN_USERNAME", "admin"
+    )
+    args.super_admin_password = get_env_value("LIGHTRAG_SUPER_ADMIN_PASSWORD", None)
+    args.super_admin_password_hash = get_env_value(
+        "LIGHTRAG_SUPER_ADMIN_PASSWORD_HASH", None
+    )
+    args.user_registration_enabled = get_env_value(
+        "LIGHTRAG_USER_REGISTRATION_ENABLED", False, bool
+    )
+    args.enterprise_disable_global_routes = get_env_value(
+        "LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES", True, bool
+    )
+    args.enterprise_legacy_api_key_superadmin = get_env_value(
+        "LIGHTRAG_ENTERPRISE_LEGACY_API_KEY_SUPERADMIN", False, bool
+    )
 
     # Token auto-renewal configuration (sliding window expiration)
     args.token_auto_renew = get_env_value("TOKEN_AUTO_RENEW", True, bool)

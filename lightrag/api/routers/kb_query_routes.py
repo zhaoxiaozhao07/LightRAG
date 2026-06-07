@@ -10,8 +10,8 @@ routes with a per-KB edge:
 - ``filters.doc_ids`` (when supplied) are validated against the KB's
   ``documents`` table so a request cannot retrieve a document that does
   not belong to the KB.
-- ``mode`` accepts the same six values as the global route. ``bypass`` is
-  still allowed but should be gated behind RBAC in a later phase.
+- ``mode`` accepts the same six values as the global route. In enterprise
+  mode, effective ``bypass`` mode is gated after active KB defaults are merged.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Literal, Optional, Protocol, cast
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -28,6 +28,11 @@ from lightrag.api.config_version_service import (
     active_query_metadata_from_rag,
 )
 from lightrag.api.document_lifecycle_service import DocumentLifecycleService
+from lightrag.api.enterprise_auth import (
+    enterprise_auth_enabled,
+    get_enterprise_authorization_service,
+    get_request_principal,
+)
 from lightrag.api.kb_service import KnowledgeBaseNotFoundError
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry
 from lightrag.api.metadata_store import DocumentRecord
@@ -54,6 +59,14 @@ _QUERY_BLOCKING_DOCUMENT_STATUSES = {
 }
 _MAX_METADATA_FILTER_BYTES = 64 * 1024
 _METADATA_FILTER_SCALAR_TYPES = (str, int, float, bool, type(None))
+
+
+def _enforce_resolved_bypass_permission(request: Request, param: QueryParam) -> None:
+    if param.mode != "bypass" or not enterprise_auth_enabled():
+        return
+    get_enterprise_authorization_service(request).require_bypass_query(
+        get_request_principal(request)
+    )
 
 
 class KBQueryFilters(BaseModel):
@@ -447,7 +460,7 @@ def create_kb_query_routes(
         dependencies=[Depends(combined_auth)],
         summary="Run a non-streaming RAG query against a knowledge base",
     )
-    async def kb_query(kb_id: str, request: KBQueryRequest):
+    async def kb_query(kb_id: str, request: KBQueryRequest, http_request: Request):
         try:
             await _ensure_query_filter_documents_available(
                 document_service,
@@ -461,6 +474,7 @@ def create_kb_query_routes(
                 is_stream=False,
                 active_defaults=active_defaults,
             )
+            _enforce_resolved_bypass_permission(http_request, param)
             param.stream = False
             # Enforce per-document retrieval scoping: ``filters.doc_ids`` plus
             # the enabled/archived control-plane state are translated into a
@@ -507,7 +521,9 @@ def create_kb_query_routes(
         dependencies=[Depends(combined_auth)],
         summary="Run a streaming RAG query against a knowledge base (NDJSON)",
     )
-    async def kb_query_stream(kb_id: str, request: KBQueryRequest):
+    async def kb_query_stream(
+        kb_id: str, request: KBQueryRequest, http_request: Request
+    ):
         try:
             await _ensure_query_filter_documents_available(
                 document_service,
@@ -522,6 +538,7 @@ def create_kb_query_routes(
                 is_stream=stream_mode,
                 active_defaults=active_defaults,
             )
+            _enforce_resolved_bypass_permission(http_request, param)
             param.ids = await _resolve_doc_id_scope(
                 document_service,
                 kb_id,
@@ -592,7 +609,7 @@ def create_kb_query_routes(
         dependencies=[Depends(combined_auth)],
         summary="Return structured retrieval data without generating an LLM answer",
     )
-    async def kb_query_data(kb_id: str, request: KBQueryRequest):
+    async def kb_query_data(kb_id: str, request: KBQueryRequest, http_request: Request):
         try:
             await _ensure_query_filter_documents_available(
                 document_service,
@@ -606,6 +623,7 @@ def create_kb_query_routes(
                 is_stream=False,
                 active_defaults=active_defaults,
             )
+            _enforce_resolved_bypass_permission(http_request, param)
             param.stream = False
             param.ids = await _resolve_doc_id_scope(
                 document_service,
@@ -638,7 +656,7 @@ def create_kb_query_routes(
         dependencies=[Depends(combined_auth)],
         summary="Alias for /query/data — retrieval only, no LLM generation",
     )
-    async def kb_retrieve(kb_id: str, request: KBQueryRequest):
-        return await kb_query_data(kb_id, request)
+    async def kb_retrieve(kb_id: str, request: KBQueryRequest, http_request: Request):
+        return await kb_query_data(kb_id, request, http_request)
 
     return router
