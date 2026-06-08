@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -8,11 +9,16 @@ from pydantic import BaseModel, Field
 from lightrag.api.auth import auth_handler
 from lightrag.api.enterprise_auth import (
     Principal,
+    REGISTRATION_MODE_ADMIN_APPROVAL,
+    REGISTRATION_MODE_INVITE_ONLY,
+    REGISTRATION_MODE_OPEN,
     USER_STATUS_ACTIVE,
     USER_STATUS_DISABLED,
+    USER_STATUS_PENDING,
     get_enterprise_api_key_service,
     get_enterprise_audit_service,
     get_enterprise_authorization_service,
+    get_enterprise_invitation_service,
     get_enterprise_settings_service,
     get_enterprise_user_service,
     get_request_principal,
@@ -21,6 +27,7 @@ from lightrag.api.kb_service import KnowledgeBaseNotFoundError, KnowledgeBaseSer
 from lightrag.api.metadata_store import (
     AuditEventRecord,
     EnterpriseAPIKeyRecord,
+    EnterpriseInvitationRecord,
     EnterpriseUserRecord,
     KBACLRecord,
     EnterpriseTenantKBACLRecord,
@@ -54,6 +61,7 @@ class EnterpriseUserResponse(BaseModel):
 class EnterpriseRegistrationRequest(BaseModel):
     username: str = Field(min_length=1)
     password: str = Field(min_length=1)
+    invitation_token: str | None = None
 
 
 class EnterpriseChangePasswordRequest(BaseModel):
@@ -159,6 +167,7 @@ class EnterpriseServiceAPIKeyCreateRequest(BaseModel):
     can_use_bypass_query: bool = False
     tenant_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    expires_in_seconds: int | None = Field(default=None, ge=1)
 
 
 class EnterpriseServiceAPIKeyResponse(BaseModel):
@@ -175,6 +184,7 @@ class EnterpriseServiceAPIKeyResponse(BaseModel):
     last_used_at: str | None
     revoked_at: str | None
     revoked_by: str | None
+    expires_at: str | None = None
 
     @classmethod
     def from_record(cls, record: EnterpriseAPIKeyRecord) -> "EnterpriseServiceAPIKeyResponse":
@@ -186,6 +196,37 @@ class EnterpriseServiceAPIKeyResponse(BaseModel):
 class EnterpriseServiceAPIKeyCreateResponse(BaseModel):
     api_key: str
     key: EnterpriseServiceAPIKeyResponse
+
+
+class EnterpriseInvitationCreateRequest(BaseModel):
+    expires_in_seconds: int | None = Field(default=None, ge=1)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class EnterpriseInvitationResponse(BaseModel):
+    id: str
+    token_preview: str
+    status: str
+    created_by: str | None
+    expires_at: str | None
+    used_by: str | None
+    used_at: str | None
+    metadata: dict[str, Any]
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_record(
+        cls, record: EnterpriseInvitationRecord
+    ) -> "EnterpriseInvitationResponse":
+        data = record.to_dict()
+        data.pop("token_hash", None)
+        return cls(**data)
+
+
+class EnterpriseInvitationCreateResponse(BaseModel):
+    invitation_token: str
+    invitation: EnterpriseInvitationResponse
 
 
 class EnterpriseAuditEventResponse(BaseModel):
@@ -261,14 +302,63 @@ def create_enterprise_routes(
     @router.post("/auth/register")
     async def register_user(request: Request, body: EnterpriseRegistrationRequest):
         settings_service = get_enterprise_settings_service(request)
-        if not await settings_service.registration_enabled():
-            raise HTTPException(status_code=403, detail="User registration is disabled")
+        mode = await settings_service.registration_mode()
         user_service = get_enterprise_user_service(request)
-        user = await user_service.create_user(
-            username=body.username,
-            password=body.password,
-        )
-        return login_response(user_service, user)
+        audit_service = get_enterprise_audit_service(request)
+
+        if mode == REGISTRATION_MODE_OPEN:
+            user = await user_service.create_user(
+                username=body.username, password=body.password
+            )
+            await audit_service.append(
+                "user_registered",
+                actor_user_id=user.id,
+                target_type="user",
+                target_id=user.id,
+                metadata={"mode": mode},
+            )
+            return login_response(user_service, user)
+
+        if mode == REGISTRATION_MODE_INVITE_ONLY:
+            invitation_service = get_enterprise_invitation_service(request)
+            # Consume the single-use token first so a failed downstream step
+            # cannot mint a user without burning the invitation.
+            await invitation_service.consume_invitation(
+                body.invitation_token, used_by=body.username.strip()
+            )
+            user = await user_service.create_user(
+                username=body.username, password=body.password
+            )
+            await audit_service.append(
+                "user_registered",
+                actor_user_id=user.id,
+                target_type="user",
+                target_id=user.id,
+                metadata={"mode": mode},
+            )
+            return login_response(user_service, user)
+
+        if mode == REGISTRATION_MODE_ADMIN_APPROVAL:
+            user = await user_service.create_user(
+                username=body.username,
+                password=body.password,
+                status=USER_STATUS_PENDING,
+            )
+            await audit_service.append(
+                "user_registration_pending",
+                actor_user_id=user.id,
+                target_type="user",
+                target_id=user.id,
+                metadata={"mode": mode},
+            )
+            return {
+                "auth_mode": "enterprise",
+                "status": USER_STATUS_PENDING,
+                "user": EnterpriseUserResponse.from_record(user).model_dump(),
+                "message": "Registration submitted; awaiting administrator approval.",
+            }
+
+        raise HTTPException(status_code=403, detail="User registration is disabled")
 
     @router.get(
         "/auth/me",
@@ -673,6 +763,12 @@ def create_enterprise_routes(
         for kb_id in body.kb_roles:
             await require_kb_exists(request, kb_id)
         api_key_service = get_enterprise_api_key_service(request)
+        expires_at = None
+        if body.expires_in_seconds is not None:
+            expires_at = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=body.expires_in_seconds)
+            ).isoformat()
         record, raw_key = await api_key_service.create_key(
             name=body.name,
             scopes={
@@ -682,6 +778,7 @@ def create_enterprise_routes(
             metadata=body.metadata,
             created_by=principal.user_id,
             tenant_id=body.tenant_id,
+            expires_at=expires_at,
         )
         return EnterpriseServiceAPIKeyCreateResponse(
             api_key=raw_key,
@@ -698,6 +795,57 @@ def create_enterprise_routes(
         api_key_service = get_enterprise_api_key_service(request)
         revoked = await api_key_service.revoke_key(key_id, revoked_by=principal.user_id)
         return EnterpriseServiceAPIKeyResponse.from_record(revoked)
+
+    @router.get(
+        "/admin/invitations",
+        response_model=list[EnterpriseInvitationResponse],
+        dependencies=[Depends(combined_auth)],
+    )
+    async def list_invitations(request: Request):
+        invitation_service = get_enterprise_invitation_service(request)
+        return [
+            EnterpriseInvitationResponse.from_record(record)
+            for record in await invitation_service.list_invitations()
+        ]
+
+    @router.post(
+        "/admin/invitations",
+        response_model=EnterpriseInvitationCreateResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def create_invitation(
+        request: Request, body: EnterpriseInvitationCreateRequest
+    ):
+        principal = require_principal(request)
+        invitation_service = get_enterprise_invitation_service(request)
+        expires_at = None
+        if body.expires_in_seconds is not None:
+            expires_at = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=body.expires_in_seconds)
+            ).isoformat()
+        record, raw_token = await invitation_service.create_invitation(
+            created_by=principal.user_id,
+            expires_at=expires_at,
+            metadata=body.metadata,
+        )
+        return EnterpriseInvitationCreateResponse(
+            invitation_token=raw_token,
+            invitation=EnterpriseInvitationResponse.from_record(record),
+        )
+
+    @router.post(
+        "/admin/invitations/{invitation_id}:revoke",
+        response_model=EnterpriseInvitationResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def revoke_invitation(invitation_id: str, request: Request):
+        principal = require_principal(request)
+        invitation_service = get_enterprise_invitation_service(request)
+        revoked = await invitation_service.revoke_invitation(
+            invitation_id, actor_user_id=principal.user_id
+        )
+        return EnterpriseInvitationResponse.from_record(revoked)
 
     @router.get(
         "/admin/audit-events",

@@ -40,6 +40,79 @@ uv run python examples/enterprise_kb_mvp/enterprise_kb_mvp_demo.py `
 - `--run-id stable-id`：使用稳定的幂等键 / 报告后缀。仅在对相同文件集合进行完全重试时复用同一个 run id；如果文件新增或变更，请使用新的 run id。
 - `--reset-kb ask|yes|no`：可在运行前选择性硬删除主 KB 和隔离控制 KB。默认 `ask` 仅在交互式终端中提示，在非交互 shell 中跳过重置以避免误删。`yes` 无提示直接重置；`no` 始终跳过。重置会调用 `DELETE /kbs/{kb_id}?hard=true`，因此会清除 KB 元数据记录、LightRAG 工作区文件、解析器输入 / 产物缓存，以及与该 KB 工作区相关联的 MinIO / S3 对象。
 
+## 企业模式运行（多用户 / RBAC / ACL / 审计）
+
+当 `.env` 设置 `LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true` 时，服务进入**企业模式**：禁用 guest、全局 `LIGHTRAG_API_KEY` 默认不能绕过 RBAC、`/kbs` 等接口按 KB 角色保护、首次启动自动 bootstrap 超级管理员。脚本会**自动探测**鉴权模式并相应认证，命令行的核心用法不变。
+
+### 1) `.env` 前置配置
+
+```env
+LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true
+# 企业模式要求 TOKEN_SECRET 为非默认值（不能是 please-change-me）
+TOKEN_SECRET=<长随机串>
+# 超级管理员：首次启动自动创建 / 同步；生产优先用 PASSWORD_HASH
+LIGHTRAG_SUPER_ADMIN_USERNAME=admin
+LIGHTRAG_SUPER_ADMIN_PASSWORD=Admin@12345
+# 生产改用：LIGHTRAG_SUPER_ADMIN_PASSWORD_HASH={bcrypt}$2b$12$...（用 lightrag-hash-password 生成）
+```
+
+可选（均有安全默认值，按需开启）：注册模式 `LIGHTRAG_USER_REGISTRATION_MODE`（`disabled/open/invite_only/admin_approval`）、登录失败锁定 `LIGHTRAG_ENTERPRISE_LOGIN_*`、并发 job 配额 `LIGHTRAG_ENTERPRISE_MAX_CONCURRENT_JOBS` / `..._TENANT_MAX_CONCURRENT_JOBS`、请求限流/配额 `LIGHTRAG_ENTERPRISE_RATE_LIMIT_*`、artifact 下载最低角色 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE`。
+
+### 2) 脚本如何认证
+
+脚本启动后调 `GET /auth-status`：
+
+- **企业模式** → 用超级管理员调 `POST /login` 拿 JWT，并改用 `Authorization: Bearer <token>`（自动摘掉 `X-API-Key`）。超级管理员通过所有 KB 角色检查，因此基线流程（建 KB / sync / parse / build / query / 硬删除）**完全不变**。
+- **非企业模式** → 沿用 `X-API-Key`（向后兼容，旧跑法不受影响）。
+
+超管密码解析优先级：`--admin-password` > 环境变量 `LIGHTRAG_SUPER_ADMIN_PASSWORD` > `--env-file`（默认 `.env`）中的 `LIGHTRAG_SUPER_ADMIN_PASSWORD`。因此**配好 `.env` 后无需在命令行再传密码**。若服务端只配了 `PASSWORD_HASH`（无明文），登录需要明文，请用 `--admin-password` 显式传入。
+
+### 3) 运行（企业模式）
+
+先起服务（读 `.env`，首次启动 bootstrap 超管）：
+
+```powershell
+lightrag-server
+```
+
+再跑演练（自动企业登录；密码从 `.env` 兜底）：
+
+```powershell
+uv run python examples/enterprise_kb_mvp/enterprise_kb_mvp_demo.py `
+  --server "http://127.0.0.1:9621" `
+  --source-dir "E:/pycharmprojects/RAG/LightRAG/模拟文件" `
+  --kb-id enterprise_mvp_demo `
+  --reset-kb yes
+```
+
+如需在 `.env` 之外显式指定超管凭据：
+
+```powershell
+uv run python examples/enterprise_kb_mvp/enterprise_kb_mvp_demo.py `
+  --admin-username admin --admin-password "Admin@12345" --reset-kb yes
+```
+
+### 4) 企业控制面特性展示（可选 `--demo-enterprise-admin`）
+
+仅在企业模式生效，默认关闭。开启后在主流程末尾额外演示本轮新增的企业能力（均安全 / 可逆）：
+
+- 创建普通用户 + 授予其对 demo KB 的 `kb_viewer` ACL（`POST /admin/users`、`PUT /admin/kbs/{kb}/acl`）；
+- 颁发**带过期的 scoped service API key**（`POST /admin/service-api-keys` 带 `expires_in_seconds`），并用该 key 调 `GET /kbs` 验证其只能看到授权 KB；
+- 颁发**单次注册邀请**（`POST /admin/invitations`，供 `invite_only` 模式注册使用），raw token 仅返回一次；
+- 读取审计事件（`GET /admin/audit-events`）。
+
+```powershell
+uv run python examples/enterprise_kb_mvp/enterprise_kb_mvp_demo.py `
+  --kb-id enterprise_mvp_demo --reset-kb yes --demo-enterprise-admin
+```
+
+### 5) 行为变化与注意事项
+
+- 企业模式下全局 `LIGHTRAG_API_KEY` **不能**访问 `/kbs`；旧脚本 / 前端需改走超管登录或 service key。
+- 硬删除（`--reset-kb yes` → `DELETE /kbs/{id}?hard=true`）是 **super-admin-only**；脚本以超管登录后可正常执行。
+- **登录失败锁定默认开启**：同一用户名连续失败达阈值（默认 10 次 / 300s）会被临时锁定并返回 `429`；若多次跑错密码被锁，需等锁定窗口（默认 900s）过去，或调大 / 关闭 `LIGHTRAG_ENTERPRISE_LOGIN_MAX_ATTEMPTS`。
+- `.env` 通常被 git 忽略，改动只影响本地；生产请把超管明文密码换成 `LIGHTRAG_SUPER_ADMIN_PASSWORD_HASH` 并删除明文行。
+
 ## 扩展端点覆盖（可选）
 
 基线流程已经覆盖约 26 个 KB 端点。以下标志会启用额外、默认未覆盖的端点。它们默认都处于 **关闭** 状态，因此不会改变基线运行流程；同时它们创建的每个任务都会被持续跟踪，不会因为客户端超时而中断（见下文“长时任务永不超时”）。

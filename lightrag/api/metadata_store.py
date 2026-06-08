@@ -384,9 +384,11 @@ class EnterpriseAPIKeyRecord:
     last_used_at: str | None
     revoked_at: str | None
     revoked_by: str | None
+    expires_at: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "EnterpriseAPIKeyRecord":
+        columns = set(row.keys())
         return cls(
             id=str(row["id"]),
             name=str(row["name"]),
@@ -402,6 +404,41 @@ class EnterpriseAPIKeyRecord:
             last_used_at=row["last_used_at"],
             revoked_at=row["revoked_at"],
             revoked_by=row["revoked_by"],
+            expires_at=row["expires_at"] if "expires_at" in columns else None,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class EnterpriseInvitationRecord:
+    id: str
+    token_hash: str
+    token_preview: str
+    status: str
+    created_by: str | None
+    expires_at: str | None
+    used_by: str | None
+    used_at: str | None
+    metadata: dict[str, Any]
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "EnterpriseInvitationRecord":
+        return cls(
+            id=str(row["id"]),
+            token_hash=str(row["token_hash"]),
+            token_preview=str(row["token_preview"]),
+            status=str(row["status"]),
+            created_by=row["created_by"],
+            expires_at=row["expires_at"],
+            used_by=row["used_by"],
+            used_at=row["used_at"],
+            metadata=_loads_json_object(row["metadata_json"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1526,6 +1563,36 @@ class SQLiteMetadataStore:
             ).fetchall()
         return [JobRecord.from_row(row) for row in rows], int(total)
 
+    async def count_active_jobs_for_principal(self, subject_id: str) -> int:
+        """Count in-flight jobs (queued/running/retrying/cancelling) across all
+        KBs attributed to a principal via ``payload._principal.subject_id``."""
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) FROM jobs
+                WHERE status IN ('queued', 'running', 'retrying', 'cancelling')
+                  AND json_extract(payload_json, '$._principal.subject_id') = ?
+                """,
+                (subject_id,),
+            ).fetchone()
+        return int(row[0])
+
+    async def count_active_jobs_for_tenant(self, tenant_id: str) -> int:
+        """Count in-flight jobs across all KBs attributed to a tenant via
+        ``payload._principal.tenant_id``."""
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) FROM jobs
+                WHERE status IN ('queued', 'running', 'retrying', 'cancelling')
+                  AND json_extract(payload_json, '$._principal.tenant_id') = ?
+                """,
+                (tenant_id,),
+            ).fetchone()
+        return int(row[0])
+
     async def list_dead_letter_jobs(
         self,
         kb_id: str,
@@ -2068,8 +2135,8 @@ class SQLiteMetadataStore:
                 INSERT INTO enterprise_api_keys (
                     id, name, key_hash, key_preview, status, created_by, tenant_id,
                     scopes_json, metadata_json, created_at, updated_at, last_used_at,
-                    revoked_at, revoked_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    revoked_at, revoked_by, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.id,
@@ -2086,6 +2153,7 @@ class SQLiteMetadataStore:
                     record.last_used_at,
                     record.revoked_at,
                     record.revoked_by,
+                    record.expires_at,
                 ),
             )
             row = conn.execute(
@@ -2180,6 +2248,111 @@ class SQLiteMetadataStore:
             ).fetchone()
             assert row is not None
             return EnterpriseAPIKeyRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def create_enterprise_invitation(
+        self, record: EnterpriseInvitationRecord
+    ) -> EnterpriseInvitationRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterpriseInvitationRecord:
+            conn.execute(
+                """
+                INSERT INTO enterprise_invitations (
+                    id, token_hash, token_preview, status, created_by, expires_at,
+                    used_by, used_at, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.id,
+                    record.token_hash,
+                    record.token_preview,
+                    record.status,
+                    record.created_by,
+                    record.expires_at,
+                    record.used_by,
+                    record.used_at,
+                    _dumps_json(record.metadata),
+                    record.created_at,
+                    record.updated_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_invitations WHERE id = ?", (record.id,)
+            ).fetchone()
+            assert row is not None
+            return EnterpriseInvitationRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def get_enterprise_invitation_by_token_hash(
+        self, token_hash: str
+    ) -> EnterpriseInvitationRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_invitations WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+        return EnterpriseInvitationRecord.from_row(row) if row is not None else None
+
+    async def list_enterprise_invitations(self) -> list[EnterpriseInvitationRecord]:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM enterprise_invitations
+                ORDER BY created_at DESC, id DESC
+                """
+            ).fetchall()
+        return [EnterpriseInvitationRecord.from_row(row) for row in rows]
+
+    async def consume_enterprise_invitation(
+        self, token_hash: str, *, used_by: str | None, used_at: str | None = None
+    ) -> EnterpriseInvitationRecord | None:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterpriseInvitationRecord | None:
+            now = used_at or utc_now_iso()
+            cursor = conn.execute(
+                """
+                UPDATE enterprise_invitations
+                SET status = 'used', used_by = ?, used_at = ?, updated_at = ?
+                WHERE token_hash = ? AND status = 'active'
+                """,
+                (used_by, now, now, token_hash),
+            )
+            if not cursor.rowcount:
+                return None
+            row = conn.execute(
+                "SELECT * FROM enterprise_invitations WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+            assert row is not None
+            return EnterpriseInvitationRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def revoke_enterprise_invitation(
+        self, invitation_id: str, *, revoked_at: str | None = None
+    ) -> EnterpriseInvitationRecord | None:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterpriseInvitationRecord | None:
+            now = revoked_at or utc_now_iso()
+            conn.execute(
+                """
+                UPDATE enterprise_invitations
+                SET status = 'revoked', updated_at = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (now, invitation_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_invitations WHERE id = ?", (invitation_id,)
+            ).fetchone()
+            return EnterpriseInvitationRecord.from_row(row) if row is not None else None
 
         return await self._write(write)
 
@@ -2913,7 +3086,8 @@ class SQLiteMetadataStore:
                 updated_at TEXT NOT NULL,
                 last_used_at TEXT,
                 revoked_at TEXT,
-                revoked_by TEXT
+                revoked_by TEXT,
+                expires_at TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_enterprise_api_keys_status
@@ -2978,14 +3152,52 @@ class SQLiteMetadataStore:
                 ON enterprise_audit_events (created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_enterprise_audit_events_actor
                 ON enterprise_audit_events (actor_user_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_invitations (
+                id TEXT PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                token_preview TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_by TEXT,
+                expires_at TEXT,
+                used_by TEXT,
+                used_at TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_invitations_status
+                ON enterprise_invitations (status);
             """
         )
         conn.execute(
             "INSERT OR IGNORE INTO metadata_schema(version, applied_at) VALUES (?, ?)",
             (_SCHEMA_VERSION, utc_now_iso()),
         )
+        self._ensure_added_columns(conn)
         self._backfill_document_source_keys(conn)
         conn.commit()
+
+    def _ensure_added_columns(self, conn: sqlite3.Connection) -> None:
+        """Idempotently add columns introduced after the initial schema.
+
+        ``CREATE TABLE IF NOT EXISTS`` never alters an already-created table, so
+        an existing ``metadata.sqlite3`` would miss columns added later. This
+        migrates those tables forward; fresh databases already have the column
+        from the DDL and skip the ALTER.
+        """
+        additions: dict[str, dict[str, str]] = {
+            "enterprise_api_keys": {"expires_at": "TEXT"},
+        }
+        for table, columns in additions.items():
+            existing = {
+                str(info["name"])
+                for info in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for column, ddl in columns.items():
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def _backfill_document_source_keys(self, conn: sqlite3.Connection) -> None:
         rows = conn.execute(

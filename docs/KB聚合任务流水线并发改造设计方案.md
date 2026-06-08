@@ -558,7 +558,7 @@ QUEUE_SIZE_INSERT=4             # 当前 4，建议提到 8（更大的批量缓
 
 ## 附录 B：相关现有文档
 
-- `docs/API接口文档.md` — KB 接口文档（L130 一句需修订）
+- [`docs/API接口.md`](API接口.md) — KB 接口文档
 - `docs/FileProcessingPipeline-zh.md` — 文档处理流水线说明
 - `docs/LightRAG-API-MinerU-Workflow-zh.md` — MinerU 调用工作流
 - `AGENTS.md` *Pipeline concurrency contract* 章节 — pipeline 互斥规则

@@ -5,6 +5,12 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
+from lightrag.api.enterprise_auth import (
+    enforce_concurrent_job_quota,
+    enterprise_auth_enabled,
+    get_current_principal,
+    principal_job_subject,
+)
 from lightrag.api.kb_service import KnowledgeBaseService, utc_now_iso
 from lightrag.api.metadata_store import (
     JobRecord,
@@ -26,6 +32,30 @@ class JobService:
     ):
         self._kb_service = kb_service
         self._metadata_store = metadata_store
+
+    async def _persist_job(self, job: JobRecord) -> JobRecord:
+        await self._apply_enterprise_job_controls(job)
+        store = self._metadata_store
+        return await store.create_job(job)
+
+    async def _persist_job_once(self, job: JobRecord) -> tuple[JobRecord, bool]:
+        await self._apply_enterprise_job_controls(job)
+        store = self._metadata_store
+        return await store.create_job_once(job)
+
+    async def _apply_enterprise_job_controls(self, job: JobRecord) -> None:
+        """Enforce the per-principal/tenant concurrent-job quota and stamp the
+        creating principal into the job payload so in-flight jobs can be
+        attributed and counted. No-op outside enterprise mode or when no
+        principal is bound to the current async context (e.g. durable worker
+        re-runs of already-counted jobs)."""
+        if not enterprise_auth_enabled():
+            return
+        principal = get_current_principal()
+        if principal is None:
+            return
+        await enforce_concurrent_job_quota(self._metadata_store, principal)
+        job.payload["_principal"] = principal_job_subject(principal)
 
     async def create_job(
         self,
@@ -70,7 +100,7 @@ class JobService:
             finished_at=None,
             cancelled_at=None,
         )
-        return await self._metadata_store.create_job(job)
+        return await self._persist_job(job)
 
     async def create_job_once(
         self,
@@ -116,7 +146,7 @@ class JobService:
             finished_at=None,
             cancelled_at=None,
         )
-        return await self._metadata_store.create_job_once(job)
+        return await self._persist_job_once(job)
 
     async def create_parse_job(
         self,
@@ -176,7 +206,7 @@ class JobService:
             finished_at=None,
             cancelled_at=None,
         )
-        return await self._metadata_store.create_job(job)
+        return await self._persist_job(job)
 
     async def create_parse_job_once(
         self,
@@ -236,7 +266,7 @@ class JobService:
             finished_at=None,
             cancelled_at=None,
         )
-        return await self._metadata_store.create_job_once(job)
+        return await self._persist_job_once(job)
 
     async def create_batch_parse_job(
         self,
@@ -580,7 +610,7 @@ class JobService:
             finished_at=None,
             cancelled_at=None,
         )
-        return await self._metadata_store.create_job_once(job)
+        return await self._persist_job_once(job)
 
     async def create_batch_build_job_once(
         self,

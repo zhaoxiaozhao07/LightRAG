@@ -96,6 +96,8 @@ from lightrag.api.enterprise_auth import (
     AuditService,
     AuthorizationService,
     EnterpriseLimitService,
+    InvitationService,
+    LoginAttemptTracker,
     ServiceAPIKeyService,
     SystemSettingsService,
     UserService,
@@ -931,6 +933,14 @@ def create_app(args):
         if enterprise_enabled
         else None
     )
+    enterprise_login_tracker = (
+        LoginAttemptTracker.from_args(args) if enterprise_enabled else None
+    )
+    enterprise_invitation_service = (
+        InvitationService(metadata_store, enterprise_audit_service)
+        if enterprise_enabled
+        else None
+    )
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """Lifespan context manager for startup and shutdown events"""
@@ -1048,6 +1058,7 @@ def create_app(args):
         app.state.enterprise_user_service = enterprise_user_service
         app.state.enterprise_settings_service = enterprise_settings_service
         app.state.enterprise_api_key_service = enterprise_api_key_service
+        app.state.enterprise_invitation_service = enterprise_invitation_service
         app.state.enterprise_limit_service = enterprise_limit_service
         app.state.enterprise_authorization_service = enterprise_authorization_service
         app.state.enterprise_audit_service = enterprise_audit_service
@@ -2501,17 +2512,26 @@ def create_app(args):
                 raise HTTPException(
                     status_code=500, detail="Enterprise user service unavailable"
                 )
+            if enterprise_login_tracker is not None:
+                enterprise_login_tracker.check(form_data.username)
             user = await enterprise_user_service.authenticate(
                 form_data.username, form_data.password
             )
             if user is None:
+                locked = (
+                    enterprise_login_tracker.record_failure(form_data.username)
+                    if enterprise_login_tracker is not None
+                    else False
+                )
                 if enterprise_audit_service is not None:
                     await enterprise_audit_service.append(
-                        "login_failed",
+                        "login_locked" if locked else "login_failed",
                         target_type="user",
                         target_id=form_data.username,
                     )
                 raise HTTPException(status_code=401, detail="Incorrect credentials")
+            if enterprise_login_tracker is not None:
+                enterprise_login_tracker.record_success(form_data.username)
             if enterprise_audit_service is not None:
                 await enterprise_audit_service.append(
                     "login_success", actor_user_id=user.id

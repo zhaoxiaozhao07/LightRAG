@@ -3,7 +3,7 @@
 > 文档版本：2026-06-08
 > 适用范围：每个知识库（KB）可单独设置的运行时配置项。
 > 权威来源：`lightrag/api/config_version_service.py`（校验/归一/hash/运行时 overlay）。
-> 配套文档：`docs/API接口文档.md` §7（Config Versions）、`docs/生产级后端改造设计方案.md` §12。
+> 配套文档：[`docs/API接口.md`](API接口.md) §7（Config Versions）、[`docs/设计方案.md`](设计方案.md) §4.7（配置版本层）、§6.1（三段 hash）。
 
 ---
 

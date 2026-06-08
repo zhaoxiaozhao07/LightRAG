@@ -36,6 +36,7 @@ from lightrag.api.metadata_store import (
     ConfigVersionRecord,
     DocumentRecord,
     EnterpriseAPIKeyRecord,
+    EnterpriseInvitationRecord,
     EnterpriseUserRecord,
     EnterpriseTenantKBACLRecord,
     EnterpriseTenantMembershipRecord,
@@ -208,6 +209,24 @@ def _enterprise_api_key(kb_id: str) -> EnterpriseAPIKeyRecord:
         last_used_at=None,
         revoked_at=None,
         revoked_by=None,
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+
+
+def _enterprise_invitation(*, expires_at: str | None = None) -> EnterpriseInvitationRecord:
+    now = utc_now_iso()
+    return EnterpriseInvitationRecord(
+        id=f"inv_{uuid.uuid4().hex[:10]}",
+        token_hash=f"sha256:{uuid.uuid4().hex}",
+        token_preview="inv123",
+        status="active",
+        created_by="admin",
+        expires_at=expires_at,
+        used_by=None,
+        used_at=None,
+        metadata={"purpose": "contract"},
+        created_at=now,
+        updated_at=now,
     )
 
 
@@ -389,6 +408,7 @@ async def test_enterprise_api_key_metadata_contract(store):
     assert by_id is not None
     assert by_id.key_preview == "abc123"
     assert by_id.scopes["kb_roles"] == {kb_id: "kb_viewer"}
+    assert by_id.expires_at == "2099-01-01T00:00:00+00:00"
     assert "api_key" not in by_id.to_dict()
 
     listed = await store.list_enterprise_api_keys()
@@ -415,6 +435,69 @@ async def test_enterprise_api_key_metadata_contract(store):
     assert revoked_by_hash.status == "revoked"
     assert await store.revoke_enterprise_api_key("missing") is None
     assert await store.mark_enterprise_api_key_used("missing") is None
+
+
+async def test_enterprise_invitation_metadata_contract(store):
+    record = await store.create_enterprise_invitation(_enterprise_invitation())
+
+    by_hash = await store.get_enterprise_invitation_by_token_hash(record.token_hash)
+    assert by_hash is not None
+    assert by_hash.id == record.id
+    assert by_hash.status == "active"
+    assert by_hash.token_preview == "inv123"
+
+    listed = await store.list_enterprise_invitations()
+    assert any(item.id == record.id for item in listed)
+
+    consumed = await store.consume_enterprise_invitation(
+        record.token_hash, used_by="usr_consumer"
+    )
+    assert consumed is not None
+    assert consumed.status == "used"
+    assert consumed.used_by == "usr_consumer"
+    assert consumed.used_at is not None
+
+    # Single-use: a second consume of the same token returns None.
+    assert (
+        await store.consume_enterprise_invitation(
+            record.token_hash, used_by="usr_other"
+        )
+        is None
+    )
+
+    # Revoke only an active invitation; a revoked one cannot be consumed.
+    fresh = await store.create_enterprise_invitation(_enterprise_invitation())
+    revoked = await store.revoke_enterprise_invitation(fresh.id)
+    assert revoked is not None
+    assert revoked.status == "revoked"
+    assert (
+        await store.consume_enterprise_invitation(fresh.token_hash, used_by="usr_x")
+        is None
+    )
+    assert await store.revoke_enterprise_invitation("inv_missing") is None
+
+
+async def test_count_active_jobs_by_principal_and_tenant(store):
+    kb_id = _unique_kb(store)
+
+    def _stamped(status: str, subject_id: str, tenant_id: str | None):
+        job = _job(kb_id, f"job_{uuid.uuid4().hex[:10]}", status=status)
+        job.payload["_principal"] = {"subject_id": subject_id, "tenant_id": tenant_id}
+        return job
+
+    await store.create_job(_stamped("queued", "usr_alice", "t1"))
+    await store.create_job(_stamped("running", "usr_alice", "t1"))
+    # Terminal jobs and unstamped jobs are not counted as in-flight.
+    await store.create_job(_stamped("succeeded", "usr_alice", "t1"))
+    await store.create_job(_job(kb_id, f"job_{uuid.uuid4().hex[:10]}", status="queued"))
+    await store.create_job(_stamped("queued", "usr_bob", "t2"))
+
+    assert await store.count_active_jobs_for_principal("usr_alice") == 2
+    assert await store.count_active_jobs_for_principal("usr_bob") == 1
+    assert await store.count_active_jobs_for_principal("usr_nobody") == 0
+    assert await store.count_active_jobs_for_tenant("t1") == 2
+    assert await store.count_active_jobs_for_tenant("t2") == 1
+    assert await store.count_active_jobs_for_tenant("t_none") == 0
 
 
 async def test_create_documents_and_job_then_read_back(store):

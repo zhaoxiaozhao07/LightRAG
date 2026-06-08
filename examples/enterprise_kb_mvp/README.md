@@ -54,6 +54,109 @@ Useful repeat-run flags:
   LightRAG workspace files, parser input/artifact cache, and MinIO/S3 objects
   associated with the KB workspace.
 
+## Running in enterprise mode (multi-user / RBAC / ACL / audit)
+
+When `.env` sets `LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true` the server runs in
+**enterprise mode**: guests are disabled, the global `LIGHTRAG_API_KEY` can no
+longer bypass RBAC by default, `/kbs` routes are guarded by KB roles, and a
+super admin is bootstrapped on first startup. The script **auto-detects** the
+auth mode and authenticates accordingly; the core command line is unchanged.
+
+### 1) `.env` prerequisites
+
+```env
+LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true
+# Enterprise mode requires a non-default TOKEN_SECRET (not "please-change-me")
+TOKEN_SECRET=<long-random-secret>
+# Super admin: created/synced on first startup; prefer PASSWORD_HASH in production
+LIGHTRAG_SUPER_ADMIN_USERNAME=admin
+LIGHTRAG_SUPER_ADMIN_PASSWORD=Admin@12345
+# Production: LIGHTRAG_SUPER_ADMIN_PASSWORD_HASH={bcrypt}$2b$12$... (lightrag-hash-password)
+```
+
+Optional (all safe defaults, enable as needed): registration mode
+`LIGHTRAG_USER_REGISTRATION_MODE` (`disabled/open/invite_only/admin_approval`),
+failed-login lockout `LIGHTRAG_ENTERPRISE_LOGIN_*`, concurrent-job quota
+`LIGHTRAG_ENTERPRISE_MAX_CONCURRENT_JOBS` / `..._TENANT_MAX_CONCURRENT_JOBS`,
+request rate-limit/quota `LIGHTRAG_ENTERPRISE_RATE_LIMIT_*`, and artifact
+download minimum role `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE`.
+
+### 2) How the script authenticates
+
+On startup the script calls `GET /auth-status`:
+
+- **Enterprise mode** → it logs in as the super admin via `POST /login`, takes
+  the JWT, and switches to `Authorization: Bearer <token>` (dropping the
+  `X-API-Key` header). The super admin passes every KB role check, so the
+  baseline flow (create KB / sync / parse / build / query / hard delete) is
+  **unchanged**.
+- **Non-enterprise mode** → it keeps using `X-API-Key` (backward compatible).
+
+Super-admin password resolution order: `--admin-password` > the
+`LIGHTRAG_SUPER_ADMIN_PASSWORD` environment variable > the
+`LIGHTRAG_SUPER_ADMIN_PASSWORD` value in `--env-file` (default `.env`). So a
+configured `.env` works without re-passing the password on the command line. If
+the server only has `PASSWORD_HASH` (no plaintext), login needs plaintext —
+pass it explicitly via `--admin-password`.
+
+### 3) Run (enterprise mode)
+
+Start the server (reads `.env`, bootstraps the super admin on first startup):
+
+```powershell
+lightrag-server
+```
+
+Run the drill (auto enterprise login; password falls back to `.env`):
+
+```powershell
+uv run python examples/enterprise_kb_mvp/enterprise_kb_mvp_demo.py `
+  --server "http://127.0.0.1:9621" `
+  --source-dir "E:/pycharmprojects/RAG/LightRAG/模拟文件" `
+  --kb-id enterprise_mvp_demo `
+  --reset-kb yes
+```
+
+To supply the super-admin credentials explicitly instead of via `.env`:
+
+```powershell
+uv run python examples/enterprise_kb_mvp/enterprise_kb_mvp_demo.py `
+  --admin-username admin --admin-password "Admin@12345" --reset-kb yes
+```
+
+### 4) Enterprise control-plane showcase (opt-in `--demo-enterprise-admin`)
+
+Enterprise mode only, off by default. When enabled it adds a final block that
+demonstrates the enterprise capabilities (all safe / reversible):
+
+- create a normal user + grant it `kb_viewer` ACL on the demo KB
+  (`POST /admin/users`, `PUT /admin/kbs/{kb}/acl`);
+- issue a **scoped, expiring service API key** (`POST /admin/service-api-keys`
+  with `expires_in_seconds`) and verify with `GET /kbs` that the key only sees
+  authorized KBs;
+- mint a **single-use registration invitation** (`POST /admin/invitations`, for
+  `invite_only` registration); the raw token is returned only once;
+- read audit events (`GET /admin/audit-events`).
+
+```powershell
+uv run python examples/enterprise_kb_mvp/enterprise_kb_mvp_demo.py `
+  --kb-id enterprise_mvp_demo --reset-kb yes --demo-enterprise-admin
+```
+
+### 5) Behavior changes and notes
+
+- In enterprise mode the global `LIGHTRAG_API_KEY` **cannot** access `/kbs`;
+  legacy scripts/frontends must switch to super-admin login or a service key.
+- Hard delete (`--reset-kb yes` → `DELETE /kbs/{id}?hard=true`) is
+  **super-admin-only**; the script can do it because it logs in as super admin.
+- **Failed-login lockout is on by default**: repeated failures for the same
+  username (default 10 within 300s) return `429` and lock the username for the
+  lockout window (default 900s). If you get locked out from wrong passwords,
+  wait it out or tune/disable `LIGHTRAG_ENTERPRISE_LOGIN_MAX_ATTEMPTS`.
+- `.env` is typically git-ignored, so changes are local only; in production
+  replace the plaintext super-admin password with
+  `LIGHTRAG_SUPER_ADMIN_PASSWORD_HASH` and remove the plaintext line.
+
 ## Extended endpoint coverage (opt-in)
 
 The baseline flow already exercises ~26 KB endpoints. These flags turn on

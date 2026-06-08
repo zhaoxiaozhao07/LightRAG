@@ -90,3 +90,5 @@ memory-bank
 /parse_output/
 
 模拟文件/
+
+node_modules/

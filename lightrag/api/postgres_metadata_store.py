@@ -24,6 +24,7 @@ from lightrag.api.metadata_store import (
     DuplicateDocumentSourceKeyError,
     EnterpriseUserRecord,
     EnterpriseAPIKeyRecord,
+    EnterpriseInvitationRecord,
     IdempotencyKeyConflictError,
     InvalidJobTransitionError,
     JobRecord,
@@ -91,6 +92,11 @@ def _enterprise_user_from_row(row: Any) -> EnterpriseUserRecord:
 def _enterprise_api_key_from_row(row: Any) -> EnterpriseAPIKeyRecord:
     data = _loads_json_object(row["data_json"])
     return EnterpriseAPIKeyRecord(**data)
+
+
+def _enterprise_invitation_from_row(row: Any) -> EnterpriseInvitationRecord:
+    data = _loads_json_object(row["data_json"])
+    return EnterpriseInvitationRecord(**data)
 
 
 def _kb_acl_from_row(row: Any) -> KBACLRecord:
@@ -881,6 +887,38 @@ class PostgresMetadataStore:
             raise MetadataRecordNotFoundError(f"Artifact '{artifact_id}' not found")
         return _artifact_from_row(row)
 
+    async def count_active_jobs_for_principal(self, subject_id: str) -> int:
+        """Count in-flight jobs (queued/running/retrying/cancelling) across all
+        KBs attributed to a principal via ``payload._principal.subject_id``."""
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            value = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM kb_jobs
+                WHERE status = ANY($1::text[])
+                  AND data_json->'payload'->'_principal'->>'subject_id' = $2
+                """,
+                ["queued", "running", "retrying", "cancelling"],
+                subject_id,
+            )
+        return int(value or 0)
+
+    async def count_active_jobs_for_tenant(self, tenant_id: str) -> int:
+        """Count in-flight jobs across all KBs attributed to a tenant via
+        ``payload._principal.tenant_id``."""
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            value = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM kb_jobs
+                WHERE status = ANY($1::text[])
+                  AND data_json->'payload'->'_principal'->>'tenant_id' = $2
+                """,
+                ["queued", "running", "retrying", "cancelling"],
+                tenant_id,
+            )
+        return int(value or 0)
+
     async def create_job(self, job: JobRecord) -> JobRecord:
         created_job, _created = await self.create_job_once(job)
         return created_job
@@ -1468,6 +1506,145 @@ class PostgresMetadataStore:
                 key_id,
                 updated.updated_at,
                 updated.last_used_at,
+                _record_json(updated),
+            )
+            return updated
+
+        return await self._write(write)
+
+    async def create_enterprise_invitation(
+        self, record: EnterpriseInvitationRecord
+    ) -> EnterpriseInvitationRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> EnterpriseInvitationRecord:
+            await conn.execute(
+                """
+                INSERT INTO enterprise_invitations (
+                    id, token_hash, status, created_by, expires_at, used_by,
+                    used_at, created_at, updated_at, data_json
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+                """,
+                record.id,
+                record.token_hash,
+                record.status,
+                record.created_by,
+                record.expires_at,
+                record.used_by,
+                record.used_at,
+                record.created_at,
+                record.updated_at,
+                _record_json(record),
+            )
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_invitations WHERE id = $1", record.id
+            )
+            if row is None:
+                raise MetadataRecordNotFoundError(
+                    f"Invitation '{record.id}' not found"
+                )
+            return _enterprise_invitation_from_row(row)
+
+        return await self._write(write)
+
+    async def get_enterprise_invitation_by_token_hash(
+        self, token_hash: str
+    ) -> EnterpriseInvitationRecord | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_invitations WHERE token_hash = $1",
+                token_hash,
+            )
+        return _enterprise_invitation_from_row(row) if row is not None else None
+
+    async def list_enterprise_invitations(self) -> list[EnterpriseInvitationRecord]:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT data_json FROM enterprise_invitations
+                ORDER BY created_at DESC, id DESC
+                """
+            )
+        return [_enterprise_invitation_from_row(row) for row in rows]
+
+    async def consume_enterprise_invitation(
+        self, token_hash: str, *, used_by: str | None, used_at: str | None = None
+    ) -> EnterpriseInvitationRecord | None:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> EnterpriseInvitationRecord | None:
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_invitations "
+                "WHERE token_hash = $1 FOR UPDATE",
+                token_hash,
+            )
+            if row is None:
+                return None
+            current = _enterprise_invitation_from_row(row)
+            if current.status != "active":
+                return None
+            now = used_at or utc_now_iso()
+            updated = EnterpriseInvitationRecord(
+                **{
+                    **current.to_dict(),
+                    "status": "used",
+                    "used_by": used_by,
+                    "used_at": now,
+                    "updated_at": now,
+                }
+            )
+            await conn.execute(
+                """
+                UPDATE enterprise_invitations
+                SET status = $2, used_by = $3, used_at = $4, updated_at = $5,
+                    data_json = $6::jsonb
+                WHERE id = $1
+                """,
+                current.id,
+                updated.status,
+                updated.used_by,
+                updated.used_at,
+                updated.updated_at,
+                _record_json(updated),
+            )
+            return updated
+
+        return await self._write(write)
+
+    async def revoke_enterprise_invitation(
+        self, invitation_id: str, *, revoked_at: str | None = None
+    ) -> EnterpriseInvitationRecord | None:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> EnterpriseInvitationRecord | None:
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_invitations WHERE id = $1 FOR UPDATE",
+                invitation_id,
+            )
+            if row is None:
+                return None
+            current = _enterprise_invitation_from_row(row)
+            if current.status != "active":
+                return current
+            now = revoked_at or utc_now_iso()
+            updated = EnterpriseInvitationRecord(
+                **{
+                    **current.to_dict(),
+                    "status": "revoked",
+                    "updated_at": now,
+                }
+            )
+            await conn.execute(
+                """
+                UPDATE enterprise_invitations
+                SET status = $2, updated_at = $3, data_json = $4::jsonb
+                WHERE id = $1
+                """,
+                current.id,
+                updated.status,
+                updated.updated_at,
                 _record_json(updated),
             )
             return updated
@@ -2133,6 +2310,21 @@ class PostgresMetadataStore:
                 ON enterprise_audit_events (created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_enterprise_audit_events_actor
                 ON enterprise_audit_events (actor_user_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_invitations (
+                id TEXT PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                created_by TEXT,
+                expires_at TEXT,
+                used_by TEXT,
+                used_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                data_json JSONB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_enterprise_invitations_status
+                ON enterprise_invitations (status);
             """
         )
         await conn.execute(

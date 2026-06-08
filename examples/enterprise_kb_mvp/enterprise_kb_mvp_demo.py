@@ -38,6 +38,8 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "examples" / "enterprise_kb_mvp" / "runs"
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
 DEFAULT_SERVER = "http://127.0.0.1:9621"
 DEFAULT_API_KEY = os.environ.get("LIGHTRAG_API_KEY", "sk-123456")
+DEFAULT_ADMIN_USERNAME = os.environ.get("LIGHTRAG_SUPER_ADMIN_USERNAME", "admin")
+DEFAULT_ADMIN_PASSWORD = os.environ.get("LIGHTRAG_SUPER_ADMIN_PASSWORD", "")
 DEFAULT_KB_ID = "enterprise_mvp_demo"
 DEFAULT_KB_NAME = "企业知识库 MVP 模拟"
 DEFAULT_PARSER_ENGINE = "mineru"
@@ -228,6 +230,81 @@ class EnterpriseKBClient:
 
     def health(self) -> dict[str, Any]:
         response = self._client.get("/health")
+        response.raise_for_status()
+        return response.json()
+
+    def auth_status(self) -> dict[str, Any]:
+        """GET /auth-status — discover whether the server runs in enterprise mode."""
+        response = self._client.get("/auth-status")
+        response.raise_for_status()
+        return response.json()
+
+    def login(self, username: str, password: str) -> dict[str, Any]:
+        """POST /login — authenticate (enterprise super admin) and switch the
+        client to the returned Bearer JWT, dropping the X-API-Key header (the
+        global API key is rejected under enterprise RBAC by default)."""
+        response = self._client.post(
+            "/login", data={"username": username, "password": password}
+        )
+        response.raise_for_status()
+        payload = response.json()
+        token = payload.get("access_token")
+        if token:
+            self._client.headers["Authorization"] = f"Bearer {token}"
+            self._client.headers.pop("X-API-Key", None)
+        return payload
+
+    # ---- Enterprise control-plane (super admin) ----
+
+    def admin_create_user(
+        self, username: str, password: str, *, can_create_kb: bool = False
+    ) -> dict[str, Any]:
+        response = self._client.post(
+            "/admin/users",
+            json={
+                "username": username,
+                "password": password,
+                "can_create_kb": can_create_kb,
+            },
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def admin_grant_kb_acl(
+        self, kb_id: str, user_id: str, role: str
+    ) -> dict[str, Any]:
+        response = self._client.put(
+            f"/admin/kbs/{kb_id}/acl", json={"user_id": user_id, "role": role}
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def admin_create_service_api_key(
+        self,
+        name: str,
+        kb_roles: dict[str, str],
+        *,
+        expires_in_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"name": name, "kb_roles": kb_roles}
+        if expires_in_seconds is not None:
+            body["expires_in_seconds"] = expires_in_seconds
+        response = self._client.post("/admin/service-api-keys", json=body)
+        response.raise_for_status()
+        return response.json()
+
+    def admin_create_invitation(
+        self, *, expires_in_seconds: int | None = None
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if expires_in_seconds is not None:
+            body["expires_in_seconds"] = expires_in_seconds
+        response = self._client.post("/admin/invitations", json=body)
+        response.raise_for_status()
+        return response.json()
+
+    def admin_list_audit_events(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        response = self._client.get("/admin/audit-events", params={"limit": limit})
         response.raise_for_status()
         return response.json()
 
@@ -1244,6 +1321,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--server", default=DEFAULT_SERVER)
     parser.add_argument("--api-key", default=DEFAULT_API_KEY)
+    parser.add_argument(
+        "--admin-username",
+        default=DEFAULT_ADMIN_USERNAME,
+        help="Enterprise super admin username for /login (enterprise mode only).",
+    )
+    parser.add_argument(
+        "--admin-password",
+        default=DEFAULT_ADMIN_PASSWORD,
+        help=(
+            "Enterprise super admin password for /login. Defaults to "
+            "LIGHTRAG_SUPER_ADMIN_PASSWORD. Required when the server runs in "
+            "enterprise mode."
+        ),
+    )
     parser.add_argument("--source-dir", type=Path, default=DEFAULT_SOURCE_DIR)
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -1427,6 +1518,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--demo-enterprise-admin",
+        action="store_true",
+        help=(
+            "Enterprise mode only: showcase the control-plane features — create a "
+            "user + grant kb_viewer ACL, issue a scoped+expiring service API key "
+            "and verify its scope, mint a registration invitation, and read audit "
+            "events. Safe/reversible; skipped automatically in non-enterprise mode."
+        ),
+    )
+    parser.add_argument(
         "--demo-url",
         default="",
         help="URL to ingest via documents:urls when --demo-ingest-variants is set.",
@@ -1467,6 +1568,51 @@ def confirm_reset_kb(args: argparse.Namespace) -> bool:
     return answer in {"y", "yes"}
 
 
+def _wait_for_kb_purge(
+    client: EnterpriseKBClient,
+    kb_id: str,
+    job_id: str,
+    *,
+    timeout_seconds: float = 600.0,
+    poll_seconds: float = 1.0,
+) -> str:
+    """Wait until a queued ``clear_kb`` job finishes purging the KB.
+
+    Returns the terminal disposition:
+
+    - ``"purged"`` — the job query returns 404. A successful hard delete purges
+      the catalog row AND the ``clear_kb`` job record itself, so once the job is
+      gone the KB id is free to re-create. This is the normal success signal.
+    - ``"succeeded"`` — observed the job reach ``succeeded`` before purge wiped
+      it (also success).
+    - ``"failed"`` / ``"cancelled"`` — purge did not complete; the catalog
+      tombstone likely persists and would block re-creation.
+
+    A 404 cannot be a false positive here: the caller only invokes this after a
+    ``hard_delete_queued`` response, so the KB was definitely tombstoned and a
+    404 means the purge removed it.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        try:
+            job = client.get_job(kb_id, job_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return "purged"
+            raise
+        status = str(job.get("status"))
+        if status == "succeeded":
+            return "succeeded"
+        if status in {"failed", "cancelled"}:
+            return status
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"clear_kb job {job_id} for {kb_id!r} did not finish within "
+                f"{timeout_seconds:.0f}s (last status={status!r})"
+            )
+        time.sleep(poll_seconds)
+
+
 def _hard_reset_demo_kbs(
     client: EnterpriseKBClient, args: argparse.Namespace
 ) -> dict[str, Any]:
@@ -1483,6 +1629,29 @@ def _hard_reset_demo_kbs(
         print(f"[reset] hard-delete {label} kb_id={kb_id!r}")
         deleted = client.hard_delete_kb(kb_id)
         state = "deleted" if deleted else "not_found"
+        # With the durable job worker enabled, a hard delete is QUEUED: the KB is
+        # tombstoned immediately and a clear_kb job purges engine storage + the
+        # catalog row asynchronously. We must wait for that job to finish before
+        # re-creating the KB with the same id — otherwise create_kb collides with
+        # the surviving tombstone and fails with 409 "already exists".
+        if (
+            deleted
+            and deleted.get("hard_delete_queued")
+            and deleted.get("hard_delete_job_id")
+        ):
+            job_id = str(deleted["hard_delete_job_id"])
+            print(
+                f"[reset] {label} clear_kb queued job={job_id}; "
+                "waiting for purge before re-create"
+            )
+            disposition = _wait_for_kb_purge(client, kb_id, job_id)
+            state = f"deleted (clear_kb={disposition})"
+            if disposition in {"failed", "cancelled"}:
+                raise SystemExit(
+                    f"clear_kb job {job_id} for {kb_id!r} ended {disposition!r}; "
+                    "the catalog tombstone may persist and block re-creation. "
+                    f"Inspect GET /kbs/{kb_id}/jobs/{job_id} and retry."
+                )
         summary["targets"][label] = {
             "kb_id": kb_id,
             "state": state,
@@ -1529,6 +1698,38 @@ def run(args: argparse.Namespace) -> int:
             f"[ok] health object_storage={health.get('configuration', {}).get('object_storage')} "
             f"metadata={health.get('configuration', {}).get('kb_metadata_backend')}"
         )
+
+        # Adapt to the server's auth mode. In enterprise mode the global API key
+        # is rejected by RBAC, so log in as the bootstrapped super admin and use
+        # the returned Bearer JWT (super admin passes every KB role check, so the
+        # rest of the flow is unchanged). Non-enterprise servers keep the API key.
+        auth = client.auth_status()
+        auth_mode = auth.get("auth_mode")
+        report["steps"]["auth"] = {"auth_mode": auth_mode}
+        if auth_mode == "enterprise":
+            admin_password = args.admin_password or parse_env_file(args.env_file).get(
+                "LIGHTRAG_SUPER_ADMIN_PASSWORD", ""
+            )
+            if not admin_password:
+                raise SystemExit(
+                    "Server is in enterprise mode. Provide the super admin password "
+                    "via --admin-password, the LIGHTRAG_SUPER_ADMIN_PASSWORD env var, "
+                    f"or the {args.env_file} env file."
+                )
+            login_result = client.login(args.admin_username, admin_password)
+            principal = login_result.get("user") or {}
+            report["steps"]["auth"].update(
+                {
+                    "logged_in_as": args.admin_username,
+                    "system_role": principal.get("system_role"),
+                }
+            )
+            print(
+                f"[ok] enterprise login user={args.admin_username} "
+                f"role={principal.get('system_role')}"
+            )
+        else:
+            print(f"[ok] auth_mode={auth_mode or 'disabled'} (using X-API-Key)")
 
         if confirm_reset_kb(args):
             report["steps"]["reset"] = _hard_reset_demo_kbs(client, args)
@@ -1663,53 +1864,62 @@ def run(args: argparse.Namespace) -> int:
         report["steps"]["configs"] = client.list_configs(args.kb_id)
         report["steps"]["status"] = client.status(args.kb_id)
 
-        if not args.skip_query:
-            if not ready_documents:
-                report["steps"]["query"] = {
-                    "skipped": True,
-                    "reason": "no_ready_documents_after_delete_test"
-                    if args.delete_test
-                    else "no_ready_documents",
-                }
-                print("[skip] query: no ready documents remain")
-            else:
-                query_result = client.query(
-                    args.kb_id,
-                    args.query,
-                    mode=args.mode,
-                    include_references=args.include_references,
-                    include_chunk_content=args.include_chunk_content,
-                    top_k=args.top_k,
-                    chunk_top_k=args.chunk_top_k,
-                )
-                doc_scoped_query = client.query(
-                    args.kb_id,
-                    args.query,
-                    mode=args.mode,
-                    include_references=True,
-                    include_chunk_content=False,
-                    top_k=args.top_k,
-                    chunk_top_k=args.chunk_top_k,
-                    doc_ids=[ready_documents[0]["id"]],
-                )
-                query_data = client.query_data(
-                    args.kb_id,
-                    args.query,
-                    mode=args.mode,
-                    top_k=args.top_k,
-                    chunk_top_k=args.chunk_top_k,
-                )
-                report["steps"]["query"] = {
-                    "question": args.query,
-                    "result": query_result,
-                    "doc_scoped_result": doc_scoped_query,
-                    "data": query_data,
-                }
-                print(
-                    f"[ok] query mode={query_result.get('mode')} refs={len(query_result.get('references') or [])}"
-                )
-        else:
+        # Query coverage. In an interactive TTY run we DO NOT fire a built-in
+        # scripted question — the interactive Q&A loop below is the only place
+        # questions are asked. Non-interactive runs (CI / --no-interactive-query)
+        # still run one scripted query (+ doc-scoped + structured retrieve) so the
+        # drill keeps exercising the /query endpoints without a human.
+        interactive_active = (
+            args.interactive_query and not args.skip_query and sys.stdin.isatty()
+        )
+        if args.skip_query:
             print("[skip] query")
+        elif interactive_active:
+            print("[ok] query: interactive Q&A only (no scripted question)")
+        elif not ready_documents:
+            report["steps"]["query"] = {
+                "skipped": True,
+                "reason": "no_ready_documents_after_delete_test"
+                if args.delete_test
+                else "no_ready_documents",
+            }
+            print("[skip] query: no ready documents remain")
+        else:
+            query_result = client.query(
+                args.kb_id,
+                args.query,
+                mode=args.mode,
+                include_references=args.include_references,
+                include_chunk_content=args.include_chunk_content,
+                top_k=args.top_k,
+                chunk_top_k=args.chunk_top_k,
+            )
+            doc_scoped_query = client.query(
+                args.kb_id,
+                args.query,
+                mode=args.mode,
+                include_references=True,
+                include_chunk_content=False,
+                top_k=args.top_k,
+                chunk_top_k=args.chunk_top_k,
+                doc_ids=[ready_documents[0]["id"]],
+            )
+            query_data = client.query_data(
+                args.kb_id,
+                args.query,
+                mode=args.mode,
+                top_k=args.top_k,
+                chunk_top_k=args.chunk_top_k,
+            )
+            report["steps"]["query"] = {
+                "question": args.query,
+                "result": query_result,
+                "doc_scoped_result": doc_scoped_query,
+                "data": query_data,
+            }
+            print(
+                f"[ok] query mode={query_result.get('mode')} refs={len(query_result.get('references') or [])}"
+            )
 
         run_optional_demos(
             client, args, ready_documents, artifact_summary, run_id, report
@@ -1851,6 +2061,103 @@ def run_optional_demos(
 
     if args.demo_reindex:
         run_reindex_demo(client, args, ready_documents, run_id, report)
+
+    if args.demo_enterprise_admin and (
+        report["steps"].get("auth", {}).get("auth_mode") == "enterprise"
+    ):
+        run_enterprise_admin_demo(client, args, run_id, report)
+
+
+def run_enterprise_admin_demo(
+    client: EnterpriseKBClient,
+    args: argparse.Namespace,
+    run_id: str,
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Enterprise control-plane showcase (super admin): create a user + grant a
+    KB ACL, issue a scoped + expiring service API key and verify its scope, mint
+    a registration invitation, and read audit events. Each block is independent
+    and records its outcome (or HTTP error) into the run report."""
+    summary: dict[str, Any] = {}
+    kb_id = args.kb_id
+
+    username = f"viewer_{run_id}"[:48]
+    try:
+        user = client.admin_create_user(username, "Viewer@12345")
+        client.admin_grant_kb_acl(kb_id, user["id"], "kb_viewer")
+        summary["user"] = {"id": user["id"], "username": user["username"]}
+        print(f"[ok] enterprise user {username!r} granted kb_viewer on {kb_id}")
+    except httpx.HTTPStatusError as exc:
+        summary["user_error"] = {
+            "status": exc.response.status_code,
+            "detail": exc.response.text[:200],
+        }
+        print(f"[warn] create-user/grant-acl failed: HTTP {exc.response.status_code}")
+
+    try:
+        created = client.admin_create_service_api_key(
+            f"reader-{run_id}", {kb_id: "kb_viewer"}, expires_in_seconds=3600
+        )
+        raw_key = created["api_key"]
+        scoped = httpx.get(
+            f"{args.server.rstrip('/')}/kbs",
+            headers={"X-API-Key": raw_key},
+            timeout=60.0,
+        )
+        scoped_kbs = (
+            [k["id"] for k in scoped.json().get("knowledge_bases", [])]
+            if scoped.status_code == 200
+            else None
+        )
+        summary["service_key"] = {
+            "id": created["key"]["id"],
+            "expires_at": created["key"]["expires_at"],
+            "scoped_list_status": scoped.status_code,
+            "scoped_kbs": scoped_kbs,
+        }
+        print(
+            f"[ok] service key issued expires_at={created['key']['expires_at']} "
+            f"scoped_kbs={scoped_kbs}"
+        )
+    except httpx.HTTPStatusError as exc:
+        summary["service_key_error"] = {
+            "status": exc.response.status_code,
+            "detail": exc.response.text[:200],
+        }
+        print(f"[warn] service-api-key failed: HTTP {exc.response.status_code}")
+
+    try:
+        invitation = client.admin_create_invitation(expires_in_seconds=3600)
+        summary["invitation"] = {
+            "id": invitation["invitation"]["id"],
+            "expires_at": invitation["invitation"]["expires_at"],
+            "token_preview": invitation["invitation"]["token_preview"],
+        }
+        print(
+            f"[ok] registration invitation minted id={invitation['invitation']['id']}"
+        )
+    except httpx.HTTPStatusError as exc:
+        summary["invitation_error"] = {
+            "status": exc.response.status_code,
+            "detail": exc.response.text[:200],
+        }
+        print(f"[warn] invitation failed: HTTP {exc.response.status_code}")
+
+    try:
+        events = client.admin_list_audit_events(limit=30)
+        summary["audit_event_types"] = sorted(
+            {str(event.get("event_type")) for event in events}
+        )
+        print(f"[ok] audit event types: {summary['audit_event_types']}")
+    except httpx.HTTPStatusError as exc:
+        summary["audit_error"] = {
+            "status": exc.response.status_code,
+            "detail": exc.response.text[:200],
+        }
+        print(f"[warn] audit-events failed: HTTP {exc.response.status_code}")
+
+    report["steps"]["enterprise_admin_demo"] = summary
+    return summary
 
 
 def run_query_extras(
@@ -2600,6 +2907,9 @@ def write_report(report: dict[str, Any], output_dir: Path, run_id: str) -> Path:
     return report_path
 
 
+_INTERACTIVE_QUERY_MODES = ("local", "global", "hybrid", "naive", "mix", "bypass")
+
+
 def run_interactive_query(
     client: EnterpriseKBClient,
     args: argparse.Namespace,
@@ -2609,8 +2919,10 @@ def run_interactive_query(
     """Stateless interactive Q&A loop.
 
     Each prompt is an independent ``/query`` call with NO conversation history —
-    every question stands alone. Prints the answer and its references each round.
-    Blank line, 'exit', 'quit', or EOF leaves the loop.
+    every question stands alone. The retrieval mode is shown in the prompt and
+    can be switched mid-session with ``/mode <mode>``. Only the references the
+    answer actually cites are printed (de-duplicated, in citation order). Blank
+    line, 'exit', 'quit', or EOF leaves the loop.
     """
     if not sys.stdin.isatty():
         print("[interactive-query] stdin is not a TTY; skipping interactive Q&A")
@@ -2618,22 +2930,50 @@ def run_interactive_query(
     if not ready_documents:
         print("[interactive-query] no ready documents; skipping interactive Q&A")
         return
+    current_mode = args.mode
     print()
     print("[interactive-query] 进入交互问答（每次独立提问，不含历史对话）。")
-    print("[interactive-query] 直接回车 / 输入 exit / quit 退出。")
+    print(
+        f"[interactive-query] 当前检索模式：{current_mode}"
+        f"（可选：{', '.join(_INTERACTIVE_QUERY_MODES)}）"
+    )
+    print(
+        "[interactive-query] 命令：'/mode' 查看当前模式，'/mode <模式>' 切换；"
+        "直接回车 / exit / quit 退出。"
+    )
     rounds: list[dict[str, Any]] = []
     while True:
         try:
-            question = input("问> ").strip()
+            raw = input(f"问[{current_mode}]> ").strip()
         except EOFError:
             break
-        if not question or question.lower() in {"exit", "quit", "q"}:
+        if not raw or raw.lower() in {"exit", "quit", "q"}:
             break
+        # Mid-session mode switch: '/mode' shows current, '/mode <m>' switches.
+        if raw.lower() == "/mode" or raw.lower().startswith("/mode "):
+            parts = raw.split(None, 1)
+            if len(parts) == 1:
+                print(
+                    f"[mode] 当前：{current_mode}；可选："
+                    f"{', '.join(_INTERACTIVE_QUERY_MODES)}"
+                )
+            else:
+                requested = parts[1].strip().lower()
+                if requested in _INTERACTIVE_QUERY_MODES:
+                    current_mode = requested
+                    print(f"[mode] 已切换检索模式 → {current_mode}")
+                else:
+                    print(
+                        f"[mode] 无效模式 {requested!r}；可选："
+                        f"{', '.join(_INTERACTIVE_QUERY_MODES)}"
+                    )
+            continue
+        question = raw
         try:
             result = client.query(
                 args.kb_id,
                 question,
-                mode=args.mode,
+                mode=current_mode,
                 include_references=True,
                 include_chunk_content=args.include_chunk_content,
                 top_k=args.top_k,
@@ -2644,26 +2984,18 @@ def run_interactive_query(
             continue
         answer = result.get("response") or "(no answer)"
         references = result.get("references") or []
-        print(f"答> {answer}")
-        if references:
-            print("引用：")
-            for ref in references:
-                ref_id = ref.get("reference_id", "?")
-                file_path = ref.get("file_path", "-")
-                print(f"  [{ref_id}] {file_path}")
-                content = ref.get("content")
-                if content:
-                    snippets = content if isinstance(content, list) else [content]
-                    for snippet in snippets:
-                        text = str(snippet).replace("\n", " ")
-                        print(f"      {text[:200]}")
-        else:
-            print("引用：(无)")
+        # Print the answer verbatim — including the model's own trailing
+        # References / 参考文献 section, which is what the answer actually cited.
+        # We deliberately do NOT print a separate reference block: the API's
+        # `references` list is the full retrieved candidate set and over-reports
+        # what the answer truly used. The raw list is still kept in the report.
+        print(f"答[{current_mode}]> {answer}")
         rounds.append(
             {
                 "question": question,
+                "mode": current_mode,
                 "answer": answer,
-                "reference_count": len(references),
+                "retrieved_reference_count": len(references),
                 "references": references,
             }
         )
@@ -2808,8 +3140,10 @@ def build_enterprise_config(
             "chunk_overlap_size": chunk_overlap,
         },
         "embedding_config": {
-            "binding": env_snapshot.get("EMBEDDING_BINDING"),
-            "host": env_snapshot.get("EMBEDDING_BINDING_HOST"),
+            # NOTE: the embedding provider binding/host are deployment-level
+            # (.env EMBEDDING_BINDING / EMBEDDING_BINDING_HOST) and are rejected
+            # by KB config validation. Only the runtime-effective fields below
+            # (model / dim / token_limit) belong in a per-KB config version.
             "model": env_snapshot.get("EMBEDDING_MODEL"),
             "dim": embedding_dim,
             "token_limit": embedding_token_limit,

@@ -30,6 +30,7 @@ from lightrag.api.enterprise_auth import (
     get_enterprise_user_service,
     principal_from_api_key,
     protected_whitelist_bypass_forbidden,
+    set_current_principal,
 )
 
 logger = logging.getLogger("lightrag")
@@ -150,6 +151,7 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                     user_service = get_enterprise_user_service(request)
                     principal = await user_service.principal_from_token_info(token_info)
                     request.state.principal = principal
+                    set_current_principal(principal)
                     await enforce_enterprise_request_access(request, principal)
                     await enforce_enterprise_request_limits(request, principal)
                     return principal
@@ -255,6 +257,7 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                 principal = await service.principal_from_api_key(api_key_header_value)
                 if principal is not None:
                     request.state.principal = principal
+                    set_current_principal(principal)
                     await enforce_enterprise_request_access(request, principal)
                     await enforce_enterprise_request_limits(request, principal)
                     return principal
@@ -272,6 +275,7 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                     )
                 principal = principal_from_api_key()
                 request.state.principal = principal
+                set_current_principal(principal)
                 await enforce_enterprise_request_access(request, principal)
                 await enforce_enterprise_request_limits(request, principal)
                 return principal

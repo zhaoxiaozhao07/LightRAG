@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+import contextvars
 import hashlib
 from importlib import import_module
 import os
@@ -16,6 +18,7 @@ from lightrag.api.kb_service import KnowledgeBaseRecord, utc_now_iso
 from lightrag.api.metadata_store import (
     AuditEventRecord,
     EnterpriseAPIKeyRecord,
+    EnterpriseInvitationRecord,
     EnterpriseUserRecord,
     KBACLRecord,
     EnterpriseTenantKBACLRecord,
@@ -37,7 +40,11 @@ REGISTRATION_MODES = {
 }
 USER_STATUS_ACTIVE = "active"
 USER_STATUS_DISABLED = "disabled"
-USER_STATUS_VALUES = {USER_STATUS_ACTIVE, USER_STATUS_DISABLED}
+USER_STATUS_PENDING = "pending"
+USER_STATUS_VALUES = {USER_STATUS_ACTIVE, USER_STATUS_DISABLED, USER_STATUS_PENDING}
+ENTERPRISE_INVITATION_STATUS_ACTIVE = "active"
+ENTERPRISE_INVITATION_STATUS_USED = "used"
+ENTERPRISE_INVITATION_STATUS_REVOKED = "revoked"
 ENTERPRISE_API_KEY_STATUS_ACTIVE = "active"
 ENTERPRISE_API_KEY_STATUS_REVOKED = "revoked"
 ENTERPRISE_API_KEY_STATUS_VALUES = {
@@ -174,6 +181,24 @@ class EnterpriseMetadataStore(Protocol):
 
     async def list_audit_events(self, *, limit: int = 100) -> list[AuditEventRecord]: ...
 
+    async def create_enterprise_invitation(
+        self, record: EnterpriseInvitationRecord
+    ) -> EnterpriseInvitationRecord: ...
+
+    async def get_enterprise_invitation_by_token_hash(
+        self, token_hash: str
+    ) -> EnterpriseInvitationRecord | None: ...
+
+    async def list_enterprise_invitations(self) -> list[EnterpriseInvitationRecord]: ...
+
+    async def consume_enterprise_invitation(
+        self, token_hash: str, *, used_by: str | None, used_at: str | None = None
+    ) -> EnterpriseInvitationRecord | None: ...
+
+    async def revoke_enterprise_invitation(
+        self, invitation_id: str, *, revoked_at: str | None = None
+    ) -> EnterpriseInvitationRecord | None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class Principal:
@@ -192,6 +217,25 @@ class Principal:
     @property
     def is_super_admin(self) -> bool:
         return self.system_role == SYSTEM_ROLE_SUPER_ADMIN
+
+
+_current_principal: contextvars.ContextVar[Principal | None] = contextvars.ContextVar(
+    "lightrag_current_principal", default=None
+)
+
+
+def set_current_principal(principal: Principal | None) -> None:
+    """Bind the authenticated principal to the current async context.
+
+    Set wherever ``request.state.principal`` is set so downstream code without a
+    ``Request`` (e.g. ``JobService``) can attribute work to the caller. Tasks
+    spawned during the request inherit a copy of this context.
+    """
+    _current_principal.set(principal)
+
+
+def get_current_principal() -> Principal | None:
+    return _current_principal.get()
 
 
 def enterprise_auth_enabled() -> bool:
@@ -392,6 +436,116 @@ class EnterpriseLimitService:
         )
 
 
+DEFAULT_LOGIN_MAX_ATTEMPTS = 10
+DEFAULT_LOGIN_WINDOW_SECONDS = 300.0
+DEFAULT_LOGIN_LOCKOUT_SECONDS = 900.0
+
+
+@dataclass(slots=True)
+class _LoginAttemptState:
+    failures: int
+    window_started_at: float
+    locked_until: float
+
+
+class LoginAttemptTracker:
+    """In-memory failed-login lockout for enterprise ``/login``.
+
+    Keyed by the submitted username (stripped). After ``max_attempts`` failures
+    within ``window_seconds`` the username is locked for ``lockout_seconds`` and
+    :meth:`check` raises HTTP 429. A successful login clears the counter.
+    ``max_attempts <= 0`` disables the tracker entirely (no behavior change).
+
+    Single-process/in-memory only — consistent with ``EnterpriseLimitService``;
+    multi-instance shared lockout coordination is a later platform concern.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_attempts: int,
+        window_seconds: float,
+        lockout_seconds: float,
+        time_func: Callable[[], float] = time.monotonic,
+    ):
+        self._max_attempts = max_attempts
+        self._window_seconds = window_seconds
+        self._lockout_seconds = lockout_seconds
+        self._time_func = time_func
+        self._states: dict[str, _LoginAttemptState] = {}
+
+    @classmethod
+    def from_args(cls, args: Any) -> "LoginAttemptTracker":
+        return cls(
+            max_attempts=_non_negative_int(
+                getattr(args, "enterprise_login_max_attempts", DEFAULT_LOGIN_MAX_ATTEMPTS),
+                DEFAULT_LOGIN_MAX_ATTEMPTS,
+            ),
+            window_seconds=_positive_float(
+                getattr(
+                    args,
+                    "enterprise_login_window_seconds",
+                    DEFAULT_LOGIN_WINDOW_SECONDS,
+                ),
+                DEFAULT_LOGIN_WINDOW_SECONDS,
+            ),
+            lockout_seconds=_positive_float(
+                getattr(
+                    args,
+                    "enterprise_login_lockout_seconds",
+                    DEFAULT_LOGIN_LOCKOUT_SECONDS,
+                ),
+                DEFAULT_LOGIN_LOCKOUT_SECONDS,
+            ),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self._max_attempts > 0
+
+    def check(self, username: str) -> None:
+        """Raise HTTP 429 when the username is currently locked out."""
+        if not self.enabled:
+            return
+        state = self._states.get(self._key(username))
+        if state is None:
+            return
+        now = self._time_func()
+        if state.locked_until > now:
+            retry_after = max(1, int(state.locked_until - now))
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed login attempts. Try again later.",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+    def record_failure(self, username: str) -> bool:
+        """Record a failed attempt; return True when it triggers a new lock."""
+        if not self.enabled:
+            return False
+        key = self._key(username)
+        now = self._time_func()
+        state = self._states.get(key)
+        if state is None or now - state.window_started_at >= self._window_seconds:
+            state = _LoginAttemptState(
+                failures=0, window_started_at=now, locked_until=0.0
+            )
+        state.failures += 1
+        triggered = False
+        if state.failures >= self._max_attempts:
+            state.locked_until = now + self._lockout_seconds
+            triggered = True
+        self._states[key] = state
+        return triggered
+
+    def record_success(self, username: str) -> None:
+        self._states.pop(self._key(username), None)
+
+    @staticmethod
+    def _key(username: str) -> str:
+        return username.strip()
+
+
 class ServiceAPIKeyService:
     def __init__(
         self,
@@ -409,6 +563,7 @@ class ServiceAPIKeyService:
         metadata: dict[str, Any] | None = None,
         created_by: str | None = None,
         tenant_id: str | None = None,
+        expires_at: str | None = None,
     ) -> tuple[EnterpriseAPIKeyRecord, str]:
         normalized_name = name.strip()
         if not normalized_name:
@@ -432,6 +587,7 @@ class ServiceAPIKeyService:
             last_used_at=None,
             revoked_at=None,
             revoked_by=None,
+            expires_at=expires_at,
         )
         saved = await self._metadata_store.create_enterprise_api_key(record)
         if self._audit_service is not None:
@@ -444,6 +600,7 @@ class ServiceAPIKeyService:
                     "name": saved.name,
                     "key_preview": saved.key_preview,
                     "scopes": saved.scopes,
+                    "expires_at": saved.expires_at,
                 },
             )
         return saved, raw_key
@@ -479,6 +636,8 @@ class ServiceAPIKeyService:
             return None
         if record.status != ENTERPRISE_API_KEY_STATUS_ACTIVE:
             return None
+        if service_api_key_is_expired(record.expires_at):
+            return None
         await self._metadata_store.mark_enterprise_api_key_used(record.id)
         scopes = _normalize_service_api_key_scopes(record.scopes)
         return Principal(
@@ -501,10 +660,117 @@ class ServiceAPIKeyService:
         )
 
 
+class InvitationService:
+    """Single-use registration invitations for ``invite_only`` mode.
+
+    The raw token is returned once at creation; only a ``sha256:`` hash and a
+    short preview are persisted. ``consume_invitation`` atomically transitions
+    an active, non-expired invitation to ``used`` so a token cannot be reused.
+    """
+
+    def __init__(
+        self,
+        metadata_store: EnterpriseMetadataStore,
+        audit_service: AuditService | None = None,
+    ):
+        self._metadata_store = metadata_store
+        self._audit_service = audit_service
+
+    async def create_invitation(
+        self,
+        *,
+        created_by: str | None = None,
+        expires_at: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[EnterpriseInvitationRecord, str]:
+        invitation_id = f"inv_{uuid4().hex}"
+        raw_token = f"lrinv_{invitation_id}_{secrets.token_urlsafe(32)}"
+        now = utc_now_iso()
+        record = EnterpriseInvitationRecord(
+            id=invitation_id,
+            token_hash=_hash_invitation_token(raw_token),
+            token_preview=raw_token[-6:],
+            status=ENTERPRISE_INVITATION_STATUS_ACTIVE,
+            created_by=created_by,
+            expires_at=expires_at,
+            used_by=None,
+            used_at=None,
+            metadata=metadata or {},
+            created_at=now,
+            updated_at=now,
+        )
+        saved = await self._metadata_store.create_enterprise_invitation(record)
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                "invitation_created",
+                actor_user_id=created_by,
+                target_type="invitation",
+                target_id=saved.id,
+                metadata={
+                    "token_preview": saved.token_preview,
+                    "expires_at": saved.expires_at,
+                },
+            )
+        return saved, raw_token
+
+    async def list_invitations(self) -> list[EnterpriseInvitationRecord]:
+        return await self._metadata_store.list_enterprise_invitations()
+
+    async def revoke_invitation(
+        self, invitation_id: str, *, actor_user_id: str | None = None
+    ) -> EnterpriseInvitationRecord:
+        revoked = await self._metadata_store.revoke_enterprise_invitation(invitation_id)
+        if revoked is None:
+            raise HTTPException(status_code=404, detail="Invitation not found")
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                "invitation_revoked",
+                actor_user_id=actor_user_id,
+                target_type="invitation",
+                target_id=revoked.id,
+            )
+        return revoked
+
+    async def consume_invitation(
+        self, raw_token: str | None, *, used_by: str | None
+    ) -> EnterpriseInvitationRecord:
+        token = (raw_token or "").strip()
+        if not token:
+            raise HTTPException(
+                status_code=403, detail="A valid invitation token is required"
+            )
+        record = await self._metadata_store.get_enterprise_invitation_by_token_hash(
+            _hash_invitation_token(token)
+        )
+        if (
+            record is None
+            or record.status != ENTERPRISE_INVITATION_STATUS_ACTIVE
+            or _iso_timestamp_is_past(record.expires_at)
+        ):
+            raise HTTPException(
+                status_code=403, detail="Invalid or expired invitation token"
+            )
+        consumed = await self._metadata_store.consume_enterprise_invitation(
+            record.token_hash, used_by=used_by
+        )
+        if consumed is None:
+            raise HTTPException(
+                status_code=403, detail="Invalid or expired invitation token"
+            )
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                "invitation_consumed",
+                actor_user_id=None,
+                target_type="invitation",
+                target_id=consumed.id,
+                metadata={"used_by": used_by},
+            )
+        return consumed
+
+
 class SystemSettingsService:
     def __init__(self, metadata_store: EnterpriseMetadataStore):
         self._metadata_store = metadata_store
-
     async def initialize_registration_setting(self, enabled: bool) -> None:
         existing = await self._metadata_store.get_enterprise_system_setting(
             ENTERPRISE_REGISTRATION_ENABLED_KEY
@@ -1086,6 +1352,15 @@ def get_enterprise_api_key_service(request: Request) -> ServiceAPIKeyService:
     return service
 
 
+def get_enterprise_invitation_service(request: Request) -> InvitationService:
+    service = getattr(request.app.state, "enterprise_invitation_service", None)
+    if not isinstance(service, InvitationService):
+        raise HTTPException(
+            status_code=500, detail="Enterprise invitation service unavailable"
+        )
+    return service
+
+
 def get_enterprise_authorization_service(request: Request) -> AuthorizationService:
     service = getattr(request.app.state, "enterprise_authorization_service", None)
     if not isinstance(service, AuthorizationService):
@@ -1229,6 +1504,39 @@ def _hash_service_api_key(raw_key: str) -> str:
     return f"sha256:{digest}"
 
 
+def _hash_invitation_token(raw_token: str) -> str:
+    digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _iso_timestamp_is_past(value: str | None, *, now: datetime | None = None) -> bool:
+    """Return True when an ISO-8601 timestamp is at or before ``now``.
+
+    A missing/empty value is never past; unparseable values are treated as
+    not-past so a corrupt field cannot revoke an otherwise valid credential.
+    """
+    if not value:
+        return False
+    try:
+        deadline = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    return (now or datetime.now(timezone.utc)) >= deadline
+
+
+def service_api_key_is_expired(
+    expires_at: str | None, *, now: datetime | None = None
+) -> bool:
+    """Return True when a service API key ``expires_at`` is at or past now.
+
+    ``expires_at`` is an ISO-8601 timestamp produced by ``utc_now_iso``; a
+    missing/empty value means the key never expires.
+    """
+    return _iso_timestamp_is_past(expires_at, now=now)
+
+
 def _normalize_service_api_key_scopes(scopes: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(scopes, dict):
         raise HTTPException(status_code=400, detail="Service API key scopes must be an object")
@@ -1370,6 +1678,86 @@ def _principal_limit_subject(principal: Principal) -> tuple[str, str]:
     if principal.auth_method == "api_key":
         return "api_key", principal.user_id
     return "user", principal.user_id
+
+
+def principal_job_subject(principal: Principal) -> dict[str, str | None]:
+    """The attribution stamp written into a job payload as ``_principal``."""
+    _subject_type, subject_id = _principal_limit_subject(principal)
+    return {"subject_id": subject_id, "tenant_id": principal.tenant_id}
+
+
+def _enterprise_concurrent_job_limits() -> tuple[int, int]:
+    args = _global_args()
+    return (
+        _non_negative_int(getattr(args, "enterprise_max_concurrent_jobs", 0), 0),
+        _non_negative_int(
+            getattr(args, "enterprise_tenant_max_concurrent_jobs", 0), 0
+        ),
+    )
+
+
+async def enforce_concurrent_job_quota(
+    metadata_store: Any, principal: Principal | None
+) -> None:
+    """Reject (HTTP 429) new job creation once a principal/tenant already holds
+    the configured number of in-flight jobs.
+
+    No-op unless enterprise auth is on and a positive limit is configured
+    (default 0 = disabled). Attribution is read from the job payload stamp
+    written by :func:`principal_job_subject`.
+    """
+    if not enterprise_auth_enabled() or principal is None:
+        return
+    principal_limit, tenant_limit = _enterprise_concurrent_job_limits()
+    if principal_limit <= 0 and tenant_limit <= 0:
+        return
+    _subject_type, subject_id = _principal_limit_subject(principal)
+    if principal_limit > 0:
+        active = await metadata_store.count_active_jobs_for_principal(subject_id)
+        if active >= principal_limit:
+            await _audit_job_quota(
+                metadata_store, principal, "principal", principal_limit, active
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="Concurrent job quota exceeded",
+                headers={"Retry-After": "30"},
+            )
+    if tenant_limit > 0 and principal.tenant_id:
+        active = await metadata_store.count_active_jobs_for_tenant(principal.tenant_id)
+        if active >= tenant_limit:
+            await _audit_job_quota(
+                metadata_store, principal, "tenant", tenant_limit, active
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="Concurrent job quota exceeded",
+                headers={"Retry-After": "30"},
+            )
+
+
+async def _audit_job_quota(
+    metadata_store: Any,
+    principal: Principal,
+    subject_type: str,
+    limit: int,
+    active: int,
+) -> None:
+    try:
+        await AuditService(metadata_store).append(
+            "quota_exceeded",
+            actor_user_id=principal.user_id,
+            target_type=subject_type,
+            metadata={
+                "limit_name": "concurrent_jobs",
+                "limit": limit,
+                "active": active,
+                "subject_type": subject_type,
+                "auth_method": principal.auth_method,
+            },
+        )
+    except Exception:
+        pass
 
 
 def _non_negative_int(value: Any, default: int) -> int:

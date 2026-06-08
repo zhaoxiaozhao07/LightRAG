@@ -733,6 +733,21 @@ def parse_args() -> argparse.Namespace:
     args.enterprise_tenant_quota_window_seconds = get_env_value(
         "LIGHTRAG_ENTERPRISE_TENANT_QUOTA_WINDOW_SECONDS", 86400.0, float
     )
+    args.enterprise_login_max_attempts = get_env_value(
+        "LIGHTRAG_ENTERPRISE_LOGIN_MAX_ATTEMPTS", 10, int
+    )
+    args.enterprise_login_window_seconds = get_env_value(
+        "LIGHTRAG_ENTERPRISE_LOGIN_WINDOW_SECONDS", 300.0, float
+    )
+    args.enterprise_login_lockout_seconds = get_env_value(
+        "LIGHTRAG_ENTERPRISE_LOGIN_LOCKOUT_SECONDS", 900.0, float
+    )
+    args.enterprise_max_concurrent_jobs = get_env_value(
+        "LIGHTRAG_ENTERPRISE_MAX_CONCURRENT_JOBS", 0, int
+    )
+    args.enterprise_tenant_max_concurrent_jobs = get_env_value(
+        "LIGHTRAG_ENTERPRISE_TENANT_MAX_CONCURRENT_JOBS", 0, int
+    )
 
     # Token auto-renewal configuration (sliding window expiration)
     args.token_auto_renew = get_env_value("TOKEN_AUTO_RENEW", True, bool)

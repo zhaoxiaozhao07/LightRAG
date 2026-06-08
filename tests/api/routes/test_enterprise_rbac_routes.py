@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 _original_argv = sys.argv[:]
@@ -21,9 +21,11 @@ from lightrag.api.enterprise_auth import (
     AuditService,
     AuthorizationService,
     EnterpriseLimitService,
+    InvitationService,
     ServiceAPIKeyService,
     SystemSettingsService,
     UserService,
+    service_api_key_is_expired,
 )
 from lightrag.api.job_service import JobService
 from lightrag.api.kb_service import KnowledgeBaseService
@@ -197,6 +199,7 @@ def _build_enterprise_client(
     user_service = UserService(metadata_store, audit_service)
     settings_service = SystemSettingsService(metadata_store)
     api_key_service = ServiceAPIKeyService(metadata_store, audit_service)
+    invitation_service = InvitationService(metadata_store, audit_service)
     limit_service = EnterpriseLimitService(audit_service)
     authz_service = AuthorizationService(metadata_store, audit_service)
     probe = BuilderProbe()
@@ -230,6 +233,7 @@ def _build_enterprise_client(
     app.state.enterprise_user_service = user_service
     app.state.enterprise_settings_service = settings_service
     app.state.enterprise_api_key_service = api_key_service
+    app.state.enterprise_invitation_service = invitation_service
     app.state.enterprise_limit_service = limit_service
     app.state.enterprise_authorization_service = authz_service
     app.state.enterprise_audit_service = audit_service
@@ -1049,6 +1053,94 @@ def test_enterprise_service_api_keys_are_scoped_and_revocable(monkeypatch, tmp_p
     assert "service_api_key_revoked" in event_types
 
 
+def test_service_api_key_expiry_rejected_at_auth(tmp_path):
+    """An expired service API key is rejected at authentication; a non-expired
+    one still resolves to a principal. Built against the real SQLite store +
+    ServiceAPIKeyService so it never depends on wall-clock waiting."""
+    from datetime import datetime, timedelta, timezone
+
+    store = SQLiteMetadataStore(tmp_path / "metadata" / "metadata.sqlite3")
+    service = ServiceAPIKeyService(store, AuditService(store))
+
+    async def scenario():
+        await store.initialize()
+        past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        expired_record, expired_raw = await service.create_key(
+            name="expired", expires_at=past
+        )
+        valid_record, valid_raw = await service.create_key(
+            name="valid", expires_at=future
+        )
+        return (
+            expired_record,
+            valid_record,
+            await service.principal_from_api_key(expired_raw),
+            await service.principal_from_api_key(valid_raw),
+        )
+
+    expired_record, valid_record, expired_principal, valid_principal = asyncio.run(
+        scenario()
+    )
+
+    assert expired_record.expires_at is not None
+    assert expired_principal is None
+    assert valid_principal is not None
+    assert valid_principal.metadata["service_api_key_id"] == valid_record.id
+    assert service_api_key_is_expired(expired_record.expires_at) is True
+    assert service_api_key_is_expired(valid_record.expires_at) is False
+    assert service_api_key_is_expired(None) is False
+
+
+def test_create_service_api_key_with_expiry_round_trips(monkeypatch, tmp_path):
+    """POST /admin/service-api-keys with expires_in_seconds returns expires_at;
+    a far-future key still authenticates and stays scoped to its KB; a
+    non-positive expires_in_seconds is rejected at the request boundary."""
+    client, user_service, _authz, admin, alice, _bob, _probe = _build_enterprise_client(
+        monkeypatch,
+        tmp_path,
+        api_key=None,
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+
+    created_kb = client.post(
+        "/kbs", json={"id": "kb_expiry", "name": "Expiry"}, headers=alice_headers
+    )
+    assert created_kb.status_code == 200, created_kb.text
+
+    created = client.post(
+        "/admin/service-api-keys",
+        json={
+            "name": "expiring-reader",
+            "kb_roles": {"kb_expiry": "kb_viewer"},
+            "expires_in_seconds": 3600,
+        },
+        headers=admin_headers,
+    )
+    assert created.status_code == 200, created.text
+    key_record = created.json()["key"]
+    assert key_record["expires_at"] is not None
+
+    listed = client.get("/admin/service-api-keys", headers=admin_headers)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()[0]["expires_at"] == key_record["expires_at"]
+
+    service_headers = {"X-API-Key": created.json()["api_key"]}
+    service_list = client.get("/kbs", headers=service_headers)
+    assert service_list.status_code == 200, service_list.text
+    assert [item["id"] for item in service_list.json()["knowledge_bases"]] == [
+        "kb_expiry"
+    ]
+
+    invalid = client.post(
+        "/admin/service-api-keys",
+        json={"name": "bad", "expires_in_seconds": 0},
+        headers=admin_headers,
+    )
+    assert invalid.status_code == 422
+
+
 def test_enterprise_user_rate_limit_returns_429_and_audits(monkeypatch, tmp_path):
     args = _enterprise_args()
     client, user_service, _authz, admin, alice, bob, _probe = _build_enterprise_client(
@@ -1292,3 +1384,209 @@ def test_enterprise_api_key_and_protected_whitelist_do_not_bypass(monkeypatch, t
     legacy = client.post("/query", headers=admin_headers)
     assert legacy.status_code == 403
     assert legacy.json()["detail"] == "Legacy global route disabled in enterprise mode"
+
+
+def test_registration_admin_approval_creates_pending_user_then_approves(
+    monkeypatch, tmp_path
+):
+    client, user_service, _authz, admin, _alice, _bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+
+    set_mode = client.patch(
+        "/admin/settings/registration",
+        json={"mode": "admin_approval"},
+        headers=admin_headers,
+    )
+    assert set_mode.status_code == 200, set_mode.text
+    assert set_mode.json() == {"enabled": False, "mode": "admin_approval"}
+
+    reg = client.post(
+        "/auth/register", json={"username": "carol", "password": "carol-pass"}
+    )
+    assert reg.status_code == 200, reg.text
+    body = reg.json()
+    assert body["status"] == "pending"
+    assert "access_token" not in body
+    assert body["user"]["status"] == "pending"
+    user_id = body["user"]["id"]
+
+    # A pending user cannot authenticate yet.
+    assert asyncio.run(user_service.authenticate("carol", "carol-pass")) is None
+
+    approved = client.post(f"/admin/users/{user_id}:enable", headers=admin_headers)
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["status"] == "active"
+
+    # After approval the user can authenticate.
+    assert asyncio.run(user_service.authenticate("carol", "carol-pass")) is not None
+
+
+def test_registration_invite_only_requires_valid_single_use_token(
+    monkeypatch, tmp_path
+):
+    client, user_service, _authz, admin, _alice, _bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+
+    set_mode = client.patch(
+        "/admin/settings/registration",
+        json={"mode": "invite_only"},
+        headers=admin_headers,
+    )
+    assert set_mode.status_code == 200, set_mode.text
+
+    # No token / bad token are both rejected.
+    assert (
+        client.post(
+            "/auth/register", json={"username": "dave", "password": "dave-pass"}
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            "/auth/register",
+            json={
+                "username": "dave",
+                "password": "dave-pass",
+                "invitation_token": "lrinv_not_a_real_token",
+            },
+        ).status_code
+        == 403
+    )
+
+    minted = client.post("/admin/invitations", json={}, headers=admin_headers)
+    assert minted.status_code == 200, minted.text
+    raw_token = minted.json()["invitation_token"]
+    assert raw_token.startswith("lrinv_")
+    assert "token_hash" not in minted.json()["invitation"]
+
+    ok = client.post(
+        "/auth/register",
+        json={
+            "username": "dave",
+            "password": "dave-pass",
+            "invitation_token": raw_token,
+        },
+    )
+    assert ok.status_code == 200, ok.text
+    assert "access_token" in ok.json()
+    assert ok.json()["user"]["status"] == "active"
+
+    # Single-use: the same token cannot be reused.
+    reused = client.post(
+        "/auth/register",
+        json={
+            "username": "erin",
+            "password": "erin-pass",
+            "invitation_token": raw_token,
+        },
+    )
+    assert reused.status_code == 403
+
+    listed = client.get("/admin/invitations", headers=admin_headers)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()[0]["status"] == "used"
+
+    # A revoked invitation is also rejected.
+    minted2 = client.post("/admin/invitations", json={}, headers=admin_headers)
+    token2 = minted2.json()["invitation_token"]
+    inv2_id = minted2.json()["invitation"]["id"]
+    revoke = client.post(
+        f"/admin/invitations/{inv2_id}:revoke", headers=admin_headers
+    )
+    assert revoke.status_code == 200, revoke.text
+    assert revoke.json()["status"] == "revoked"
+    after_revoke = client.post(
+        "/auth/register",
+        json={
+            "username": "frank",
+            "password": "frank-pass",
+            "invitation_token": token2,
+        },
+    )
+    assert after_revoke.status_code == 403
+
+
+def test_invitation_expiry_rejected_at_consume(tmp_path):
+    """An expired invitation is rejected by consume_invitation (403). Built
+    against the real SQLite store + InvitationService without waiting."""
+    from datetime import datetime, timedelta, timezone
+
+    store = SQLiteMetadataStore(tmp_path / "metadata" / "metadata.sqlite3")
+    service = InvitationService(store, AuditService(store))
+
+    async def scenario():
+        await store.initialize()
+        past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        record, raw_token = await service.create_invitation(expires_at=past)
+        return record, raw_token
+
+    record, raw_token = asyncio.run(scenario())
+    assert record.status == "active"
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(service.consume_invitation(raw_token, used_by="someone"))
+    assert exc.value.status_code == 403
+
+
+def test_concurrent_job_quota_blocks_excess_jobs(monkeypatch, tmp_path):
+    """JobService rejects (429) a new job once the principal already holds the
+    configured number of in-flight jobs; a different principal is unaffected.
+    Driven directly against JobService + the real SQLite store."""
+    from lightrag.api import config as api_config
+    from lightrag.api.enterprise_auth import (
+        Principal,
+        SYSTEM_ROLE_USER,
+        USER_STATUS_ACTIVE,
+        set_current_principal,
+    )
+
+    args = _enterprise_args(enterprise_max_concurrent_jobs=1)
+    monkeypatch.setattr(api_config, "global_args", args)
+
+    kb_service = KnowledgeBaseService(tmp_path / "metadata" / "kb.json")
+    metadata_store = SQLiteMetadataStore(tmp_path / "metadata" / "metadata.sqlite3")
+    job_service = JobService(kb_service, metadata_store)
+
+    def _principal(user_id: str) -> Principal:
+        return Principal(
+            user_id=user_id,
+            username=user_id,
+            system_role=SYSTEM_ROLE_USER,
+            status=USER_STATUS_ACTIVE,
+            tenant_id=None,
+            tenant_roles={},
+            can_create_kb=True,
+            can_use_bypass_query=False,
+            token_version=1,
+            auth_method="jwt",
+            metadata={},
+        )
+
+    async def setup():
+        await kb_service.initialize()
+        await metadata_store.initialize()
+        await kb_service.create(name="Quota KB", kb_id="kb_quota")
+
+    asyncio.run(setup())
+
+    async def create_as(principal: Principal):
+        set_current_principal(principal)
+        try:
+            return await job_service.create_job("kb_quota", job_type="parse")
+        finally:
+            set_current_principal(None)
+
+    first = asyncio.run(create_as(_principal("usr_alice")))
+    assert first.status == "queued"
+    assert first.payload["_principal"]["subject_id"] == "usr_alice"
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(create_as(_principal("usr_alice")))
+    assert exc.value.status_code == 429
+
+    # A different principal is unaffected by alice's in-flight jobs.
+    bob_job = asyncio.run(create_as(_principal("usr_bob")))
+    assert bob_job.status == "queued"
