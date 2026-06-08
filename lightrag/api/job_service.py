@@ -302,6 +302,34 @@ class JobService:
             idempotency_key=idempotency_key,
         )
 
+    async def list_document_ids_for_config_followup(
+        self, kb_id: str, *, statuses: Sequence[str]
+    ) -> list[str]:
+        """Return enabled, non-archived document ids matching config follow-up statuses."""
+        record = await self._kb_service.get(kb_id)
+        document_ids: list[str] = []
+        seen: set[str] = set()
+        for status in statuses:
+            offset = 0
+            while True:
+                documents, total = await self._metadata_store.list_documents(
+                    record.id,
+                    status=status,
+                    limit=200,
+                    offset=offset,
+                )
+                for document in documents:
+                    if not document.enabled or document.archived:
+                        continue
+                    if document.id in seen:
+                        continue
+                    seen.add(document.id)
+                    document_ids.append(document.id)
+                if not documents or offset + len(documents) >= total:
+                    break
+                offset += len(documents)
+        return document_ids
+
     async def list_jobs(
         self,
         kb_id: str,
@@ -310,8 +338,9 @@ class JobService:
         document_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        include_deleted: bool = False,
     ) -> tuple[list[JobRecord], int]:
-        record = await self._kb_service.get(kb_id)
+        record = await self._kb_service.get(kb_id, include_deleted=include_deleted)
         return await self._metadata_store.list_jobs(
             record.id,
             statuses=statuses,
@@ -321,24 +350,30 @@ class JobService:
         )
 
     async def list_running_jobs(
-        self, kb_id: str, *, limit: int = 20
+        self, kb_id: str, *, limit: int = 20, include_deleted: bool = False
     ) -> list[JobRecord]:
         jobs, _total = await self.list_jobs(
-            kb_id, statuses=_RUNNING_JOB_STATUSES, limit=limit, offset=0
+            kb_id,
+            statuses=_RUNNING_JOB_STATUSES,
+            limit=limit,
+            offset=0,
+            include_deleted=include_deleted,
         )
         return jobs
 
     async def list_dead_letter_jobs(
-        self, kb_id: str, *, limit: int = 50, offset: int = 0
+        self, kb_id: str, *, limit: int = 50, offset: int = 0, include_deleted: bool = False
     ) -> tuple[list[JobRecord], int]:
         """List dead-lettered jobs (failed + retries exhausted) for the KB."""
-        record = await self._kb_service.get(kb_id)
+        record = await self._kb_service.get(kb_id, include_deleted=include_deleted)
         return await self._metadata_store.list_dead_letter_jobs(
             record.id, limit=limit, offset=offset
         )
 
-    async def get_job(self, kb_id: str, job_id: str) -> JobRecord:
-        record = await self._kb_service.get(kb_id)
+    async def get_job(
+        self, kb_id: str, job_id: str, *, include_deleted: bool = False
+    ) -> JobRecord:
+        record = await self._kb_service.get(kb_id, include_deleted=include_deleted)
         return await self._metadata_store.get_job(record.id, job_id)
 
     async def get_job_by_idempotency_key(
@@ -443,9 +478,9 @@ class JobService:
         )
 
     async def cancel_job(
-        self, kb_id: str, job_id: str
+        self, kb_id: str, job_id: str, *, include_deleted: bool = False
     ) -> tuple[JobRecord, bool]:
-        record = await self._kb_service.get(kb_id)
+        record = await self._kb_service.get(kb_id, include_deleted=include_deleted)
         existing = await self._metadata_store.get_job(record.id, job_id)
         if existing.status in {"succeeded", "cancelled"}:
             return existing, False
@@ -475,8 +510,9 @@ class JobService:
         job_id: str,
         *,
         new_idempotency_key: str | None = None,
+        include_deleted: bool = False,
     ) -> JobRecord:
-        record = await self._kb_service.get(kb_id)
+        record = await self._kb_service.get(kb_id, include_deleted=include_deleted)
         return await self._metadata_store.reset_job_for_retry(
             record.id, job_id, new_idempotency_key=new_idempotency_key
         )

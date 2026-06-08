@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 from importlib import import_module
 import os
+import secrets
+import time
 from types import SimpleNamespace
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from uuid import uuid4
 
 from fastapi import HTTPException, Request, status
@@ -12,14 +15,36 @@ from fastapi import HTTPException, Request, status
 from lightrag.api.kb_service import KnowledgeBaseRecord, utc_now_iso
 from lightrag.api.metadata_store import (
     AuditEventRecord,
+    EnterpriseAPIKeyRecord,
     EnterpriseUserRecord,
     KBACLRecord,
+    EnterpriseTenantKBACLRecord,
+    EnterpriseTenantMembershipRecord,
 )
 from lightrag.api.passwords import hash_password, verify_password
 
 ENTERPRISE_REGISTRATION_ENABLED_KEY = "registration_enabled"
+ENTERPRISE_REGISTRATION_MODE_KEY = "registration_mode"
+REGISTRATION_MODE_DISABLED = "disabled"
+REGISTRATION_MODE_OPEN = "open"
+REGISTRATION_MODE_INVITE_ONLY = "invite_only"
+REGISTRATION_MODE_ADMIN_APPROVAL = "admin_approval"
+REGISTRATION_MODES = {
+    REGISTRATION_MODE_DISABLED,
+    REGISTRATION_MODE_OPEN,
+    REGISTRATION_MODE_INVITE_ONLY,
+    REGISTRATION_MODE_ADMIN_APPROVAL,
+}
 USER_STATUS_ACTIVE = "active"
 USER_STATUS_DISABLED = "disabled"
+USER_STATUS_VALUES = {USER_STATUS_ACTIVE, USER_STATUS_DISABLED}
+ENTERPRISE_API_KEY_STATUS_ACTIVE = "active"
+ENTERPRISE_API_KEY_STATUS_REVOKED = "revoked"
+ENTERPRISE_API_KEY_STATUS_VALUES = {
+    ENTERPRISE_API_KEY_STATUS_ACTIVE,
+    ENTERPRISE_API_KEY_STATUS_REVOKED,
+}
+SERVICE_API_KEY_AUTH_METHOD = "service_api_key"
 SYSTEM_ROLE_SUPER_ADMIN = "super_admin"
 SYSTEM_ROLE_USER = "user"
 KB_ROLE_VIEWER = "kb_viewer"
@@ -67,6 +92,32 @@ class EnterpriseMetadataStore(Protocol):
         self, user: EnterpriseUserRecord
     ) -> EnterpriseUserRecord: ...
 
+    async def create_enterprise_api_key(
+        self, record: EnterpriseAPIKeyRecord
+    ) -> EnterpriseAPIKeyRecord: ...
+
+    async def get_enterprise_api_key_by_hash(
+        self, key_hash: str
+    ) -> EnterpriseAPIKeyRecord | None: ...
+
+    async def get_enterprise_api_key_by_id(
+        self, key_id: str
+    ) -> EnterpriseAPIKeyRecord | None: ...
+
+    async def list_enterprise_api_keys(self) -> list[EnterpriseAPIKeyRecord]: ...
+
+    async def revoke_enterprise_api_key(
+        self,
+        key_id: str,
+        *,
+        revoked_by: str | None = None,
+        revoked_at: str | None = None,
+    ) -> EnterpriseAPIKeyRecord | None: ...
+
+    async def mark_enterprise_api_key_used(
+        self, key_id: str, *, last_used_at: str | None = None
+    ) -> EnterpriseAPIKeyRecord | None: ...
+
     async def set_enterprise_system_setting(
         self, key: str, value: str, *, updated_by: str | None = None
     ) -> None: ...
@@ -85,6 +136,38 @@ class EnterpriseMetadataStore(Protocol):
 
     async def list_kb_ids_for_user(self, user_id: str) -> list[str]: ...
 
+    async def upsert_tenant_membership(
+        self, membership: EnterpriseTenantMembershipRecord
+    ) -> EnterpriseTenantMembershipRecord: ...
+
+    async def delete_tenant_membership(self, tenant_id: str, user_id: str) -> bool: ...
+
+    async def list_tenant_memberships(
+        self, tenant_id: str
+    ) -> list[EnterpriseTenantMembershipRecord]: ...
+
+    async def list_user_tenant_memberships(
+        self, user_id: str
+    ) -> list[EnterpriseTenantMembershipRecord]: ...
+
+    async def get_tenant_membership(
+        self, tenant_id: str, user_id: str
+    ) -> EnterpriseTenantMembershipRecord | None: ...
+
+    async def upsert_tenant_kb_acl(
+        self, acl: EnterpriseTenantKBACLRecord
+    ) -> EnterpriseTenantKBACLRecord: ...
+
+    async def delete_tenant_kb_acl(self, tenant_id: str, kb_id: str) -> bool: ...
+
+    async def list_kb_tenant_acl(
+        self, kb_id: str
+    ) -> list[EnterpriseTenantKBACLRecord]: ...
+
+    async def get_tenant_kb_acl_role(self, tenant_id: str, kb_id: str) -> str | None: ...
+
+    async def list_kb_ids_for_tenants(self, tenant_ids: list[str]) -> list[str]: ...
+
     async def append_audit_event(
         self, event: AuditEventRecord
     ) -> AuditEventRecord: ...
@@ -99,6 +182,7 @@ class Principal:
     system_role: str
     status: str
     tenant_id: str | None
+    tenant_roles: dict[str, str]
     can_create_kb: bool
     can_use_bypass_query: bool
     token_version: int
@@ -122,6 +206,16 @@ def enterprise_global_routes_disabled() -> bool:
     return bool(getattr(_global_args(), "enterprise_disable_global_routes", True))
 
 
+def enterprise_artifact_download_min_role() -> str:
+    configured = getattr(
+        _global_args(), "enterprise_artifact_download_min_role", KB_ROLE_VIEWER
+    )
+    normalized = _normalize_kb_role(str(configured))
+    if normalized is None:
+        return KB_ROLE_VIEWER
+    return normalized
+
+
 def protected_whitelist_bypass_forbidden(path: str) -> bool:
     if not enterprise_auth_enabled():
         return False
@@ -135,6 +229,7 @@ def principal_from_api_key() -> Principal:
         system_role=SYSTEM_ROLE_SUPER_ADMIN,
         status=USER_STATUS_ACTIVE,
         tenant_id=None,
+        tenant_roles={},
         can_create_kb=True,
         can_use_bypass_query=True,
         token_version=1,
@@ -171,6 +266,241 @@ class AuditService:
         return await self._metadata_store.list_audit_events(limit=limit)
 
 
+@dataclass(frozen=True, slots=True)
+class EnterpriseLimitConfig:
+    enabled: bool
+    rate_limit_requests: int
+    rate_limit_window_seconds: float
+    tenant_rate_limit_requests: int
+    tenant_rate_limit_window_seconds: float
+    quota_requests: int
+    quota_window_seconds: float
+    tenant_quota_requests: int
+    tenant_quota_window_seconds: float
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and any(
+            requests > 0
+            for requests in (
+                self.rate_limit_requests,
+                self.tenant_rate_limit_requests,
+                self.quota_requests,
+                self.tenant_quota_requests,
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _LimitRule:
+    name: str
+    event_type: str
+    subject_type: str
+    subject_id: str
+    requests: int
+    window_seconds: float
+
+
+@dataclass(slots=True)
+class _LimitBucket:
+    count: int
+    reset_at: float
+
+
+class EnterpriseLimitService:
+    def __init__(
+        self,
+        audit_service: AuditService | None = None,
+        *,
+        time_func: Callable[[], float] = time.monotonic,
+    ):
+        self._audit_service = audit_service
+        self._time_func = time_func
+        self._buckets: dict[tuple[str, str, str], _LimitBucket] = {}
+
+    async def enforce(self, request: Request, principal: Principal) -> None:
+        config = _enterprise_limit_config()
+        if not config.active:
+            return
+
+        rules = _limit_rules_for_principal(config, principal)
+        if not rules:
+            return
+
+        now = self._time_func()
+        self._prune_expired(now)
+        increments: list[_LimitBucket] = []
+        for rule in rules:
+            bucket = self._bucket_for(rule, now)
+            if bucket.count >= rule.requests:
+                retry_after = max(1, int(bucket.reset_at - now))
+                await self._audit_limit_exceeded(request, principal, rule, retry_after)
+                detail = (
+                    "Enterprise quota exceeded"
+                    if rule.event_type == "quota_exceeded"
+                    else "Enterprise rate limit exceeded"
+                )
+                raise HTTPException(
+                    status_code=429,
+                    detail=detail,
+                    headers={"Retry-After": str(retry_after)},
+                )
+            increments.append(bucket)
+
+        for bucket in increments:
+            bucket.count += 1
+
+    def _bucket_for(self, rule: _LimitRule, now: float) -> _LimitBucket:
+        key = (rule.name, rule.subject_type, rule.subject_id)
+        bucket = self._buckets.get(key)
+        if bucket is None or now >= bucket.reset_at:
+            bucket = _LimitBucket(count=0, reset_at=now + rule.window_seconds)
+            self._buckets[key] = bucket
+        return bucket
+
+    def _prune_expired(self, now: float) -> None:
+        if len(self._buckets) < 1000:
+            return
+        expired = [key for key, bucket in self._buckets.items() if now >= bucket.reset_at]
+        for key in expired:
+            self._buckets.pop(key, None)
+
+    async def _audit_limit_exceeded(
+        self,
+        request: Request,
+        principal: Principal,
+        rule: _LimitRule,
+        retry_after: int,
+    ) -> None:
+        if self._audit_service is None:
+            return
+        await self._audit_service.append(
+            rule.event_type,
+            actor_user_id=principal.user_id,
+            target_type=rule.subject_type,
+            target_id=rule.subject_id,
+            metadata={
+                "auth_method": principal.auth_method,
+                "limit_name": rule.name,
+                "limit": rule.requests,
+                "window_seconds": rule.window_seconds,
+                "method": request.method.upper(),
+                "path": request.url.path,
+                "retry_after_seconds": retry_after,
+                "subject_type": rule.subject_type,
+            },
+        )
+
+
+class ServiceAPIKeyService:
+    def __init__(
+        self,
+        metadata_store: EnterpriseMetadataStore,
+        audit_service: AuditService | None = None,
+    ):
+        self._metadata_store = metadata_store
+        self._audit_service = audit_service
+
+    async def create_key(
+        self,
+        *,
+        name: str,
+        scopes: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+        created_by: str | None = None,
+        tenant_id: str | None = None,
+    ) -> tuple[EnterpriseAPIKeyRecord, str]:
+        normalized_name = name.strip()
+        if not normalized_name:
+            raise HTTPException(status_code=400, detail="Service API key name is required")
+        normalized_scopes = _normalize_service_api_key_scopes(scopes or {})
+        key_id = f"svc_key_{uuid4().hex}"
+        raw_key = f"lrsk_{key_id}_{secrets.token_urlsafe(32)}"
+        now = utc_now_iso()
+        record = EnterpriseAPIKeyRecord(
+            id=key_id,
+            name=normalized_name,
+            key_hash=_hash_service_api_key(raw_key),
+            key_preview=raw_key[-6:],
+            status=ENTERPRISE_API_KEY_STATUS_ACTIVE,
+            created_by=created_by,
+            tenant_id=tenant_id,
+            scopes=normalized_scopes,
+            metadata=metadata or {},
+            created_at=now,
+            updated_at=now,
+            last_used_at=None,
+            revoked_at=None,
+            revoked_by=None,
+        )
+        saved = await self._metadata_store.create_enterprise_api_key(record)
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                "service_api_key_created",
+                actor_user_id=created_by,
+                target_type="service_api_key",
+                target_id=saved.id,
+                metadata={
+                    "name": saved.name,
+                    "key_preview": saved.key_preview,
+                    "scopes": saved.scopes,
+                },
+            )
+        return saved, raw_key
+
+    async def list_keys(self) -> list[EnterpriseAPIKeyRecord]:
+        return await self._metadata_store.list_enterprise_api_keys()
+
+    async def revoke_key(
+        self, key_id: str, *, revoked_by: str | None = None
+    ) -> EnterpriseAPIKeyRecord:
+        revoked = await self._metadata_store.revoke_enterprise_api_key(
+            key_id,
+            revoked_by=revoked_by,
+        )
+        if revoked is None:
+            raise HTTPException(status_code=404, detail="Service API key not found")
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                "service_api_key_revoked",
+                actor_user_id=revoked_by,
+                target_type="service_api_key",
+                target_id=revoked.id,
+                metadata={"name": revoked.name, "key_preview": revoked.key_preview},
+            )
+        return revoked
+
+    async def principal_from_api_key(self, raw_key: str) -> Principal | None:
+        if not raw_key.strip():
+            return None
+        key_hash = _hash_service_api_key(raw_key)
+        record = await self._metadata_store.get_enterprise_api_key_by_hash(key_hash)
+        if record is None or not secrets.compare_digest(record.key_hash, key_hash):
+            return None
+        if record.status != ENTERPRISE_API_KEY_STATUS_ACTIVE:
+            return None
+        await self._metadata_store.mark_enterprise_api_key_used(record.id)
+        scopes = _normalize_service_api_key_scopes(record.scopes)
+        return Principal(
+            user_id=f"service-key:{record.id}",
+            username=record.name,
+            system_role=SYSTEM_ROLE_USER,
+            status=USER_STATUS_ACTIVE,
+            tenant_id=record.tenant_id,
+            tenant_roles={},
+            can_create_kb=False,
+            can_use_bypass_query=bool(scopes.get("can_use_bypass_query", False)),
+            token_version=1,
+            auth_method=SERVICE_API_KEY_AUTH_METHOD,
+            metadata={
+                "auth_mode": "enterprise",
+                "service_api_key_id": record.id,
+                "key_preview": record.key_preview,
+                "scopes": scopes,
+            },
+        )
+
+
 class SystemSettingsService:
     def __init__(self, metadata_store: EnterpriseMetadataStore):
         self._metadata_store = metadata_store
@@ -179,24 +509,61 @@ class SystemSettingsService:
         existing = await self._metadata_store.get_enterprise_system_setting(
             ENTERPRISE_REGISTRATION_ENABLED_KEY
         )
+        mode = await self._metadata_store.get_enterprise_system_setting(
+            ENTERPRISE_REGISTRATION_MODE_KEY
+        )
         if existing is None:
             await self.set_registration_enabled(enabled)
+        elif mode is None:
+            await self._metadata_store.set_enterprise_system_setting(
+                ENTERPRISE_REGISTRATION_MODE_KEY,
+                REGISTRATION_MODE_OPEN
+                if str(existing).lower() == "true"
+                else REGISTRATION_MODE_DISABLED,
+            )
+
+    async def registration_mode(self) -> str:
+        value = await self._metadata_store.get_enterprise_system_setting(
+            ENTERPRISE_REGISTRATION_MODE_KEY
+        )
+        if value is None:
+            enabled = await self._metadata_store.get_enterprise_system_setting(
+                ENTERPRISE_REGISTRATION_ENABLED_KEY,
+                "false",
+            )
+            return (
+                REGISTRATION_MODE_OPEN
+                if str(enabled).lower() == "true"
+                else REGISTRATION_MODE_DISABLED
+            )
+        return _normalize_registration_mode(value)
 
     async def registration_enabled(self) -> bool:
-        value = await self._metadata_store.get_enterprise_system_setting(
-            ENTERPRISE_REGISTRATION_ENABLED_KEY,
-            "false",
-        )
-        return str(value).lower() == "true"
+        return await self.registration_mode() == REGISTRATION_MODE_OPEN
 
     async def set_registration_enabled(
         self, enabled: bool, *, updated_by: str | None = None
     ) -> None:
-        await self._metadata_store.set_enterprise_system_setting(
-            ENTERPRISE_REGISTRATION_ENABLED_KEY,
-            "true" if enabled else "false",
+        await self.set_registration_mode(
+            REGISTRATION_MODE_OPEN if enabled else REGISTRATION_MODE_DISABLED,
             updated_by=updated_by,
         )
+
+    async def set_registration_mode(
+        self, mode: str, *, updated_by: str | None = None
+    ) -> str:
+        normalized = _normalize_registration_mode(mode)
+        await self._metadata_store.set_enterprise_system_setting(
+            ENTERPRISE_REGISTRATION_MODE_KEY,
+            normalized,
+            updated_by=updated_by,
+        )
+        await self._metadata_store.set_enterprise_system_setting(
+            ENTERPRISE_REGISTRATION_ENABLED_KEY,
+            "true" if normalized == REGISTRATION_MODE_OPEN else "false",
+            updated_by=updated_by,
+        )
+        return normalized
 
 
 class UserService:
@@ -332,6 +699,8 @@ class UserService:
         actor_user_id: str | None = None,
     ) -> EnterpriseUserRecord:
         user = await self.get_user_or_404(user_id)
+        if status_value is not None and status_value not in USER_STATUS_VALUES:
+            raise HTTPException(status_code=400, detail="Invalid user status")
         if user.system_role == SYSTEM_ROLE_SUPER_ADMIN and status_value == USER_STATUS_DISABLED:
             raise HTTPException(status_code=400, detail="Cannot disable a super admin")
         updated = replace(
@@ -392,7 +761,8 @@ class UserService:
         token_version = metadata.get("token_version")
         if token_version != user.token_version:
             raise HTTPException(status_code=401, detail="Token has been revoked")
-        return principal_from_user(user, auth_method="jwt")
+        memberships = await self._metadata_store.list_user_tenant_memberships(user.id)
+        return principal_from_user(user, auth_method="jwt", memberships=memberships)
 
     def token_metadata_for_user(self, user: EnterpriseUserRecord) -> dict[str, Any]:
         return {
@@ -439,6 +809,8 @@ class AuthorizationService:
 
     def require_create_kb(self, principal: Principal | None) -> Principal:
         principal = _require_principal(principal)
+        if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
+            raise HTTPException(status_code=403, detail="Create-KB permission required")
         if not (principal.is_super_admin or principal.can_create_kb):
             raise HTTPException(status_code=403, detail="Create-KB permission required")
         return principal
@@ -455,9 +827,10 @@ class AuthorizationService:
         principal = _require_principal(principal)
         if principal.is_super_admin:
             return principal
-        role = _normalize_kb_role(
-            await self._metadata_store.get_kb_acl_role(kb_id, principal.user_id)
-        )
+        if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
+            role = _service_api_key_kb_role(principal, kb_id)
+        else:
+            role = await self._effective_user_kb_role(principal, kb_id)
         if role is None or _KB_ROLE_RANK.get(role, 0) < _KB_ROLE_RANK[minimum_role]:
             await self._audit_denied(principal, kb_id, minimum_role)
             raise HTTPException(status_code=403, detail="Knowledge-base access denied")
@@ -469,7 +842,12 @@ class AuthorizationService:
         principal = _require_principal(principal)
         if principal.is_super_admin:
             return records
-        allowed_ids = set(await self._metadata_store.list_kb_ids_for_user(principal.user_id))
+        if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
+            allowed_ids = _service_api_key_kb_ids(principal)
+        else:
+            allowed_ids = set(await self._metadata_store.list_kb_ids_for_user(principal.user_id))
+            tenant_ids = list(principal.tenant_roles)
+            allowed_ids.update(await self._metadata_store.list_kb_ids_for_tenants(tenant_ids))
         return [record for record in records if record.id in allowed_ids]
 
     async def grant_kb_role(
@@ -523,6 +901,127 @@ class AuthorizationService:
     async def list_kb_acl(self, kb_id: str) -> list[KBACLRecord]:
         return await self._metadata_store.list_kb_acl(kb_id)
 
+    async def grant_tenant_membership(
+        self,
+        tenant_id: str,
+        user_id: str,
+        role: str,
+        *,
+        granted_by: str | None = None,
+    ) -> EnterpriseTenantMembershipRecord:
+        tenant_id = _normalize_required_id(tenant_id, "Tenant id")
+        normalized_role = _normalize_tenant_role(role)
+        user = await self._metadata_store.get_enterprise_user_by_id(user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        now = utc_now_iso()
+        membership = EnterpriseTenantMembershipRecord(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            role=normalized_role,
+            granted_by=granted_by,
+            created_at=now,
+            updated_at=now,
+        )
+        saved = await self._metadata_store.upsert_tenant_membership(membership)
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                "tenant_membership_granted",
+                actor_user_id=granted_by,
+                target_type="tenant",
+                target_id=tenant_id,
+                metadata={"user_id": user_id, "role": normalized_role},
+            )
+        return saved
+
+    async def revoke_tenant_membership(
+        self, tenant_id: str, user_id: str, *, actor_user_id: str | None = None
+    ) -> bool:
+        tenant_id = _normalize_required_id(tenant_id, "Tenant id")
+        deleted = await self._metadata_store.delete_tenant_membership(tenant_id, user_id)
+        if deleted and self._audit_service is not None:
+            await self._audit_service.append(
+                "tenant_membership_revoked",
+                actor_user_id=actor_user_id,
+                target_type="tenant",
+                target_id=tenant_id,
+                metadata={"user_id": user_id},
+            )
+        return deleted
+
+    async def list_tenant_memberships(
+        self, tenant_id: str
+    ) -> list[EnterpriseTenantMembershipRecord]:
+        tenant_id = _normalize_required_id(tenant_id, "Tenant id")
+        return await self._metadata_store.list_tenant_memberships(tenant_id)
+
+    async def grant_tenant_kb_role(
+        self,
+        kb_id: str,
+        tenant_id: str,
+        role: str,
+        *,
+        granted_by: str | None = None,
+    ) -> EnterpriseTenantKBACLRecord:
+        tenant_id = _normalize_required_id(tenant_id, "Tenant id")
+        normalized_role = _normalize_kb_role(role)
+        if normalized_role not in _KB_ROLE_RANK:
+            raise HTTPException(status_code=400, detail="Invalid KB ACL role")
+        now = utc_now_iso()
+        acl = EnterpriseTenantKBACLRecord(
+            tenant_id=tenant_id,
+            kb_id=kb_id,
+            role=normalized_role,
+            granted_by=granted_by,
+            created_at=now,
+            updated_at=now,
+        )
+        saved = await self._metadata_store.upsert_tenant_kb_acl(acl)
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                "tenant_kb_acl_granted",
+                actor_user_id=granted_by,
+                target_type="kb",
+                target_id=kb_id,
+                metadata={"tenant_id": tenant_id, "role": normalized_role},
+            )
+        return saved
+
+    async def revoke_tenant_kb_role(
+        self, kb_id: str, tenant_id: str, *, actor_user_id: str | None = None
+    ) -> bool:
+        tenant_id = _normalize_required_id(tenant_id, "Tenant id")
+        deleted = await self._metadata_store.delete_tenant_kb_acl(tenant_id, kb_id)
+        if deleted and self._audit_service is not None:
+            await self._audit_service.append(
+                "tenant_kb_acl_revoked",
+                actor_user_id=actor_user_id,
+                target_type="kb",
+                target_id=kb_id,
+                metadata={"tenant_id": tenant_id},
+            )
+        return deleted
+
+    async def list_kb_tenant_acl(self, kb_id: str) -> list[EnterpriseTenantKBACLRecord]:
+        return await self._metadata_store.list_kb_tenant_acl(kb_id)
+
+    async def _effective_user_kb_role(self, principal: Principal, kb_id: str) -> str | None:
+        roles: list[str] = []
+        direct_role = _normalize_kb_role(
+            await self._metadata_store.get_kb_acl_role(kb_id, principal.user_id)
+        )
+        if direct_role is not None:
+            roles.append(direct_role)
+        for tenant_id in principal.tenant_roles:
+            tenant_role = _normalize_kb_role(
+                await self._metadata_store.get_tenant_kb_acl_role(tenant_id, kb_id)
+            )
+            if tenant_role is not None:
+                roles.append(tenant_role)
+        if not roles:
+            return None
+        return max(roles, key=lambda item: _KB_ROLE_RANK.get(item, 0))
+
     async def _audit_denied(
         self, principal: Principal, kb_id: str, minimum_role: str
     ) -> None:
@@ -536,13 +1035,23 @@ class AuthorizationService:
             )
 
 
-def principal_from_user(user: EnterpriseUserRecord, *, auth_method: str) -> Principal:
+def principal_from_user(
+    user: EnterpriseUserRecord,
+    *,
+    auth_method: str,
+    memberships: list[EnterpriseTenantMembershipRecord] | None = None,
+) -> Principal:
+    tenant_roles = {
+        membership.tenant_id: membership.role
+        for membership in memberships or []
+    }
     return Principal(
         user_id=user.id,
         username=user.username,
         system_role=user.system_role,
         status=user.status,
         tenant_id=user.tenant_id,
+        tenant_roles=tenant_roles,
         can_create_kb=user.can_create_kb,
         can_use_bypass_query=user.can_use_bypass_query,
         token_version=user.token_version,
@@ -570,6 +1079,13 @@ def get_enterprise_settings_service(request: Request) -> SystemSettingsService:
     return service
 
 
+def get_enterprise_api_key_service(request: Request) -> ServiceAPIKeyService:
+    service = getattr(request.app.state, "enterprise_api_key_service", None)
+    if not isinstance(service, ServiceAPIKeyService):
+        raise HTTPException(status_code=500, detail="Enterprise API key service unavailable")
+    return service
+
+
 def get_enterprise_authorization_service(request: Request) -> AuthorizationService:
     service = getattr(request.app.state, "enterprise_authorization_service", None)
     if not isinstance(service, AuthorizationService):
@@ -582,6 +1098,37 @@ def get_enterprise_audit_service(request: Request) -> AuditService:
     if not isinstance(service, AuditService):
         raise HTTPException(status_code=500, detail="Enterprise audit service unavailable")
     return service
+
+
+async def append_enterprise_audit_event(
+    request: Request,
+    event_type: str,
+    *,
+    target_type: str | None = None,
+    target_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    if not enterprise_auth_enabled():
+        return
+    principal = get_request_principal(request)
+    await get_enterprise_audit_service(request).append(
+        event_type,
+        actor_user_id=principal.user_id if principal is not None else None,
+        target_type=target_type,
+        target_id=target_id,
+        metadata=metadata,
+    )
+
+
+async def enforce_enterprise_request_limits(
+    request: Request, principal: Principal | None
+) -> None:
+    if not enterprise_auth_enabled():
+        return
+    principal = _require_principal(principal)
+    service = getattr(request.app.state, "enterprise_limit_service", None)
+    if isinstance(service, EnterpriseLimitService):
+        await service.enforce(request, principal)
 
 
 async def enforce_enterprise_request_access(
@@ -633,6 +1180,12 @@ async def enforce_enterprise_request_access(
         await authz.require_kb_role(principal, kb_id, minimum)
         return
 
+    if _is_artifact_download_action(path):
+        await authz.require_kb_role(
+            principal, kb_id, enterprise_artifact_download_min_role()
+        )
+        return
+
     if method == "GET":
         await authz.require_kb_role(principal, kb_id, KB_ROLE_VIEWER)
         return
@@ -652,7 +1205,186 @@ def _normalize_kb_role(role: str | None) -> str | None:
     if role is None:
         return None
     normalized = role.strip()
-    return _KB_ROLE_ALIASES.get(normalized, normalized)
+    if normalized in _KB_ROLE_RANK:
+        return normalized
+    return _KB_ROLE_ALIASES.get(normalized)
+
+
+def _normalize_tenant_role(role: str) -> str:
+    normalized = role.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Invalid tenant role")
+    return normalized
+
+
+def _normalize_required_id(value: str, label: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail=f"{label} is required")
+    return normalized
+
+
+def _hash_service_api_key(raw_key: str) -> str:
+    digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _normalize_service_api_key_scopes(scopes: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(scopes, dict):
+        raise HTTPException(status_code=400, detail="Service API key scopes must be an object")
+    if bool(scopes.get("can_create_kb", False)):
+        raise HTTPException(status_code=400, detail="Service API keys cannot create knowledge bases")
+    raw_kb_roles = scopes.get("kb_roles", {})
+    if raw_kb_roles is None:
+        raw_kb_roles = {}
+    if not isinstance(raw_kb_roles, dict):
+        raise HTTPException(status_code=400, detail="Service API key kb_roles must be an object")
+    kb_roles: dict[str, str] = {}
+    for kb_id, role in raw_kb_roles.items():
+        if not isinstance(kb_id, str) or not kb_id.strip():
+            raise HTTPException(status_code=400, detail="Service API key KB id is invalid")
+        if not isinstance(role, str):
+            raise HTTPException(status_code=400, detail="Service API key KB role is invalid")
+        normalized_role = _normalize_kb_role(role)
+        if normalized_role not in _KB_ROLE_RANK:
+            raise HTTPException(status_code=400, detail="Service API key KB role is invalid")
+        kb_roles[kb_id.strip()] = normalized_role
+    return {
+        "kb_roles": kb_roles,
+        "can_use_bypass_query": bool(scopes.get("can_use_bypass_query", False)),
+    }
+
+
+def _service_api_key_scopes(principal: Principal) -> dict[str, Any]:
+    if principal.auth_method != SERVICE_API_KEY_AUTH_METHOD:
+        return {}
+    scopes = principal.metadata.get("scopes", {})
+    return _normalize_service_api_key_scopes(scopes if isinstance(scopes, dict) else {})
+
+
+def _service_api_key_kb_role(principal: Principal, kb_id: str) -> str | None:
+    scopes = _service_api_key_scopes(principal)
+    kb_roles = scopes.get("kb_roles", {})
+    if not isinstance(kb_roles, dict):
+        return None
+    role = kb_roles.get(kb_id)
+    return _normalize_kb_role(role) if isinstance(role, str) else None
+
+
+def _service_api_key_kb_ids(principal: Principal) -> set[str]:
+    scopes = _service_api_key_scopes(principal)
+    kb_roles = scopes.get("kb_roles", {})
+    if not isinstance(kb_roles, dict):
+        return set()
+    return {kb_id for kb_id, role in kb_roles.items() if _normalize_kb_role(role)}
+
+
+def _enterprise_limit_config() -> EnterpriseLimitConfig:
+    args = _global_args()
+    return EnterpriseLimitConfig(
+        enabled=bool(getattr(args, "enterprise_rate_limit_enabled", False)),
+        rate_limit_requests=_non_negative_int(
+            getattr(args, "enterprise_rate_limit_requests", 60), 60
+        ),
+        rate_limit_window_seconds=_positive_float(
+            getattr(args, "enterprise_rate_limit_window_seconds", 60.0), 60.0
+        ),
+        tenant_rate_limit_requests=_non_negative_int(
+            getattr(args, "enterprise_tenant_rate_limit_requests", 0), 0
+        ),
+        tenant_rate_limit_window_seconds=_positive_float(
+            getattr(args, "enterprise_tenant_rate_limit_window_seconds", 60.0), 60.0
+        ),
+        quota_requests=_non_negative_int(
+            getattr(args, "enterprise_quota_requests", 0), 0
+        ),
+        quota_window_seconds=_positive_float(
+            getattr(args, "enterprise_quota_window_seconds", 86400.0), 86400.0
+        ),
+        tenant_quota_requests=_non_negative_int(
+            getattr(args, "enterprise_tenant_quota_requests", 0), 0
+        ),
+        tenant_quota_window_seconds=_positive_float(
+            getattr(args, "enterprise_tenant_quota_window_seconds", 86400.0), 86400.0
+        ),
+    )
+
+
+def _limit_rules_for_principal(
+    config: EnterpriseLimitConfig, principal: Principal
+) -> list[_LimitRule]:
+    subject_type, subject_id = _principal_limit_subject(principal)
+    rules: list[_LimitRule] = []
+    if config.rate_limit_requests > 0:
+        rules.append(
+            _LimitRule(
+                name="principal_rate",
+                event_type="rate_limited",
+                subject_type=subject_type,
+                subject_id=subject_id,
+                requests=config.rate_limit_requests,
+                window_seconds=config.rate_limit_window_seconds,
+            )
+        )
+    if config.quota_requests > 0:
+        rules.append(
+            _LimitRule(
+                name="principal_quota",
+                event_type="quota_exceeded",
+                subject_type=subject_type,
+                subject_id=subject_id,
+                requests=config.quota_requests,
+                window_seconds=config.quota_window_seconds,
+            )
+        )
+    if principal.tenant_id:
+        if config.tenant_rate_limit_requests > 0:
+            rules.append(
+                _LimitRule(
+                    name="tenant_rate",
+                    event_type="rate_limited",
+                    subject_type="tenant",
+                    subject_id=principal.tenant_id,
+                    requests=config.tenant_rate_limit_requests,
+                    window_seconds=config.tenant_rate_limit_window_seconds,
+                )
+            )
+        if config.tenant_quota_requests > 0:
+            rules.append(
+                _LimitRule(
+                    name="tenant_quota",
+                    event_type="quota_exceeded",
+                    subject_type="tenant",
+                    subject_id=principal.tenant_id,
+                    requests=config.tenant_quota_requests,
+                    window_seconds=config.tenant_quota_window_seconds,
+                )
+            )
+    return rules
+
+
+def _principal_limit_subject(principal: Principal) -> tuple[str, str]:
+    if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
+        key_id = principal.metadata.get("service_api_key_id")
+        return "service_api_key", str(key_id or principal.user_id)
+    if principal.auth_method == "api_key":
+        return "api_key", principal.user_id
+    return "user", principal.user_id
+
+
+def _non_negative_int(value: Any, default: int) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _positive_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _global_args() -> Any:
@@ -669,6 +1401,31 @@ def _global_args() -> Any:
         enterprise_legacy_api_key_superadmin=_env_bool(
             "LIGHTRAG_ENTERPRISE_LEGACY_API_KEY_SUPERADMIN", False
         ),
+        enterprise_rate_limit_enabled=_env_bool(
+            "LIGHTRAG_ENTERPRISE_RATE_LIMIT_ENABLED", False
+        ),
+        enterprise_rate_limit_requests=_env_int(
+            "LIGHTRAG_ENTERPRISE_RATE_LIMIT_REQUESTS", 60
+        ),
+        enterprise_rate_limit_window_seconds=_env_float(
+            "LIGHTRAG_ENTERPRISE_RATE_LIMIT_WINDOW_SECONDS", 60.0
+        ),
+        enterprise_tenant_rate_limit_requests=_env_int(
+            "LIGHTRAG_ENTERPRISE_TENANT_RATE_LIMIT_REQUESTS", 0
+        ),
+        enterprise_tenant_rate_limit_window_seconds=_env_float(
+            "LIGHTRAG_ENTERPRISE_TENANT_RATE_LIMIT_WINDOW_SECONDS", 60.0
+        ),
+        enterprise_quota_requests=_env_int("LIGHTRAG_ENTERPRISE_QUOTA_REQUESTS", 0),
+        enterprise_quota_window_seconds=_env_float(
+            "LIGHTRAG_ENTERPRISE_QUOTA_WINDOW_SECONDS", 86400.0
+        ),
+        enterprise_tenant_quota_requests=_env_int(
+            "LIGHTRAG_ENTERPRISE_TENANT_QUOTA_REQUESTS", 0
+        ),
+        enterprise_tenant_quota_window_seconds=_env_float(
+            "LIGHTRAG_ENTERPRISE_TENANT_QUOTA_WINDOW_SECONDS", 86400.0
+        ),
     )
 
 
@@ -684,10 +1441,37 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def _normalize_username(username: str) -> str:
     normalized = username.strip()
     if not normalized:
         raise HTTPException(status_code=400, detail="Username cannot be empty")
+    return normalized
+
+
+def _normalize_registration_mode(mode: str) -> str:
+    normalized = mode.strip().lower()
+    if normalized not in REGISTRATION_MODES:
+        raise HTTPException(status_code=400, detail="Invalid registration mode")
     return normalized
 
 
@@ -696,6 +1480,10 @@ def _extract_kb_id(path: str) -> str | None:
     if len(parts) >= 2 and parts[0] == "kbs":
         return parts[1]
     return None
+
+
+def _is_artifact_download_action(path: str) -> bool:
+    return path.endswith(":download") or path.endswith(":download-url")
 
 
 async def _request_uses_bypass_mode(request: Request) -> bool:

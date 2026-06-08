@@ -18,9 +18,11 @@ flag, and that it registers every resumable job type with a callable executor.
 from __future__ import annotations
 
 import sys
-from unittest.mock import MagicMock, patch
+import time
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi.testclient import TestClient
 
 pytestmark = pytest.mark.offline
 
@@ -45,6 +47,8 @@ _ENV_TO_ISOLATE = (
     "LIGHTRAG_KB_METADATA_BACKEND",
     "LIGHTRAG_OBJECT_STORAGE",
     "LIGHTRAG_KB_JOB_WORKER",
+    "LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS",
+    "LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS",
 )
 
 # Every resumable job type the server must register an executor for when the
@@ -76,6 +80,8 @@ def _make_app(tmp_path, monkeypatch, *, worker_enabled: bool):
     monkeypatch.setenv("WORKING_DIR", str(tmp_path / "rag_storage"))
     if worker_enabled:
         monkeypatch.setenv("LIGHTRAG_KB_JOB_WORKER", "true")
+        monkeypatch.setenv("LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS", "0.05")
+        monkeypatch.setenv("LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS", "0")
 
     from lightrag.api.config import parse_args
 
@@ -87,7 +93,11 @@ def _make_app(tmp_path, monkeypatch, *, worker_enabled: bool):
     try:
         args = parse_args()
         with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
-            mock_rag.return_value = MagicMock()
+            fake_rag = MagicMock()
+            fake_rag.initialize_storages = AsyncMock()
+            fake_rag.check_and_migrate_data = AsyncMock()
+            fake_rag.finalize_storages = AsyncMock()
+            mock_rag.return_value = fake_rag
             from lightrag.api.lightrag_server import create_app
 
             return create_app(args)
@@ -117,3 +127,55 @@ def test_no_job_worker_when_disabled(tmp_path, monkeypatch):
     identical to the historical in-process-only path."""
     app = _make_app(tmp_path, monkeypatch, worker_enabled=False)
     assert app.state.job_worker is None
+
+
+def test_job_worker_lifespan_consumes_queued_job_and_stops(tmp_path, monkeypatch):
+    """The real FastAPI lifespan starts the server-wired worker, consumes an
+    eligible queued job, and stops the loop on shutdown."""
+    app = _make_app(tmp_path, monkeypatch, worker_enabled=True)
+    worker = app.state.job_worker
+    job_service = app.state.job_service
+    kb_service = app.state.kb_service
+    executed_job_ids: list[str] = []
+
+    async def fake_parse_executor(job):
+        executed_job_ids.append(job.id)
+        await job_service.transition_job(
+            job.kb_id,
+            job.id,
+            status="succeeded",
+            progress=1.0,
+            completed_items=1,
+            result={"lifespan_e2e": True},
+        )
+
+    worker._executors["parse"] = fake_parse_executor
+
+    async def seed_job():
+        await kb_service.create(name="Lifespan", kb_id="kb_lifespan")
+        return await job_service.create_job(
+            "kb_lifespan",
+            job_type="parse",
+            stage="parsing",
+            payload={"lifespan_e2e": True},
+        )
+
+    with TestClient(app) as client:
+        assert client.portal is not None
+        portal = client.portal
+        assert worker._task is not None
+        assert not worker._task.done()
+        job = portal.call(seed_job)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            current = portal.call(job_service.get_job, "kb_lifespan", job.id)
+            if current.status == "succeeded":
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("worker did not consume queued job during FastAPI lifespan")
+
+        assert current.result == {"lifespan_e2e": True}
+        assert executed_job_ids == [job.id]
+
+    assert worker._task is None

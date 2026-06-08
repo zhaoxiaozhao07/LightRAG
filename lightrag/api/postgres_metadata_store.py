@@ -23,10 +23,13 @@ from lightrag.api.metadata_store import (
     DocumentRecord,
     DuplicateDocumentSourceKeyError,
     EnterpriseUserRecord,
+    EnterpriseAPIKeyRecord,
     IdempotencyKeyConflictError,
     InvalidJobTransitionError,
     JobRecord,
     KBACLRecord,
+    EnterpriseTenantKBACLRecord,
+    EnterpriseTenantMembershipRecord,
     MetadataJobStatus,
     MetadataRecordNotFoundError,
 )
@@ -85,9 +88,24 @@ def _enterprise_user_from_row(row: Any) -> EnterpriseUserRecord:
     return EnterpriseUserRecord(**data)
 
 
+def _enterprise_api_key_from_row(row: Any) -> EnterpriseAPIKeyRecord:
+    data = _loads_json_object(row["data_json"])
+    return EnterpriseAPIKeyRecord(**data)
+
+
 def _kb_acl_from_row(row: Any) -> KBACLRecord:
     data = _loads_json_object(row["data_json"])
     return KBACLRecord(**data)
+
+
+def _tenant_membership_from_row(row: Any) -> EnterpriseTenantMembershipRecord:
+    data = _loads_json_object(row["data_json"])
+    return EnterpriseTenantMembershipRecord(**data)
+
+
+def _tenant_kb_acl_from_row(row: Any) -> EnterpriseTenantKBACLRecord:
+    data = _loads_json_object(row["data_json"])
+    return EnterpriseTenantKBACLRecord(**data)
 
 
 def _audit_event_from_row(row: Any) -> AuditEventRecord:
@@ -1305,6 +1323,157 @@ class PostgresMetadataStore:
             )
         return default if value is None else str(value)
 
+    async def create_enterprise_api_key(
+        self, record: EnterpriseAPIKeyRecord
+    ) -> EnterpriseAPIKeyRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> EnterpriseAPIKeyRecord:
+            await conn.execute(
+                """
+                INSERT INTO enterprise_api_keys (
+                    id, name, key_hash, key_preview, status, created_by, tenant_id,
+                    created_at, updated_at, last_used_at, revoked_at, revoked_by,
+                    data_json
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
+                """,
+                record.id,
+                record.name,
+                record.key_hash,
+                record.key_preview,
+                record.status,
+                record.created_by,
+                record.tenant_id,
+                record.created_at,
+                record.updated_at,
+                record.last_used_at,
+                record.revoked_at,
+                record.revoked_by,
+                _record_json(record),
+            )
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_api_keys WHERE id = $1", record.id
+            )
+            if row is None:
+                raise MetadataRecordNotFoundError(f"API key '{record.id}' not found")
+            return _enterprise_api_key_from_row(row)
+
+        return await self._write(write)
+
+    async def get_enterprise_api_key_by_hash(
+        self, key_hash: str
+    ) -> EnterpriseAPIKeyRecord | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_api_keys WHERE key_hash = $1",
+                key_hash,
+            )
+        return _enterprise_api_key_from_row(row) if row is not None else None
+
+    async def get_enterprise_api_key_by_id(
+        self, key_id: str
+    ) -> EnterpriseAPIKeyRecord | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_api_keys WHERE id = $1",
+                key_id,
+            )
+        return _enterprise_api_key_from_row(row) if row is not None else None
+
+    async def list_enterprise_api_keys(self) -> list[EnterpriseAPIKeyRecord]:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT data_json FROM enterprise_api_keys
+                ORDER BY created_at DESC, id DESC
+                """
+            )
+        return [_enterprise_api_key_from_row(row) for row in rows]
+
+    async def revoke_enterprise_api_key(
+        self,
+        key_id: str,
+        *,
+        revoked_by: str | None = None,
+        revoked_at: str | None = None,
+    ) -> EnterpriseAPIKeyRecord | None:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> EnterpriseAPIKeyRecord | None:
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_api_keys WHERE id = $1 FOR UPDATE",
+                key_id,
+            )
+            if row is None:
+                return None
+            current = _enterprise_api_key_from_row(row)
+            now = revoked_at or utc_now_iso()
+            updated = EnterpriseAPIKeyRecord(
+                **{
+                    **current.to_dict(),
+                    "status": "revoked",
+                    "updated_at": now,
+                    "revoked_at": now,
+                    "revoked_by": revoked_by,
+                }
+            )
+            await conn.execute(
+                """
+                UPDATE enterprise_api_keys
+                SET status = $2, updated_at = $3, revoked_at = $4, revoked_by = $5,
+                    data_json = $6::jsonb
+                WHERE id = $1
+                """,
+                key_id,
+                updated.status,
+                updated.updated_at,
+                updated.revoked_at,
+                updated.revoked_by,
+                _record_json(updated),
+            )
+            return updated
+
+        return await self._write(write)
+
+    async def mark_enterprise_api_key_used(
+        self, key_id: str, *, last_used_at: str | None = None
+    ) -> EnterpriseAPIKeyRecord | None:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> EnterpriseAPIKeyRecord | None:
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_api_keys WHERE id = $1 FOR UPDATE",
+                key_id,
+            )
+            if row is None:
+                return None
+            current = _enterprise_api_key_from_row(row)
+            now = last_used_at or utc_now_iso()
+            updated = EnterpriseAPIKeyRecord(
+                **{
+                    **current.to_dict(),
+                    "last_used_at": now,
+                    "updated_at": now,
+                }
+            )
+            await conn.execute(
+                """
+                UPDATE enterprise_api_keys
+                SET updated_at = $2, last_used_at = $3, data_json = $4::jsonb
+                WHERE id = $1
+                """,
+                key_id,
+                updated.updated_at,
+                updated.last_used_at,
+                _record_json(updated),
+            )
+            return updated
+
+        return await self._write(write)
+
     async def upsert_kb_acl(self, acl: KBACLRecord) -> KBACLRecord:
         await self._ensure_initialized()
 
@@ -1391,6 +1560,205 @@ class PostgresMetadataStore:
                 ORDER BY kb_id ASC
                 """,
                 user_id,
+            )
+        return [str(row["kb_id"]) for row in rows]
+
+    async def upsert_tenant_membership(
+        self, membership: EnterpriseTenantMembershipRecord
+    ) -> EnterpriseTenantMembershipRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> EnterpriseTenantMembershipRecord:
+            await conn.execute(
+                """
+                INSERT INTO enterprise_tenant_memberships (
+                    tenant_id, user_id, role, granted_by, created_at, updated_at, data_json
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                ON CONFLICT (tenant_id, user_id) DO UPDATE SET
+                    role = excluded.role,
+                    granted_by = excluded.granted_by,
+                    updated_at = excluded.updated_at,
+                    data_json = excluded.data_json
+                """,
+                membership.tenant_id,
+                membership.user_id,
+                membership.role,
+                membership.granted_by,
+                membership.created_at,
+                membership.updated_at,
+                _record_json(membership),
+            )
+            row = await conn.fetchrow(
+                """
+                SELECT data_json FROM enterprise_tenant_memberships
+                WHERE tenant_id = $1 AND user_id = $2
+                """,
+                membership.tenant_id,
+                membership.user_id,
+            )
+            if row is None:
+                raise MetadataRecordNotFoundError("Tenant membership not found")
+            return _tenant_membership_from_row(row)
+
+        return await self._write(write)
+
+    async def delete_tenant_membership(self, tenant_id: str, user_id: str) -> bool:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> bool:
+            status = await conn.execute(
+                """
+                DELETE FROM enterprise_tenant_memberships
+                WHERE tenant_id = $1 AND user_id = $2
+                """,
+                tenant_id,
+                user_id,
+            )
+            return _rowcount(status) > 0
+
+        return await self._write(write)
+
+    async def list_tenant_memberships(
+        self, tenant_id: str
+    ) -> list[EnterpriseTenantMembershipRecord]:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT data_json FROM enterprise_tenant_memberships
+                WHERE tenant_id = $1
+                ORDER BY created_at ASC, user_id ASC
+                """,
+                tenant_id,
+            )
+        return [_tenant_membership_from_row(row) for row in rows]
+
+    async def list_user_tenant_memberships(
+        self, user_id: str
+    ) -> list[EnterpriseTenantMembershipRecord]:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT data_json FROM enterprise_tenant_memberships
+                WHERE user_id = $1
+                ORDER BY tenant_id ASC
+                """,
+                user_id,
+            )
+        return [_tenant_membership_from_row(row) for row in rows]
+
+    async def get_tenant_membership(
+        self, tenant_id: str, user_id: str
+    ) -> EnterpriseTenantMembershipRecord | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT data_json FROM enterprise_tenant_memberships
+                WHERE tenant_id = $1 AND user_id = $2
+                """,
+                tenant_id,
+                user_id,
+            )
+        return _tenant_membership_from_row(row) if row is not None else None
+
+    async def upsert_tenant_kb_acl(
+        self, acl: EnterpriseTenantKBACLRecord
+    ) -> EnterpriseTenantKBACLRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> EnterpriseTenantKBACLRecord:
+            await conn.execute(
+                """
+                INSERT INTO enterprise_tenant_kb_acl (
+                    tenant_id, kb_id, role, granted_by, created_at, updated_at, data_json
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                ON CONFLICT (tenant_id, kb_id) DO UPDATE SET
+                    role = excluded.role,
+                    granted_by = excluded.granted_by,
+                    updated_at = excluded.updated_at,
+                    data_json = excluded.data_json
+                """,
+                acl.tenant_id,
+                acl.kb_id,
+                acl.role,
+                acl.granted_by,
+                acl.created_at,
+                acl.updated_at,
+                _record_json(acl),
+            )
+            row = await conn.fetchrow(
+                """
+                SELECT data_json FROM enterprise_tenant_kb_acl
+                WHERE tenant_id = $1 AND kb_id = $2
+                """,
+                acl.tenant_id,
+                acl.kb_id,
+            )
+            if row is None:
+                raise MetadataRecordNotFoundError("Tenant KB ACL grant not found")
+            return _tenant_kb_acl_from_row(row)
+
+        return await self._write(write)
+
+    async def delete_tenant_kb_acl(self, tenant_id: str, kb_id: str) -> bool:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> bool:
+            status = await conn.execute(
+                """
+                DELETE FROM enterprise_tenant_kb_acl
+                WHERE tenant_id = $1 AND kb_id = $2
+                """,
+                tenant_id,
+                kb_id,
+            )
+            return _rowcount(status) > 0
+
+        return await self._write(write)
+
+    async def list_kb_tenant_acl(
+        self, kb_id: str
+    ) -> list[EnterpriseTenantKBACLRecord]:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT data_json FROM enterprise_tenant_kb_acl
+                WHERE kb_id = $1
+                ORDER BY created_at ASC, tenant_id ASC
+                """,
+                kb_id,
+            )
+        return [_tenant_kb_acl_from_row(row) for row in rows]
+
+    async def get_tenant_kb_acl_role(self, tenant_id: str, kb_id: str) -> str | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            role = await conn.fetchval(
+                """
+                SELECT role FROM enterprise_tenant_kb_acl
+                WHERE tenant_id = $1 AND kb_id = $2
+                """,
+                tenant_id,
+                kb_id,
+            )
+        return None if role is None else str(role)
+
+    async def list_kb_ids_for_tenants(self, tenant_ids: Sequence[str]) -> list[str]:
+        await self._ensure_initialized()
+        normalized_ids = sorted({tenant_id for tenant_id in tenant_ids if tenant_id})
+        if not normalized_ids:
+            return []
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT kb_id FROM enterprise_tenant_kb_acl
+                WHERE tenant_id = ANY($1::text[])
+                ORDER BY kb_id ASC
+                """,
+                normalized_ids,
             )
         return [str(row["kb_id"]) for row in rows]
 
@@ -1689,6 +2057,28 @@ class PostgresMetadataStore:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS enterprise_api_keys (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                key_hash TEXT NOT NULL UNIQUE,
+                key_preview TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_by TEXT,
+                tenant_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_used_at TEXT,
+                revoked_at TEXT,
+                revoked_by TEXT,
+                data_json JSONB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_enterprise_api_keys_status
+                ON enterprise_api_keys (status);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_api_keys_created_by
+                ON enterprise_api_keys (created_by, status);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_api_keys_tenant
+                ON enterprise_api_keys (tenant_id, status);
+
             CREATE TABLE IF NOT EXISTS enterprise_kb_acl (
                 kb_id TEXT NOT NULL,
                 user_id TEXT NOT NULL,
@@ -1702,6 +2092,33 @@ class PostgresMetadataStore:
             );
             CREATE INDEX IF NOT EXISTS idx_enterprise_kb_acl_user
                 ON enterprise_kb_acl (user_id, kb_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_tenant_memberships (
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                granted_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                data_json JSONB NOT NULL,
+                PRIMARY KEY (tenant_id, user_id),
+                FOREIGN KEY (user_id) REFERENCES enterprise_users(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_enterprise_tenant_memberships_user
+                ON enterprise_tenant_memberships (user_id, tenant_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_tenant_kb_acl (
+                tenant_id TEXT NOT NULL,
+                kb_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                granted_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                data_json JSONB NOT NULL,
+                PRIMARY KEY (tenant_id, kb_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_enterprise_tenant_kb_acl_kb
+                ON enterprise_tenant_kb_acl (kb_id, tenant_id);
 
             CREATE TABLE IF NOT EXISTS enterprise_audit_events (
                 id TEXT PRIMARY KEY,

@@ -22,6 +22,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
     UploadFile,
 )
 from fastapi.responses import FileResponse, StreamingResponse
@@ -56,6 +57,7 @@ from lightrag.api.metadata_store import (
     MetadataRecordNotFoundError,
 )
 from lightrag.api.routers.document_routes import SUPPORTED_DOCUMENT_EXTENSIONS
+from lightrag.api.enterprise_auth import append_enterprise_audit_event
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.utils import generate_track_id, logger
 
@@ -117,10 +119,63 @@ def _stream_directory_as_zip(artifact_file: Any) -> StreamingResponse:
                 )
             archive.write(entry, arcname=str(relative).replace("\\", "/"))
     buffer.seek(0)
-    headers = {
-        "Content-Disposition": f'attachment; filename="{artifact_file.filename}"',
+    zip_name = artifact_file.filename
+    return StreamingResponse(
+        iter([buffer.getvalue()]),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+    )
+
+
+def _artifact_audit_metadata(artifact: ArtifactRecord, **extra: Any) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "artifact_id": artifact.id,
+        "document_id": artifact.document_id,
+        "artifact_type": artifact.artifact_type,
+        "size_bytes": artifact.size_bytes,
     }
-    return StreamingResponse(buffer, media_type="application/zip", headers=headers)
+    metadata.update({key: value for key, value in extra.items() if value is not None})
+    return metadata
+
+
+def _document_audit_metadata(
+    *,
+    job: JobRecord | None = None,
+    operation: str,
+    document_ids: Sequence[str] = (),
+    document_count: int | None = None,
+    batch_id: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"operation": operation}
+    if job is not None:
+        metadata["job_id"] = job.id
+        metadata["job_type"] = job.job_type
+    if batch_id is not None:
+        metadata["batch_id"] = batch_id
+    if document_ids:
+        ids = list(document_ids)
+        metadata["document_ids"] = ids
+        metadata["document_count"] = document_count if document_count is not None else len(ids)
+    elif document_count is not None:
+        metadata["document_count"] = document_count
+    metadata.update({key: value for key, value in extra.items() if value is not None})
+    return metadata
+
+
+async def _append_kb_document_audit_event(
+    request: Request,
+    event_type: str,
+    kb_id: str,
+    metadata: dict[str, Any],
+) -> None:
+    await append_enterprise_audit_event(
+        request,
+        event_type,
+        target_type="kb",
+        target_id=kb_id,
+        metadata=metadata,
+    )
 
 
 def _is_previewable_media_type(media_type: str) -> bool:
@@ -3009,6 +3064,7 @@ def create_kb_document_routes(
     async def upload_documents(
         kb_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         files: list[UploadFile] = File(...),
         auto_parse: bool = False,
         auto_index: bool = False,
@@ -3067,6 +3123,22 @@ def create_kb_document_routes(
                     documents=result.documents,
                     auto_index=auto_index,
                 )
+            await _append_kb_document_audit_event(
+                http_request,
+                "documents_uploaded",
+                kb_id,
+                _document_audit_metadata(
+                    job=result.job,
+                    operation="upload",
+                    document_ids=[document.id for document in result.documents],
+                    batch_id=result.batch_id,
+                    source_type="upload",
+                    auto_parse=auto_parse,
+                    auto_index=auto_index,
+                    created=result.created,
+                    parser_engine=parser_engine,
+                ),
+            )
             return DocumentBatchResponse(
                 job_id=result.job.id,
                 batch_id=result.batch_id,
@@ -3097,6 +3169,7 @@ def create_kb_document_routes(
     async def import_text_documents(
         kb_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         request: TextDocumentsRequest,
     ):
         try:
@@ -3126,6 +3199,22 @@ def create_kb_document_routes(
                     documents=result.documents,
                     auto_index=request.auto_index,
                 )
+            await _append_kb_document_audit_event(
+                http_request,
+                "text_documents_imported",
+                kb_id,
+                _document_audit_metadata(
+                    job=result.job,
+                    operation="import_texts",
+                    document_ids=[document.id for document in result.documents],
+                    batch_id=result.batch_id,
+                    source_type="text",
+                    auto_parse=request.auto_parse,
+                    auto_index=request.auto_index,
+                    created=result.created,
+                    parser_engine=request.parser_engine,
+                ),
+            )
             return DocumentBatchResponse(
                 job_id=result.job.id,
                 batch_id=result.batch_id,
@@ -3156,6 +3245,7 @@ def create_kb_document_routes(
     async def ingest_url_documents(
         kb_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         request: UrlDocumentsRequest,
     ):
         try:
@@ -3194,6 +3284,22 @@ def create_kb_document_routes(
                     documents=result.documents,
                     auto_index=request.auto_index,
                 )
+            await _append_kb_document_audit_event(
+                http_request,
+                "url_documents_ingested",
+                kb_id,
+                _document_audit_metadata(
+                    job=result.job,
+                    operation="ingest_urls",
+                    document_ids=[document.id for document in result.documents],
+                    batch_id=result.batch_id,
+                    source_type="url",
+                    auto_parse=request.auto_parse,
+                    auto_index=request.auto_index,
+                    created=result.created,
+                    parser_engine=request.parser_engine,
+                ),
+            )
             return DocumentBatchResponse(
                 job_id=result.job.id,
                 batch_id=result.batch_id,
@@ -3224,6 +3330,7 @@ def create_kb_document_routes(
     async def import_local_documents(
         kb_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         request: LocalImportDocumentsRequest,
     ):
         try:
@@ -3283,6 +3390,22 @@ def create_kb_document_routes(
                     documents=result.documents,
                     auto_index=request.auto_index,
                 )
+            await _append_kb_document_audit_event(
+                http_request,
+                "local_documents_imported",
+                kb_id,
+                _document_audit_metadata(
+                    job=result.job,
+                    operation="import_local",
+                    document_ids=[document.id for document in result.documents],
+                    batch_id=result.batch_id,
+                    source_type="import",
+                    auto_parse=request.auto_parse,
+                    auto_index=request.auto_index,
+                    created=result.created,
+                    parser_engine=request.parser_engine,
+                ),
+            )
             return DocumentBatchResponse(
                 job_id=result.job.id,
                 batch_id=result.batch_id,
@@ -3313,6 +3436,7 @@ def create_kb_document_routes(
     async def scan_local_documents(
         kb_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         request: LocalScanDocumentsRequest,
     ):
         try:
@@ -3370,6 +3494,23 @@ def create_kb_document_routes(
                     documents=result.documents,
                     auto_index=request.auto_index,
                 )
+            await _append_kb_document_audit_event(
+                http_request,
+                "local_documents_scanned",
+                kb_id,
+                _document_audit_metadata(
+                    job=result.job,
+                    operation="scan_local",
+                    document_ids=[document.id for document in result.documents],
+                    batch_id=result.batch_id,
+                    source_type="scan",
+                    auto_parse=request.auto_parse,
+                    auto_index=request.auto_index,
+                    recursive=request.recursive,
+                    created=result.created,
+                    parser_engine=request.parser_engine,
+                ),
+            )
             return DocumentBatchResponse(
                 job_id=result.job.id,
                 batch_id=result.batch_id,
@@ -3446,7 +3587,7 @@ def create_kb_document_routes(
         summary="Patch knowledge base document metadata",
     )
     async def patch_document(
-        kb_id: str, document_id: str, request: PatchDocumentRequest
+        kb_id: str, document_id: str, http_request: Request, request: PatchDocumentRequest
     ):
         try:
             if not request.model_fields_set:
@@ -3458,21 +3599,30 @@ def create_kb_document_routes(
                 raise HTTPException(
                     status_code=400, detail="metadata must be an object"
                 )
-            return DocumentResponse.from_record(
-                await document_service.update_document(
-                    kb_id,
-                    document_id,
-                    metadata_patch=request.metadata
-                    if "metadata" in request.model_fields_set
-                    else None,
-                    enabled=request.enabled
-                    if "enabled" in request.model_fields_set
-                    else None,
-                    archived=request.archived
-                    if "archived" in request.model_fields_set
-                    else None,
-                )
+            document = await document_service.update_document(
+                kb_id,
+                document_id,
+                metadata_patch=request.metadata
+                if "metadata" in request.model_fields_set
+                else None,
+                enabled=request.enabled
+                if "enabled" in request.model_fields_set
+                else None,
+                archived=request.archived
+                if "archived" in request.model_fields_set
+                else None,
             )
+            await _append_kb_document_audit_event(
+                http_request,
+                "document_updated",
+                kb_id,
+                _document_audit_metadata(
+                    operation="patch_document",
+                    document_ids=[document.id],
+                    fields=sorted(request.model_fields_set),
+                ),
+            )
+            return DocumentResponse.from_record(document)
         except HTTPException:
             raise
         except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
@@ -3486,13 +3636,21 @@ def create_kb_document_routes(
         dependencies=[Depends(combined_auth)],
         summary="Disable one knowledge base document",
     )
-    async def disable_document(kb_id: str, document_id: str):
+    async def disable_document(kb_id: str, document_id: str, http_request: Request):
         try:
-            return DocumentResponse.from_record(
-                await document_service.update_document(
-                    kb_id, document_id, enabled=False
-                )
+            document = await document_service.update_document(
+                kb_id, document_id, enabled=False
             )
+            await _append_kb_document_audit_event(
+                http_request,
+                "document_disabled",
+                kb_id,
+                _document_audit_metadata(
+                    operation="disable_document",
+                    document_ids=[document.id],
+                ),
+            )
+            return DocumentResponse.from_record(document)
         except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -3504,11 +3662,19 @@ def create_kb_document_routes(
         dependencies=[Depends(combined_auth)],
         summary="Enable one knowledge base document",
     )
-    async def enable_document(kb_id: str, document_id: str):
+    async def enable_document(kb_id: str, document_id: str, http_request: Request):
         try:
-            return DocumentResponse.from_record(
-                await document_service.update_document(kb_id, document_id, enabled=True)
+            document = await document_service.update_document(kb_id, document_id, enabled=True)
+            await _append_kb_document_audit_event(
+                http_request,
+                "document_enabled",
+                kb_id,
+                _document_audit_metadata(
+                    operation="enable_document",
+                    document_ids=[document.id],
+                ),
             )
+            return DocumentResponse.from_record(document)
         except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -3523,6 +3689,7 @@ def create_kb_document_routes(
     async def sync_documents(
         kb_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         files: list[UploadFile] = File(...),
         source_keys: list[str] = Form(...),
         auto_parse: bool = True,
@@ -3665,6 +3832,25 @@ def create_kb_document_routes(
                 await document_service.clear_staged_sync_sources(kb_id, batch_id=batch_id)
                 sync_staged = False
                 return JobResponse.from_record(job)
+            await _append_kb_document_audit_event(
+                http_request,
+                "documents_sync_queued",
+                kb_id,
+                _document_audit_metadata(
+                    job=job,
+                    operation="sync_documents",
+                    document_count=len(prepared_sources),
+                    batch_id=batch_id,
+                    source_type="upload",
+                    auto_parse=auto_parse,
+                    auto_index=auto_index,
+                    force_reparse=force_reparse,
+                    delete_source_file=delete_source_file,
+                    delete_artifacts=delete_artifacts,
+                    delete_llm_cache=delete_llm_cache,
+                    parser_engine=parser_engine,
+                ),
+            )
 
             async def _sync_task() -> None:
                 item_results: list[dict[str, Any]] = []
@@ -3954,6 +4140,7 @@ def create_kb_document_routes(
         kb_id: str,
         document_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         file: UploadFile = File(...),
         auto_parse: bool = False,
         auto_index: bool = False,
@@ -4072,6 +4259,26 @@ def create_kb_document_routes(
                     status_code=409,
                     detail=_active_job_conflict_detail(exc),
                 ) from exc
+
+            await _append_kb_document_audit_event(
+                http_request,
+                "document_replace_queued",
+                kb_id,
+                _document_audit_metadata(
+                    job=job,
+                    operation="replace_document",
+                    document_ids=[document.id],
+                    source_type=replacement.source_type,
+                    size_bytes=replacement.size_bytes,
+                    auto_parse=auto_parse,
+                    auto_index=auto_index,
+                    force_reparse=force_reparse,
+                    delete_source_file=delete_source_file,
+                    delete_artifacts=delete_artifacts,
+                    delete_llm_cache=delete_llm_cache,
+                    parser_engine=parser_engine,
+                ),
+            )
 
             async def _replace_task() -> None:
                 replace_claim_released = False
@@ -4223,6 +4430,7 @@ def create_kb_document_routes(
         kb_id: str,
         document_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         delete_source_file: bool = False,
         delete_artifacts: bool = False,
         delete_llm_cache: bool = False,
@@ -4302,6 +4510,22 @@ def create_kb_document_routes(
                     status_code=409,
                     detail=_active_job_conflict_detail(exc),
                 ) from exc
+
+            await _append_kb_document_audit_event(
+                http_request,
+                "document_delete_queued",
+                kb_id,
+                _document_audit_metadata(
+                    job=job,
+                    operation="delete_document",
+                    document_ids=[document.id],
+                    delete_source_file=delete_source_file,
+                    delete_artifacts=delete_artifacts,
+                    delete_llm_cache=delete_llm_cache,
+                    delete_graph_orphans=delete_graph_orphans,
+                    strategy=strategy,
+                ),
+            )
 
             async def _delete_task() -> None:
                 try:
@@ -4429,6 +4653,7 @@ def create_kb_document_routes(
     async def batch_delete_documents(
         kb_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         request: BatchDeleteDocumentsRequest,
     ):
         if registry is None:
@@ -4462,6 +4687,25 @@ def create_kb_document_routes(
                 job=job,
                 delete_source_file=request.delete_source_file,
                 delete_artifacts=request.delete_artifacts,
+            )
+
+            await _append_kb_document_audit_event(
+                http_request,
+                "documents_batch_delete_queued",
+                kb_id,
+                _document_audit_metadata(
+                    job=job,
+                    operation="batch_delete_documents",
+                    document_ids=[document.id for document in documents],
+                    document_count=len(request.document_ids),
+                    batch_id=job.batch_id or batch_id,
+                    delete_source_file=request.delete_source_file,
+                    delete_artifacts=request.delete_artifacts,
+                    delete_llm_cache=request.delete_llm_cache,
+                    delete_graph_orphans=request.delete_graph_orphans,
+                    strategy=request.strategy,
+                    claim_failure_count=len(claim_failures),
+                ),
             )
 
             async def _batch_delete_task() -> None:
@@ -4633,6 +4877,7 @@ def create_kb_document_routes(
     async def batch_parse_documents(
         kb_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         request: BatchParseDocumentsRequest,
     ):
         if registry is None:
@@ -4701,6 +4946,23 @@ def create_kb_document_routes(
                 for plan in batch_plan.plans
                 if plan.document.id in queued_document_ids
             ]
+
+            await _append_kb_document_audit_event(
+                http_request,
+                "documents_batch_parse_queued",
+                kb_id,
+                _document_audit_metadata(
+                    job=job,
+                    operation="batch_parse_documents",
+                    document_ids=[document.id for document in queued_documents],
+                    document_count=len(request.document_ids),
+                    batch_id=job.batch_id or batch_plan.batch_id,
+                    force_reparse=request.force_reparse,
+                    parser_engine=request.engine,
+                    claim_failure_count=len(claim_failures),
+                    planning_failure_count=len(batch_plan.failures),
+                ),
+            )
 
             async def _batch_parse_task() -> None:
                 item_results = [*batch_plan.failures, *claim_failures]
@@ -4850,6 +5112,7 @@ def create_kb_document_routes(
         kb_id: str,
         document_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         request: ParseDocumentRequest = Body(default_factory=ParseDocumentRequest),
     ):
         if registry is None:
@@ -4909,6 +5172,20 @@ def create_kb_document_routes(
                     status_code=409,
                     detail=_active_job_conflict_detail(exc),
                 ) from exc
+
+            await _append_kb_document_audit_event(
+                http_request,
+                "document_parse_queued",
+                kb_id,
+                _document_audit_metadata(
+                    job=job,
+                    operation="parse_document",
+                    document_ids=[document_id],
+                    force_reparse=request.force_reparse,
+                    parser_engine=plan.parser_engine,
+                    parser_hash=plan.parser_hash,
+                ),
+            )
 
             async def _parse_task() -> None:
                 try:
@@ -5014,6 +5291,7 @@ def create_kb_document_routes(
         force_embedding: bool,
         idempotency_key: Optional[str],
         background_tasks: BackgroundTasks,
+        http_request: Request,
         job_type: str = "build_kg",
     ) -> JobResponse:
         if registry is None or index_service is None:
@@ -5074,6 +5352,24 @@ def create_kb_document_routes(
                 status_code=409,
                 detail=_active_job_conflict_detail(exc),
             ) from exc
+
+        await _append_kb_document_audit_event(
+            http_request,
+            "document_reindex_queued" if job_type == "reindex" else "document_build_queued",
+            kb_id,
+            _document_audit_metadata(
+                job=job,
+                operation="reindex_document" if job_type == "reindex" else "build_document_kg",
+                document_ids=[document_id],
+                parser_hash=plan.parser_hash,
+                index_hash=plan.index_hash,
+                force_rechunk=force_rechunk,
+                force_extract=force_extract,
+                force_embedding=force_embedding,
+                skipped=plan.skipped,
+                skip_reason=plan.skip_reason,
+            ),
+        )
 
         if plan.skipped:
             await job_service.transition_job(
@@ -5220,6 +5516,7 @@ def create_kb_document_routes(
         kb_id: str,
         document_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         request: BuildKGRequest = Body(default_factory=BuildKGRequest),
     ):
         try:
@@ -5231,6 +5528,7 @@ def create_kb_document_routes(
                 force_embedding=request.force_embedding,
                 idempotency_key=request.idempotency_key,
                 background_tasks=background_tasks,
+                http_request=http_request,
             )
         except HTTPException:
             raise
@@ -5271,6 +5569,7 @@ def create_kb_document_routes(
         kb_id: str,
         document_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         request: ReindexRequest = Body(default_factory=ReindexRequest),
     ):
         try:
@@ -5282,6 +5581,7 @@ def create_kb_document_routes(
                 force_embedding=request.force_embedding,
                 idempotency_key=request.idempotency_key,
                 background_tasks=background_tasks,
+                http_request=http_request,
                 job_type="reindex",
             )
         except HTTPException:
@@ -5322,7 +5622,10 @@ def create_kb_document_routes(
         force_embedding: bool,
         idempotency_key: Optional[str],
         background_tasks: BackgroundTasks,
+        http_request: Request,
         job_type: str = "build_kg",
+        audit_event_type: str | None = None,
+        audit_operation: str | None = None,
     ) -> DocumentBatchResponse:
         if registry is None or index_service is None:
             raise HTTPException(
@@ -5390,6 +5693,31 @@ def create_kb_document_routes(
         execution_plans = [
             plan for plan in active_plans if plan.document.id in queued_document_ids
         ]
+
+        default_event_type = (
+            "documents_batch_reindex_queued"
+            if job_type == "reindex"
+            else "documents_batch_build_queued"
+        )
+        await _append_kb_document_audit_event(
+            http_request,
+            audit_event_type or default_event_type,
+            kb_id,
+            _document_audit_metadata(
+                job=job,
+                operation=audit_operation
+                or ("batch_reindex_documents" if job_type == "reindex" else "batch_build_documents"),
+                document_ids=[document.id for document in queued_documents],
+                document_count=len(request_ids),
+                batch_id=job.batch_id or batch_plan.batch_id,
+                force_rechunk=force_rechunk,
+                force_extract=force_extract,
+                force_embedding=force_embedding,
+                claim_failure_count=len(claim_failures),
+                planning_failure_count=len(batch_plan.failures),
+                skipped_count=len(skipped_plans),
+            ),
+        )
 
         async def _batch_build_task() -> None:
             item_results: list[dict[str, Any]] = [
@@ -5563,6 +5891,7 @@ def create_kb_document_routes(
     async def batch_build_documents(
         kb_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         request: BatchBuildKGRequest,
     ):
         try:
@@ -5574,6 +5903,7 @@ def create_kb_document_routes(
                 force_embedding=request.force_embedding,
                 idempotency_key=request.idempotency_key,
                 background_tasks=background_tasks,
+                http_request=http_request,
             )
         except HTTPException:
             raise
@@ -5596,6 +5926,7 @@ def create_kb_document_routes(
     async def batch_reindex_documents(
         kb_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         request: BatchReindexRequest,
     ):
         try:
@@ -5607,6 +5938,7 @@ def create_kb_document_routes(
                 force_embedding=request.force_embedding,
                 idempotency_key=request.idempotency_key,
                 background_tasks=background_tasks,
+                http_request=http_request,
                 job_type="reindex",
             )
         except HTTPException:
@@ -5630,6 +5962,7 @@ def create_kb_document_routes(
     async def rebuild_kb(
         kb_id: str,
         background_tasks: BackgroundTasks,
+        http_request: Request,
         request: RebuildKBRequest = Body(default_factory=RebuildKBRequest),
     ):
         """Conservative whole-KB rebuild.
@@ -5672,6 +6005,9 @@ def create_kb_document_routes(
                 force_embedding=request.force_embedding,
                 idempotency_key=request.idempotency_key,
                 background_tasks=background_tasks,
+                http_request=http_request,
+                audit_event_type="kb_rebuild_queued",
+                audit_operation="rebuild_kb",
             )
         except HTTPException:
             raise
@@ -5691,9 +6027,24 @@ def create_kb_document_routes(
         dependencies=[Depends(combined_auth)],
         summary="Cancel a queued or running job",
     )
-    async def cancel_job(kb_id: str, job_id: str):
+    async def cancel_job(kb_id: str, job_id: str, http_request: Request):
         try:
-            job, _changed = await job_service.cancel_job(kb_id, job_id)
+            job, changed = await job_service.cancel_job(
+                kb_id, job_id, include_deleted=True
+            )
+            await _append_kb_document_audit_event(
+                http_request,
+                "job_cancel_requested",
+                kb_id,
+                _document_audit_metadata(
+                    job=job,
+                    operation="cancel_job",
+                    document_ids=[job.document_id] if job.document_id else (),
+                    batch_id=job.batch_id,
+                    changed=changed,
+                    status=job.status,
+                ),
+            )
             return JobResponse.from_record(job)
         except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -5711,11 +6062,28 @@ def create_kb_document_routes(
     async def retry_job(
         kb_id: str,
         job_id: str,
+        http_request: Request,
         request: JobRetryRequest = Body(default_factory=JobRetryRequest),
     ):
         try:
             job = await job_service.retry_job(
-                kb_id, job_id, new_idempotency_key=request.idempotency_key
+                kb_id,
+                job_id,
+                new_idempotency_key=request.idempotency_key,
+                include_deleted=True,
+            )
+            await _append_kb_document_audit_event(
+                http_request,
+                "job_retry_queued",
+                kb_id,
+                _document_audit_metadata(
+                    job=job,
+                    operation="retry_job",
+                    document_ids=[job.document_id] if job.document_id else (),
+                    batch_id=job.batch_id,
+                    original_job_id=job_id,
+                    status=job.status,
+                ),
             )
             return JobResponse.from_record(job)
         except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
@@ -5763,11 +6131,23 @@ def create_kb_document_routes(
         summary="Download a knowledge base document artifact (file or directory zip)",
     )
     async def download_document_artifact(
-        kb_id: str, document_id: str, artifact_id: str
+        request: Request, kb_id: str, document_id: str, artifact_id: str
     ):
         try:
             artifact_file = await document_service.get_document_artifact_file(
                 kb_id, document_id, artifact_id
+            )
+            await append_enterprise_audit_event(
+                request,
+                "artifact_downloaded",
+                target_type="kb",
+                target_id=kb_id,
+                metadata=_artifact_audit_metadata(
+                    artifact_file.artifact,
+                    is_directory=artifact_file.is_directory,
+                    filename=artifact_file.filename,
+                    media_type=artifact_file.media_type,
+                ),
             )
             if artifact_file.is_directory:
                 return _stream_directory_as_zip(artifact_file)
@@ -5789,11 +6169,22 @@ def create_kb_document_routes(
         summary="Preview a supported knowledge base document artifact inline",
     )
     async def preview_document_artifact(
-        kb_id: str, document_id: str, artifact_id: str
+        request: Request, kb_id: str, document_id: str, artifact_id: str
     ):
         try:
             artifact_file = await document_service.get_document_artifact_file(
                 kb_id, document_id, artifact_id
+            )
+            await append_enterprise_audit_event(
+                request,
+                "artifact_previewed",
+                target_type="kb",
+                target_id=kb_id,
+                metadata=_artifact_audit_metadata(
+                    artifact_file.artifact,
+                    filename=artifact_file.filename,
+                    media_type=artifact_file.media_type,
+                ),
             )
             return _artifact_preview_response(artifact_file)
         except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
@@ -5810,6 +6201,7 @@ def create_kb_document_routes(
         summary="Create a presigned download URL for an object-backed file artifact",
     )
     async def create_document_artifact_download_url(
+        request: Request,
         kb_id: str,
         document_id: str,
         artifact_id: str,
@@ -5825,6 +6217,19 @@ def create_kb_document_routes(
                 document_id,
                 artifact_id,
                 expires_in_seconds=expires_in_seconds,
+            )
+            await append_enterprise_audit_event(
+                request,
+                "artifact_download_url_created",
+                target_type="kb",
+                target_id=kb_id,
+                metadata=_artifact_audit_metadata(
+                    result.artifact,
+                    expires_in_seconds=result.expires_in_seconds,
+                    filename=result.filename,
+                    media_type=result.media_type,
+                    object_backed=True,
+                ),
             )
             return ArtifactDownloadUrlResponse(
                 artifact_id=result.artifact.id,
@@ -5880,6 +6285,7 @@ def create_kb_document_routes(
                 document_id=document_id,
                 limit=limit,
                 offset=offset,
+                include_deleted=True,
             )
             return JobListResponse(
                 jobs=[JobResponse.from_record(item) for item in jobs],
@@ -5909,7 +6315,7 @@ def create_kb_document_routes(
         terminal failures separately from still-retryable ones."""
         try:
             jobs, total = await job_service.list_dead_letter_jobs(
-                kb_id, limit=limit, offset=offset
+                kb_id, limit=limit, offset=offset, include_deleted=True
             )
             return JobListResponse(
                 jobs=[JobResponse.from_record(item) for item in jobs],
@@ -5930,7 +6336,9 @@ def create_kb_document_routes(
     )
     async def get_job(kb_id: str, job_id: str):
         try:
-            return JobResponse.from_record(await job_service.get_job(kb_id, job_id))
+            return JobResponse.from_record(
+                await job_service.get_job(kb_id, job_id, include_deleted=True)
+            )
         except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -5958,7 +6366,7 @@ def create_kb_document_routes(
         deadline = asyncio.get_event_loop().time() + timeout_seconds
         try:
             while True:
-                job = await job_service.get_job(kb_id, job_id)
+                job = await job_service.get_job(kb_id, job_id, include_deleted=True)
                 if job.status in terminal_states:
                     return JobResponse.from_record(job)
                 remaining = deadline - asyncio.get_event_loop().time()

@@ -73,6 +73,7 @@ from lightrag.api.kb_deletion_service import KBDeletionService
 from lightrag.api.kb_service import KnowledgeBaseRecord, KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
 from lightrag.api.metadata_store import SQLiteMetadataStore
+from lightrag.api.metrics import build_prometheus_metrics
 from lightrag.api.object_storage import create_object_storage_from_env
 from lightrag.api.postgres_kb_service import PostgresKnowledgeBaseService
 from lightrag.api.postgres_metadata_store import PostgresMetadataStore
@@ -94,6 +95,8 @@ from lightrag.api.auth import auth_handler
 from lightrag.api.enterprise_auth import (
     AuditService,
     AuthorizationService,
+    EnterpriseLimitService,
+    ServiceAPIKeyService,
     SystemSettingsService,
     UserService,
 )
@@ -915,6 +918,14 @@ def create_app(args):
     enterprise_settings_service = (
         SystemSettingsService(metadata_store) if enterprise_enabled else None
     )
+    enterprise_api_key_service = (
+        ServiceAPIKeyService(metadata_store, enterprise_audit_service)
+        if enterprise_enabled
+        else None
+    )
+    enterprise_limit_service = (
+        EnterpriseLimitService(enterprise_audit_service) if enterprise_enabled else None
+    )
     enterprise_authorization_service = (
         AuthorizationService(metadata_store, enterprise_audit_service)
         if enterprise_enabled
@@ -1036,6 +1047,8 @@ def create_app(args):
     if enterprise_enabled:
         app.state.enterprise_user_service = enterprise_user_service
         app.state.enterprise_settings_service = enterprise_settings_service
+        app.state.enterprise_api_key_service = enterprise_api_key_service
+        app.state.enterprise_limit_service = enterprise_limit_service
         app.state.enterprise_authorization_service = enterprise_authorization_service
         app.state.enterprise_audit_service = enterprise_audit_service
 
@@ -2381,6 +2394,23 @@ def create_app(args):
     # Add Ollama API routes
     ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
     app.include_router(ollama_api.router, prefix="/api")
+
+    @app.get(
+        "/metrics",
+        dependencies=[Depends(combined_auth)],
+        summary="Get Prometheus metrics",
+        response_description="Prometheus text-format metrics",
+    )
+    async def get_metrics():
+        content = await build_prometheus_metrics(
+            kb_service=kb_service,
+            metadata_store=metadata_store,
+            enterprise_enabled=enterprise_enabled,
+            job_worker_enabled=job_worker is not None,
+            object_storage_enabled=object_storage is not None,
+            kb_metadata_backend=kb_metadata_backend or "local",
+        )
+        return Response(content=content, media_type="text/plain; version=0.0.4")
 
     # Custom Swagger UI endpoint for offline support
     @app.get("/docs", include_in_schema=False)

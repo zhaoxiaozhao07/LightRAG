@@ -16,9 +16,27 @@ ROLE_MAX_ASYNC_ENV_KEYS = (
     "VLM_MAX_ASYNC_LLM",
 )
 
+ENTERPRISE_LIMIT_ENV_KEYS = (
+    "LIGHTRAG_ENTERPRISE_RATE_LIMIT_ENABLED",
+    "LIGHTRAG_ENTERPRISE_RATE_LIMIT_REQUESTS",
+    "LIGHTRAG_ENTERPRISE_RATE_LIMIT_WINDOW_SECONDS",
+    "LIGHTRAG_ENTERPRISE_TENANT_RATE_LIMIT_REQUESTS",
+    "LIGHTRAG_ENTERPRISE_TENANT_RATE_LIMIT_WINDOW_SECONDS",
+    "LIGHTRAG_ENTERPRISE_QUOTA_REQUESTS",
+    "LIGHTRAG_ENTERPRISE_QUOTA_WINDOW_SECONDS",
+    "LIGHTRAG_ENTERPRISE_TENANT_QUOTA_REQUESTS",
+    "LIGHTRAG_ENTERPRISE_TENANT_QUOTA_WINDOW_SECONDS",
+    "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE",
+)
+
 
 def _clear_max_async_env(monkeypatch):
     for key in ROLE_MAX_ASYNC_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+
+def _clear_enterprise_limit_env(monkeypatch):
+    for key in ENTERPRISE_LIMIT_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
 
 
@@ -61,3 +79,59 @@ def test_role_max_async_literal_none_string_is_preserved(monkeypatch):
 
     assert args.max_async == 10
     assert args.query_llm_max_async is None
+
+
+def test_enterprise_limit_config_defaults_disabled(monkeypatch):
+    _clear_enterprise_limit_env(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["lightrag-server"])
+
+    args = parse_args()
+
+    assert args.enterprise_rate_limit_enabled is False
+    assert args.enterprise_rate_limit_requests == 60
+    assert args.enterprise_rate_limit_window_seconds == 60.0
+    assert args.enterprise_tenant_rate_limit_requests == 0
+    assert args.enterprise_quota_requests == 0
+    assert args.enterprise_tenant_quota_requests == 0
+    assert args.enterprise_artifact_download_min_role == "kb_viewer"
+
+
+def test_enterprise_limit_config_reads_env_overrides(monkeypatch):
+    _clear_enterprise_limit_env(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["lightrag-server"])
+    monkeypatch.setenv("LIGHTRAG_ENTERPRISE_RATE_LIMIT_ENABLED", "true")
+    monkeypatch.setenv("LIGHTRAG_ENTERPRISE_RATE_LIMIT_REQUESTS", "7")
+    monkeypatch.setenv("LIGHTRAG_ENTERPRISE_RATE_LIMIT_WINDOW_SECONDS", "12.5")
+    monkeypatch.setenv("LIGHTRAG_ENTERPRISE_TENANT_RATE_LIMIT_REQUESTS", "19")
+    monkeypatch.setenv("LIGHTRAG_ENTERPRISE_TENANT_RATE_LIMIT_WINDOW_SECONDS", "30.5")
+    monkeypatch.setenv("LIGHTRAG_ENTERPRISE_QUOTA_REQUESTS", "101")
+    monkeypatch.setenv("LIGHTRAG_ENTERPRISE_QUOTA_WINDOW_SECONDS", "3600")
+    monkeypatch.setenv("LIGHTRAG_ENTERPRISE_TENANT_QUOTA_REQUESTS", "303")
+    monkeypatch.setenv("LIGHTRAG_ENTERPRISE_TENANT_QUOTA_WINDOW_SECONDS", "7200")
+    monkeypatch.setenv("LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE", "kb_admin")
+
+    args = parse_args()
+
+    assert args.enterprise_rate_limit_enabled is True
+    assert args.enterprise_rate_limit_requests == 7
+    assert args.enterprise_rate_limit_window_seconds == 12.5
+    assert args.enterprise_tenant_rate_limit_requests == 19
+    assert args.enterprise_tenant_rate_limit_window_seconds == 30.5
+    assert args.enterprise_quota_requests == 101
+    assert args.enterprise_quota_window_seconds == 3600.0
+    assert args.enterprise_tenant_quota_requests == 303
+    assert args.enterprise_tenant_quota_window_seconds == 7200.0
+    assert args.enterprise_artifact_download_min_role == "kb_admin"
+
+
+def test_enterprise_artifact_download_min_role_validation(monkeypatch):
+    _clear_enterprise_limit_env(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["lightrag-server"])
+    monkeypatch.setenv("LIGHTRAG_ENTERPRISE_AUTH_ENABLED", "true")
+    monkeypatch.setenv("TOKEN_SECRET", "test-token-secret")
+    monkeypatch.setenv("LIGHTRAG_SUPER_ADMIN_USERNAME", "admin")
+    monkeypatch.setenv("LIGHTRAG_SUPER_ADMIN_PASSWORD", "admin-pass")
+    monkeypatch.setenv("LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE", "viewer")
+
+    with pytest.raises(ValueError, match="ARTIFACT_DOWNLOAD_MIN_ROLE"):
+        parse_args()

@@ -56,7 +56,8 @@ load_dotenv(dotenv_path=".env", override=False)
 
 
 ollama_server_infos = OllamaServerInfos()
-DEFAULT_TOKEN_SECRET = "lightrag-jwt-default-secret-key!"
+DEFAULT_TOKEN_SECRET = "please-change-me"
+ENTERPRISE_KB_ROLES = {"kb_viewer", "kb_editor", "kb_admin", "kb_owner"}
 NO_PREFIX_SENTINEL = "NO_PREFIX"
 PROVIDER_ASYMMETRIC_EMBEDDING_BINDINGS = {"gemini", "jina", "voyageai"}
 PREFIX_ASYMMETRIC_EMBEDDING_BINDINGS = {"azure_openai", "ollama", "openai"}
@@ -189,6 +190,15 @@ def validate_auth_configuration(args: argparse.Namespace) -> None:
         if not super_admin_password and not super_admin_password_hash:
             raise ValueError(
                 "LIGHTRAG_SUPER_ADMIN_PASSWORD or LIGHTRAG_SUPER_ADMIN_PASSWORD_HASH is required when enterprise auth is enabled."
+            )
+        artifact_role = (
+            getattr(args, "enterprise_artifact_download_min_role", "kb_viewer")
+            or "kb_viewer"
+        ).strip()
+        if artifact_role not in ENTERPRISE_KB_ROLES:
+            raise ValueError(
+                "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE must be one of: "
+                f"{', '.join(sorted(ENTERPRISE_KB_ROLES))}."
             )
 
 
@@ -692,6 +702,36 @@ def parse_args() -> argparse.Namespace:
     )
     args.enterprise_legacy_api_key_superadmin = get_env_value(
         "LIGHTRAG_ENTERPRISE_LEGACY_API_KEY_SUPERADMIN", False, bool
+    )
+    args.enterprise_artifact_download_min_role = get_env_value(
+        "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE", "kb_viewer"
+    )
+    args.enterprise_rate_limit_enabled = get_env_value(
+        "LIGHTRAG_ENTERPRISE_RATE_LIMIT_ENABLED", False, bool
+    )
+    args.enterprise_rate_limit_requests = get_env_value(
+        "LIGHTRAG_ENTERPRISE_RATE_LIMIT_REQUESTS", 60, int
+    )
+    args.enterprise_rate_limit_window_seconds = get_env_value(
+        "LIGHTRAG_ENTERPRISE_RATE_LIMIT_WINDOW_SECONDS", 60.0, float
+    )
+    args.enterprise_tenant_rate_limit_requests = get_env_value(
+        "LIGHTRAG_ENTERPRISE_TENANT_RATE_LIMIT_REQUESTS", 0, int
+    )
+    args.enterprise_tenant_rate_limit_window_seconds = get_env_value(
+        "LIGHTRAG_ENTERPRISE_TENANT_RATE_LIMIT_WINDOW_SECONDS", 60.0, float
+    )
+    args.enterprise_quota_requests = get_env_value(
+        "LIGHTRAG_ENTERPRISE_QUOTA_REQUESTS", 0, int
+    )
+    args.enterprise_quota_window_seconds = get_env_value(
+        "LIGHTRAG_ENTERPRISE_QUOTA_WINDOW_SECONDS", 86400.0, float
+    )
+    args.enterprise_tenant_quota_requests = get_env_value(
+        "LIGHTRAG_ENTERPRISE_TENANT_QUOTA_REQUESTS", 0, int
+    )
+    args.enterprise_tenant_quota_window_seconds = get_env_value(
+        "LIGHTRAG_ENTERPRISE_TENANT_QUOTA_WINDOW_SECONDS", 86400.0, float
     )
 
     # Token auto-renewal configuration (sliding window expiration)

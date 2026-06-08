@@ -369,6 +369,46 @@ class EnterpriseUserRecord:
 
 
 @dataclass(slots=True)
+class EnterpriseAPIKeyRecord:
+    id: str
+    name: str
+    key_hash: str
+    key_preview: str
+    status: str
+    created_by: str | None
+    tenant_id: str | None
+    scopes: dict[str, Any]
+    metadata: dict[str, Any]
+    created_at: str
+    updated_at: str
+    last_used_at: str | None
+    revoked_at: str | None
+    revoked_by: str | None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "EnterpriseAPIKeyRecord":
+        return cls(
+            id=str(row["id"]),
+            name=str(row["name"]),
+            key_hash=str(row["key_hash"]),
+            key_preview=str(row["key_preview"]),
+            status=str(row["status"]),
+            created_by=row["created_by"],
+            tenant_id=row["tenant_id"],
+            scopes=_loads_json_object(row["scopes_json"]),
+            metadata=_loads_json_object(row["metadata_json"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+            last_used_at=row["last_used_at"],
+            revoked_at=row["revoked_at"],
+            revoked_by=row["revoked_by"],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class KBACLRecord:
     kb_id: str
     user_id: str
@@ -382,6 +422,54 @@ class KBACLRecord:
         return cls(
             kb_id=str(row["kb_id"]),
             user_id=str(row["user_id"]),
+            role=str(row["role"]),
+            granted_by=row["granted_by"],
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class EnterpriseTenantMembershipRecord:
+    tenant_id: str
+    user_id: str
+    role: str
+    granted_by: str | None
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "EnterpriseTenantMembershipRecord":
+        return cls(
+            tenant_id=str(row["tenant_id"]),
+            user_id=str(row["user_id"]),
+            role=str(row["role"]),
+            granted_by=row["granted_by"],
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class EnterpriseTenantKBACLRecord:
+    tenant_id: str
+    kb_id: str
+    role: str
+    granted_by: str | None
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "EnterpriseTenantKBACLRecord":
+        return cls(
+            tenant_id=str(row["tenant_id"]),
+            kb_id=str(row["kb_id"]),
             role=str(row["role"]),
             granted_by=row["granted_by"],
             created_at=str(row["created_at"]),
@@ -1969,6 +2057,132 @@ class SQLiteMetadataStore:
             ).fetchone()
         return default if row is None else str(row["value"])
 
+    async def create_enterprise_api_key(
+        self, record: EnterpriseAPIKeyRecord
+    ) -> EnterpriseAPIKeyRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterpriseAPIKeyRecord:
+            conn.execute(
+                """
+                INSERT INTO enterprise_api_keys (
+                    id, name, key_hash, key_preview, status, created_by, tenant_id,
+                    scopes_json, metadata_json, created_at, updated_at, last_used_at,
+                    revoked_at, revoked_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.id,
+                    record.name,
+                    record.key_hash,
+                    record.key_preview,
+                    record.status,
+                    record.created_by,
+                    record.tenant_id,
+                    _dumps_json(record.scopes),
+                    _dumps_json(record.metadata),
+                    record.created_at,
+                    record.updated_at,
+                    record.last_used_at,
+                    record.revoked_at,
+                    record.revoked_by,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_api_keys WHERE id = ?", (record.id,)
+            ).fetchone()
+            assert row is not None
+            return EnterpriseAPIKeyRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def get_enterprise_api_key_by_hash(
+        self, key_hash: str
+    ) -> EnterpriseAPIKeyRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_api_keys WHERE key_hash = ?",
+                (key_hash,),
+            ).fetchone()
+        return EnterpriseAPIKeyRecord.from_row(row) if row is not None else None
+
+    async def get_enterprise_api_key_by_id(
+        self, key_id: str
+    ) -> EnterpriseAPIKeyRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_api_keys WHERE id = ?",
+                (key_id,),
+            ).fetchone()
+        return EnterpriseAPIKeyRecord.from_row(row) if row is not None else None
+
+    async def list_enterprise_api_keys(self) -> list[EnterpriseAPIKeyRecord]:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM enterprise_api_keys
+                ORDER BY created_at DESC, id DESC
+                """
+            ).fetchall()
+        return [EnterpriseAPIKeyRecord.from_row(row) for row in rows]
+
+    async def revoke_enterprise_api_key(
+        self,
+        key_id: str,
+        *,
+        revoked_by: str | None = None,
+        revoked_at: str | None = None,
+    ) -> EnterpriseAPIKeyRecord | None:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterpriseAPIKeyRecord | None:
+            now = revoked_at or utc_now_iso()
+            cursor = conn.execute(
+                """
+                UPDATE enterprise_api_keys
+                SET status = ?, revoked_at = ?, revoked_by = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                ("revoked", now, revoked_by, now, key_id),
+            )
+            if not cursor.rowcount:
+                return None
+            row = conn.execute(
+                "SELECT * FROM enterprise_api_keys WHERE id = ?", (key_id,)
+            ).fetchone()
+            assert row is not None
+            return EnterpriseAPIKeyRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def mark_enterprise_api_key_used(
+        self, key_id: str, *, last_used_at: str | None = None
+    ) -> EnterpriseAPIKeyRecord | None:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterpriseAPIKeyRecord | None:
+            now = last_used_at or utc_now_iso()
+            cursor = conn.execute(
+                """
+                UPDATE enterprise_api_keys
+                SET last_used_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, key_id),
+            )
+            if not cursor.rowcount:
+                return None
+            row = conn.execute(
+                "SELECT * FROM enterprise_api_keys WHERE id = ?", (key_id,)
+            ).fetchone()
+            assert row is not None
+            return EnterpriseAPIKeyRecord.from_row(row)
+
+        return await self._write(write)
+
     async def upsert_kb_acl(self, acl: KBACLRecord) -> KBACLRecord:
         await self._ensure_initialized()
 
@@ -2051,6 +2265,198 @@ class SQLiteMetadataStore:
                 ORDER BY kb_id ASC
                 """,
                 (user_id,),
+            ).fetchall()
+        return [str(row["kb_id"]) for row in rows]
+
+    async def upsert_tenant_membership(
+        self, membership: EnterpriseTenantMembershipRecord
+    ) -> EnterpriseTenantMembershipRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterpriseTenantMembershipRecord:
+            conn.execute(
+                """
+                INSERT INTO enterprise_tenant_memberships (
+                    tenant_id, user_id, role, granted_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id, user_id) DO UPDATE SET
+                    role = excluded.role,
+                    granted_by = excluded.granted_by,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    membership.tenant_id,
+                    membership.user_id,
+                    membership.role,
+                    membership.granted_by,
+                    membership.created_at,
+                    membership.updated_at,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM enterprise_tenant_memberships
+                WHERE tenant_id = ? AND user_id = ?
+                """,
+                (membership.tenant_id, membership.user_id),
+            ).fetchone()
+            assert row is not None
+            return EnterpriseTenantMembershipRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def delete_tenant_membership(self, tenant_id: str, user_id: str) -> bool:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute(
+                """
+                DELETE FROM enterprise_tenant_memberships
+                WHERE tenant_id = ? AND user_id = ?
+                """,
+                (tenant_id, user_id),
+            )
+            return bool(cursor.rowcount)
+
+        return await self._write(write)
+
+    async def list_tenant_memberships(
+        self, tenant_id: str
+    ) -> list[EnterpriseTenantMembershipRecord]:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM enterprise_tenant_memberships
+                WHERE tenant_id = ?
+                ORDER BY created_at ASC, user_id ASC
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return [EnterpriseTenantMembershipRecord.from_row(row) for row in rows]
+
+    async def list_user_tenant_memberships(
+        self, user_id: str
+    ) -> list[EnterpriseTenantMembershipRecord]:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM enterprise_tenant_memberships
+                WHERE user_id = ?
+                ORDER BY tenant_id ASC
+                """,
+                (user_id,),
+            ).fetchall()
+        return [EnterpriseTenantMembershipRecord.from_row(row) for row in rows]
+
+    async def get_tenant_membership(
+        self, tenant_id: str, user_id: str
+    ) -> EnterpriseTenantMembershipRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM enterprise_tenant_memberships
+                WHERE tenant_id = ? AND user_id = ?
+                """,
+                (tenant_id, user_id),
+            ).fetchone()
+        return None if row is None else EnterpriseTenantMembershipRecord.from_row(row)
+
+    async def upsert_tenant_kb_acl(
+        self, acl: EnterpriseTenantKBACLRecord
+    ) -> EnterpriseTenantKBACLRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterpriseTenantKBACLRecord:
+            conn.execute(
+                """
+                INSERT INTO enterprise_tenant_kb_acl (
+                    tenant_id, kb_id, role, granted_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id, kb_id) DO UPDATE SET
+                    role = excluded.role,
+                    granted_by = excluded.granted_by,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    acl.tenant_id,
+                    acl.kb_id,
+                    acl.role,
+                    acl.granted_by,
+                    acl.created_at,
+                    acl.updated_at,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM enterprise_tenant_kb_acl
+                WHERE tenant_id = ? AND kb_id = ?
+                """,
+                (acl.tenant_id, acl.kb_id),
+            ).fetchone()
+            assert row is not None
+            return EnterpriseTenantKBACLRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def delete_tenant_kb_acl(self, tenant_id: str, kb_id: str) -> bool:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute(
+                """
+                DELETE FROM enterprise_tenant_kb_acl
+                WHERE tenant_id = ? AND kb_id = ?
+                """,
+                (tenant_id, kb_id),
+            )
+            return bool(cursor.rowcount)
+
+        return await self._write(write)
+
+    async def list_kb_tenant_acl(
+        self, kb_id: str
+    ) -> list[EnterpriseTenantKBACLRecord]:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM enterprise_tenant_kb_acl
+                WHERE kb_id = ?
+                ORDER BY created_at ASC, tenant_id ASC
+                """,
+                (kb_id,),
+            ).fetchall()
+        return [EnterpriseTenantKBACLRecord.from_row(row) for row in rows]
+
+    async def get_tenant_kb_acl_role(self, tenant_id: str, kb_id: str) -> str | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT role FROM enterprise_tenant_kb_acl
+                WHERE tenant_id = ? AND kb_id = ?
+                """,
+                (tenant_id, kb_id),
+            ).fetchone()
+        return None if row is None else str(row["role"])
+
+    async def list_kb_ids_for_tenants(self, tenant_ids: Sequence[str]) -> list[str]:
+        await self._ensure_initialized()
+        normalized_ids = sorted({tenant_id for tenant_id in tenant_ids if tenant_id})
+        if not normalized_ids:
+            return []
+        placeholders = ",".join("?" for _ in normalized_ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT kb_id FROM enterprise_tenant_kb_acl
+                WHERE tenant_id IN ({placeholders})
+                ORDER BY kb_id ASC
+                """,
+                normalized_ids,
             ).fetchall()
         return [str(row["kb_id"]) for row in rows]
 
@@ -2493,6 +2899,30 @@ class SQLiteMetadataStore:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS enterprise_api_keys (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                key_hash TEXT NOT NULL UNIQUE,
+                key_preview TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_by TEXT,
+                tenant_id TEXT,
+                scopes_json TEXT NOT NULL DEFAULT '{}',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_used_at TEXT,
+                revoked_at TEXT,
+                revoked_by TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_api_keys_status
+                ON enterprise_api_keys (status);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_api_keys_created_by
+                ON enterprise_api_keys (created_by, status);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_api_keys_tenant
+                ON enterprise_api_keys (tenant_id, status);
+
             CREATE TABLE IF NOT EXISTS enterprise_kb_acl (
                 kb_id TEXT NOT NULL,
                 user_id TEXT NOT NULL,
@@ -2506,6 +2936,33 @@ class SQLiteMetadataStore:
 
             CREATE INDEX IF NOT EXISTS idx_enterprise_kb_acl_user
                 ON enterprise_kb_acl (user_id, kb_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_tenant_memberships (
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                granted_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, user_id),
+                FOREIGN KEY (user_id) REFERENCES enterprise_users(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_tenant_memberships_user
+                ON enterprise_tenant_memberships (user_id, tenant_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_tenant_kb_acl (
+                tenant_id TEXT NOT NULL,
+                kb_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                granted_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, kb_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_tenant_kb_acl_kb
+                ON enterprise_tenant_kb_acl (kb_id, tenant_id);
 
             CREATE TABLE IF NOT EXISTS enterprise_audit_events (
                 id TEXT PRIMARY KEY,

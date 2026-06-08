@@ -21,9 +21,15 @@ from lightrag.api.config_version_service import (
 )
 from lightrag.api.index_build_service import compute_index_hash
 from lightrag.api.job_service import JobService
-from lightrag.api.kb_service import KnowledgeBaseService
+from lightrag.api.kb_service import KnowledgeBaseService, utc_now_iso
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
-from lightrag.api.metadata_store import ConfigVersionRecord, SQLiteMetadataStore
+from lightrag.api.metadata_store import (
+    ConfigVersionRecord,
+    DocumentRecord,
+    JobRecord,
+    SQLiteMetadataStore,
+)
+from lightrag.base import TextChunkSchema
 from lightrag.utils import EmbeddingFunc
 
 _original_argv = sys.argv[:]
@@ -90,6 +96,9 @@ class FakeRAG:
     async def finalize_storages(self) -> None:
         self.finalized = True
 
+    async def adrop_all_storages(self) -> dict:
+        return {}
+
 
 class BuilderProbe:
     def __init__(self):
@@ -130,6 +139,92 @@ def _create_kb(client: TestClient, kb_id: str):
     )
     assert response.status_code == 200
     return response.json()
+
+
+def _document_record(
+    kb_id: str,
+    workspace: str,
+    doc_id: str,
+    *,
+    status: str,
+    enabled: bool = True,
+    archived: bool = False,
+) -> DocumentRecord:
+    now = utc_now_iso()
+    parsed_statuses = {"parsed", "build_queued", "building", "ready", "build_failed"}
+    return DocumentRecord(
+        id=doc_id,
+        kb_id=kb_id,
+        workspace=workspace,
+        lightrag_doc_id=f"lightrag-{doc_id}" if status in parsed_statuses else None,
+        source_type="upload",
+        source_name=f"{doc_id}.txt",
+        source_uri=f"/inputs/{doc_id}.txt",
+        source_hash=f"sha256:{doc_id}",
+        content_type="text/plain",
+        size_bytes=32,
+        parser_hash="sha256:old-parser" if status in parsed_statuses else None,
+        index_hash="sha256:old-index" if status == "ready" else None,
+        status=status,
+        enabled=enabled,
+        archived=archived,
+        chunks_count=1 if status in parsed_statuses else None,
+        entity_count=1 if status == "ready" else None,
+        relation_count=0 if status == "ready" else None,
+        error_code=None,
+        error_message=None,
+        metadata={"source_key": doc_id},
+        created_at=now,
+        updated_at=now,
+        deleted_at=None,
+    )
+
+
+def _seed_documents(
+    metadata_store: SQLiteMetadataStore,
+    *,
+    kb_id: str,
+    workspace: str,
+    statuses: list[str],
+) -> list[str]:
+    import asyncio
+
+    now = utc_now_iso()
+    documents = [
+        _document_record(kb_id, workspace, f"doc_{index}", status=status)
+        for index, status in enumerate(statuses, start=1)
+    ]
+    job = JobRecord(
+        id=f"job_seed_{kb_id}",
+        kb_id=kb_id,
+        workspace=workspace,
+        batch_id=None,
+        document_id=None,
+        job_type="seed",
+        status="succeeded",
+        stage=None,
+        progress=1.0,
+        total_items=len(documents),
+        completed_items=len(documents),
+        failed_items=0,
+        idempotency_key=None,
+        config_version_id=None,
+        config_hash=None,
+        retry_count=0,
+        max_retries=0,
+        payload={"document_ids": [document.id for document in documents]},
+        result={"seeded": True},
+        error_code=None,
+        error_message=None,
+        created_at=now,
+        updated_at=now,
+        queued_at=now,
+        started_at=now,
+        finished_at=now,
+        cancelled_at=None,
+    )
+    asyncio.run(metadata_store.create_documents_and_job(documents, job))
+    return [document.id for document in documents]
 
 
 _BASE_CONFIG = {
@@ -422,7 +517,7 @@ def test_extraction_config_reaches_real_extraction_prompt():
         "tokenizer": Tokenizer("dummy", _DummyTokenizer()),
         "llm_model_max_async": 1,
     }
-    chunks = {
+    chunks: dict[str, TextChunkSchema] = {
         "chunk-001": {
             "tokens": 13,
             "content": "Test content.",
@@ -1177,6 +1272,182 @@ def test_config_version_diff_reports_changes(tmp_path):
     assert body["requires_reparse"] is False
     assert "embedding_changed" in body["reasons"]
     assert "index_hash_changed" in body["reasons"]
+
+
+def test_config_activate_auto_enqueue_parser_change_queues_parse_job(tmp_path):
+    import asyncio
+
+    client, kb_service, metadata_store, *_ = _build_client(tmp_path)
+    _create_kb(client, "kb_auto_parse")
+    kb = asyncio.run(kb_service.get("kb_auto_parse"))
+    document_ids = _seed_documents(
+        metadata_store,
+        kb_id=kb.id,
+        workspace=kb.workspace,
+        statuses=["uploaded", "parsed", "ready"],
+    )
+    base = client.post(
+        "/kbs/kb_auto_parse/configs",
+        json={"config": _BASE_CONFIG},
+        headers=_HEADERS,
+    )
+    client.post(
+        f"/kbs/kb_auto_parse/configs/{base.json()['id']}:activate",
+        headers=_HEADERS,
+    )
+    target = client.post(
+        "/kbs/kb_auto_parse/configs",
+        json={"config": {**_BASE_CONFIG, "parser_config": {"engine": "docling"}}},
+        headers=_HEADERS,
+    )
+
+    activate = client.post(
+        f"/kbs/kb_auto_parse/configs/{target.json()['id']}:activate",
+        json={"auto_enqueue": True},
+        headers=_HEADERS,
+    )
+
+    assert activate.status_code == 200, activate.text
+    body = activate.json()
+    assert body["auto_enqueue"] is True
+    assert body["follow_up_noop_reason"] is None
+    assert body["diff"]["requires_reparse"] is True
+    assert body["diff"]["requires_reindex"] is True
+    assert len(body["follow_up_jobs"]) == 1
+    job = body["follow_up_jobs"][0]
+    assert job["job_type"] == "parse"
+    assert job["status"] == "queued"
+    assert job["total_items"] == len(document_ids)
+    assert job["payload"]["document_ids"] == document_ids
+    assert job["payload"]["force_reparse"] is True
+    assert job["payload"]["auto_index"] is True
+    assert job["idempotency_key"].startswith("config-activation:")
+
+
+def test_config_activate_auto_enqueue_index_change_queues_reindex_job(tmp_path):
+    import asyncio
+
+    client, kb_service, metadata_store, *_ = _build_client(tmp_path)
+    _create_kb(client, "kb_auto_reindex")
+    kb = asyncio.run(kb_service.get("kb_auto_reindex"))
+    _seed_documents(
+        metadata_store,
+        kb_id=kb.id,
+        workspace=kb.workspace,
+        statuses=["uploaded", "parsed", "ready", "build_failed"],
+    )
+    base = client.post(
+        "/kbs/kb_auto_reindex/configs",
+        json={"config": _BASE_CONFIG},
+        headers=_HEADERS,
+    )
+    client.post(
+        f"/kbs/kb_auto_reindex/configs/{base.json()['id']}:activate",
+        headers=_HEADERS,
+    )
+    target = client.post(
+        "/kbs/kb_auto_reindex/configs",
+        json={
+            "config": {
+                **_BASE_CONFIG,
+                "embedding_config": {"model": "bge-m3", "dim": 1024},
+            }
+        },
+        headers=_HEADERS,
+    )
+
+    activate = client.post(
+        f"/kbs/kb_auto_reindex/configs/{target.json()['id']}:activate",
+        json={"auto_enqueue": True},
+        headers=_HEADERS,
+    )
+
+    assert activate.status_code == 200, activate.text
+    body = activate.json()
+    assert body["diff"]["requires_reparse"] is False
+    assert body["diff"]["requires_reindex"] is True
+    assert body["diff"]["requires_vector_rebuild"] is True
+    assert len(body["follow_up_jobs"]) == 1
+    job = body["follow_up_jobs"][0]
+    assert job["job_type"] == "reindex"
+    assert job["status"] == "queued"
+    assert job["payload"]["document_ids"] == ["doc_2", "doc_3", "doc_4"]
+    assert job["payload"]["force_rechunk"] is True
+    assert job["payload"]["force_extract"] is True
+    assert job["payload"]["force_embedding"] is True
+
+
+def test_config_activate_auto_enqueue_query_only_noops(tmp_path):
+    import asyncio
+
+    client, kb_service, metadata_store, *_ = _build_client(tmp_path)
+    _create_kb(client, "kb_auto_query")
+    kb = asyncio.run(kb_service.get("kb_auto_query"))
+    _seed_documents(
+        metadata_store,
+        kb_id=kb.id,
+        workspace=kb.workspace,
+        statuses=["ready"],
+    )
+    base = client.post(
+        "/kbs/kb_auto_query/configs",
+        json={"config": _BASE_CONFIG},
+        headers=_HEADERS,
+    )
+    client.post(
+        f"/kbs/kb_auto_query/configs/{base.json()['id']}:activate",
+        headers=_HEADERS,
+    )
+    target = client.post(
+        "/kbs/kb_auto_query/configs",
+        json={"config": {**_BASE_CONFIG, "query_config": {"top_k": 80}}},
+        headers=_HEADERS,
+    )
+
+    activate = client.post(
+        f"/kbs/kb_auto_query/configs/{target.json()['id']}:activate",
+        json={"auto_enqueue": True},
+        headers=_HEADERS,
+    )
+
+    assert activate.status_code == 200, activate.text
+    body = activate.json()
+    assert body["diff"]["requires_reparse"] is False
+    assert body["diff"]["requires_reindex"] is False
+    assert body["diff"]["requires_vector_rebuild"] is False
+    assert body["follow_up_jobs"] == []
+    assert body["follow_up_noop_reason"] == "no_rebuild_required"
+
+
+def test_config_activate_auto_enqueue_no_documents_noops(tmp_path):
+    client, *_ = _build_client(tmp_path)
+    _create_kb(client, "kb_auto_empty")
+    base = client.post(
+        "/kbs/kb_auto_empty/configs",
+        json={"config": _BASE_CONFIG},
+        headers=_HEADERS,
+    )
+    client.post(
+        f"/kbs/kb_auto_empty/configs/{base.json()['id']}:activate",
+        headers=_HEADERS,
+    )
+    target = client.post(
+        "/kbs/kb_auto_empty/configs",
+        json={"config": {**_BASE_CONFIG, "parser_config": {"engine": "docling"}}},
+        headers=_HEADERS,
+    )
+
+    activate = client.post(
+        f"/kbs/kb_auto_empty/configs/{target.json()['id']}:activate",
+        json={"auto_enqueue": True},
+        headers=_HEADERS,
+    )
+
+    assert activate.status_code == 200, activate.text
+    body = activate.json()
+    assert body["diff"]["requires_reparse"] is True
+    assert body["follow_up_jobs"] == []
+    assert body["follow_up_noop_reason"] == "no_eligible_documents"
 
 
 def test_config_version_diff_without_active_returns_full_rebuild(tmp_path):

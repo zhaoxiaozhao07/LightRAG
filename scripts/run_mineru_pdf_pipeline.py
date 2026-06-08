@@ -22,11 +22,6 @@ from typing import Any, Callable
 
 import httpx
 from dotenv import load_dotenv
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(PROJECT_ROOT / ".env", override=False)
-
 from lightrag import LightRAG, QueryParam
 from lightrag.constants import (
     FULL_DOCS_FORMAT_PENDING_PARSE,
@@ -36,6 +31,10 @@ from lightrag.llm.openai import openai_complete_if_cache, openai_embed
 from lightrag.llm_roles import RoleLLMConfig
 from lightrag.rerank import ali_rerank, cohere_rerank, jina_rerank
 from lightrag.utils import EmbeddingFunc, generate_track_id
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 
 DEFAULT_QUERY = "Summarize the indexed PDFs and list key entities and relationships."

@@ -1,6 +1,6 @@
 # LightRAG API 接口文档
 
-> 文档版本：2026-06-07
+> 文档版本：2026-06-08
 > 适用范围：当前已经合并到 `main` 分支并通过测试的接口。
 > 路径前缀：所有路径均为相对路径；部署时通过 FastAPI `root_path` 或 `--api-prefix /api/v1` 暴露为 `/api/v1/...`。
 > 鉴权：除 `/health`、`/auth-status`、`/login` 等少数公开接口外，所有接口都受 `combined_auth` 依赖保护，需要在请求头携带 `X-API-Key: <api_key>` 或 JWT。企业模式启用后，`/kbs`、legacy `/documents`/`/query`/`/graph`、Ollama `/api/*` 会额外受企业 RBAC / anti-bypass 策略约束。
@@ -35,7 +35,7 @@
 | `GET` | `/kbs` | 列出所有知识库 |
 | `GET` | `/kbs/{kb_id}` | 获取知识库详情 |
 | `PATCH` | `/kbs/{kb_id}` | 局部更新知识库（名称、描述、状态等） |
-| `DELETE` | `/kbs/{kb_id}` | 软删除知识库；附加 `?hard=true` 触发同步硬删除流程 |
+| `DELETE` | `/kbs/{kb_id}` | 软删除知识库；附加 `?hard=true` 触发硬删除（durable worker 启用时入队 `clear_kb`，否则同步执行） |
 | `GET` | `/kbs/{kb_id}/status` | 知识库状态聚合（含运行中任务、pipeline 状态） |
 
 ### 1.1 创建知识库
@@ -60,16 +60,16 @@ Content-Type: application/json
 
 - `GET /kbs?include_deleted=false`：默认排除软删除记录。
 - `GET /kbs/{kb_id}`：404 表示未找到或已软删除。
-- `PATCH /kbs/{kb_id}`：仅更新请求体显式给出的字段；`status` 不允许直接置为 `deleted`。
+- `PATCH /kbs/{kb_id}`：仅更新请求体显式给出的字段；`status` 不允许直接置为 `deleted`；`active_config_version_id` 不能通过 PATCH 修改，若请求体包含该字段返回 `400`，请改用 `POST /kbs/{kb_id}/configs/{version_id}:activate`。
 - `DELETE /kbs/{kb_id}`：默认软删除，同步从 `LightRAGInstanceRegistry` 卸载实例。
-- `DELETE /kbs/{kb_id}?hard=true`：触发同步硬删除流程。`KBDeletionService` 在 destructive lock 下依次执行：
+- `DELETE /kbs/{kb_id}?hard=true`：触发硬删除。若服务端启用 durable worker 且 `clear_kb` 在 `job_worker.resumable_job_types` 中，路由会先 soft-delete/tombstone KB，再调用 `KBDeletionService.enqueue_hard_delete()` 创建 queued `clear_kb` job，并返回 `KnowledgeBaseDeleteResponse` 中的 `hard_delete_queued=true`、`hard_delete_job_id`、`hard_delete_job_type="clear_kb"`、`hard_delete_job_status="queued"`；后续由 worker 通过 `resume_hard_delete` 幂等执行，且 job 查询/取消/重试端点对 soft-deleted KB 使用 `include_deleted=true`，因此硬删除 job 在 KB tombstone 后仍可观察和控制。若 durable worker 未启用，保持兼容的同步硬删除流程：`KBDeletionService` 在 destructive lock 下依次执行：
   1. `force_evict` 在内存中的 LightRAG 实例并调用 `finalize_storages`（关闭存储句柄，不删数据）；
   2. **drop 全部引擎 storage 数据**：用 registry builder 建一个未缓存的瞬时实例并调用 `LightRAG.adrop_all_storages()`，对 full_docs / text_chunks / entities / relations / chunks / vector / graph / doc_status / llm_cache 等全部 storage 调 `drop()`。下一步删 `working_dir` 只能清文件型后端，外部后端（PostgreSQL / Milvus / Neo4j / Qdrant / Redis / Mongo / OpenSearch）数据在远端服务里，必须经此步显式清除，否则会残留并被复用同 workspace 的新 KB 读到；
   3. 删除 `working_dir/<workspace>`（如已配置）；
   4. 删除 `input_dir/<workspace>`（上传文件 + 解析 artifact 的本地 cache）；
   5. 若启用对象存储，删除该 workspace 下的 source/artifact 对象；
   6. 清空 metadata store 控制面（documents / jobs / artifacts / config_versions；local 模式为 SQLite，PostgreSQL 模式为对应表）。
-  返回前会创建一条 `clear_kb` 类型的 job 记录最终结果，`result` 包含 `dropped_storages`（成功 drop 的 storage 数）、`cleared_object_storage` 和 `deleted_objects`；任一步失败（含某个 storage `drop()` 失败）HTTP 500 + `clear_kb` job 终态 `failed`，使操作者知道可能有残留并 `:retry`。失败的 `clear_kb` job（`max_retries=3`）可经 `:retry` 重置回 `queued`；启用 durable worker（`LIGHTRAG_KB_JOB_WORKER=true`）时，queued 的 `clear_kb` job 会被孤儿恢复保留并由 worker 通过 `resume_hard_delete` 幂等续跑（`KBDeletionService.enqueue_hard_delete` 也可直接创建 queued job 交给 worker）。
+  同步分支返回前会创建一条 `clear_kb` 类型的 job 记录最终结果，`result` 包含 `dropped_storages`（成功 drop 的 storage 数）、`cleared_object_storage` 和 `deleted_objects`；任一步失败（含某个 storage `drop()` 失败）HTTP 500 + `clear_kb` job 终态 `failed`，使操作者知道可能有残留并 `:retry`。失败的 `clear_kb` job（`max_retries=3`）可经 `:retry` 重置回 `queued`。
 
 企业模式（`LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true`）下：
 
@@ -654,6 +654,7 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 列表示例：`GET /kbs/{kb_id}/documents/{document_id}/artifacts?artifact_type=markdown&limit=50&offset=0`。
 
 下载约束：
+- 企业模式权限：artifact list/detail/preview 按 `kb_viewer` 或更高角色读取；`:download` 与 `:download-url` 的最低角色由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 控制，默认 `kb_viewer` 保持旧行为，可提升为 `kb_editor`、`kb_admin` 或 `kb_owner`。提升后低角色仍可读取列表/详情/预览，但下载和预签名 URL 返回 `403`。
 - 文件型产物（`original` / `blocks` / `markdown` / `content_list` / `middle_json` / `model_json` / `image` / `layout_pdf`）以 `FileResponse` 直接返回。
 - 目录型产物（`sidecar` / `raw_dir`）以流式 zip 返回（`Content-Type: application/zip`），单次下载 zip 内未压缩字节上限 512 MB，超限返回 `413`。
 - 路径必须位于 `inputs/<workspace>/<document_id>` 内；跨 KB、缺失文件、路径逃逸均返回 `404` / `400`。
@@ -710,6 +711,11 @@ Content-Type: application/json
 
 ```http
 POST /kbs/{kb_id}/configs/{version_id}:activate
+Content-Type: application/json
+
+{
+  "auto_enqueue": true
+}
 ```
 
 行为：
@@ -717,6 +723,44 @@ POST /kbs/{kb_id}/configs/{version_id}:activate
 - 写入配置版本的 `activated_at`。
 - 调用 `LightRAGInstanceRegistry.discard(kb_id)` 卸载实例，下次请求按已支持的 active config 字段重建。
 - 若该 KB 上有 destructive job 在执行（如 `clear_kb`），discard 静默跳过。
+- 请求体可省略或传 `{"auto_enqueue": false}`，保持旧行为：只激活配置，不创建后续 job。
+- `auto_enqueue=true` 时，服务先按 `:diff` 结果判断影响，再创建至多一个可查询 follow-up job：
+  - `requires_reparse=true`：枚举 `uploaded/parsed/parse_failed/build_failed/ready` 且 `enabled=true`、`archived=false` 的文档，创建聚合 `job_type="parse"` job，`payload.force_reparse=true`、`payload.auto_index=true`，由 parse worker 重新规划并在解析成功后批量构建。
+  - 否则 `requires_reindex=true` 或 `requires_vector_rebuild=true`：枚举 `parsed/ready/build_failed` 且 `enabled=true`、`archived=false` 的文档，创建聚合 `job_type="reindex"` job，`force_rechunk/force_extract/force_embedding=true`，复用 `:batch-reindex` 语义。
+  - query-only 变更不创建 job，返回 `follow_up_noop_reason="no_rebuild_required"`；无 eligible 文档返回 `follow_up_noop_reason="no_eligible_documents"`；未配置 `JobService` 返回 `job_service_unavailable`。
+  - follow-up job 使用 `config-activation:{version_id}:{job_type}:{digest}` 幂等 key，同一目标版本、job 类型与文档集合不会重复创建冲突 job。
+
+注意：`auto_enqueue=true` 在激活接口中只负责创建 `queued` follow-up job；实际 parse/reindex 执行依赖 durable job worker 或对应 job consumer 继续消费队列。未配置 `JobService` 时不会创建任务，返回 `follow_up_noop_reason="job_service_unavailable"`；query-only 变更或无 eligible 文档时也不会创建任务。
+
+返回 `ConfigVersionActivationResponse`，兼容包含原 `ConfigVersionResponse` 字段，并额外包含：
+
+```json
+{
+  "id": "cfg_target",
+  "kb_id": "kb_research",
+  "version": 2,
+  "activated_at": "2026-06-08T...Z",
+  "auto_enqueue": true,
+  "diff": {
+    "target_version_id": "cfg_target",
+    "active_version_id": "cfg_previous",
+    "requires_reparse": false,
+    "requires_reindex": true,
+    "requires_vector_rebuild": true,
+    "reasons": ["embedding_changed", "index_hash_changed"]
+  },
+  "follow_up_jobs": [
+    {
+      "id": "job_reindex_...",
+      "job_type": "reindex",
+      "status": "queued",
+      "total_items": 3,
+      "payload": {"document_ids": ["doc_a", "doc_b", "doc_c"], "force_embedding": true}
+    }
+  ],
+  "follow_up_noop_reason": null
+}
+```
 
 ### 7.3 配置 Diff
 
@@ -879,6 +923,7 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/health` | 系统健康、配置和队列状态；默认 whitelist 放行 |
+| `GET` | `/metrics` | Prometheus text format 基础指标；受 `combined_auth` 保护，默认不在 whitelist |
 | `GET` | `/auth-status` | 认证模式状态；非企业模式下可能签发 guest token |
 | `POST` | `/login` | 非企业模式下使用 `AUTH_ACCOUNTS`；企业模式下使用企业用户表 |
 
@@ -886,7 +931,7 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 
 ## 十、企业模式 Auth / Admin
 
-本节接口仅在 `LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true` 时挂载或启用。企业模式默认禁用 guest 对受保护 API 的访问；`LIGHTRAG_API_KEY` 默认不能绕过 RBAC；`WHITELIST_PATHS` 不能放行 `/kbs`、`/documents`、`/query`、`/graph`、`/api` 等受保护前缀。
+本节接口仅在 `LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true` 时挂载或启用。企业模式默认禁用 guest 对受保护 API 的访问；`LIGHTRAG_API_KEY` 默认不能绕过 RBAC；`WHITELIST_PATHS` 不能放行 `/kbs`、`/documents`、`/query`、`/graph`、`/api` 等受保护前缀。企业 service API key 使用同一 `X-API-Key` 请求头，但与全局 `LIGHTRAG_API_KEY` 分离：只按持久化 hash 查找、只拥有创建时授予的 KB role scope，不能成为 super admin，撤销后立即失效。
 
 ### 10.1 配置项
 
@@ -897,11 +942,31 @@ LIGHTRAG_SUPER_ADMIN_USERNAME=admin
 LIGHTRAG_SUPER_ADMIN_PASSWORD_HASH={bcrypt}$2b$12$...
 # 或仅首次开发引导使用：LIGHTRAG_SUPER_ADMIN_PASSWORD=change-me
 LIGHTRAG_USER_REGISTRATION_ENABLED=false
+# 可选运行时注册模式：disabled / open / invite_only / admin_approval
 LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES=true
 LIGHTRAG_ENTERPRISE_LEGACY_API_KEY_SUPERADMIN=false
+# artifact 下载/预签名 URL 的最低 KB role；默认 kb_viewer 保持旧行为，可设 kb_editor/kb_admin/kb_owner
+LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE=kb_viewer
+
+# 默认关闭的企业请求限流/配额；开启后在认证与 RBAC 通过后计数
+LIGHTRAG_ENTERPRISE_RATE_LIMIT_ENABLED=false
+# user / service key / legacy enterprise API key principal 固定窗口请求限流
+LIGHTRAG_ENTERPRISE_RATE_LIMIT_REQUESTS=60
+LIGHTRAG_ENTERPRISE_RATE_LIMIT_WINDOW_SECONDS=60
+# tenant_id 固定窗口请求限流；0 表示禁用 tenant 维度
+LIGHTRAG_ENTERPRISE_TENANT_RATE_LIMIT_REQUESTS=0
+LIGHTRAG_ENTERPRISE_TENANT_RATE_LIMIT_WINDOW_SECONDS=60
+# principal 固定窗口 quota；0 表示禁用 quota 维度
+LIGHTRAG_ENTERPRISE_QUOTA_REQUESTS=0
+LIGHTRAG_ENTERPRISE_QUOTA_WINDOW_SECONDS=86400
+# tenant_id 固定窗口 quota；0 表示禁用 tenant quota
+LIGHTRAG_ENTERPRISE_TENANT_QUOTA_REQUESTS=0
+LIGHTRAG_ENTERPRISE_TENANT_QUOTA_WINDOW_SECONDS=86400
 ```
 
 ### 10.2 登录与当前用户
+
+当前企业认证支持企业用户表登录、JWT、service/scoped API key。SSO/OIDC/SAML 未纳入本轮上线闭环；后续接入前需补 issuer/client/audience/redirect URI/certs 配置校验、回调 state/CSRF 校验、用户映射策略、审计与端到端回调测试。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -936,17 +1001,65 @@ username=admin&password=change-me
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/admin/settings/registration` | 读取实时注册开关 |
-| `PATCH` / `PUT` | `/admin/settings/registration` | 更新实时注册开关，body：`{"enabled": true}` |
+| `GET` | `/admin/settings/registration` | 读取实时注册策略，返回 `enabled` 与 `mode` |
+| `PATCH` / `PUT` | `/admin/settings/registration` | 更新实时注册策略，body：`{"enabled": true}` 或 `{"mode":"open"}` |
 | `GET` | `/admin/users` | 列出企业用户 |
 | `POST` | `/admin/users` | 创建用户，可设置 `can_create_kb`、`can_use_bypass_query`、`tenant_id` |
-| `PATCH` | `/admin/users/{user_id}` | 更新用户状态/能力/密码；状态或密码变化会增加 `token_version` |
-| `GET` | `/admin/kbs/{kb_id}/acl` | 查看 KB ACL |
-| `PUT` | `/admin/kbs/{kb_id}/acl` | 授权 KB 角色，body：`{"user_id":"usr_...","role":"kb_viewer"}` |
-| `DELETE` | `/admin/kbs/{kb_id}/acl/{user_id}` | 撤销用户对 KB 的 ACL |
+| `GET` | `/admin/users/{user_id}` | 查询用户详情 |
+| `PATCH` | `/admin/users/{user_id}` | 更新用户状态/能力/tenant/password；请求体包含 `status`、`can_create_kb`、`can_use_bypass_query`、`tenant_id` 中任一非 null 字段并通过 `update_user()`，或修改 `password`，都会增加 `token_version` 并使旧 token 失效；当前实现中 `tenant_id:null` 表示不变而非清空 |
+| `POST` | `/admin/users/{user_id}:disable` | 禁用用户并递增 `token_version`，旧 token 失效 |
+| `POST` | `/admin/users/{user_id}:enable` | 启用用户并递增 `token_version` |
+| `POST` | `/admin/users/{user_id}:reset-password` | 重置用户密码并递增 `token_version` |
+| `GET` | `/admin/tenants/{tenant_id}/members` | 列出 tenant 成员与 tenant role |
+| `PUT` | `/admin/tenants/{tenant_id}/members/{user_id}` | 写入/更新 tenant membership，body：`{"role":"tenant_member"}` |
+| `DELETE` | `/admin/tenants/{tenant_id}/members/{user_id}` | 删除 tenant membership |
+| `GET` | `/admin/kbs/{kb_id}/acl` | 查看 KB ACL，返回 user 与 tenant 两类 principal；KB 不存在时返回 404 |
+| `PUT` | `/admin/kbs/{kb_id}/acl` | 授权 KB 角色，body：`{"user_id":"usr_...","role":"kb_viewer"}` 或 `{"tenant_id":"tenant-a","role":"kb_viewer"}`；KB 不存在时返回 404 |
+| `POST` | `/admin/kbs/{kb_id}/acl:batch-set` | 批量授权/撤销指定 KB 的 user/tenant ACL |
+| `DELETE` | `/admin/kbs/{kb_id}/acl/{user_id}` | 撤销用户对 KB 的 ACL；KB 不存在时返回 404 |
+| `DELETE` | `/admin/kbs/{kb_id}/acl/tenants/{tenant_id}` | 撤销 tenant 对 KB 的 ACL；KB 不存在时返回 404 |
+| `GET` | `/admin/service-api-keys` | 列出 service/scoped API key；响应不包含 raw key 或 hash |
+| `POST` | `/admin/service-api-keys` | 创建 service/scoped API key；raw key 仅在创建响应返回一次 |
+| `POST` | `/admin/service-api-keys/{key_id}:revoke` | 撤销 service/scoped API key；撤销后下一次请求立即失效 |
 | `GET` | `/admin/audit-events` | 查看最近审计事件；支持 `?limit=100` 限制返回条数 |
 
-KB ACL 角色使用规范名称：`kb_viewer`、`kb_editor`、`kb_admin`、`kb_owner`。第一期中 KB ACL 管理由 super admin 统一执行；普通 KB owner 不具备删除 KB 的平台权限。
+KB ACL 角色使用规范名称：`kb_viewer`、`kb_editor`、`kb_admin`、`kb_owner`。用户 effective KB role 取 direct user ACL 与其 tenant memberships 命中的 tenant-scoped KB ACL 的最高角色；没有 direct/tenant ACL 时跨 tenant 默认拒绝。Service/scoped API key 只按自身 `kb_roles` scope 授权，不会因为 `tenant_id` 隐式继承 tenant ACL。第一期中 KB ACL 与 tenant membership 管理由 super admin 统一执行；普通 KB owner 不具备删除 KB 的平台权限。
+
+KB ACL 请求/响应约束：
+
+- `PUT /admin/kbs/{kb_id}/acl` 请求体必须且只能包含 `user_id` 或 `tenant_id` 之一，并必须包含 `role`。
+- `POST /admin/kbs/{kb_id}/acl:batch-set` 的每个 entry 必须且只能包含 `user_id` 或 `tenant_id` 之一；`action` 默认为 `grant`，取值 `grant` / `revoke`；`grant` 必须提供 `role`，`revoke` 不需要 `role`。
+- ACL 响应对象字段为：`kb_id`、`user_id`、`tenant_id`、`principal_type`（`user` / `tenant`）、`role`、`granted_by`、`created_at`、`updated_at`。
+- `batch-set` 响应中 `granted` 为 ACL 响应对象数组；`revoked` 为本次实际删除成功的 user id 或 tenant id 字符串数组。
+
+`GET /admin/audit-events` 返回最近审计事件，按 `created_at DESC, id DESC` 排序；`limit` 默认 `100`，服务端会 clamp 到 `1..500`。
+
+审计事件响应字段：
+
+```json
+{
+  "id": "audit_...",
+  "event_type": "kb_created",
+  "actor_user_id": "usr_...",
+  "target_type": "kb",
+  "target_id": "kb_...",
+  "metadata": {},
+  "created_at": "2026-06-08T...Z"
+}
+```
+
+企业模式已实现的审计事件类型包括：
+
+- 登录/注册设置：`login_success`、`login_failed`、`registration_setting_updated`
+- super admin bootstrap/sync：`super_admin_bootstrapped`、`super_admin_synced`
+- 用户管理：`user_created`、`user_updated`、`user_password_changed`
+- service API key：`service_api_key_created`、`service_api_key_revoked`
+- KB ACL / tenant：`kb_acl_granted`、`kb_acl_revoked`、`tenant_membership_granted`、`tenant_membership_revoked`、`tenant_kb_acl_granted`、`tenant_kb_acl_revoked`
+- 权限/限流/配额：`permission_denied`、`rate_limited`、`quota_exceeded`
+- KB/config/query：`kb_created`、`kb_deleted`、`kb_hard_deleted`、`kb_config_activated`、`query_executed`、`query_stream_started`、`retrieve_executed`
+- artifact/job/document 类事件：`artifact_downloaded`、`artifact_previewed`、`artifact_download_url_created`、`kb_rebuild_queued`、`job_cancel_requested`、`job_retry_queued`，以及文档 upload/texts/urls/import/scan/sync/patch/enable/disable/replace/delete/batch-delete/parse/batch-parse/build/reindex/batch-build/batch-reindex/rebuild 相关事件。
+
+审计覆盖：企业模式下，KB 创建/删除、config 激活、query/query-stream/retrieve、artifact download/preview/download-url、文档 upload/texts/urls/import/scan/sync/patch/enable/disable/replace/delete/batch-delete/parse/batch-parse/build/reindex/batch-build/batch-reindex/rebuild，以及 job cancel/retry 均写入 audit event。审计 metadata 采用白名单字段：query 仅记录 `query_hash`、mode、过滤摘要；文档与 artifact 事件仅记录 job/batch/document/artifact id、count、flag、hash、size/type 等，不记录 raw query、上传正文、URL、local path、presigned URL、密码/token/API key 明文。
 
 管理请求体示例：
 
@@ -954,29 +1067,112 @@ KB ACL 角色使用规范名称：`kb_viewer`、`kb_editor`、`kb_admin`、`kb_o
 // PATCH /admin/settings/registration
 {"enabled": true}
 
+// PATCH /admin/settings/registration
+{"mode": "invite_only"}
+// 返回：{"enabled": false, "mode": "invite_only"}
+
 // POST /admin/users
 {"username":"bob","password":"bob-pass","can_create_kb":true,"can_use_bypass_query":false,"tenant_id":null}
 
 // PATCH /admin/users/{user_id}
-{"status":"active","can_create_kb":false,"can_use_bypass_query":true,"tenant_id":null,"password":"new-pass"}
+{"status":"active","can_create_kb":false,"can_use_bypass_query":true,"tenant_id":"tenant-a","password":"new-pass"}
+
+// POST /admin/users/{user_id}:reset-password
+{"password":"new-pass"}
 
 // PUT /admin/kbs/{kb_id}/acl
 {"user_id":"usr_...","role":"kb_viewer"}
+
+// PUT /admin/tenants/{tenant_id}/members/{user_id}
+{"role":"tenant_member"}
+
+// PUT /admin/kbs/{kb_id}/acl
+{"tenant_id":"tenant-a","role":"kb_viewer"}
+
+// POST /admin/kbs/{kb_id}/acl:batch-set
+{"entries":[{"user_id":"usr_1","role":"kb_editor"},{"tenant_id":"tenant-a","role":"kb_viewer"},{"user_id":"usr_2","action":"revoke"},{"tenant_id":"tenant-b","action":"revoke"}]}
+// 返回：{"granted":[...],"revoked":["usr_2","tenant-b"]}
+
+// POST /admin/service-api-keys
+{"name":"ci-reader","kb_roles":{"kb_123":"kb_viewer"},"can_use_bypass_query":false,"metadata":{"purpose":"ci"}}
+// 返回：{"api_key":"lrsk_svc_key_...","key":{"id":"svc_key_...","key_preview":"...","status":"active", ...}}
+
+// POST /admin/service-api-keys/{key_id}:revoke
+// 返回的 key.status 为 "revoked"
 ```
+
+Service API key 行为约束：
+
+创建请求：
+
+```json
+{
+  "name": "ci-reader",
+  "kb_roles": {"kb_123": "kb_viewer"},
+  "can_use_bypass_query": false,
+  "tenant_id": null,
+  "metadata": {"purpose": "ci"}
+}
+```
+
+创建响应：
+
+```json
+{
+  "api_key": "lrsk_svc_key_...",
+  "key": {
+    "id": "svc_key_...",
+    "name": "ci-reader",
+    "key_preview": "...",
+    "status": "active",
+    "created_by": "usr_...",
+    "tenant_id": null,
+    "scopes": {
+      "kb_roles": {"kb_123": "kb_viewer"},
+      "can_use_bypass_query": false
+    },
+    "metadata": {"purpose": "ci"},
+    "created_at": "2026-06-08T...Z",
+    "updated_at": "2026-06-08T...Z",
+    "last_used_at": null,
+    "revoked_at": null,
+    "revoked_by": null
+  }
+}
+```
+
+- `GET /admin/service-api-keys` 与 revoke 响应只返回 `key` 对象形态，不返回 `api_key` 明文。
+- `POST /admin/service-api-keys` 会校验 `kb_roles` 中每个 KB 是否存在；任一 KB 不存在返回 `404`。
+- Service key 认证成功时会更新 `last_used_at`。
+- 只存储 `sha256:<hex>` lookup hash 和 `key_preview`，不存储 raw key；raw key 只在创建响应返回一次。
+- 支持 `kb_roles` scope，角色名按 `kb_viewer` / `kb_editor` / `kb_admin` / `kb_owner` 规范化并复用同一角色阶梯。
+- `tenant_id` 仅作为 service key 的归属/审计/配额维度；service key 不会隐式继承 tenant-scoped KB ACL，必须在 `kb_roles` 中显式列出可访问 KB。
+- 当前最小闭环**不允许 service key 创建 KB 或成为 super admin**；`POST /kbs` 仍要求 super admin 或普通用户 `can_create_kb=true`。
+- `can_use_bypass_query=true` 只授予 bypass 查询能力，仍必须同时拥有目标 KB 的 `kb_viewer` 或更高 role。
+- 撤销通过 `status=revoked` 持久化；认证每次从 metadata store 查 hash，因此撤销无需等待 token 过期。
+
+企业请求限流/配额行为约束：
+
+- 默认关闭；只有 `LIGHTRAG_ENTERPRISE_RATE_LIMIT_ENABLED=true` 且对应 request 阈值大于 0 时生效。
+- 计数发生在企业认证成功且 RBAC/bypass 权限校验通过之后；未认证或无权限请求不会消耗额度。
+- principal 维度覆盖普通用户、service API key 和显式启用的 legacy enterprise API key；tenant 维度仅在 principal 带 `tenant_id` 时额外计数。
+- 超过 request rate limit 返回 `429`、`Retry-After`，并写 `rate_limited` 审计事件；超过 quota 返回 `429`、`Retry-After`，并写 `quota_exceeded` 审计事件。
+- 审计 metadata 只记录 `method`、`path`、`auth_method`、`limit`、`window_seconds`、`subject_type`、`retry_after_seconds` 等安全字段；不记录 query/body/raw API key。
 
 ### 10.4 企业模式权限边界
 
 - `mode="bypass"` 查询需要 KB read ACL 加 `can_use_bypass_query=true` 或 super admin；按最终解析后的查询模式判断，包括 active query config 默认值。
 - legacy/global `/documents`、`/query`、`/graph`、Ollama `/api/*` 在 `LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES=true` 时默认拒绝；关闭该开关后仍需 super admin。
 - super admin bootstrap 来自 `.env`，启动后同步为 active super admin；企业模式要求非默认 `TOKEN_SECRET`。
+- Tenant membership 与 tenant-scoped KB ACL 已接入用户 principal hydration；用户请求按 direct user ACL 与 tenant ACL 最高角色授权，service key 请求仍只按显式 `kb_roles` scope 授权。
 
 KB 路由角色矩阵：
 
 | 范围 | 最低角色 / 能力 |
 |---|---|
 | `POST /kbs` | super admin 或 `can_create_kb=true` |
-| `GET /kbs` | super admin 看全部；普通用户仅看已授权 KB |
-| `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高 |
+| `GET /kbs` | super admin 看全部；普通用户仅看 direct user ACL 或 tenant ACL 授权 KB；service key 仅看 `kb_roles` scope |
+| `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高；artifact `:download` / `:download-url` 可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 提升最低角色 |
 | `/kbs/{kb_id}/query`、`/query/stream`、`/query/data`、`/retrieve` | `kb_viewer` 或更高；最终 `mode="bypass"` 额外需要 `can_use_bypass_query=true` |
 | 文档上传/解析/构建/删除/替换/sync、job wait/cancel/retry 等写操作 | `kb_editor` 或更高 |
 | KB 配置创建/激活/diff、`PATCH /kbs/{kb_id}` | `kb_admin` 或更高 |

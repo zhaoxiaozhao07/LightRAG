@@ -1,6 +1,6 @@
 # LightRAG KB 配置项速查表
 
-> 文档版本：2026-06-05
+> 文档版本：2026-06-08
 > 适用范围：每个知识库（KB）可单独设置的运行时配置项。
 > 权威来源：`lightrag/api/config_version_service.py`（校验/归一/hash/运行时 overlay）。
 > 配套文档：`docs/API接口文档.md` §7（Config Versions）、`docs/生产级后端改造设计方案.md` §12。
@@ -13,7 +13,7 @@
 
 ```http
 POST   /kbs/{kb_id}/configs                      # 创建配置版本（返回 version_id）
-POST   /kbs/{kb_id}/configs/{version_id}:activate # 激活（写入 active_config_version_id 并丢弃缓存实例）
+POST   /kbs/{kb_id}/configs/{version_id}:activate # 激活（写入 active_config_version_id 并丢弃缓存实例；可选 auto_enqueue 创建后续 job）
 POST   /kbs/{kb_id}/configs/{version_id}:diff     # 预测：与当前激活版本比，需不需要 reparse/reindex/vector rebuild
 GET    /kbs/{kb_id}/configs                        # 列表
 GET    /kbs/{kb_id}/configs/{version_id}           # 详情
@@ -149,7 +149,7 @@ Content-Type: application/json
   "created_by": "alice"
 }
 ```
-随后：`POST /kbs/{kb_id}/configs/{version_id}:activate` 生效。
+随后：`POST /kbs/{kb_id}/configs/{version_id}:activate` 生效；若需要由服务端按 diff 创建后续任务，可传 JSON 请求体 `{"auto_enqueue": true}`。
 
 ---
 
@@ -177,8 +177,8 @@ Content-Type: application/json
 
 ## 6. 注意事项
 
-1. **`bypass` 模式可用但无权限门控**：`bypass`（直通 LLM、绕过检索）功能正常，但当前任何已认证调用方都能用（RBAC 未做）。生产环境建议自行限制谁能用它（避免绕过知识库直连 LLM 消耗 token）。
+1. **`bypass` 模式有企业权限门控**：非企业模式下按普通认证策略可用；企业模式下最终解析后的 `mode="bypass"`（包括 KB `query_config` 默认值）必须同时满足目标 KB `kb_viewer` 或更高读取权限，并具备 `can_use_bypass_query=true`，或由 super admin 调用。未授权请求由后端返回 403；前端隐藏入口只属于 UX。
 2. **`stream` / `ids` 作为 KB 默认意义有限**：查询路由会按端点（流式与否）和文档范围（`filters.doc_ids`/enabled/archived）在运行时强制覆盖这两个值，所以把它们写进 `query_config` 默认值基本不起作用。
 3. **`cosine_threshold` / `related_chunk_number` 是实例级**：它们不是 per-request `QueryParam` 字段，只能作为 KB 默认，无法逐请求覆盖。
-4. **激活不自动重建数据**：`:activate` 只切换配置并丢弃缓存实例；是否需要 reparse/reindex/vector rebuild 由 `:diff` 提示，需你显式触发 `:reindex` / `:rebuild` 等。
+4. **激活默认不自动重建数据，`auto_enqueue=true` 可创建后续任务**：无请求体或 `{"auto_enqueue": false}` 时，`:activate` 只切换配置并丢弃缓存实例；是否需要 reparse/reindex/vector rebuild 可先用 `:diff` 判断。传 `{"auto_enqueue": true}` 时，服务端按 diff 至多创建一个 queued follow-up job：`requires_reparse=true` 创建聚合 `parse`（`force_reparse=true` + `auto_index=true`），否则 `requires_reindex=true` 或 `requires_vector_rebuild=true` 创建聚合 `reindex`（`force_rechunk/force_extract/force_embedding=true`）。query-only 变更返回 `follow_up_noop_reason="no_rebuild_required"`；无 eligible 文档返回 `"no_eligible_documents"`；未配置 `JobService` 返回 `"job_service_unavailable"`。激活接口只负责入队，实际执行仍依赖 durable job worker 或对应 job consumer 继续消费队列。
 5. **未知键现在会报错**：历史上未知键会被静默忽略（"存了不生效"）；自 2026-06-05 起改为创建时 `400`，避免误以为生效。

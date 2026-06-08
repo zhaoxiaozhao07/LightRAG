@@ -59,6 +59,12 @@ class BuilderProbe:
         self.finalized.append(rag.workspace)
 
 
+class FakeJobWorker:
+    @property
+    def resumable_job_types(self) -> set[str]:
+        return {"clear_kb"}
+
+
 def _build_client(tmp_path: Path):
     service = KnowledgeBaseService(tmp_path / "metadata" / "knowledge_bases.json")
     probe = BuilderProbe()
@@ -92,6 +98,33 @@ def _build_hard_delete_client(tmp_path: Path):
         )
     )
     return TestClient(app), metadata_store, registry, probe
+
+
+def _build_durable_hard_delete_client(tmp_path: Path):
+    service = KnowledgeBaseService(tmp_path / "metadata" / "knowledge_bases.json")
+    metadata_store = SQLiteMetadataStore(tmp_path / "metadata" / "metadata.sqlite3")
+    job_service = JobService(service, metadata_store)
+    probe = BuilderProbe()
+    registry = LightRAGInstanceRegistry(service, probe.build, probe.finalize)
+    deletion_service = KBDeletionService(
+        service,
+        metadata_store,
+        registry,
+        input_root=tmp_path / "inputs",
+        working_dir=tmp_path / "working",
+    )
+    app = FastAPI()
+    app.state.job_worker = FakeJobWorker()
+    app.include_router(
+        create_kb_routes(
+            service,
+            registry,
+            api_key=_API_KEY,
+            job_service=job_service,
+            deletion_service=deletion_service,
+        )
+    )
+    return TestClient(app), metadata_store, job_service, registry, probe
 
 
 def _create_kb_after_start_event(
@@ -461,6 +494,55 @@ def test_hard_delete_route_purges_control_plane_and_files(tmp_path):
     assert result["cleared_input_dir"] is True
     assert result["finalized_storages"] is True
     assert result["dropped_storages"] == 12
+
+
+def test_hard_delete_route_enqueues_clear_kb_when_worker_enabled(tmp_path):
+    client, metadata_store, job_service, registry, probe = _build_durable_hard_delete_client(
+        tmp_path
+    )
+    create_response = client.post(
+        "/kbs", json={"id": "kb_hard_queued", "name": "Queued Hard"}, headers=_HEADERS
+    )
+    assert create_response.status_code == 200
+    workspace = create_response.json()["workspace"]
+    input_workspace = tmp_path / "inputs" / workspace
+    input_workspace.mkdir(parents=True)
+    (input_workspace / "source.txt").write_text("raw", encoding="utf-8")
+    working_workspace = tmp_path / "working" / workspace
+    working_workspace.mkdir(parents=True)
+    (working_workspace / "graph.json").write_text("{}", encoding="utf-8")
+
+    asyncio.run(registry.get("kb_hard_queued"))
+    assert registry.is_loaded("kb_hard_queued")
+
+    delete_response = client.delete(
+        "/kbs/kb_hard_queued?hard=true", headers=_HEADERS
+    )
+
+    assert delete_response.status_code == 200, delete_response.text
+    payload = delete_response.json()
+    assert payload["status"] == "deleted"
+    assert payload["deleted_at"] is not None
+    assert payload["hard_delete_queued"] is True
+    assert payload["hard_delete_job_type"] == "clear_kb"
+    assert payload["hard_delete_job_status"] == "queued"
+    assert payload["hard_delete_job_id"].startswith("job_clear_kb")
+    assert not registry.is_loaded("kb_hard_queued")
+    assert probe.finalized == [workspace]
+    assert input_workspace.exists()
+    assert working_workspace.exists()
+
+    jobs, total_jobs = asyncio.run(metadata_store.list_jobs("kb_hard_queued"))
+    assert total_jobs == 1
+    assert jobs[0].id == payload["hard_delete_job_id"]
+    assert jobs[0].job_type == "clear_kb"
+    assert jobs[0].status == "queued"
+    fetched = asyncio.run(
+        job_service.get_job(
+            "kb_hard_queued", payload["hard_delete_job_id"], include_deleted=True
+        )
+    )
+    assert fetched.id == jobs[0].id
 
 
 def test_missing_kb_returns_404(tmp_path):

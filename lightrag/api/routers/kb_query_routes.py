@@ -16,6 +16,7 @@ routes with a per-KB edge:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, Dict, List, Literal, Optional, Protocol, cast
 
@@ -29,6 +30,7 @@ from lightrag.api.config_version_service import (
 )
 from lightrag.api.document_lifecycle_service import DocumentLifecycleService
 from lightrag.api.enterprise_auth import (
+    append_enterprise_audit_event,
     enterprise_auth_enabled,
     get_enterprise_authorization_service,
     get_request_principal,
@@ -67,6 +69,37 @@ def _enforce_resolved_bypass_permission(request: Request, param: QueryParam) -> 
     get_enterprise_authorization_service(request).require_bypass_query(
         get_request_principal(request)
     )
+
+
+def _query_audit_metadata(
+    body: "KBQueryRequest",
+    param: QueryParam,
+    active_metadata: dict[str, Any],
+    *,
+    route: str,
+    stream: bool,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "route": route,
+        "mode": param.mode,
+        "stream": stream,
+        "query_hash": hashlib.sha256(body.query.encode("utf-8")).hexdigest(),
+        "top_k": getattr(param, "top_k", None),
+        "chunk_top_k": getattr(param, "chunk_top_k", None),
+        "only_need_context": getattr(param, "only_need_context", None),
+        "only_need_prompt": getattr(param, "only_need_prompt", None),
+        "has_doc_filters": bool(body.filters and body.filters.doc_ids),
+        "doc_filter_count": len(body.filters.doc_ids)
+        if body.filters and body.filters.doc_ids
+        else 0,
+        "metadata_filter_keys": sorted((body.filters.metadata or {}).keys())
+        if body.filters and body.filters.metadata
+        else [],
+    }
+    for key in ("config_version_id", "parser_hash", "index_hash", "query_hash"):
+        if key in active_metadata:
+            metadata[f"active_{key}"] = active_metadata[key]
+    return metadata
 
 
 class KBQueryFilters(BaseModel):
@@ -495,6 +528,19 @@ def create_kb_query_routes(
                 references = _enrich_with_chunk_content(
                     references, data.get("chunks", [])
                 )
+            await append_enterprise_audit_event(
+                http_request,
+                "query_executed",
+                target_type="kb",
+                target_id=kb_id,
+                metadata=_query_audit_metadata(
+                    request,
+                    param,
+                    active_metadata,
+                    route="query",
+                    stream=False,
+                ),
+            )
             return KBQueryResponse(
                 kb_id=kb_id,
                 mode=cast(QueryMode, param.mode),
@@ -545,6 +591,19 @@ def create_kb_query_routes(
                 request.filters,
             )
             result = await rag.aquery_llm(request.query, param=param)
+            await append_enterprise_audit_event(
+                http_request,
+                "query_stream_started",
+                target_type="kb",
+                target_id=kb_id,
+                metadata=_query_audit_metadata(
+                    request,
+                    param,
+                    active_metadata,
+                    route="query_stream",
+                    stream=True,
+                ),
+            )
 
             async def stream_generator():
                 references = result.get("data", {}).get("references", [])
@@ -631,6 +690,21 @@ def create_kb_query_routes(
                 request.filters,
             )
             result = await rag.aquery_data(request.query, param=param)
+            await append_enterprise_audit_event(
+                http_request,
+                "retrieve_executed",
+                target_type="kb",
+                target_id=kb_id,
+                metadata=_query_audit_metadata(
+                    request,
+                    param,
+                    active_metadata,
+                    route="retrieve"
+                    if http_request.url.path.endswith("/retrieve")
+                    else "query_data",
+                    stream=False,
+                ),
+            )
             return KBQueryDataResponse(
                 kb_id=kb_id,
                 status=result.get("status", "success"),

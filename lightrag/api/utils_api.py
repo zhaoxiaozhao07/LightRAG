@@ -22,7 +22,9 @@ from starlette.status import HTTP_403_FORBIDDEN
 from .auth import auth_handler
 from .config import ollama_server_infos, global_args, get_env_value
 from lightrag.api.enterprise_auth import (
+    ServiceAPIKeyService,
     enforce_enterprise_request_access,
+    enforce_enterprise_request_limits,
     enterprise_auth_enabled,
     enterprise_legacy_api_key_superadmin_enabled,
     get_enterprise_user_service,
@@ -120,20 +122,15 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
         tokenUrl="login", auto_error=False, description="OAuth2 Password Authentication"
     )
 
-    # If API key is configured, create an API key header security
-    api_key_header = None
-    if api_key_configured:
-        api_key_header = APIKeyHeader(
-            name="X-API-Key", auto_error=False, description="API Key Authentication"
-        )
+    api_key_header = APIKeyHeader(
+        name="X-API-Key", auto_error=False, description="API Key Authentication"
+    )
 
     async def combined_dependency(
         request: Request,
         response: Response,  # Added: needed to return new token via response header
         token: Optional[str] = Security(oauth2_scheme),
-        api_key_header_value: Optional[str] = None
-        if api_key_header is None
-        else Security(api_key_header),
+        api_key_header_value: Optional[str] = Security(api_key_header),
     ):
         # 1. Check if path is in whitelist
         path = request.url.path
@@ -154,6 +151,7 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                     principal = await user_service.principal_from_token_info(token_info)
                     request.state.principal = principal
                     await enforce_enterprise_request_access(request, principal)
+                    await enforce_enterprise_request_limits(request, principal)
                     return principal
 
                 # ========== Token Auto-Renewal Logic ==========
@@ -251,6 +249,16 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                 # For other exceptions, continue processing
 
         # 3. Validate API key if provided and API-Key authentication is configured
+        if enterprise_auth_enabled() and api_key_header_value:
+            service = getattr(request.app.state, "enterprise_api_key_service", None)
+            if isinstance(service, ServiceAPIKeyService):
+                principal = await service.principal_from_api_key(api_key_header_value)
+                if principal is not None:
+                    request.state.principal = principal
+                    await enforce_enterprise_request_access(request, principal)
+                    await enforce_enterprise_request_limits(request, principal)
+                    return principal
+
         if (
             api_key_configured
             and api_key_header_value
@@ -265,6 +273,7 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                 principal = principal_from_api_key()
                 request.state.principal = principal
                 await enforce_enterprise_request_access(request, principal)
+                await enforce_enterprise_request_limits(request, principal)
                 return principal
             return  # API key validation successful
 

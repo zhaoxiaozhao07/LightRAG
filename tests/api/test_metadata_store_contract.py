@@ -35,7 +35,10 @@ from lightrag.api.metadata_store import (
     AuditEventRecord,
     ConfigVersionRecord,
     DocumentRecord,
+    EnterpriseAPIKeyRecord,
     EnterpriseUserRecord,
+    EnterpriseTenantKBACLRecord,
+    EnterpriseTenantMembershipRecord,
     IdempotencyKeyConflictError,
     InvalidJobTransitionError,
     JobRecord,
@@ -188,6 +191,26 @@ def _enterprise_user(username: str) -> EnterpriseUserRecord:
     )
 
 
+def _enterprise_api_key(kb_id: str) -> EnterpriseAPIKeyRecord:
+    now = utc_now_iso()
+    return EnterpriseAPIKeyRecord(
+        id=f"svc_key_{uuid.uuid4().hex[:10]}",
+        name="contract-key",
+        key_hash=f"sha256:{uuid.uuid4().hex}",
+        key_preview="abc123",
+        status="active",
+        created_by=None,
+        tenant_id=None,
+        scopes={"kb_roles": {kb_id: "kb_viewer"}, "can_use_bypass_query": False},
+        metadata={"purpose": "contract"},
+        created_at=now,
+        updated_at=now,
+        last_used_at=None,
+        revoked_at=None,
+        revoked_by=None,
+    )
+
+
 async def test_enterprise_metadata_contract(store):
     kb_id = _unique_kb(store)
     user = await store.upsert_enterprise_user(_enterprise_user("alice"))
@@ -265,6 +288,133 @@ async def test_enterprise_metadata_contract(store):
 
     assert await store.delete_kb_acl(kb_id, user.id) is True
     assert await store.get_kb_acl_role(kb_id, user.id) is None
+
+
+async def test_enterprise_tenant_membership_and_kb_acl_contract(store):
+    kb_id = _unique_kb(store)
+    alice = await store.upsert_enterprise_user(_enterprise_user("tenant-alice"))
+    bob = await store.upsert_enterprise_user(_enterprise_user("tenant-bob"))
+    now = utc_now_iso()
+
+    alice_membership = await store.upsert_tenant_membership(
+        EnterpriseTenantMembershipRecord(
+            tenant_id="tenant-a",
+            user_id=alice.id,
+            role="tenant_admin",
+            granted_by=bob.id,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    bob_membership = await store.upsert_tenant_membership(
+        EnterpriseTenantMembershipRecord(
+            tenant_id="tenant-a",
+            user_id=bob.id,
+            role="tenant_member",
+            granted_by=alice.id,
+            created_at=utc_now_iso(),
+            updated_at=utc_now_iso(),
+        )
+    )
+    assert alice_membership.role == "tenant_admin"
+    assert bob_membership.role == "tenant_member"
+    assert [item.user_id for item in await store.list_tenant_memberships("tenant-a")] == [
+        alice.id,
+        bob.id,
+    ]
+    assert [item.tenant_id for item in await store.list_user_tenant_memberships(alice.id)] == [
+        "tenant-a"
+    ]
+    fetched_membership = await store.get_tenant_membership("tenant-a", alice.id)
+    assert fetched_membership is not None
+    assert fetched_membership.role == "tenant_admin"
+
+    updated_membership = await store.upsert_tenant_membership(
+        EnterpriseTenantMembershipRecord(
+            tenant_id="tenant-a",
+            user_id=alice.id,
+            role="tenant_owner",
+            granted_by=bob.id,
+            created_at=alice_membership.created_at,
+            updated_at=utc_now_iso(),
+        )
+    )
+    assert updated_membership.created_at == alice_membership.created_at
+    assert updated_membership.role == "tenant_owner"
+
+    tenant_acl = await store.upsert_tenant_kb_acl(
+        EnterpriseTenantKBACLRecord(
+            tenant_id="tenant-a",
+            kb_id=kb_id,
+            role="kb_viewer",
+            granted_by=alice.id,
+            created_at=utc_now_iso(),
+            updated_at=utc_now_iso(),
+        )
+    )
+    assert tenant_acl.role == "kb_viewer"
+    assert await store.get_tenant_kb_acl_role("tenant-a", kb_id) == "kb_viewer"
+    assert await store.list_kb_ids_for_tenants(["tenant-a", "tenant-missing"]) == [kb_id]
+    assert [item.tenant_id for item in await store.list_kb_tenant_acl(kb_id)] == [
+        "tenant-a"
+    ]
+
+    updated_acl = await store.upsert_tenant_kb_acl(
+        EnterpriseTenantKBACLRecord(
+            tenant_id="tenant-a",
+            kb_id=kb_id,
+            role="kb_editor",
+            granted_by=bob.id,
+            created_at=tenant_acl.created_at,
+            updated_at=utc_now_iso(),
+        )
+    )
+    assert updated_acl.created_at == tenant_acl.created_at
+    assert await store.get_tenant_kb_acl_role("tenant-a", kb_id) == "kb_editor"
+
+    assert await store.delete_tenant_kb_acl("tenant-a", kb_id) is True
+    assert await store.get_tenant_kb_acl_role("tenant-a", kb_id) is None
+    assert await store.delete_tenant_membership("tenant-a", alice.id) is True
+    assert await store.get_tenant_membership("tenant-a", alice.id) is None
+
+
+async def test_enterprise_api_key_metadata_contract(store):
+    kb_id = _unique_kb(store)
+    record = await store.create_enterprise_api_key(_enterprise_api_key(kb_id))
+
+    by_hash = await store.get_enterprise_api_key_by_hash(record.key_hash)
+    by_id = await store.get_enterprise_api_key_by_id(record.id)
+    assert by_hash is not None
+    assert by_hash.id == record.id
+    assert by_id is not None
+    assert by_id.key_preview == "abc123"
+    assert by_id.scopes["kb_roles"] == {kb_id: "kb_viewer"}
+    assert "api_key" not in by_id.to_dict()
+
+    listed = await store.list_enterprise_api_keys()
+    assert any(item.id == record.id for item in listed)
+
+    used_at = utc_now_iso()
+    used = await store.mark_enterprise_api_key_used(record.id, last_used_at=used_at)
+    assert used is not None
+    assert used.last_used_at == used_at
+
+    revoked_at = utc_now_iso()
+    revoked = await store.revoke_enterprise_api_key(
+        record.id,
+        revoked_by="admin",
+        revoked_at=revoked_at,
+    )
+    assert revoked is not None
+    assert revoked.status == "revoked"
+    assert revoked.revoked_by == "admin"
+    assert revoked.revoked_at == revoked_at
+
+    revoked_by_hash = await store.get_enterprise_api_key_by_hash(record.key_hash)
+    assert revoked_by_hash is not None
+    assert revoked_by_hash.status == "revoked"
+    assert await store.revoke_enterprise_api_key("missing") is None
+    assert await store.mark_enterprise_api_key_used("missing") is None
 
 
 async def test_create_documents_and_job_then_read_back(store):
