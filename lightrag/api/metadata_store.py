@@ -346,6 +346,10 @@ class EnterpriseUserRecord:
     metadata: dict[str, Any]
     created_at: str
     updated_at: str
+    # Capability to delete documents uploaded by other users. Declared last with
+    # a default so old PostgreSQL JSONB rows (predating the column) deserialize
+    # and existing keyword constructions keep working.
+    can_delete_documents: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "EnterpriseUserRecord":
@@ -362,6 +366,7 @@ class EnterpriseUserRecord:
             metadata=_loads_json_object(row["metadata_json"]),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+            can_delete_documents=bool(row["can_delete_documents"]),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -2076,9 +2081,9 @@ class SQLiteMetadataStore:
                 """
                 INSERT INTO enterprise_users (
                     id, username, password_hash, system_role, status, tenant_id,
-                    can_create_kb, can_use_bypass_query, token_version,
-                    metadata_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    can_create_kb, can_use_bypass_query, can_delete_documents,
+                    token_version, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     username = excluded.username,
                     password_hash = excluded.password_hash,
@@ -2087,6 +2092,7 @@ class SQLiteMetadataStore:
                     tenant_id = excluded.tenant_id,
                     can_create_kb = excluded.can_create_kb,
                     can_use_bypass_query = excluded.can_use_bypass_query,
+                    can_delete_documents = excluded.can_delete_documents,
                     token_version = excluded.token_version,
                     metadata_json = excluded.metadata_json,
                     updated_at = excluded.updated_at
@@ -2100,6 +2106,7 @@ class SQLiteMetadataStore:
                     user.tenant_id,
                     int(user.can_create_kb),
                     int(user.can_use_bypass_query),
+                    int(user.can_delete_documents),
                     user.token_version,
                     _dumps_json(user.metadata),
                     user.created_at,
@@ -3146,6 +3153,7 @@ class SQLiteMetadataStore:
                 tenant_id TEXT,
                 can_create_kb INTEGER NOT NULL DEFAULT 0,
                 can_use_bypass_query INTEGER NOT NULL DEFAULT 0,
+                can_delete_documents INTEGER NOT NULL DEFAULT 0,
                 token_version INTEGER NOT NULL DEFAULT 1,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
@@ -3295,6 +3303,9 @@ class SQLiteMetadataStore:
         """
         additions: dict[str, dict[str, str]] = {
             "enterprise_api_keys": {"expires_at": "TEXT"},
+            "enterprise_users": {
+                "can_delete_documents": "INTEGER NOT NULL DEFAULT 0"
+            },
         }
         for table, columns in additions.items():
             existing = {

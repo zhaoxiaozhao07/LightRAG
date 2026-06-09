@@ -2153,3 +2153,421 @@ def test_concurrent_job_quota_blocks_excess_jobs(monkeypatch, tmp_path):
     # A different principal is unaffected by alice's in-flight jobs.
     bob_job = asyncio.run(create_as(_principal("usr_bob")))
     assert bob_job.status == "queued"
+
+
+# ---------------------------------------------------------------------------
+# Ownership-aware document deletion + can_delete_documents capability
+# ---------------------------------------------------------------------------
+
+
+def _dd_create_kb(client, headers, kb_id, name="KB"):
+    resp = client.post("/kbs", json={"id": kb_id, "name": name}, headers=headers)
+    assert resp.status_code == 200, resp.text
+
+
+def _dd_grant(client, admin_headers, kb_id, user_id, role):
+    resp = client.put(
+        f"/admin/kbs/{kb_id}/acl",
+        json={"user_id": user_id, "role": role},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def _dd_upload(client, headers, kb_id, source_name="note.md"):
+    resp = client.post(
+        f"/kbs/{kb_id}/documents:texts",
+        json={"documents": [{"text": "hello world", "source_name": source_name}]},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["documents"][0]
+
+
+def _dd_audit(client, admin_headers):
+    resp = client.get("/admin/audit-events", headers=admin_headers)
+    assert resp.status_code == 200
+    return resp.json()
+
+
+def test_enterprise_kb_editor_can_self_delete_own_document(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, _alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    _dd_create_kb(client, admin_headers, "kb_self")
+    _dd_grant(client, admin_headers, "kb_self", bob.id, "kb_editor")
+    doc = _dd_upload(client, bob_headers, "kb_self")
+    # created_by is principal-derived and surfaced on the document record.
+    assert doc["metadata"]["created_by"] == bob.id
+
+    deleted = client.delete(
+        f"/kbs/kb_self/documents/{doc['id']}", headers=bob_headers
+    )
+    assert deleted.status_code == 200, deleted.text
+
+    events = _dd_audit(client, admin_headers)
+    delete_events = [e for e in events if e["event_type"] == "document_delete_queued"]
+    assert delete_events, "expected a document_delete_queued audit event"
+    meta = delete_events[0]["metadata"]
+    assert meta["delete_scope"] == "self"
+    assert meta["document_owner"] == bob.id
+    assert delete_events[0]["actor_user_id"] == bob.id
+
+
+def test_enterprise_kb_editor_cannot_delete_others_document(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, _alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    carol = asyncio.run(
+        user_service.create_user(username="carol", password="carol-pass")
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+    carol_headers = {"Authorization": f"Bearer {_token(user_service, carol)}"}
+
+    _dd_create_kb(client, admin_headers, "kb_shared")
+    _dd_grant(client, admin_headers, "kb_shared", bob.id, "kb_editor")
+    _dd_grant(client, admin_headers, "kb_shared", carol.id, "kb_editor")
+    doc = _dd_upload(client, carol_headers, "kb_shared")  # carol owns it
+
+    denied = client.delete(
+        f"/kbs/kb_shared/documents/{doc['id']}", headers=bob_headers
+    )
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == "Document delete denied"
+
+    events = _dd_audit(client, admin_headers)
+    assert any(
+        e["event_type"] == "permission_denied"
+        and e["actor_user_id"] == bob.id
+        and e.get("metadata", {}).get("minimum_role") == "kb_admin"
+        for e in events
+    )
+    # The denied document must not have produced a delete job / queued event.
+    assert not any(
+        e["event_type"] == "document_delete_queued"
+        and doc["id"] in (e.get("metadata", {}).get("document_ids") or [])
+        for e in events
+    )
+
+
+def test_enterprise_can_delete_documents_capability_allows_deleting_others(
+    monkeypatch, tmp_path
+):
+    client, user_service, _authz, admin, _alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    carol = asyncio.run(
+        user_service.create_user(username="carol", password="carol-pass")
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    carol_headers = {"Authorization": f"Bearer {_token(user_service, carol)}"}
+
+    _dd_create_kb(client, admin_headers, "kb_cap")
+    _dd_grant(client, admin_headers, "kb_cap", bob.id, "kb_editor")
+    _dd_grant(client, admin_headers, "kb_cap", carol.id, "kb_editor")
+    doc = _dd_upload(client, carol_headers, "kb_cap")  # carol owns it
+
+    # Without the capability bob (editor) cannot delete carol's document.
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+    pre = client.delete(f"/kbs/kb_cap/documents/{doc['id']}", headers=bob_headers)
+    assert pre.status_code == 403
+
+    granted = client.patch(
+        f"/admin/users/{bob.id}",
+        json={"can_delete_documents": True},
+        headers=admin_headers,
+    )
+    assert granted.status_code == 200, granted.text
+    assert granted.json()["can_delete_documents"] is True
+
+    # The capability toggle bumps token_version, so re-mint bob's token.
+    bob = asyncio.run(user_service.get_user_or_404(bob.id))
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    me = client.get("/auth/me", headers=bob_headers)
+    assert me.status_code == 200, me.text
+    assert me.json()["principal"]["can_delete_documents"] is True
+
+    deleted = client.delete(f"/kbs/kb_cap/documents/{doc['id']}", headers=bob_headers)
+    assert deleted.status_code == 200, deleted.text
+    events = _dd_audit(client, admin_headers)
+    delete_events = [e for e in events if e["event_type"] == "document_delete_queued"]
+    assert delete_events[0]["metadata"]["delete_scope"] == "privileged"
+
+
+def test_enterprise_kb_admin_and_super_admin_delete_any_document(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, _alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    carol = asyncio.run(
+        user_service.create_user(username="carol", password="carol-pass")
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+    carol_headers = {"Authorization": f"Bearer {_token(user_service, carol)}"}
+
+    _dd_create_kb(client, admin_headers, "kb_admindel")
+    _dd_grant(client, admin_headers, "kb_admindel", bob.id, "kb_admin")
+    _dd_grant(client, admin_headers, "kb_admindel", carol.id, "kb_editor")
+    doc1 = _dd_upload(client, carol_headers, "kb_admindel", source_name="one.md")
+    doc2 = _dd_upload(client, carol_headers, "kb_admindel", source_name="two.md")
+
+    admin_del = client.delete(
+        f"/kbs/kb_admindel/documents/{doc1['id']}", headers=bob_headers
+    )
+    assert admin_del.status_code == 200, admin_del.text
+
+    super_del = client.delete(
+        f"/kbs/kb_admindel/documents/{doc2['id']}", headers=admin_headers
+    )
+    assert super_del.status_code == 200, super_del.text
+
+    events = _dd_audit(client, admin_headers)
+    scopes = [
+        e["metadata"]["delete_scope"]
+        for e in events
+        if e["event_type"] == "document_delete_queued"
+    ]
+    assert scopes == ["privileged", "privileged"]
+
+
+def test_enterprise_batch_delete_mixes_self_and_permission_denied(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, _alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    carol = asyncio.run(
+        user_service.create_user(username="carol", password="carol-pass")
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+    carol_headers = {"Authorization": f"Bearer {_token(user_service, carol)}"}
+
+    _dd_create_kb(client, admin_headers, "kb_batch")
+    _dd_grant(client, admin_headers, "kb_batch", bob.id, "kb_editor")
+    _dd_grant(client, admin_headers, "kb_batch", carol.id, "kb_editor")
+    doc_own = _dd_upload(client, bob_headers, "kb_batch", source_name="own.md")
+    doc_other = _dd_upload(client, carol_headers, "kb_batch", source_name="other.md")
+
+    resp = client.post(
+        "/kbs/kb_batch/documents:batch-delete",
+        json={"document_ids": [doc_own["id"], doc_other["id"]]},
+        headers=bob_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    job_id = resp.json()["id"]
+
+    job = client.get(f"/kbs/kb_batch/jobs/{job_id}", headers=bob_headers).json()
+    items = {item["document_id"]: item for item in job["result"]["items"]}
+    assert items[doc_own["id"]]["status"] == "succeeded"
+    assert items[doc_other["id"]]["error_code"] == "permission_denied"
+
+    # The unauthorized document was never claimed and remains intact.
+    other = client.get(
+        f"/kbs/kb_batch/documents/{doc_other['id']}", headers=bob_headers
+    )
+    assert other.status_code == 200
+    assert other.json()["status"] == "uploaded"
+
+    events = _dd_audit(client, admin_headers)
+    batch_events = [
+        e for e in events if e["event_type"] == "documents_batch_delete_queued"
+    ]
+    assert batch_events[0]["metadata"]["permission_denied_count"] == 1
+    assert batch_events[0]["metadata"]["delete_scopes"][doc_own["id"]] == "self"
+
+
+def test_enterprise_document_created_by_is_unspoofable(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, _alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    _dd_create_kb(client, admin_headers, "kb_spoof")
+    _dd_grant(client, admin_headers, "kb_spoof", bob.id, "kb_editor")
+
+    # created_by is a reserved metadata key — rejected on :texts upload...
+    spoof_texts = client.post(
+        "/kbs/kb_spoof/documents:texts",
+        json={
+            "documents": [
+                {"text": "x", "source_name": "n.md", "metadata": {"created_by": "evil"}}
+            ]
+        },
+        headers=bob_headers,
+    )
+    assert spoof_texts.status_code == 422
+
+    doc = _dd_upload(client, bob_headers, "kb_spoof")
+    assert doc["metadata"]["created_by"] == bob.id
+
+    # ...and rejected on PATCH metadata.
+    spoof_patch = client.patch(
+        f"/kbs/kb_spoof/documents/{doc['id']}",
+        json={"metadata": {"created_by": "evil"}},
+        headers=bob_headers,
+    )
+    assert spoof_patch.status_code == 422
+
+
+def test_enterprise_service_key_delete_is_owner_scoped(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, _alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    _dd_create_kb(client, admin_headers, "kb_svc")
+    _dd_grant(client, admin_headers, "kb_svc", bob.id, "kb_editor")
+
+    created = client.post(
+        "/admin/service-api-keys",
+        json={"name": "svc-editor", "kb_roles": {"kb_svc": "kb_editor"}},
+        headers=admin_headers,
+    )
+    assert created.status_code == 200, created.text
+    svc_headers = {"X-API-Key": created.json()["api_key"]}
+
+    # The service key may delete a document it uploaded itself (scope "self").
+    own = _dd_upload(client, svc_headers, "kb_svc", source_name="svc-own.md")
+    own_del = client.delete(
+        f"/kbs/kb_svc/documents/{own['id']}", headers=svc_headers
+    )
+    assert own_del.status_code == 200, own_del.text
+
+    # ...but not a document uploaded by another principal (no capability).
+    other = _dd_upload(client, bob_headers, "kb_svc", source_name="bob-own.md")
+    denied = client.delete(
+        f"/kbs/kb_svc/documents/{other['id']}", headers=svc_headers
+    )
+    assert denied.status_code == 403
+
+
+def test_authorize_document_delete_decision_matrix(tmp_path):
+    from lightrag.api.enterprise_auth import (
+        AuditService,
+        AuthorizationService,
+        Principal,
+        SERVICE_API_KEY_AUTH_METHOD,
+        SYSTEM_ROLE_SUPER_ADMIN,
+        SYSTEM_ROLE_USER,
+        USER_STATUS_ACTIVE,
+    )
+    from lightrag.api.kb_service import utc_now_iso
+    from lightrag.api.metadata_store import EnterpriseUserRecord, KBACLRecord
+
+    store = SQLiteMetadataStore(tmp_path / "metadata" / "matrix.sqlite3")
+    authz = AuthorizationService(store, AuditService(store))
+
+    def principal(user_id, *, role=SYSTEM_ROLE_USER, can_delete=False, auth="jwt"):
+        return Principal(
+            user_id=user_id,
+            username=user_id,
+            system_role=role,
+            status=USER_STATUS_ACTIVE,
+            tenant_id=None,
+            tenant_roles={},
+            can_create_kb=False,
+            can_use_bypass_query=False,
+            token_version=1,
+            auth_method=auth,
+            metadata={},
+            can_delete_documents=can_delete,
+        )
+
+    async def run():
+        await store.initialize()
+        now = utc_now_iso()
+        # enterprise_kb_acl.user_id has a FK to enterprise_users(id).
+        for uid in ("usr_editor", "usr_admin_role"):
+            await store.upsert_enterprise_user(
+                EnterpriseUserRecord(
+                    id=uid,
+                    username=uid,
+                    password_hash="x",
+                    system_role=SYSTEM_ROLE_USER,
+                    status=USER_STATUS_ACTIVE,
+                    tenant_id=None,
+                    can_create_kb=False,
+                    can_use_bypass_query=False,
+                    token_version=1,
+                    metadata={},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        await store.upsert_kb_acl(
+            KBACLRecord(
+                kb_id="kb1",
+                user_id="usr_editor",
+                role="kb_editor",
+                granted_by="admin",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await store.upsert_kb_acl(
+            KBACLRecord(
+                kb_id="kb1",
+                user_id="usr_admin_role",
+                role="kb_admin",
+                granted_by="admin",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+        # super admin and kb_admin and the capability all delete any document.
+        assert (
+            await authz.authorize_document_delete(
+                principal("x", role=SYSTEM_ROLE_SUPER_ADMIN), "kb1", document_owner_id=None
+            )
+            == "privileged"
+        )
+        assert (
+            await authz.authorize_document_delete(
+                principal("usr_admin_role"), "kb1", document_owner_id="someone"
+            )
+            == "privileged"
+        )
+        assert (
+            await authz.authorize_document_delete(
+                principal("usr_cap", can_delete=True), "kb1", document_owner_id="someone"
+            )
+            == "privileged"
+        )
+
+        # editor deletes only its own uploads.
+        assert (
+            await authz.authorize_document_delete(
+                principal("usr_editor"), "kb1", document_owner_id="usr_editor"
+            )
+            == "self"
+        )
+        with pytest.raises(HTTPException) as denied_other:
+            await authz.authorize_document_delete(
+                principal("usr_editor"), "kb1", document_owner_id="someone_else"
+            )
+        assert denied_other.value.status_code == 403
+
+        # legacy documents without created_by are only deletable by privileged actors.
+        with pytest.raises(HTTPException) as denied_legacy:
+            await authz.authorize_document_delete(
+                principal("usr_editor"), "kb1", document_owner_id=None
+            )
+        assert denied_legacy.value.status_code == 403
+
+        # the capability is ignored for service-key principals.
+        with pytest.raises(HTTPException) as denied_service:
+            await authz.authorize_document_delete(
+                principal("svc", can_delete=True, auth=SERVICE_API_KEY_AUTH_METHOD),
+                "kb1",
+                document_owner_id="someone",
+            )
+        assert denied_service.value.status_code == 403
+
+    asyncio.run(run())

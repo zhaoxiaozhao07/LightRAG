@@ -10,6 +10,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from lightrag.api.config_version_service import active_parser_runtime_config_from_version
+from lightrag.api.enterprise_auth import enterprise_auth_enabled, get_current_principal
 from lightrag.api.kb_service import KnowledgeBaseService, utc_now_iso
 from lightrag.api.metadata_store import (
     ActiveDocumentParseJobError,
@@ -241,6 +242,14 @@ class DocumentLifecycleService:
         job_id = generate_track_id(f"job_{job_type}")
         document_status = "parse_queued" if auto_parse else "uploaded"
         now = utc_now_iso()
+        # Stamp the uploading principal (enterprise mode only) so editors can
+        # self-delete their own uploads; reads the request-scoped contextvar set
+        # by combined_auth, mirroring JobService's principal attribution.
+        created_by: str | None = None
+        if enterprise_auth_enabled():
+            principal = get_current_principal()
+            if principal is not None:
+                created_by = principal.user_id
         saved_paths: list[Path] = []
         saved_dirs: list[Path] = []
         saved_object_uris: list[str] = []
@@ -305,6 +314,7 @@ class DocumentLifecycleService:
                                 if source_object_uri
                                 else {}
                             ),
+                            **({"created_by": created_by} if created_by else {}),
                             "batch_id": batch_id,
                             "auto_parse": auto_parse,
                             "auto_index": auto_index,

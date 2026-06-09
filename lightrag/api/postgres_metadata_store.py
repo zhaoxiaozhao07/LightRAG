@@ -87,6 +87,9 @@ def _config_from_row(row: Any) -> ConfigVersionRecord:
 
 def _enterprise_user_from_row(row: Any) -> EnterpriseUserRecord:
     data = _loads_json_object(row["data_json"])
+    # Legacy JSONB rows predate can_delete_documents; default it so the
+    # dataclass deserializes without raising on the missing key.
+    data.setdefault("can_delete_documents", False)
     return EnterpriseUserRecord(**data)
 
 

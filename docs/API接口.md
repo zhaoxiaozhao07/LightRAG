@@ -313,6 +313,7 @@ DELETE /kbs/{kb_id}/documents/{document_id}?delete_source_file=false&delete_arti
 - **`delete_graph_orphans`**（默认 `true`）：引擎始终修剪失去最后来源的孤立实体/关系；显式传 `false` 暂不支持，返回 `400`。
 - `idempotency_key` 在 `(kb_id, job_type=delete)` 维度唯一；请求指纹包含 `delete_source_file`、`delete_artifacts`、`delete_llm_cache`、`delete_graph_orphans` 与 `strategy`。同 key 同策略复用原 job；同 key 不同清理/图谱策略返回 `409`。
 - `delete_source_file=true` / `delete_artifacts=true` 时仅允许删除 `INPUT_DIR/<workspace>/<document_id>/...` 内的 source/artifact 文件或目录（source 与 artifact 均锚定到规范化的 `<workspace>/<document_id>` 目录做 containment 校验），路径逃逸会使 job 失败并保留文档为 `delete_failed`。启用对象存储时会同步删除 `metadata.source_object_uri`、artifact `metadata.object_uri` / `metadata.object_prefix_uri`，并在 job result 的 `file_delete_result.deleted_objects[]` 中返回已清理对象 URI/prefix。
+- **企业模式删除鉴权**：`kb_editor` 仅可删除本人上传（`metadata.created_by`）的文档（自助撤销误上传，无需额外授予）；删除他人文档需用户级能力 `can_delete_documents` 或 `kb_admin`+/`super_admin`，否则 `403`（`detail="Document delete denied"`）。删除审计事件 `document_delete_queued` 记录 `delete_scope`（`self`/`privileged`）与 `document_owner`（上传者）。`created_by` 是保留 metadata key，用户在 upload/`:texts`/PATCH 中携带会被拒绝；早于本特性、无 `created_by` 的历史文档只能由 `can_delete_documents`/`kb_admin`+/`super_admin` 删除。
 
 批量删除：
 
@@ -331,7 +332,7 @@ Content-Type: application/json
 }
 ```
 
-创建单个聚合 `delete` job（`document_id=null`、`batch_id` 非空）。每个 item 独立 claim 和执行；active job、缺失文档等作为 per-item failure 写入 `job.result.items[]`，不阻塞其他可删除文档。`strategy`（`safe`/`rebuild_doc_scope`/`rebuild_kb`/`rebuild_subgraph`，默认 `safe`）与 `delete_graph_orphans`（默认 `true`，显式 `false` 返回 `400`）语义与单文档删除一致，对整批删除生效；`rebuild_kb`/`rebuild_subgraph` 同样需注入 `IndexBuildService`，否则 `503`。启用 durable worker 时，`documents:batch-delete` 属于可恢复聚合任务：worker 可从 job payload 的 `document_ids` 与删除选项恢复执行，服务重启后 queued batch-delete 不会被孤儿恢复直接标失败。
+创建单个聚合 `delete` job（`document_id=null`、`batch_id` 非空）。每个 item 独立 claim 和执行；active job、缺失文档等作为 per-item failure 写入 `job.result.items[]`，不阻塞其他可删除文档。`strategy`（`safe`/`rebuild_doc_scope`/`rebuild_kb`/`rebuild_subgraph`，默认 `safe`）与 `delete_graph_orphans`（默认 `true`，显式 `false` 返回 `400`）语义与单文档删除一致，对整批删除生效；`rebuild_kb`/`rebuild_subgraph` 同样需注入 `IndexBuildService`，否则 `503`。启用 durable worker 时，`documents:batch-delete` 属于可恢复聚合任务：worker 可从 job payload 的 `document_ids` 与删除选项恢复执行，服务重启后 queued batch-delete 不会被孤儿恢复直接标失败。企业模式下对每个文档独立做删除鉴权（规则同单文档删除）：无权删除的文档作为 `error_code=permission_denied` 的 per-item failure 写入 `job.result.items[]`，不阻塞其他文档，且不会被 claim 到 `deleting`；为防 durable worker 崩溃续跑误删，job payload 的 `document_ids` 会被收缩为已授权集合。审计事件 `documents_batch_delete_queued` 记录 `permission_denied_count` 与每文档 `delete_scopes`。
 
 ### 2.9 文档替换
 
@@ -1055,9 +1056,9 @@ username=admin&password=change-me
 | `GET` | `/admin/settings/registration` | 读取实时注册策略，返回 `enabled` 与 `mode` |
 | `PATCH` / `PUT` | `/admin/settings/registration` | 更新实时注册策略，body：`{"enabled": true}` 或 `{"mode":"open"}` |
 | `GET` | `/admin/users` | 列出企业用户 |
-| `POST` | `/admin/users` | 创建用户，可设置 `can_create_kb`、`can_use_bypass_query`、`tenant_id` |
+| `POST` | `/admin/users` | 创建用户，可设置 `can_create_kb`、`can_use_bypass_query`、`can_delete_documents`、`tenant_id` |
 | `GET` | `/admin/users/{user_id}` | 查询用户详情 |
-| `PATCH` | `/admin/users/{user_id}` | 更新用户状态/能力/tenant/password；请求体包含 `status`、`can_create_kb`、`can_use_bypass_query`、`tenant_id` 中任一非 null 字段并通过 `update_user()`，或修改 `password`，都会增加 `token_version` 并使旧 token 失效；当前实现中 `tenant_id:null` 表示不变而非清空 |
+| `PATCH` | `/admin/users/{user_id}` | 更新用户状态/能力/tenant/password；请求体包含 `status`、`can_create_kb`、`can_use_bypass_query`、`can_delete_documents`、`tenant_id` 中任一非 null 字段并通过 `update_user()`，或修改 `password`，都会增加 `token_version` 并使旧 token 失效；当前实现中 `tenant_id:null` 表示不变而非清空 |
 | `POST` | `/admin/users/{user_id}:disable` | 禁用用户并递增 `token_version`，旧 token 失效 |
 | `POST` | `/admin/users/{user_id}:enable` | 启用用户并递增 `token_version` |
 | `POST` | `/admin/users/{user_id}:reset-password` | 重置用户密码并递增 `token_version` |
@@ -1136,10 +1137,10 @@ KB ACL 请求/响应约束：
 // 返回：{"enabled": false, "mode": "invite_only"}
 
 // POST /admin/users
-{"username":"bob","password":"bob-pass","can_create_kb":true,"can_use_bypass_query":false,"tenant_id":null}
+{"username":"bob","password":"bob-pass","can_create_kb":true,"can_use_bypass_query":false,"can_delete_documents":false,"tenant_id":null}
 
 // PATCH /admin/users/{user_id}
-{"status":"active","can_create_kb":false,"can_use_bypass_query":true,"tenant_id":"tenant-a","password":"new-pass"}
+{"status":"active","can_create_kb":false,"can_use_bypass_query":true,"can_delete_documents":true,"tenant_id":"tenant-a","password":"new-pass"}
 
 // POST /admin/users/{user_id}:reset-password
 {"password":"new-pass"}
@@ -1247,6 +1248,7 @@ Service API key 行为约束：
 - legacy/global `/documents`、`/query`、`/graph`、Ollama `/api/*` 在 `LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES=true` 时默认拒绝；关闭该开关后仍需 super admin。
 - super admin bootstrap 来自 `.env`，启动后同步为 active super admin；企业模式要求非默认 `TOKEN_SECRET`。
 - Tenant membership 与 tenant-scoped KB ACL 已接入用户 principal hydration；用户请求按 direct user ACL 与 tenant ACL 最高角色授权。Service key 请求默认只按显式 `kb_roles` scope 授权；设置 `tenant_id + inherit_tenant_kb_acl=true` 时显式继承 tenant ACL。
+- 文档删除为所有权感知模型：`kb_editor` 仅可删除本人上传（`metadata.created_by`）的文档；删除他人文档需用户级能力 `can_delete_documents`（super admin 通过 `/admin/users` 授予）或 `kb_admin`+/`super_admin`。service/scoped API key 不会获得 `can_delete_documents`：只能按 `kb_admin` scope 删任意，或按 `kb_editor` scope 删除该 key 自身上传的文档；无 `created_by` 的历史文档仅 privileged 主体可删。
 
 KB 路由角色矩阵：
 
@@ -1256,7 +1258,8 @@ KB 路由角色矩阵：
 | `GET /kbs` | super admin 看全部；普通用户仅看 direct user ACL 或 tenant ACL 授权 KB；service key 默认仅看 `kb_roles` scope，显式 `inherit_tenant_kb_acl` 时额外继承 tenant ACL |
 | `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高；artifact `:download` / `:download-url` 可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 全局提升最低角色，也可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY` 按 artifact type 覆盖；`:download` / `:download-url` / `:preview` 还可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY` 按 action + artifact type 覆盖 |
 | `/kbs/{kb_id}/query`、`/query/stream`、`/query/data`、`/retrieve` | `kb_viewer` 或更高；最终 `mode="bypass"` 额外需要 `can_use_bypass_query=true` |
-| 文档上传/解析/构建/删除/替换/sync、job wait/cancel/retry 等写操作 | `kb_editor` 或更高 |
+| 文档上传/解析/构建/替换/sync、job wait/cancel/retry 等写操作 | `kb_editor` 或更高 |
+| 文档删除（`DELETE …/documents/{id}`、`:batch-delete`） | `kb_editor` 仅删本人上传(`metadata.created_by`)的文档；删他人需 `can_delete_documents` 能力或 `kb_admin`+/`super_admin` |
 | KB 配置创建/激活/diff、`PATCH /kbs/{kb_id}` | `kb_admin` 或更高 |
 | `DELETE /kbs/{kb_id}`、`?hard=true`、`/admin/...` | super admin |
 

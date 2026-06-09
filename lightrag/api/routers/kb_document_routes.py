@@ -283,6 +283,7 @@ _RESERVED_DOCUMENT_METADATA_KEYS = {
     "build_skipped",
     "build_skip_reason",
     "build_started_at",
+    "created_by",
     "current_build_job_id",
     "current_parse_job_id",
     "current_replace_job_id",
@@ -565,11 +566,7 @@ class TextDocumentRequest(BaseModel):
     @field_validator("metadata", mode="after")
     @classmethod
     def limit_metadata_size(cls, value: dict[str, Any]) -> dict[str, Any]:
-        size = len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
-        if size > _MAX_TEXT_METADATA_BYTES:
-            raise ValueError(
-                f"Text document metadata too large. Maximum size: {_MAX_TEXT_METADATA_BYTES} bytes"
-            )
+        _validate_user_metadata_size(value, label="Text document metadata")
         return value
 
 
@@ -589,6 +586,11 @@ def _validate_user_metadata_size(value: dict[str, Any], *, label: str) -> None:
     if size > _MAX_TEXT_METADATA_BYTES:
         raise ValueError(
             f"{label} too large. Maximum size: {_MAX_TEXT_METADATA_BYTES} bytes"
+        )
+    reserved_keys = sorted(set(value) & _RESERVED_DOCUMENT_METADATA_KEYS)
+    if reserved_keys:
+        raise ValueError(
+            f"{label} contains reserved key(s): " + ", ".join(reserved_keys)
         )
 
 
@@ -4541,6 +4543,15 @@ def create_kb_document_routes(
                         raise IdempotencyKeyConflictError(idempotency_key)
                     return JobResponse.from_record(existing_job)
             document = await document_service.get_document(kb_id, document_id)
+            delete_scope: str | None = None
+            if enterprise_auth_enabled():
+                delete_scope = await get_enterprise_authorization_service(
+                    http_request
+                ).authorize_document_delete(
+                    get_request_principal(http_request),
+                    kb_id,
+                    document_owner_id=document.metadata.get("created_by"),
+                )
             job, created_job = await job_service.create_delete_job_once(
                 kb_id,
                 document_id=document_id,
@@ -4596,6 +4607,8 @@ def create_kb_document_routes(
                     delete_llm_cache=delete_llm_cache,
                     delete_graph_orphans=delete_graph_orphans,
                     strategy=strategy,
+                    delete_scope=delete_scope,
+                    document_owner=document.metadata.get("created_by"),
                 ),
             )
 
@@ -4753,13 +4766,66 @@ def create_kb_document_routes(
             )
             if not created_job:
                 return JobResponse.from_record(job)
-            documents, claim_failures = await document_service.claim_batch_delete(
+
+            # Ownership/capability check per requested document (enterprise mode).
+            # kb_editor may only delete its own uploads; kb_admin+/super_admin or
+            # the can_delete_documents capability may delete any. Denied docs
+            # become per-item permission_denied failures and are NOT claimed.
+            permission_failures: list[dict[str, Any]] = []
+            scope_by_doc: dict[str, str] = {}
+            authorized_ids: list[str] = list(request.document_ids)
+            if enterprise_auth_enabled():
+                authz = get_enterprise_authorization_service(http_request)
+                principal = get_request_principal(http_request)
+                existing_docs = await document_service.get_documents_by_ids(
+                    kb_id, list(request.document_ids)
+                )
+                owner_by_id = {
+                    doc.id: doc.metadata.get("created_by") for doc in existing_docs
+                }
+                authorized_ids = []
+                for doc_id in request.document_ids:
+                    # Unknown ids fall through to claim so they surface the
+                    # canonical document_not_found failure rather than
+                    # permission_denied (avoids existence disclosure).
+                    if doc_id not in owner_by_id:
+                        authorized_ids.append(doc_id)
+                        continue
+                    try:
+                        scope = await authz.authorize_document_delete(
+                            principal,
+                            kb_id,
+                            document_owner_id=owner_by_id[doc_id],
+                        )
+                    except HTTPException as exc:
+                        if exc.status_code != 403:
+                            raise
+                        permission_failures.append(
+                            {
+                                "document_id": doc_id,
+                                "status": "failed",
+                                "error_code": "permission_denied",
+                                "error_message": "Document delete denied",
+                            }
+                        )
+                        continue
+                    scope_by_doc[doc_id] = scope
+                    authorized_ids.append(doc_id)
+                # Shrink the durable payload so a worker resume after a crash can
+                # never delete documents the caller was not authorized for.
+                if authorized_ids != list(request.document_ids):
+                    await job_service.update_job_payload_patch(
+                        kb_id, job.id, payload_patch={"document_ids": authorized_ids}
+                    )
+
+            documents, store_claim_failures = await document_service.claim_batch_delete(
                 kb_id,
-                request.document_ids,
+                authorized_ids,
                 job=job,
                 delete_source_file=request.delete_source_file,
                 delete_artifacts=request.delete_artifacts,
             )
+            claim_failures = [*permission_failures, *store_claim_failures]
 
             await _append_kb_document_audit_event(
                 http_request,
@@ -4776,7 +4842,9 @@ def create_kb_document_routes(
                     delete_llm_cache=request.delete_llm_cache,
                     delete_graph_orphans=request.delete_graph_orphans,
                     strategy=request.strategy,
-                    claim_failure_count=len(claim_failures),
+                    claim_failure_count=len(store_claim_failures),
+                    permission_denied_count=len(permission_failures) or None,
+                    delete_scopes=scope_by_doc or None,
                 ),
             )
 

@@ -241,6 +241,10 @@ class Principal:
     token_version: int
     auth_method: str
     metadata: dict[str, Any]
+    # Capability to delete documents uploaded by other users (delete-any).
+    # Declared last with a default so existing keyword constructions and the
+    # frozen-dataclass field ordering stay valid.
+    can_delete_documents: bool = False
 
     @property
     def is_super_admin(self) -> bool:
@@ -399,6 +403,7 @@ def principal_from_api_key() -> Principal:
         token_version=1,
         auth_method="api_key",
         metadata={"auth_mode": "enterprise", "api_key_superadmin": True},
+        can_delete_documents=True,
     )
 
 
@@ -818,6 +823,7 @@ class ServiceAPIKeyService:
                 "key_preview": record.key_preview,
                 "scopes": scopes,
             },
+            can_delete_documents=False,
         )
 
 
@@ -1107,6 +1113,7 @@ class UserService:
                 metadata={"bootstrap": True},
                 created_at=now,
                 updated_at=now,
+                can_delete_documents=True,
             )
             user = await self._metadata_store.upsert_enterprise_user(created)
             await self._audit("super_admin_bootstrapped", actor_user_id=user.id)
@@ -1120,6 +1127,7 @@ class UserService:
             status=USER_STATUS_ACTIVE,
             can_create_kb=True,
             can_use_bypass_query=True,
+            can_delete_documents=True,
             token_version=existing.token_version
             + (1 if new_hash != existing.password_hash else 0),
             updated_at=now,
@@ -1150,6 +1158,7 @@ class UserService:
         created_by: str | None = None,
         can_create_kb: bool = False,
         can_use_bypass_query: bool = False,
+        can_delete_documents: bool = False,
         tenant_id: str | None = None,
         status: str = USER_STATUS_ACTIVE,
     ) -> EnterpriseUserRecord:
@@ -1170,6 +1179,7 @@ class UserService:
             metadata={},
             created_at=now,
             updated_at=now,
+            can_delete_documents=can_delete_documents,
         )
         created = await self._metadata_store.upsert_enterprise_user(user)
         await self._audit(
@@ -1196,6 +1206,7 @@ class UserService:
         status_value: str | None = None,
         can_create_kb: bool | None = None,
         can_use_bypass_query: bool | None = None,
+        can_delete_documents: bool | None = None,
         tenant_id: str | None = None,
         actor_user_id: str | None = None,
     ) -> EnterpriseUserRecord:
@@ -1213,6 +1224,9 @@ class UserService:
             can_use_bypass_query=user.can_use_bypass_query
             if can_use_bypass_query is None
             else can_use_bypass_query,
+            can_delete_documents=user.can_delete_documents
+            if can_delete_documents is None
+            else can_delete_documents,
             tenant_id=user.tenant_id if tenant_id is None else tenant_id,
             token_version=user.token_version + 1,
             updated_at=utc_now_iso(),
@@ -1336,6 +1350,55 @@ class AuthorizationService:
             await self._audit_denied(principal, kb_id, minimum_role)
             raise HTTPException(status_code=403, detail="Knowledge-base access denied")
         return principal
+
+    async def authorize_document_delete(
+        self,
+        principal: Principal | None,
+        kb_id: str,
+        *,
+        document_owner_id: str | None,
+    ) -> str:
+        """Authorize a document deletion and return the delete scope.
+
+        The central request middleware already enforced ``kb_editor`` on the
+        delete route, so the caller has write access to the KB. This refines
+        that into ownership/capability semantics and returns the scope so the
+        route can audit it:
+
+          * ``"privileged"`` — may delete ANY document (super admin, effective
+            ``kb_admin``+, or the ``can_delete_documents`` capability).
+          * ``"self"``       — a ``kb_editor`` deleting a document they uploaded
+            (``document_owner_id`` matches the caller).
+
+        Anything else raises HTTP 403. The effective role is computed directly
+        (not via :meth:`require_kb_role`) so the allowed ``self``/``privileged``
+        outcomes never emit a misleading ``permission_denied`` audit — only the
+        genuine denial path audits.
+        """
+        principal = _require_principal(principal)
+        if principal.is_super_admin:
+            return "privileged"
+        # User-level capability grants delete-any; service keys never carry it.
+        if (
+            principal.auth_method != SERVICE_API_KEY_AUTH_METHOD
+            and principal.can_delete_documents
+        ):
+            return "privileged"
+        if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
+            role = await self._effective_service_api_key_kb_role(principal, kb_id)
+        else:
+            role = await self._effective_user_kb_role(principal, kb_id)
+        rank = _KB_ROLE_RANK.get(role, 0) if role else 0
+        if rank >= _KB_ROLE_RANK[KB_ROLE_ADMIN]:
+            return "privileged"
+        if rank >= _KB_ROLE_RANK[KB_ROLE_EDITOR]:
+            if (
+                document_owner_id is not None
+                and document_owner_id == principal.user_id
+            ):
+                return "self"
+        await self._audit_denied(principal, kb_id, KB_ROLE_ADMIN)
+        raise HTTPException(status_code=403, detail="Document delete denied")
 
     async def require_tenant_role(
         self, principal: Principal | None, tenant_id: str, minimum_role: str
@@ -1619,6 +1682,7 @@ def principal_from_user(
         token_version=user.token_version,
         auth_method=auth_method,
         metadata=dict(user.metadata),
+        can_delete_documents=user.can_delete_documents,
     )
 
 

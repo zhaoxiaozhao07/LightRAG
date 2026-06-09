@@ -51,6 +51,7 @@ class EnterpriseUserResponse(BaseModel):
     tenant_id: str | None
     can_create_kb: bool
     can_use_bypass_query: bool
+    can_delete_documents: bool
     token_version: int
     created_at: str
     updated_at: str
@@ -89,6 +90,7 @@ class EnterpriseUserCreateRequest(BaseModel):
     password: str = Field(min_length=1)
     can_create_kb: bool = False
     can_use_bypass_query: bool = False
+    can_delete_documents: bool = False
     tenant_id: str | None = None
 
 
@@ -96,6 +98,7 @@ class EnterpriseUserUpdateRequest(BaseModel):
     status: str | None = None
     can_create_kb: bool | None = None
     can_use_bypass_query: bool | None = None
+    can_delete_documents: bool | None = None
     tenant_id: str | None = None
     password: str | None = None
 
@@ -301,6 +304,7 @@ def create_enterprise_routes(
             "tenant_roles": principal.tenant_roles,
             "can_create_kb": principal.can_create_kb,
             "can_use_bypass_query": principal.can_use_bypass_query,
+            "can_delete_documents": principal.can_delete_documents,
             "token_version": principal.token_version,
             "auth_method": principal.auth_method,
         }
@@ -617,6 +621,7 @@ def create_enterprise_routes(
             created_by=principal.user_id,
             can_create_kb=body.can_create_kb,
             can_use_bypass_query=body.can_use_bypass_query,
+            can_delete_documents=body.can_delete_documents,
             tenant_id=body.tenant_id,
         )
         return EnterpriseUserResponse.from_record(user)
@@ -696,6 +701,7 @@ def create_enterprise_routes(
                 body.status,
                 body.can_create_kb,
                 body.can_use_bypass_query,
+                body.can_delete_documents,
                 body.tenant_id,
             )
         ):
@@ -704,6 +710,7 @@ def create_enterprise_routes(
                 status_value=body.status,
                 can_create_kb=body.can_create_kb,
                 can_use_bypass_query=body.can_use_bypass_query,
+                can_delete_documents=body.can_delete_documents,
                 tenant_id=body.tenant_id,
                 actor_user_id=principal.user_id,
             )
