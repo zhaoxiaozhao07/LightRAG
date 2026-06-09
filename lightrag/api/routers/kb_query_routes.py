@@ -30,6 +30,7 @@ from lightrag.api.config_version_service import (
 )
 from lightrag.api.document_lifecycle_service import DocumentLifecycleService
 from lightrag.api.enterprise_auth import (
+    UserKBQuerySettingsService,
     append_enterprise_audit_event,
     enterprise_auth_enabled,
     get_enterprise_authorization_service,
@@ -69,6 +70,31 @@ def _enforce_resolved_bypass_permission(request: Request, param: QueryParam) -> 
     get_enterprise_authorization_service(request).require_bypass_query(
         get_request_principal(request)
     )
+
+
+async def _merge_user_query_defaults(
+    request: Request,
+    kb_id: str,
+    active_defaults: dict[str, Any],
+) -> dict[str, Any]:
+    """Overlay per-user persisted KB query prompt on KB active defaults.
+
+    Request fields still win because ``KBQueryRequest.to_query_params`` only
+    applies defaults for fields the request did not explicitly provide.
+    """
+    defaults = dict(active_defaults)
+    if not enterprise_auth_enabled():
+        return defaults
+    principal = get_request_principal(request)
+    if principal is None or principal.auth_method != "jwt":
+        return defaults
+    service = getattr(request.app.state, "enterprise_user_kb_query_settings_service", None)
+    if not isinstance(service, UserKBQuerySettingsService):
+        return defaults
+    settings = await service.get_settings(principal.user_id, kb_id)
+    if settings is not None and settings.user_prompt:
+        defaults["user_prompt"] = settings.user_prompt
+    return defaults
 
 
 def _query_audit_metadata(
@@ -501,7 +527,11 @@ def create_kb_query_routes(
                 request.filters,
             )
             rag = cast(Any, await registry.get(kb_id))
-            active_defaults = active_query_defaults_from_rag(rag)
+            active_defaults = await _merge_user_query_defaults(
+                http_request,
+                kb_id,
+                active_query_defaults_from_rag(rag),
+            )
             active_metadata = active_query_metadata_from_rag(rag)
             param = request.to_query_params(
                 is_stream=False,
@@ -577,7 +607,11 @@ def create_kb_query_routes(
                 request.filters,
             )
             rag = cast(Any, await registry.get(kb_id))
-            active_defaults = active_query_defaults_from_rag(rag)
+            active_defaults = await _merge_user_query_defaults(
+                http_request,
+                kb_id,
+                active_query_defaults_from_rag(rag),
+            )
             active_metadata = active_query_metadata_from_rag(rag)
             stream_mode = request.stream if request.stream is not None else True
             param = request.to_query_params(
@@ -676,7 +710,11 @@ def create_kb_query_routes(
                 request.filters,
             )
             rag = cast(Any, await registry.get(kb_id))
-            active_defaults = active_query_defaults_from_rag(rag)
+            active_defaults = await _merge_user_query_defaults(
+                http_request,
+                kb_id,
+                active_query_defaults_from_rag(rag),
+            )
             active_metadata = active_query_metadata_from_rag(rag)
             param = request.to_query_params(
                 is_stream=False,

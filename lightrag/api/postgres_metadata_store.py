@@ -23,6 +23,7 @@ from lightrag.api.metadata_store import (
     DocumentRecord,
     DuplicateDocumentSourceKeyError,
     EnterpriseUserRecord,
+    EnterpriseUserKBQuerySettingsRecord,
     EnterpriseAPIKeyRecord,
     EnterpriseInvitationRecord,
     IdempotencyKeyConflictError,
@@ -87,6 +88,13 @@ def _config_from_row(row: Any) -> ConfigVersionRecord:
 def _enterprise_user_from_row(row: Any) -> EnterpriseUserRecord:
     data = _loads_json_object(row["data_json"])
     return EnterpriseUserRecord(**data)
+
+
+def _enterprise_user_kb_query_settings_from_row(
+    row: Any,
+) -> EnterpriseUserKBQuerySettingsRecord:
+    data = _loads_json_object(row["data_json"])
+    return EnterpriseUserKBQuerySettingsRecord(**data)
 
 
 def _enterprise_api_key_from_row(row: Any) -> EnterpriseAPIKeyRecord:
@@ -1324,6 +1332,84 @@ class PostgresMetadataStore:
 
         return await self._write(write)
 
+    async def get_enterprise_user_kb_query_settings(
+        self, user_id: str, kb_id: str
+    ) -> EnterpriseUserKBQuerySettingsRecord | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT data_json FROM enterprise_user_kb_query_settings
+                WHERE user_id = $1 AND kb_id = $2
+                """,
+                user_id,
+                kb_id,
+            )
+        return (
+            _enterprise_user_kb_query_settings_from_row(row)
+            if row is not None
+            else None
+        )
+
+    async def upsert_enterprise_user_kb_query_settings(
+        self, record: EnterpriseUserKBQuerySettingsRecord
+    ) -> EnterpriseUserKBQuerySettingsRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> EnterpriseUserKBQuerySettingsRecord:
+            await conn.execute(
+                """
+                INSERT INTO enterprise_user_kb_query_settings (
+                    user_id, kb_id, user_prompt, created_at, updated_at, data_json
+                ) VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                ON CONFLICT (user_id, kb_id) DO UPDATE SET
+                    user_prompt = excluded.user_prompt,
+                    updated_at = excluded.updated_at,
+                    data_json = jsonb_set(
+                        excluded.data_json,
+                        '{created_at}',
+                        to_jsonb(enterprise_user_kb_query_settings.created_at)
+                    )
+                """,
+                record.user_id,
+                record.kb_id,
+                record.user_prompt,
+                record.created_at,
+                record.updated_at,
+                _record_json(record),
+            )
+            row = await conn.fetchrow(
+                """
+                SELECT data_json FROM enterprise_user_kb_query_settings
+                WHERE user_id = $1 AND kb_id = $2
+                """,
+                record.user_id,
+                record.kb_id,
+            )
+            if row is None:
+                raise MetadataRecordNotFoundError("User KB query settings not found")
+            return _enterprise_user_kb_query_settings_from_row(row)
+
+        return await self._write(write)
+
+    async def delete_enterprise_user_kb_query_settings(
+        self, user_id: str, kb_id: str
+    ) -> bool:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> bool:
+            status = await conn.execute(
+                """
+                DELETE FROM enterprise_user_kb_query_settings
+                WHERE user_id = $1 AND kb_id = $2
+                """,
+                user_id,
+                kb_id,
+            )
+            return _rowcount(status) > 0
+
+        return await self._write(write)
+
     async def set_enterprise_system_setting(
         self, key: str, value: str, *, updated_by: str | None = None
     ) -> None:
@@ -1998,6 +2084,7 @@ class PostgresMetadataStore:
             counts = {"document_source_keys": int(source_key_count or 0)}
             for table, label in (
                 ("kb_document_artifacts", "document_artifacts"),
+                ("enterprise_user_kb_query_settings", "enterprise_user_kb_query_settings"),
                 ("kb_config_versions", "kb_config_versions"),
                 ("kb_jobs", "jobs"),
                 ("kb_documents", "documents"),
@@ -2233,6 +2320,19 @@ class PostgresMetadataStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS enterprise_user_kb_query_settings (
+                user_id TEXT NOT NULL,
+                kb_id TEXT NOT NULL,
+                user_prompt TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                data_json JSONB NOT NULL,
+                PRIMARY KEY (user_id, kb_id),
+                FOREIGN KEY (user_id) REFERENCES enterprise_users(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_enterprise_user_kb_query_settings_kb
+                ON enterprise_user_kb_query_settings (kb_id, user_id);
 
             CREATE TABLE IF NOT EXISTS enterprise_api_keys (
                 id TEXT PRIMARY KEY,

@@ -101,6 +101,7 @@ from lightrag.api.enterprise_auth import (
     LoginAttemptTracker,
     ServiceAPIKeyService,
     SystemSettingsService,
+    UserKBQuerySettingsService,
     UserService,
 )
 from lightrag.api.routers.enterprise_routes import create_enterprise_routes
@@ -921,6 +922,11 @@ def create_app(args):
     enterprise_settings_service = (
         SystemSettingsService(metadata_store) if enterprise_enabled else None
     )
+    enterprise_user_kb_query_settings_service = (
+        UserKBQuerySettingsService(metadata_store, enterprise_audit_service)
+        if enterprise_enabled
+        else None
+    )
     enterprise_api_key_service = (
         ServiceAPIKeyService(metadata_store, enterprise_audit_service)
         if enterprise_enabled
@@ -1081,6 +1087,9 @@ def create_app(args):
     if enterprise_enabled:
         app.state.enterprise_user_service = enterprise_user_service
         app.state.enterprise_settings_service = enterprise_settings_service
+        app.state.enterprise_user_kb_query_settings_service = (
+            enterprise_user_kb_query_settings_service
+        )
         app.state.enterprise_api_key_service = enterprise_api_key_service
         app.state.enterprise_invitation_service = enterprise_invitation_service
         app.state.enterprise_limit_service = enterprise_limit_service

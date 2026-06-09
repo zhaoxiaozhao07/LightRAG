@@ -38,6 +38,7 @@ from lightrag.api.metadata_store import (
     EnterpriseAPIKeyRecord,
     EnterpriseInvitationRecord,
     EnterpriseUserRecord,
+    EnterpriseUserKBQuerySettingsRecord,
     EnterpriseTenantKBACLRecord,
     EnterpriseTenantMembershipRecord,
     IdempotencyKeyConflictError,
@@ -260,6 +261,36 @@ async def test_enterprise_metadata_contract(store):
     )
     assert await store.get_enterprise_system_setting("registration_enabled") == "true"
     assert await store.get_enterprise_system_setting("missing", "fallback") == "fallback"
+
+    assert await store.get_enterprise_user_kb_query_settings(user.id, kb_id) is None
+    first_settings = await store.upsert_enterprise_user_kb_query_settings(
+        EnterpriseUserKBQuerySettingsRecord(
+            user_id=user.id,
+            kb_id=kb_id,
+            user_prompt="answer in Chinese",
+            created_at=utc_now_iso(),
+            updated_at=utc_now_iso(),
+        )
+    )
+    assert first_settings.user_prompt == "answer in Chinese"
+    fetched_settings = await store.get_enterprise_user_kb_query_settings(
+        user.id, kb_id
+    )
+    assert fetched_settings is not None
+    assert fetched_settings.user_prompt == "answer in Chinese"
+    updated_settings = await store.upsert_enterprise_user_kb_query_settings(
+        EnterpriseUserKBQuerySettingsRecord(
+            user_id=user.id,
+            kb_id=kb_id,
+            user_prompt="",
+            created_at=first_settings.created_at,
+            updated_at=utc_now_iso(),
+        )
+    )
+    assert updated_settings.user_prompt == ""
+    assert await store.delete_enterprise_user_kb_query_settings(user.id, kb_id) is True
+    assert await store.get_enterprise_user_kb_query_settings(user.id, kb_id) is None
+    assert await store.delete_enterprise_user_kb_query_settings(user.id, kb_id) is False
 
     now = utc_now_iso()
     acl = await store.upsert_kb_acl(
@@ -793,12 +824,24 @@ async def test_complete_document_replace_preserves_provided_source_type(store):
 
 async def test_purge_kb_metadata_removes_everything(store):
     kb_id = _unique_kb(store)
+    user = await store.upsert_enterprise_user(_enterprise_user("purge-settings-user"))
+    await store.upsert_enterprise_user_kb_query_settings(
+        EnterpriseUserKBQuerySettingsRecord(
+            user_id=user.id,
+            kb_id=kb_id,
+            user_prompt="temporary prompt",
+            created_at=utc_now_iso(),
+            updated_at=utc_now_iso(),
+        )
+    )
     await store.create_documents_and_job(
         [_doc(kb_id, "doc_a")], _job(kb_id, "job_x", document_id="doc_a")
     )
     purged = await store.purge_kb_metadata(kb_id)
     assert purged["documents"] >= 1
     assert purged["jobs"] >= 1
+    assert purged["enterprise_user_kb_query_settings"] >= 1
+    assert await store.get_enterprise_user_kb_query_settings(user.id, kb_id) is None
     with pytest.raises(MetadataRecordNotFoundError):
         await store.get_document(kb_id, "doc_a")
 

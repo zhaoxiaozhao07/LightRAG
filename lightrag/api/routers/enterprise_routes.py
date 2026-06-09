@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from lightrag.api.auth import auth_handler
 from lightrag.api.enterprise_auth import (
     Principal,
+    KB_ROLE_VIEWER,
     REGISTRATION_MODE_ADMIN_APPROVAL,
     REGISTRATION_MODE_INVITE_ONLY,
     REGISTRATION_MODE_OPEN,
@@ -23,6 +24,7 @@ from lightrag.api.enterprise_auth import (
     get_enterprise_authorization_service,
     get_enterprise_invitation_service,
     get_enterprise_settings_service,
+    get_enterprise_user_kb_query_settings_service,
     get_enterprise_user_service,
     get_request_principal,
 )
@@ -272,6 +274,16 @@ class EnterpriseMeResponse(BaseModel):
     principal: dict[str, Any]
 
 
+class EnterpriseUserKBQuerySettingsRequest(BaseModel):
+    user_prompt: str = Field(default="", max_length=16384)
+
+
+class EnterpriseUserKBQuerySettingsResponse(BaseModel):
+    user_id: str
+    kb_id: str
+    user_prompt: str
+
+
 def create_enterprise_routes(
     api_key: str | None = None,
     kb_service: KnowledgeBaseService | None = None,
@@ -297,6 +309,15 @@ def create_enterprise_routes(
         principal = get_request_principal(request)
         if principal is None:
             raise HTTPException(status_code=401, detail="Login required")
+        return principal
+
+    def require_interactive_user_principal(request: Request) -> Principal:
+        principal = require_principal(request)
+        if principal.auth_method != "jwt":
+            raise HTTPException(
+                status_code=403,
+                detail="User query settings are only available for interactive users",
+            )
         return principal
 
     async def require_kb_exists(request: Request, kb_id: str) -> None:
@@ -439,6 +460,63 @@ def create_enterprise_routes(
         return EnterpriseMeResponse(
             user=EnterpriseUserResponse.from_record(user),
             principal=principal_payload(principal),
+        )
+
+    @router.get(
+        "/auth/me/kbs/{kb_id}/query-settings",
+        response_model=EnterpriseUserKBQuerySettingsResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def get_my_kb_query_settings(kb_id: str, request: Request):
+        principal = require_interactive_user_principal(request)
+        await require_kb_exists(request, kb_id)
+        await get_enterprise_authorization_service(request).require_kb_role(
+            principal, kb_id, KB_ROLE_VIEWER
+        )
+        settings = await get_enterprise_user_kb_query_settings_service(
+            request
+        ).get_settings(principal.user_id, kb_id)
+        return EnterpriseUserKBQuerySettingsResponse(
+            user_id=principal.user_id,
+            kb_id=kb_id,
+            user_prompt=settings.user_prompt if settings is not None else "",
+        )
+
+    @router.put(
+        "/auth/me/kbs/{kb_id}/query-settings",
+        response_model=EnterpriseUserKBQuerySettingsResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def set_my_kb_query_settings(
+        kb_id: str, request: Request, body: EnterpriseUserKBQuerySettingsRequest
+    ):
+        principal = require_interactive_user_principal(request)
+        await require_kb_exists(request, kb_id)
+        await get_enterprise_authorization_service(request).require_kb_role(
+            principal, kb_id, KB_ROLE_VIEWER
+        )
+        settings_service = get_enterprise_user_kb_query_settings_service(request)
+        if body.user_prompt == "":
+            await settings_service.clear_user_prompt(
+                user_id=principal.user_id,
+                kb_id=kb_id,
+                actor_user_id=principal.user_id,
+            )
+            return EnterpriseUserKBQuerySettingsResponse(
+                user_id=principal.user_id,
+                kb_id=kb_id,
+                user_prompt="",
+            )
+        settings = await settings_service.set_user_prompt(
+            user_id=principal.user_id,
+            kb_id=kb_id,
+            user_prompt=body.user_prompt,
+            actor_user_id=principal.user_id,
+        )
+        return EnterpriseUserKBQuerySettingsResponse(
+            user_id=settings.user_id,
+            kb_id=settings.kb_id,
+            user_prompt=settings.user_prompt,
         )
 
     @router.post(

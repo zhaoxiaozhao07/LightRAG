@@ -20,6 +20,7 @@ from lightrag.api.metadata_store import (
     AuditEventRecord,
     EnterpriseAPIKeyRecord,
     EnterpriseInvitationRecord,
+    EnterpriseUserKBQuerySettingsRecord,
     EnterpriseUserRecord,
     KBACLRecord,
     EnterpriseTenantKBACLRecord,
@@ -113,6 +114,18 @@ class EnterpriseMetadataStore(Protocol):
     async def upsert_enterprise_user(
         self, user: EnterpriseUserRecord
     ) -> EnterpriseUserRecord: ...
+
+    async def get_enterprise_user_kb_query_settings(
+        self, user_id: str, kb_id: str
+    ) -> EnterpriseUserKBQuerySettingsRecord | None: ...
+
+    async def upsert_enterprise_user_kb_query_settings(
+        self, record: EnterpriseUserKBQuerySettingsRecord
+    ) -> EnterpriseUserKBQuerySettingsRecord: ...
+
+    async def delete_enterprise_user_kb_query_settings(
+        self, user_id: str, kb_id: str
+    ) -> bool: ...
 
     async def create_enterprise_api_key(
         self, record: EnterpriseAPIKeyRecord
@@ -806,6 +819,80 @@ class ServiceAPIKeyService:
                 "scopes": scopes,
             },
         )
+
+
+class UserKBQuerySettingsService:
+    def __init__(
+        self,
+        metadata_store: EnterpriseMetadataStore,
+        audit_service: AuditService | None = None,
+    ):
+        self._metadata_store = metadata_store
+        self._audit_service = audit_service
+
+    async def get_settings(
+        self, user_id: str, kb_id: str
+    ) -> EnterpriseUserKBQuerySettingsRecord | None:
+        return await self._metadata_store.get_enterprise_user_kb_query_settings(
+            user_id, kb_id
+        )
+
+    async def set_user_prompt(
+        self,
+        *,
+        user_id: str,
+        kb_id: str,
+        user_prompt: str,
+        actor_user_id: str | None = None,
+    ) -> EnterpriseUserKBQuerySettingsRecord:
+        existing = await self.get_settings(user_id, kb_id)
+        now = utc_now_iso()
+        record = EnterpriseUserKBQuerySettingsRecord(
+            user_id=user_id,
+            kb_id=kb_id,
+            user_prompt=user_prompt,
+            created_at=existing.created_at if existing is not None else now,
+            updated_at=now,
+        )
+        saved = await self._metadata_store.upsert_enterprise_user_kb_query_settings(
+            record
+        )
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                "user_kb_query_settings_updated",
+                actor_user_id=actor_user_id or user_id,
+                target_type="kb",
+                target_id=kb_id,
+                metadata={
+                    "user_id": user_id,
+                    "has_user_prompt": bool(user_prompt),
+                },
+            )
+        return saved
+
+    async def clear_user_prompt(
+        self,
+        *,
+        user_id: str,
+        kb_id: str,
+        actor_user_id: str | None = None,
+    ) -> bool:
+        deleted = await self._metadata_store.delete_enterprise_user_kb_query_settings(
+            user_id, kb_id
+        )
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                "user_kb_query_settings_updated",
+                actor_user_id=actor_user_id or user_id,
+                target_type="kb",
+                target_id=kb_id,
+                metadata={
+                    "user_id": user_id,
+                    "has_user_prompt": False,
+                    "deleted": deleted,
+                },
+            )
+        return deleted
 
 
 class InvitationService:
@@ -1558,6 +1645,18 @@ def get_enterprise_api_key_service(request: Request) -> ServiceAPIKeyService:
     service = getattr(request.app.state, "enterprise_api_key_service", None)
     if not isinstance(service, ServiceAPIKeyService):
         raise HTTPException(status_code=500, detail="Enterprise API key service unavailable")
+    return service
+
+
+def get_enterprise_user_kb_query_settings_service(
+    request: Request,
+) -> UserKBQuerySettingsService:
+    service = getattr(request.app.state, "enterprise_user_kb_query_settings_service", None)
+    if not isinstance(service, UserKBQuerySettingsService):
+        raise HTTPException(
+            status_code=500,
+            detail="Enterprise user KB query settings service unavailable",
+        )
     return service
 
 

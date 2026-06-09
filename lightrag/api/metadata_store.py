@@ -369,6 +369,28 @@ class EnterpriseUserRecord:
 
 
 @dataclass(slots=True)
+class EnterpriseUserKBQuerySettingsRecord:
+    user_id: str
+    kb_id: str
+    user_prompt: str
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "EnterpriseUserKBQuerySettingsRecord":
+        return cls(
+            user_id=str(row["user_id"]),
+            kb_id=str(row["kb_id"]),
+            user_prompt=str(row["user_prompt"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class EnterpriseAPIKeyRecord:
     id: str
     name: str
@@ -2092,6 +2114,76 @@ class SQLiteMetadataStore:
 
         return await self._write(write)
 
+    async def get_enterprise_user_kb_query_settings(
+        self, user_id: str, kb_id: str
+    ) -> EnterpriseUserKBQuerySettingsRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM enterprise_user_kb_query_settings
+                WHERE user_id = ? AND kb_id = ?
+                """,
+                (user_id, kb_id),
+            ).fetchone()
+        return (
+            EnterpriseUserKBQuerySettingsRecord.from_row(row)
+            if row is not None
+            else None
+        )
+
+    async def upsert_enterprise_user_kb_query_settings(
+        self, record: EnterpriseUserKBQuerySettingsRecord
+    ) -> EnterpriseUserKBQuerySettingsRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterpriseUserKBQuerySettingsRecord:
+            conn.execute(
+                """
+                INSERT INTO enterprise_user_kb_query_settings (
+                    user_id, kb_id, user_prompt, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, kb_id) DO UPDATE SET
+                    user_prompt = excluded.user_prompt,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    record.user_id,
+                    record.kb_id,
+                    record.user_prompt,
+                    record.created_at,
+                    record.updated_at,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM enterprise_user_kb_query_settings
+                WHERE user_id = ? AND kb_id = ?
+                """,
+                (record.user_id, record.kb_id),
+            ).fetchone()
+            assert row is not None
+            return EnterpriseUserKBQuerySettingsRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def delete_enterprise_user_kb_query_settings(
+        self, user_id: str, kb_id: str
+    ) -> bool:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute(
+                """
+                DELETE FROM enterprise_user_kb_query_settings
+                WHERE user_id = ? AND kb_id = ?
+                """,
+                (user_id, kb_id),
+            )
+            return bool(cursor.rowcount)
+
+        return await self._write(write)
+
     async def set_enterprise_system_setting(
         self, key: str, value: str, *, updated_by: str | None = None
     ) -> None:
@@ -2692,6 +2784,7 @@ class SQLiteMetadataStore:
             for table in (
                 "document_artifacts",
                 "document_source_keys",
+                "enterprise_user_kb_query_settings",
                 "kb_config_versions",
                 "jobs",
                 "documents",
@@ -3071,6 +3164,19 @@ class SQLiteMetadataStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS enterprise_user_kb_query_settings (
+                user_id TEXT NOT NULL,
+                kb_id TEXT NOT NULL,
+                user_prompt TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, kb_id),
+                FOREIGN KEY (user_id) REFERENCES enterprise_users(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_user_kb_query_settings_kb
+                ON enterprise_user_kb_query_settings (kb_id, user_id);
 
             CREATE TABLE IF NOT EXISTS enterprise_api_keys (
                 id TEXT PRIMARY KEY,

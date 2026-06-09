@@ -802,6 +802,8 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 | `POST` | `/kbs/{kb_id}/query/data` | 仅返回结构化检索数据，不调用 LLM |
 | `POST` | `/kbs/{kb_id}/retrieve` | `query/data` 的别名，语义等价 |
 
+企业模式下，当前用户还可以为单个 KB 保存个人查询提示词：见 [10.2 登录与当前用户](#102-登录与当前用户) 的 `/auth/me/kbs/{kb_id}/query-settings`。KB query 最终 `user_prompt` 优先级为：请求体显式 `user_prompt` > 当前用户在该 KB 下持久化的 `user_prompt` > active KB config 的 `query_config.user_prompt` > 空字符串。
+
 请求体（与全局 `/query` 共用字段，新增 KB scoped `filters.doc_ids` / `filters.metadata`）：
 
 ```json
@@ -848,6 +850,7 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 - 若 KB-wide 查询时 KB 内存在 `deleting` / `replacing` 文档，或显式 `filters.doc_ids` / `filters.metadata` 命中的候选文档中存在此类 active 文档，查询返回 `409`，避免读到删除/替换中的旧内容；metadata filter 未命中的 active 文档不会阻断本次 scoped 查询。
 - `mode` 支持 `local / global / hybrid / naive / mix / bypass`；建议默认 `mix`。
 - 企业模式下，`mode="bypass"` 按最终解析后的查询模式检查：请求体显式 `mode="bypass"` 或 active query config 默认值解析为 `bypass` 时，均需要 KB read ACL 加 `can_use_bypass_query=true` 或 super admin。
+- 企业模式下，用户可按 `user_id + kb_id` 保存个人 `user_prompt`；保存后对 `/kbs/{kb_id}/query`、`/query/stream`、`/query/data` 自动生效，但请求体显式传入的 `user_prompt` 始终优先。
 - `filters.doc_ids` 会先校验 ID 必须属于本 KB（不在则 400 + `error_code=doc_ids_not_in_kb`），随后在检索层精确生效：服务端把 `filters.doc_ids` 与"可检索集合"（`enabled=true` 且 `archived=false` 且已建索引、有 `lightrag_doc_id`）取交集，映射成 `QueryParam.ids`（即 `full_doc_id` 白名单）传入 LightRAG。被禁用/归档的文档即使显式出现在 `filters.doc_ids` 里也会被静默剔除，不会进入答案。KB 边界仍由 workspace 双重保证。
 - `filters.metadata` 支持非空 key，value 为标量或标量列表（列表为 OR 语义），总 JSON 大小上限 64 KB；它会先在 KB documents metadata 上做精确匹配，再与 `filters.doc_ids`、`enabled/archived/lightrag_doc_id` 可检索集合取交集。无匹配时传入空 `QueryParam.ids=[]`，返回空检索范围而不是退回 KB-wide。
 - `include_chunk_content=true` 时 `references[].content` 返回该 reference 命中的 chunk 文本数组，便于评估与排查。
@@ -996,6 +999,8 @@ LIGHTRAG_ENTERPRISE_TENANT_MAX_CONCURRENT_JOBS=0
 | `POST` | `/auth/register` | 注册新用户；行为随注册模式而定：`open` 直接创建 active 用户并返回 token；`invite_only` 必须携带有效 `invitation_token`；`admin_approval` 创建 `pending` 用户、待管理员 `:enable` 审批后才能登录（响应不含 token）；`disabled` 返回 `403`。注册失败按 `LIGHTRAG_ENTERPRISE_REGISTRATION_*` 做单进程 per-username 锁定，失败/触发锁定写审计。新用户默认无 KB 权限且不可创建 KB |
 | `GET` | `/auth/me` | 返回当前用户与 principal 权限信息；service API key 请求返回 `user:null` 与 service-key principal payload |
 | `POST` | `/auth/change-password` | 当前用户修改密码；成功后 `token_version` 增加，旧 token 失效 |
+| `GET` | `/auth/me/kbs/{kb_id}/query-settings` | 读取当前用户在指定 KB 下的个人查询设置；需 `kb_viewer`+；非交互式用户/API-key principal 返回 `403` |
+| `PUT` | `/auth/me/kbs/{kb_id}/query-settings` | 写入/覆盖当前用户在指定 KB 下的个人 `user_prompt`；需 `kb_viewer`+；非交互式用户/API-key principal 返回 `403` |
 
 `GET /auth-status` 响应形态：企业模式返回 `auth_mode="enterprise"` 与注册开关且不签发 guest token；禁用认证时返回 guest bearer token；普通认证模式返回认证开关与登录入口信息。
 
@@ -1026,7 +1031,20 @@ username=admin&password=change-me
 
 // POST /auth/change-password
 {"current_password":"old-pass","new_password":"new-pass"}
+
+// PUT /auth/me/kbs/kb_research/query-settings
+{"user_prompt":"请优先使用中文回答，并给出引用依据"}
+
+// GET/PUT /auth/me/kbs/kb_research/query-settings
+{"user_id":"usr_alice","kb_id":"kb_research","user_prompt":"请优先使用中文回答，并给出引用依据"}
 ```
+
+当前用户 KB 查询设置说明：
+
+- 存储维度为 `user_id + kb_id`，不同企业用户、不同知识库互不影响；默认 `user_prompt` 为空字符串。
+- 读取或写入前会校验 KB 存在和当前 principal 至少拥有 `kb_viewer` 角色；无权限返回 `403`，KB 不存在返回 `404`。
+- service/scoped API key 与 legacy enterprise API key superadmin 不属于交互式用户，不能使用该 self-service 设置接口，也不会在 query 时套用个人 `user_prompt`。
+- `PUT` 传空字符串可清空个人提示词。清空后 query 回退到 active KB config 的 `query_config.user_prompt`；若也未配置则为空。
 
 ### 10.3 管理接口
 

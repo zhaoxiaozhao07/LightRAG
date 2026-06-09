@@ -25,6 +25,7 @@ from lightrag.api.enterprise_auth import (
     LoginAttemptTracker,
     ServiceAPIKeyService,
     SystemSettingsService,
+    UserKBQuerySettingsService,
     UserService,
     service_api_key_is_expired,
 )
@@ -205,6 +206,9 @@ def _build_enterprise_client(
     audit_service = AuditService(metadata_store)
     user_service = UserService(metadata_store, audit_service)
     settings_service = SystemSettingsService(metadata_store)
+    user_kb_query_settings_service = UserKBQuerySettingsService(
+        metadata_store, audit_service
+    )
     api_key_service = ServiceAPIKeyService(metadata_store, audit_service)
     invitation_service = InvitationService(metadata_store, audit_service)
     limit_service = EnterpriseLimitService(audit_service)
@@ -239,6 +243,7 @@ def _build_enterprise_client(
     app.state.enterprise_enabled = True
     app.state.enterprise_user_service = user_service
     app.state.enterprise_settings_service = settings_service
+    app.state.enterprise_user_kb_query_settings_service = user_kb_query_settings_service
     app.state.enterprise_api_key_service = api_key_service
     app.state.enterprise_invitation_service = invitation_service
     app.state.enterprise_limit_service = limit_service
@@ -361,6 +366,150 @@ def test_enterprise_kb_create_list_acl_delete_and_bypass(monkeypatch, tmp_path):
     audit_events = client.get("/admin/audit-events", headers=admin_headers)
     assert audit_events.status_code == 200
     assert any(event["event_type"] == "kb_deleted" for event in audit_events.json())
+
+
+def test_enterprise_user_kb_query_settings_are_per_user_and_used_by_query(
+    monkeypatch, tmp_path
+):
+    client, user_service, _authz, admin, alice, bob, probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+    probe.active_query_config = {"user_prompt": "kb default prompt"}
+
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_prompt", "name": "Prompt KB"},
+        headers=alice_headers,
+    )
+    assert created.status_code == 200, created.text
+
+    default_settings = client.get(
+        "/auth/me/kbs/kb_prompt/query-settings",
+        headers=alice_headers,
+    )
+    assert default_settings.status_code == 200, default_settings.text
+    assert default_settings.json() == {
+        "user_id": alice.id,
+        "kb_id": "kb_prompt",
+        "user_prompt": "",
+    }
+
+    bob_settings_denied = client.put(
+        "/auth/me/kbs/kb_prompt/query-settings",
+        json={"user_prompt": "bob prompt"},
+        headers=bob_headers,
+    )
+    assert bob_settings_denied.status_code == 403
+
+    grant = client.put(
+        "/admin/kbs/kb_prompt/acl",
+        json={"user_id": bob.id, "role": "kb_viewer"},
+        headers=admin_headers,
+    )
+    assert grant.status_code == 200, grant.text
+
+    alice_settings = client.put(
+        "/auth/me/kbs/kb_prompt/query-settings",
+        json={"user_prompt": "alice persistent prompt"},
+        headers=alice_headers,
+    )
+    assert alice_settings.status_code == 200, alice_settings.text
+    assert alice_settings.json()["user_prompt"] == "alice persistent prompt"
+
+    bob_settings = client.put(
+        "/auth/me/kbs/kb_prompt/query-settings",
+        json={"user_prompt": "bob persistent prompt"},
+        headers=bob_headers,
+    )
+    assert bob_settings.status_code == 200, bob_settings.text
+    assert bob_settings.json()["user_prompt"] == "bob persistent prompt"
+
+    alice_query = client.post(
+        "/kbs/kb_prompt/query",
+        json={"query": "what prompt applies", "mode": "mix"},
+        headers=alice_headers,
+    )
+    assert alice_query.status_code == 200, alice_query.text
+    assert probe.instances["kb_prompt"].query_params[-1].user_prompt == (
+        "alice persistent prompt"
+    )
+
+    bob_query = client.post(
+        "/kbs/kb_prompt/query",
+        json={"query": "what prompt applies", "mode": "mix"},
+        headers=bob_headers,
+    )
+    assert bob_query.status_code == 200, bob_query.text
+    assert probe.instances["kb_prompt"].query_params[-1].user_prompt == (
+        "bob persistent prompt"
+    )
+
+    explicit_query = client.post(
+        "/kbs/kb_prompt/query",
+        json={
+            "query": "what prompt applies",
+            "mode": "mix",
+            "user_prompt": "request prompt wins",
+        },
+        headers=bob_headers,
+    )
+    assert explicit_query.status_code == 200, explicit_query.text
+    assert probe.instances["kb_prompt"].query_params[-1].user_prompt == (
+        "request prompt wins"
+    )
+
+    cleared = client.put(
+        "/auth/me/kbs/kb_prompt/query-settings",
+        json={"user_prompt": ""},
+        headers=bob_headers,
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["user_prompt"] == ""
+
+    fallback_query = client.post(
+        "/kbs/kb_prompt/query",
+        json={"query": "what prompt applies", "mode": "mix"},
+        headers=bob_headers,
+    )
+    assert fallback_query.status_code == 200, fallback_query.text
+    assert probe.instances["kb_prompt"].query_params[-1].user_prompt == (
+        "kb default prompt"
+    )
+
+
+def test_enterprise_user_kb_query_settings_reject_legacy_api_key_principal(
+    monkeypatch, tmp_path
+):
+    args = _enterprise_args(enterprise_legacy_api_key_superadmin=True)
+    client, user_service, _authz, _admin, alice, _bob, _probe = _build_enterprise_client(
+        monkeypatch,
+        tmp_path,
+        args=args,
+    )
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    legacy_api_key_headers = {"X-API-Key": _API_KEY}
+
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_api_key_settings", "name": "API Key Settings"},
+        headers=alice_headers,
+    )
+    assert created.status_code == 200, created.text
+
+    settings_read = client.get(
+        "/auth/me/kbs/kb_api_key_settings/query-settings",
+        headers=legacy_api_key_headers,
+    )
+    assert settings_read.status_code == 403
+    settings_write = client.put(
+        "/auth/me/kbs/kb_api_key_settings/query-settings",
+        json={"user_prompt": "api key prompt"},
+        headers=legacy_api_key_headers,
+    )
+    assert settings_write.status_code == 403
 
 
 def test_enterprise_tenant_kb_acl_authorizes_members_only(monkeypatch, tmp_path):
@@ -1312,6 +1461,18 @@ def test_enterprise_service_api_keys_are_scoped_and_revocable(monkeypatch, tmp_p
     assert service_me.json()["principal"]["auth_method"] == "service_api_key"
     assert service_me.json()["principal"]["user_id"] == f"service-key:{key_record['id']}"
     assert service_me.json()["principal"]["username"] == "alpha-reader"
+
+    service_settings = client.get(
+        "/auth/me/kbs/kb_service_alpha/query-settings",
+        headers=service_headers,
+    )
+    assert service_settings.status_code == 403
+    service_settings_write = client.put(
+        "/auth/me/kbs/kb_service_alpha/query-settings",
+        json={"user_prompt": "service prompt"},
+        headers=service_headers,
+    )
+    assert service_settings_write.status_code == 403
 
     create_denied = client.post(
         "/kbs",
