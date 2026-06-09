@@ -1448,6 +1448,8 @@ lightrag-migrate-kb-metadata --working-dir ./rag_storage --strategy fail --yes
 > ```
 >
 > 注：`source_name` 文档过滤在 Postgres 后端的 `ESCAPE` 子句此前误用两字符转义串（`InvalidEscapeSequenceError`），已修复为单字符并由该 live 契约测试守护。
+>
+> live 验证记录（2026-06-10，PG 15）：对真实 `192.168.1.66:5433/knowledge_base` 运行 `tests/api/test_metadata_store_contract.py` **38 passed**，覆盖 KB/文档/任务/配置版本/企业用户·租户实体·成员·KB ACL·审计 全套，且包含新增的租户实体 CRUD/删除与审计过滤分页契约——确认 Postgres 路径与 SQLite 行为一致。
 
 ### 12.2 MinIO / S3 source 与 artifact 存储
 
