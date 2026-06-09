@@ -1,7 +1,69 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
+import threading
 from typing import Any
+
+
+HTTP_LATENCY_BUCKETS = (
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+)
+
+_HTTP_METRICS_LOCK = threading.Lock()
+_HTTP_REQUEST_TOTALS: Counter[tuple[str, str, str]] = Counter()
+_HTTP_DURATION_SUMS: defaultdict[tuple[str, str, str], float] = defaultdict(float)
+_HTTP_DURATION_BUCKETS: Counter[tuple[str, str, str, str]] = Counter()
+
+
+def record_http_request(
+    method: str,
+    route: str | None,
+    status_code: int | str,
+    duration_seconds: float,
+) -> None:
+    """Record one HTTP request for the in-process Prometheus exporter.
+
+    Labels intentionally use route templates (for example
+    ``/kbs/{kb_id}/query``) instead of raw paths to avoid unbounded
+    cardinality. Metrics are process-local, which matches the current
+    single-server deployment target.
+    """
+
+    normalized_method = (method or "UNKNOWN").upper()
+    normalized_route = (route or "__unmatched__").strip() or "__unmatched__"
+    normalized_status = str(status_code)
+    duration = max(0.0, float(duration_seconds or 0.0))
+    key = (normalized_method, normalized_route, normalized_status)
+    with _HTTP_METRICS_LOCK:
+        _HTTP_REQUEST_TOTALS[key] += 1
+        _HTTP_DURATION_SUMS[key] += duration
+        for bucket in HTTP_LATENCY_BUCKETS:
+            if duration <= bucket:
+                _HTTP_DURATION_BUCKETS[
+                    (*key, _format_bucket_le(bucket))
+                ] += 1
+        _HTTP_DURATION_BUCKETS[(*key, "+Inf")] += 1
+
+
+def reset_http_metrics_for_tests() -> None:
+    """Clear process-local HTTP metrics between tests."""
+
+    with _HTTP_METRICS_LOCK:
+        _HTTP_REQUEST_TOTALS.clear()
+        _HTTP_DURATION_SUMS.clear()
+        _HTTP_DURATION_BUCKETS.clear()
 
 
 DOCUMENT_STATUSES = (
@@ -56,6 +118,7 @@ async def build_prometheus_metrics(
         1,
         labels={"kb_metadata_backend": kb_metadata_backend},
     )
+    _append_http_request_metrics(lines)
 
     try:
         kb_records = await kb_service.list(include_deleted=True)
@@ -168,6 +231,64 @@ async def _append_audit_metrics(lines: list[str], metadata_store: Any) -> None:
     )
 
 
+def _append_http_request_metrics(lines: list[str]) -> None:
+    with _HTTP_METRICS_LOCK:
+        request_totals = dict(_HTTP_REQUEST_TOTALS)
+        duration_sums = dict(_HTTP_DURATION_SUMS)
+        duration_buckets = dict(_HTTP_DURATION_BUCKETS)
+
+    _append_help(
+        lines,
+        "lightrag_http_requests_total",
+        "HTTP requests observed by method, route template, and status code.",
+        metric_type="counter",
+    )
+    for (method, route, status_code), count in sorted(request_totals.items()):
+        _append_gauge(
+            lines,
+            "lightrag_http_requests_total",
+            count,
+            labels={"method": method, "route": route, "status_code": status_code},
+        )
+
+    _append_help(
+        lines,
+        "lightrag_http_request_duration_seconds",
+        "HTTP request duration histogram in seconds by method, route template, and status code.",
+        metric_type="histogram",
+    )
+    for (method, route, status_code, le), count in sorted(duration_buckets.items()):
+        _append_gauge(
+            lines,
+            "lightrag_http_request_duration_seconds_bucket",
+            count,
+            labels={
+                "method": method,
+                "route": route,
+                "status_code": status_code,
+                "le": le,
+            },
+        )
+    for (method, route, status_code), total in sorted(duration_sums.items()):
+        labels = {"method": method, "route": route, "status_code": status_code}
+        _append_gauge(
+            lines,
+            "lightrag_http_request_duration_seconds_sum",
+            total,
+            labels=labels,
+        )
+        _append_gauge(
+            lines,
+            "lightrag_http_request_duration_seconds_count",
+            request_totals.get((method, route, status_code), 0),
+            labels=labels,
+        )
+
+
+def _format_bucket_le(bucket: float) -> str:
+    return f"{bucket:g}"
+
+
 def _append_collection_error(
     lines: list[str], scope: str, labels: dict[str, str] | None = None
 ) -> None:
@@ -177,9 +298,9 @@ def _append_collection_error(
     _append_gauge(lines, "lightrag_metrics_collection_error", 1, labels=merged_labels)
 
 
-def _append_help(lines: list[str], name: str, help_text: str) -> None:
+def _append_help(lines: list[str], name: str, help_text: str, metric_type: str = "gauge") -> None:
     lines.append(f"# HELP {name} {help_text}")
-    lines.append(f"# TYPE {name} gauge")
+    lines.append(f"# TYPE {name} {metric_type}")
 
 
 def _append_gauge(

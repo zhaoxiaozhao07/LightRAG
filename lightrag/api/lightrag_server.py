@@ -15,6 +15,7 @@ import re
 import logging
 import logging.config
 import sys
+import time
 import textwrap
 import uvicorn
 import pipmaster as pm
@@ -73,7 +74,7 @@ from lightrag.api.kb_deletion_service import KBDeletionService
 from lightrag.api.kb_service import KnowledgeBaseRecord, KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
 from lightrag.api.metadata_store import SQLiteMetadataStore
-from lightrag.api.metrics import build_prometheus_metrics
+from lightrag.api.metrics import build_prometheus_metrics, record_http_request
 from lightrag.api.object_storage import create_object_storage_from_env
 from lightrag.api.postgres_kb_service import PostgresKnowledgeBaseService
 from lightrag.api.postgres_metadata_store import PostgresMetadataStore
@@ -936,6 +937,29 @@ def create_app(args):
     enterprise_login_tracker = (
         LoginAttemptTracker.from_args(args) if enterprise_enabled else None
     )
+    enterprise_registration_tracker = (
+        LoginAttemptTracker(
+            max_attempts=max(
+                0, int(getattr(args, "enterprise_registration_max_attempts", 10) or 0)
+            ),
+            window_seconds=max(
+                1.0,
+                float(
+                    getattr(args, "enterprise_registration_window_seconds", 300.0)
+                    or 300.0
+                ),
+            ),
+            lockout_seconds=max(
+                1.0,
+                float(
+                    getattr(args, "enterprise_registration_lockout_seconds", 900.0)
+                    or 900.0
+                ),
+            ),
+        )
+        if enterprise_enabled
+        else None
+    )
     enterprise_invitation_service = (
         InvitationService(metadata_store, enterprise_audit_service)
         if enterprise_enabled
@@ -1062,6 +1086,7 @@ def create_app(args):
         app.state.enterprise_limit_service = enterprise_limit_service
         app.state.enterprise_authorization_service = enterprise_authorization_service
         app.state.enterprise_audit_service = enterprise_audit_service
+        app.state.enterprise_registration_tracker = enterprise_registration_tracker
 
     # Add custom validation error handler for /query/data endpoint
     @app.exception_handler(RequestValidationError)
@@ -1125,6 +1150,23 @@ def create_app(args):
 
     # Create combined auth dependency for all endpoints
     combined_auth = get_combined_auth_dependency(api_key)
+
+    @app.middleware("http")
+    async def _record_http_metrics(request: Request, call_next):
+        started = time.perf_counter()
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            route = getattr(request.scope.get("route"), "path", None)
+            record_http_request(
+                request.method,
+                route,
+                status_code,
+                time.perf_counter() - started,
+            )
 
     def get_workspace_from_request(request: Request) -> str | None:
         """

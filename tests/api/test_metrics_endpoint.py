@@ -8,10 +8,21 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from lightrag.api.metrics import build_prometheus_metrics
+from lightrag.api.metrics import (
+    build_prometheus_metrics,
+    record_http_request,
+    reset_http_metrics_for_tests,
+)
 
 
 pytestmark = pytest.mark.offline
+
+
+@pytest.fixture(autouse=True)
+def _reset_http_metrics():
+    reset_http_metrics_for_tests()
+    yield
+    reset_http_metrics_for_tests()
 
 
 class FakeKBService:
@@ -92,6 +103,31 @@ def test_build_prometheus_metrics_includes_kb_document_job_and_audit_counts():
     )
 
 
+def test_build_prometheus_metrics_includes_http_counters_and_latency_histogram():
+    record_http_request("GET", "/health", 200, 0.03)
+
+    metrics = asyncio.run(_build_sample_metrics())
+
+    assert "# TYPE lightrag_http_requests_total counter" in metrics
+    assert (
+        'lightrag_http_requests_total{method="GET",route="/health",status_code="200"} 1'
+        in metrics
+    )
+    assert "# TYPE lightrag_http_request_duration_seconds histogram" in metrics
+    assert (
+        'lightrag_http_request_duration_seconds_bucket{le="0.05",method="GET",route="/health",status_code="200"} 1'
+        in metrics
+    )
+    assert (
+        'lightrag_http_request_duration_seconds_bucket{le="+Inf",method="GET",route="/health",status_code="200"} 1'
+        in metrics
+    )
+    assert (
+        'lightrag_http_request_duration_seconds_count{method="GET",route="/health",status_code="200"} 1'
+        in metrics
+    )
+
+
 def test_metrics_endpoint_returns_prometheus_text(tmp_path, monkeypatch):
     for var in (
         "LLM_BINDING",
@@ -108,6 +144,9 @@ def test_metrics_endpoint_returns_prometheus_text(tmp_path, monkeypatch):
         "LIGHTRAG_KB_METADATA_BACKEND",
         "LIGHTRAG_OBJECT_STORAGE",
         "LIGHTRAG_KB_JOB_WORKER",
+        "LIGHTRAG_ENTERPRISE_AUTH_ENABLED",
+        "LIGHTRAG_ENTERPRISE_LEGACY_API_KEY_SUPERADMIN",
+        "LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES",
     ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("LLM_BINDING", "openai")
@@ -121,14 +160,16 @@ def test_metrics_endpoint_returns_prometheus_text(tmp_path, monkeypatch):
     monkeypatch.setenv("EMBEDDING_DIM", "1536")
     monkeypatch.setenv("RERANK_BINDING", "null")
     monkeypatch.setenv("LIGHTRAG_API_KEY", "metrics-key")
+    monkeypatch.setenv("LIGHTRAG_ENTERPRISE_AUTH_ENABLED", "false")
     monkeypatch.setenv("WORKING_DIR", str(tmp_path / "rag_storage"))
 
-    from lightrag.api.config import parse_args
+    from lightrag.api.config import initialize_config, parse_args
 
     original_argv = sys.argv.copy()
     sys.argv = ["lightrag-server"]
     try:
         args = parse_args()
+        initialize_config(args, force=True)
         with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
             mock_rag.return_value = MagicMock()
             from lightrag.api.lightrag_server import create_app
@@ -144,3 +185,8 @@ def test_metrics_endpoint_returns_prometheus_text(tmp_path, monkeypatch):
     assert response.headers["content-type"].startswith("text/plain")
     assert "lightrag_enterprise_enabled 0" in response.text
     assert "lightrag_kb_total" in response.text
+
+    second = client.get("/metrics", headers={"X-API-Key": "metrics-key"})
+    assert second.status_code == 200
+    assert 'lightrag_http_requests_total{method="GET",route="/metrics",status_code="200"}' in second.text
+    assert 'lightrag_http_request_duration_seconds_count{method="GET",route="/metrics",status_code="200"}' in second.text

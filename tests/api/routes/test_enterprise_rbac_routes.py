@@ -22,6 +22,7 @@ from lightrag.api.enterprise_auth import (
     AuthorizationService,
     EnterpriseLimitService,
     InvitationService,
+    LoginAttemptTracker,
     ServiceAPIKeyService,
     SystemSettingsService,
     UserService,
@@ -136,6 +137,11 @@ def _enterprise_args(**overrides):
         "enterprise_tenant_quota_requests": 0,
         "enterprise_tenant_quota_window_seconds": 86400.0,
         "enterprise_artifact_download_min_role": "kb_viewer",
+        "enterprise_artifact_download_policy": "",
+        "enterprise_mask_storage_uris": True,
+        "enterprise_registration_max_attempts": 10,
+        "enterprise_registration_window_seconds": 300.0,
+        "enterprise_registration_lockout_seconds": 900.0,
         "token_auto_renew": False,
         "token_renew_threshold": 0.5,
     }
@@ -721,9 +727,7 @@ def test_enterprise_artifact_download_can_require_stronger_role(monkeypatch, tmp
     assert artifacts.status_code == 200, artifacts.text
     artifact_items = artifacts.json()["artifacts"]
     previewable = next(
-        item
-        for item in artifact_items
-        if item["artifact_type"] in {"blocks", "markdown"}
+        item for item in artifact_items if item["artifact_type"] == "original"
     )
     artifact_id = previewable["id"]
 
@@ -760,6 +764,95 @@ def test_enterprise_artifact_download_can_require_stronger_role(monkeypatch, tmp
         headers=bob_headers,
     )
     assert allowed_download.status_code == 200, allowed_download.text
+
+
+def test_enterprise_artifact_per_type_policy_and_storage_uri_masking(
+    monkeypatch, tmp_path
+):
+    args = _enterprise_args(
+        enterprise_artifact_download_policy=json.dumps({"original": "kb_editor"}),
+        enterprise_mask_storage_uris=True,
+    )
+    client, user_service, _authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path, args=args
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_artifact_type_policy", "name": "Artifact Type Policy"},
+        headers=alice_headers,
+    )
+    assert created.status_code == 200, created.text
+    grant_viewer = client.put(
+        "/admin/kbs/kb_artifact_type_policy/acl",
+        json={"user_id": bob.id, "role": "kb_viewer"},
+        headers=admin_headers,
+    )
+    assert grant_viewer.status_code == 200, grant_viewer.text
+
+    uploaded = client.post(
+        "/kbs/kb_artifact_type_policy/documents:upload",
+        files=[("files", ("artifact.pdf", b"pdf", "application/pdf"))],
+        headers=alice_headers,
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    document_id = uploaded.json()["documents"][0]["id"]
+    parsed = client.post(
+        f"/kbs/kb_artifact_type_policy/documents/{document_id}:parse",
+        json={"engine": "mineru", "process_options": "iF"},
+        headers=alice_headers,
+    )
+    assert parsed.status_code == 200, parsed.text
+
+    document_detail = client.get(
+        f"/kbs/kb_artifact_type_policy/documents/{document_id}",
+        headers=bob_headers,
+    )
+    assert document_detail.status_code == 200, document_detail.text
+    assert document_detail.json()["source_uri"] == "<masked>"
+
+    artifacts = client.get(
+        f"/kbs/kb_artifact_type_policy/documents/{document_id}/artifacts",
+        headers=bob_headers,
+    )
+    assert artifacts.status_code == 200, artifacts.text
+    artifact_items = artifacts.json()["artifacts"]
+    original = next(item for item in artifact_items if item["artifact_type"] == "original")
+    blocks = next(item for item in artifact_items if item["artifact_type"] == "blocks")
+    assert original["uri"] == "<masked>"
+    assert "object_uri" not in original["metadata"]
+
+    viewer_original_download = client.get(
+        f"/kbs/kb_artifact_type_policy/documents/{document_id}/artifacts/{original['id']}:download",
+        headers=bob_headers,
+    )
+    assert viewer_original_download.status_code == 403
+    viewer_original_preview = client.get(
+        f"/kbs/kb_artifact_type_policy/documents/{document_id}/artifacts/{original['id']}:preview",
+        headers=bob_headers,
+    )
+    assert viewer_original_preview.status_code == 403
+
+    viewer_blocks_download = client.get(
+        f"/kbs/kb_artifact_type_policy/documents/{document_id}/artifacts/{blocks['id']}:download",
+        headers=bob_headers,
+    )
+    assert viewer_blocks_download.status_code == 200, viewer_blocks_download.text
+
+    grant_editor = client.put(
+        "/admin/kbs/kb_artifact_type_policy/acl",
+        json={"user_id": bob.id, "role": "kb_editor"},
+        headers=admin_headers,
+    )
+    assert grant_editor.status_code == 200, grant_editor.text
+    editor_original_download = client.get(
+        f"/kbs/kb_artifact_type_policy/documents/{document_id}/artifacts/{original['id']}:download",
+        headers=bob_headers,
+    )
+    assert editor_original_download.status_code == 200, editor_original_download.text
 
 
 def test_enterprise_registration_patch_and_disabled_token_rejection(monkeypatch, tmp_path):
@@ -830,6 +923,44 @@ def test_enterprise_registration_patch_and_disabled_token_rejection(monkeypatch,
 
     stale_token = client.get("/auth/me", headers=bob_headers)
     assert stale_token.status_code == 401
+
+
+def test_enterprise_registration_failed_attempts_are_limited_and_audited(
+    monkeypatch, tmp_path
+):
+    client, user_service, _authz, admin, _alice, _bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    client.app.state.enterprise_registration_tracker = LoginAttemptTracker(
+        max_attempts=2,
+        window_seconds=60.0,
+        lockout_seconds=120.0,
+        time_func=lambda: 1000.0,
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+
+    opened = client.patch(
+        "/admin/settings/registration",
+        json={"mode": "open"},
+        headers=admin_headers,
+    )
+    assert opened.status_code == 200, opened.text
+
+    duplicate_payload = {"username": "alice", "password": "not-used"}
+    first = client.post("/auth/register", json=duplicate_payload)
+    second = client.post("/auth/register", json=duplicate_payload)
+    locked = client.post("/auth/register", json=duplicate_payload)
+
+    assert first.status_code == 409
+    assert second.status_code == 409
+    assert locked.status_code == 429
+    assert locked.headers["Retry-After"] == "120"
+
+    audit_events = client.get("/admin/audit-events", headers=admin_headers)
+    assert audit_events.status_code == 200, audit_events.text
+    event_types = [event["event_type"] for event in audit_events.json()]
+    assert "registration_failed" in event_types
+    assert "registration_locked" in event_types
 
 
 def test_enterprise_admin_user_lifecycle_and_acl_batch(monkeypatch, tmp_path):
@@ -966,6 +1097,13 @@ def test_enterprise_service_api_keys_are_scoped_and_revocable(monkeypatch, tmp_p
     assert [item["id"] for item in service_list.json()["knowledge_bases"]] == [
         "kb_service_alpha"
     ]
+
+    service_me = client.get("/auth/me", headers=service_headers)
+    assert service_me.status_code == 200, service_me.text
+    assert service_me.json()["user"] is None
+    assert service_me.json()["principal"]["auth_method"] == "service_api_key"
+    assert service_me.json()["principal"]["user_id"] == f"service-key:{key_record['id']}"
+    assert service_me.json()["principal"]["username"] == "alpha-reader"
 
     create_denied = client.post(
         "/kbs",
@@ -1139,6 +1277,62 @@ def test_create_service_api_key_with_expiry_round_trips(monkeypatch, tmp_path):
         headers=admin_headers,
     )
     assert invalid.status_code == 422
+
+
+def test_rotate_service_api_key_returns_new_raw_key_and_revokes_old(
+    monkeypatch, tmp_path
+):
+    client, user_service, _authz, admin, alice, _bob, _probe = _build_enterprise_client(
+        monkeypatch,
+        tmp_path,
+        api_key=None,
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+
+    created_kb = client.post(
+        "/kbs", json={"id": "kb_rotate", "name": "Rotate"}, headers=alice_headers
+    )
+    assert created_kb.status_code == 200, created_kb.text
+    created = client.post(
+        "/admin/service-api-keys",
+        json={"name": "rotating", "kb_roles": {"kb_rotate": "kb_viewer"}},
+        headers=admin_headers,
+    )
+    assert created.status_code == 200, created.text
+    old_raw = created.json()["api_key"]
+    old_key = created.json()["key"]
+
+    rotated = client.post(
+        f"/admin/service-api-keys/{old_key['id']}:rotate",
+        json={"expires_in_seconds": 7200},
+        headers=admin_headers,
+    )
+    assert rotated.status_code == 200, rotated.text
+    new_raw = rotated.json()["api_key"]
+    new_key = rotated.json()["key"]
+    assert new_raw != old_raw
+    assert new_key["id"] != old_key["id"]
+    assert new_key["metadata"]["rotated_from"] == old_key["id"]
+    assert new_key["expires_at"] is not None
+
+    assert client.get("/kbs", headers={"X-API-Key": old_raw}).status_code == 401
+    new_list = client.get("/kbs", headers={"X-API-Key": new_raw})
+    assert new_list.status_code == 200, new_list.text
+    assert [item["id"] for item in new_list.json()["knowledge_bases"]] == [
+        "kb_rotate"
+    ]
+
+    listed = client.get("/admin/service-api-keys", headers=admin_headers)
+    by_id = {item["id"]: item for item in listed.json()}
+    assert by_id[old_key["id"]]["status"] == "revoked"
+    assert by_id[new_key["id"]]["status"] == "active"
+    assert "api_key" not in by_id[new_key["id"]]
+    assert "key_hash" not in by_id[new_key["id"]]
+
+    events = client.get("/admin/audit-events", headers=admin_headers).json()
+    event_types = {event["event_type"] for event in events}
+    assert "service_api_key_rotated" in event_types
 
 
 def test_enterprise_user_rate_limit_returns_429_and_audits(monkeypatch, tmp_path):

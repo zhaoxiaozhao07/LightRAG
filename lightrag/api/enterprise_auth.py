@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import contextvars
 import hashlib
+import json
 from importlib import import_module
 import os
 import secrets
@@ -258,6 +259,51 @@ def enterprise_artifact_download_min_role() -> str:
     if normalized is None:
         return KB_ROLE_VIEWER
     return normalized
+
+
+def enterprise_artifact_download_policy() -> dict[str, str]:
+    configured = getattr(_global_args(), "enterprise_artifact_download_policy", "")
+    if not configured:
+        return {}
+    if isinstance(configured, str):
+        try:
+            parsed = json.loads(configured)
+        except json.JSONDecodeError:
+            return {}
+    elif isinstance(configured, dict):
+        parsed = configured
+    else:
+        return {}
+    policy: dict[str, str] = {}
+    for artifact_type, role in parsed.items():
+        if not isinstance(artifact_type, str) or not artifact_type.strip():
+            continue
+        normalized = _normalize_kb_role(str(role or ""))
+        if normalized is not None:
+            policy[artifact_type.strip()] = normalized
+    return policy
+
+
+def enterprise_artifact_min_role_for_type(
+    artifact_type: str | None,
+    *,
+    action: str = "download",
+) -> str:
+    policy = enterprise_artifact_download_policy()
+    normalized_type = (artifact_type or "").strip()
+    if normalized_type in policy:
+        return policy[normalized_type]
+    if "*" in policy:
+        return policy["*"]
+    if action == "preview":
+        return KB_ROLE_VIEWER
+    return enterprise_artifact_download_min_role()
+
+
+def enterprise_mask_storage_uris() -> bool:
+    return enterprise_auth_enabled() and bool(
+        getattr(_global_args(), "enterprise_mask_storage_uris", True)
+    )
 
 
 def protected_whitelist_bypass_forbidden(path: str) -> bool:
@@ -626,6 +672,47 @@ class ServiceAPIKeyService:
                 metadata={"name": revoked.name, "key_preview": revoked.key_preview},
             )
         return revoked
+
+    async def rotate_key(
+        self,
+        key_id: str,
+        *,
+        rotated_by: str | None = None,
+        expires_at: str | None = None,
+        revoke_old: bool = True,
+    ) -> tuple[EnterpriseAPIKeyRecord, str]:
+        existing = await self._metadata_store.get_enterprise_api_key_by_id(key_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Service API key not found")
+        if existing.status != ENTERPRISE_API_KEY_STATUS_ACTIVE:
+            raise HTTPException(status_code=409, detail="Only active service API keys can be rotated")
+        metadata = dict(existing.metadata or {})
+        metadata["rotated_from"] = existing.id
+        new_key, raw_key = await self.create_key(
+            name=existing.name,
+            scopes=existing.scopes,
+            metadata=metadata,
+            created_by=rotated_by,
+            tenant_id=existing.tenant_id,
+            expires_at=expires_at if expires_at is not None else existing.expires_at,
+        )
+        if revoke_old:
+            await self.revoke_key(existing.id, revoked_by=rotated_by)
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                "service_api_key_rotated",
+                actor_user_id=rotated_by,
+                target_type="service_api_key",
+                target_id=existing.id,
+                metadata={
+                    "new_key_id": new_key.id,
+                    "new_key_preview": new_key.key_preview,
+                    "old_key_preview": existing.key_preview,
+                    "revoke_old": revoke_old,
+                    "expires_at": new_key.expires_at,
+                },
+            )
+        return new_key, raw_key
 
     async def principal_from_api_key(self, raw_key: str) -> Principal | None:
         if not raw_key.strip():
@@ -1456,9 +1543,10 @@ async def enforce_enterprise_request_access(
         return
 
     if _is_artifact_download_action(path):
-        await authz.require_kb_role(
-            principal, kb_id, enterprise_artifact_download_min_role()
-        )
+        # Artifact-type policy needs the artifact metadata, so the path-level
+        # guard only establishes KB read access. The route performs the
+        # stricter per-type check before restore/presign work.
+        await authz.require_kb_role(principal, kb_id, KB_ROLE_VIEWER)
         return
 
     if method == "GET":
@@ -1788,6 +1876,15 @@ def _global_args() -> Any:
         ),
         enterprise_legacy_api_key_superadmin=_env_bool(
             "LIGHTRAG_ENTERPRISE_LEGACY_API_KEY_SUPERADMIN", False
+        ),
+        enterprise_artifact_download_min_role=os.getenv(
+            "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE", KB_ROLE_VIEWER
+        ),
+        enterprise_artifact_download_policy=os.getenv(
+            "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY", ""
+        ),
+        enterprise_mask_storage_uris=_env_bool(
+            "LIGHTRAG_ENTERPRISE_MASK_STORAGE_URIS", True
         ),
         enterprise_rate_limit_enabled=_env_bool(
             "LIGHTRAG_ENTERPRISE_RATE_LIMIT_ENABLED", False

@@ -4,6 +4,7 @@ Configs for the LightRAG API.
 
 import os
 import re
+import json
 import argparse
 import logging
 from dotenv import load_dotenv
@@ -200,6 +201,33 @@ def validate_auth_configuration(args: argparse.Namespace) -> None:
                 "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE must be one of: "
                 f"{', '.join(sorted(ENTERPRISE_KB_ROLES))}."
             )
+        artifact_policy = getattr(args, "enterprise_artifact_download_policy", None)
+        if artifact_policy:
+            try:
+                parsed_policy = (
+                    json.loads(artifact_policy)
+                    if isinstance(artifact_policy, str)
+                    else artifact_policy
+                )
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY must be a JSON object."
+                ) from exc
+            if not isinstance(parsed_policy, dict):
+                raise ValueError(
+                    "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY must be a JSON object."
+                )
+            for artifact_type, role in parsed_policy.items():
+                if not isinstance(artifact_type, str) or not artifact_type.strip():
+                    raise ValueError(
+                        "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY keys must be non-empty strings."
+                    )
+                normalized_role = str(role or "").strip()
+                if normalized_role not in ENTERPRISE_KB_ROLES:
+                    raise ValueError(
+                        "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY roles must be one of: "
+                        f"{', '.join(sorted(ENTERPRISE_KB_ROLES))}."
+                    )
 
 
 def _is_set(value: str | None) -> bool:
@@ -706,6 +734,12 @@ def parse_args() -> argparse.Namespace:
     args.enterprise_artifact_download_min_role = get_env_value(
         "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE", "kb_viewer"
     )
+    args.enterprise_artifact_download_policy = get_env_value(
+        "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY", ""
+    )
+    args.enterprise_mask_storage_uris = get_env_value(
+        "LIGHTRAG_ENTERPRISE_MASK_STORAGE_URIS", True, bool
+    )
     args.enterprise_rate_limit_enabled = get_env_value(
         "LIGHTRAG_ENTERPRISE_RATE_LIMIT_ENABLED", False, bool
     )
@@ -741,6 +775,15 @@ def parse_args() -> argparse.Namespace:
     )
     args.enterprise_login_lockout_seconds = get_env_value(
         "LIGHTRAG_ENTERPRISE_LOGIN_LOCKOUT_SECONDS", 900.0, float
+    )
+    args.enterprise_registration_max_attempts = get_env_value(
+        "LIGHTRAG_ENTERPRISE_REGISTRATION_MAX_ATTEMPTS", 10, int
+    )
+    args.enterprise_registration_window_seconds = get_env_value(
+        "LIGHTRAG_ENTERPRISE_REGISTRATION_WINDOW_SECONDS", 300.0, float
+    )
+    args.enterprise_registration_lockout_seconds = get_env_value(
+        "LIGHTRAG_ENTERPRISE_REGISTRATION_LOCKOUT_SECONDS", 900.0, float
     )
     args.enterprise_max_concurrent_jobs = get_env_value(
         "LIGHTRAG_ENTERPRISE_MAX_CONCURRENT_JOBS", 0, int

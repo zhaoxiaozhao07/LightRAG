@@ -31,6 +31,7 @@ import asyncio
 import importlib
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -56,6 +57,21 @@ pytestmark = pytest.mark.offline
 
 _API_KEY = "test-key"
 _HEADERS = {"X-API-Key": _API_KEY}
+
+
+@pytest.fixture(autouse=True)
+def _disable_enterprise_auth_for_non_enterprise_route_tests(monkeypatch):
+    from lightrag.api import config as api_config
+
+    monkeypatch.setattr(
+        api_config,
+        "global_args",
+        SimpleNamespace(
+            enterprise_auth_enabled=False,
+            token_auto_renew=False,
+            token_renew_threshold=0.5,
+        ),
+    )
 
 
 class FakeDocStatus:
@@ -469,6 +485,41 @@ def test_upload_auto_parse_single_drain(tmp_path):
     assert len(rag.enqueue_calls) == 1
     assert len(rag.enqueue_calls[0]["ids"]) == 3
     assert rag.process_enqueue_calls == 1
+
+
+def test_batch_parse_route_parses_documents_concurrently_and_respects_limit(tmp_path):
+    client, probe = _build_client(
+        tmp_path, max_parallel_parse_mineru=2, parse_delay=0.03
+    )
+    _create_kb(client, "kb_batch_parse_concurrent")
+    upload = client.post(
+        "/kbs/kb_batch_parse_concurrent/documents:upload",
+        files=[
+            ("files", (f"doc_{i}.pdf", f"content {i}".encode(), "application/pdf"))
+            for i in range(4)
+        ],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200, upload.text
+    document_ids = [item["id"] for item in upload.json()["documents"]]
+
+    response = client.post(
+        "/kbs/kb_batch_parse_concurrent/documents:batch-parse",
+        json={
+            "document_ids": document_ids,
+            "engine": "mineru",
+            "process_options": "iF",
+        },
+        headers=_HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    final = _wait(client, "kb_batch_parse_concurrent", response.json()["job_id"])
+
+    assert final["status"] == "succeeded"
+    rag = probe.instances["kb_batch_parse_concurrent"]
+    assert len(rag.parse_calls) == 4
+    assert rag.max_concurrent_parses > 1
+    assert rag.max_concurrent_parses <= 2
 
 
 # ---------------------------------------------------------------------------

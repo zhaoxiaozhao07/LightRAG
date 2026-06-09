@@ -57,7 +57,14 @@ from lightrag.api.metadata_store import (
     MetadataRecordNotFoundError,
 )
 from lightrag.api.routers.document_routes import SUPPORTED_DOCUMENT_EXTENSIONS
-from lightrag.api.enterprise_auth import append_enterprise_audit_event
+from lightrag.api.enterprise_auth import (
+    append_enterprise_audit_event,
+    enterprise_artifact_min_role_for_type,
+    enterprise_auth_enabled,
+    enterprise_mask_storage_uris,
+    get_enterprise_authorization_service,
+    get_request_principal,
+)
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.utils import generate_track_id, logger
 
@@ -136,6 +143,41 @@ def _artifact_audit_metadata(artifact: ArtifactRecord, **extra: Any) -> dict[str
     }
     metadata.update({key: value for key, value in extra.items() if value is not None})
     return metadata
+
+
+def _masked_storage_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    masked = dict(metadata)
+    for key in (
+        "source_uri",
+        "source_object_uri",
+        "object_uri",
+        "object_prefix_uri",
+        "blocks_path",
+        "local_path",
+        "path",
+    ):
+        masked.pop(key, None)
+    return masked
+
+
+async def _enforce_artifact_content_policy(
+    request: Request,
+    kb_id: str,
+    artifact: ArtifactRecord,
+    *,
+    action: str,
+) -> None:
+    if not enterprise_auth_enabled():
+        return
+    min_role = enterprise_artifact_min_role_for_type(
+        artifact.artifact_type,
+        action=action,
+    )
+    await get_enterprise_authorization_service(request).require_kb_role(
+        get_request_principal(request),
+        kb_id,
+        min_role,
+    )
 
 
 def _document_audit_metadata(
@@ -288,7 +330,11 @@ class DocumentResponse(BaseModel):
 
     @classmethod
     def from_record(cls, record: DocumentRecord) -> "DocumentResponse":
-        return cls(**record.to_dict())
+        data = record.to_dict()
+        if enterprise_mask_storage_uris():
+            data["source_uri"] = "<masked>"
+            data["metadata"] = _masked_storage_metadata(data.get("metadata") or {})
+        return cls(**data)
 
 
 class DocumentBatchResponse(BaseModel):
@@ -318,7 +364,11 @@ class ArtifactResponse(BaseModel):
 
     @classmethod
     def from_record(cls, record: ArtifactRecord) -> "ArtifactResponse":
-        return cls(**record.to_dict())
+        data = record.to_dict()
+        if enterprise_mask_storage_uris():
+            data["uri"] = "<masked>"
+            data["metadata"] = _masked_storage_metadata(data.get("metadata") or {})
+        return cls(**data)
 
 
 class ArtifactListResponse(BaseModel):
@@ -4464,6 +4514,9 @@ def create_kb_document_routes(
                         == delete_artifacts
                         and bool(existing_payload.get("delete_llm_cache"))
                         == delete_llm_cache
+                        and bool(existing_payload.get("delete_graph_orphans", True))
+                        == delete_graph_orphans
+                        and str(existing_payload.get("strategy", "safe")) == strategy
                     )
                     if not same_request:
                         raise IdempotencyKeyConflictError(idempotency_key)
@@ -4984,18 +5037,41 @@ def create_kb_document_routes(
                         ),
                     )
                     rag = await active_registry.get(kb_id) if execution_plans else None
-                    for plan in execution_plans:
-                        if rag is None:
-                            raise RuntimeError(
-                                "KB parse service did not return a LightRAG instance"
-                            )
-                        item = await _execute_parse_plan(
-                            document_service=document_service,
-                            kb_id=kb_id,
-                            job_id=job.id,
-                            plan=plan,
-                            rag=rag,
+                    if execution_plans and rag is None:
+                        raise RuntimeError(
+                            "KB parse service did not return a LightRAG instance"
                         )
+                    parse_concurrency = max(
+                        1,
+                        int(getattr(rag, "max_parallel_parse_mineru", 1) or 1),
+                    ) if rag is not None else 1
+                    parse_sem = asyncio.Semaphore(parse_concurrency)
+
+                    async def _do_one_parse(plan: Any) -> dict[str, Any]:
+                        async with parse_sem:
+                            return await _execute_parse_plan(
+                                document_service=document_service,
+                                kb_id=kb_id,
+                                job_id=job.id,
+                                plan=plan,
+                                rag=rag,
+                                job_service=job_service,
+                            )
+
+                    raw_items = await asyncio.gather(
+                        *[_do_one_parse(plan) for plan in execution_plans],
+                        return_exceptions=True,
+                    )
+                    for plan, outcome in zip(execution_plans, raw_items):
+                        if isinstance(outcome, BaseException):
+                            item = {
+                                "document_id": plan.document.id,
+                                "status": "failed",
+                                "error_code": "parse_failed",
+                                "error_message": str(outcome),
+                            }
+                        else:
+                            item = outcome
                         item_results.append(item)
                         if item["status"] == "succeeded":
                             completed_items += 1
@@ -6134,6 +6210,12 @@ def create_kb_document_routes(
         request: Request, kb_id: str, document_id: str, artifact_id: str
     ):
         try:
+            artifact = await document_service.get_document_artifact(
+                kb_id, document_id, artifact_id
+            )
+            await _enforce_artifact_content_policy(
+                request, kb_id, artifact, action="download"
+            )
             artifact_file = await document_service.get_document_artifact_file(
                 kb_id, document_id, artifact_id
             )
@@ -6172,6 +6254,12 @@ def create_kb_document_routes(
         request: Request, kb_id: str, document_id: str, artifact_id: str
     ):
         try:
+            artifact = await document_service.get_document_artifact(
+                kb_id, document_id, artifact_id
+            )
+            await _enforce_artifact_content_policy(
+                request, kb_id, artifact, action="preview"
+            )
             artifact_file = await document_service.get_document_artifact_file(
                 kb_id, document_id, artifact_id
             )
@@ -6212,6 +6300,12 @@ def create_kb_document_routes(
                 1,
                 min(expires_in_seconds, _MAX_PRESIGNED_URL_EXPIRES_SECONDS),
             )
+            artifact = await document_service.get_document_artifact(
+                kb_id, document_id, artifact_id
+            )
+            await _enforce_artifact_content_policy(
+                request, kb_id, artifact, action="download_url"
+            )
             result = await document_service.get_document_artifact_download_url(
                 kb_id,
                 document_id,
@@ -6234,7 +6328,7 @@ def create_kb_document_routes(
             return ArtifactDownloadUrlResponse(
                 artifact_id=result.artifact.id,
                 url=result.url,
-                object_uri=result.object_uri,
+                object_uri="<masked>" if enterprise_mask_storage_uris() else result.object_uri,
                 expires_in_seconds=result.expires_in_seconds,
                 filename=result.filename,
                 media_type=result.media_type,

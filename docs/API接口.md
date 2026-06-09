@@ -1,6 +1,6 @@
 # LightRAG API 接口文档
 
-> 文档版本：2026-06-08
+> 文档版本：2026-06-09
 > 文档定位：LightRAG 生产级 KB 后端与企业能力的**单一权威接口契约**（取代 `archive/API接口文档.md`，内容无损延续）。
 > 适用范围：当前已经合并到 `main` 分支并通过测试的接口。
 > 路径前缀：所有路径均为相对路径；部署时通过 FastAPI `root_path` 或 `--api-prefix /api/v1` 暴露为 `/api/v1/...`。
@@ -259,7 +259,7 @@ Content-Type: application/json
 ```
 
 约束：
-- 三类接口最终都调用 `DocumentLifecycleService.create_source_batch`，落 KB `documents/jobs` metadata，并写入对应 `source_type=url/import/scan`；`auto_parse/auto_index/parser_engine/process_options/idempotency_key` 语义与 `:upload` / `:texts` 一致。
+- 三类接口最终都调用 `DocumentLifecycleService.create_source_batch`，落 KB `documents/jobs` metadata，并写入对应 `source_type=url/import/scan`；`auto_parse/auto_index/parser_engine/process_options/idempotency_key` 语义与 `:upload` / `:texts` 一致。`auto_parse=true` 时同一 `idempotency_key` + 同请求指纹会复用原聚合 parse batch/job，指纹不同返回 `409`。
 - `:urls` 仅允许 `http/https`，URL 必须有 hostname，禁止 userinfo；请求前解析 hostname 并拒绝 loopback/private/link-local/multicast/reserved/unspecified 地址；`httpx.AsyncClient` 使用 `trust_env=false`、`follow_redirects=false`、显式 timeout，并在读取响应体前复验实际连接的 peer address，防止 DNS rebinding/解析 TOCTOU 读取内网响应。`Content-Length` 会预检，流式读取时仍按 `MAX_UPLOAD_SIZE` 和请求总字节数二次截断；3xx 不自动跟随。
 - URL `source_name` 优先级：显式 `source_name` > `Content-Disposition` filename > URL path basename；最终扩展名必须在 `SUPPORTED_DOCUMENT_EXTENSIONS` 内。未显式传 `source_key` 时默认 `url:<normalized-url>`，metadata 会写入 `source_url`。
 - `:import` 仅允许读取配置的 `INPUT_DIR` 下文件；绝对路径/相对路径都会规范化并做 containment 校验，逃逸 `INPUT_DIR`、目录、symlink、空文件、不支持扩展名或超限文件均拒绝。未显式传 `source_key` 时默认 `import:<relative-path>`，metadata 写入 `staged_source_path`。
@@ -311,6 +311,7 @@ DELETE /kbs/{kb_id}/documents/{document_id}?delete_source_file=false&delete_arti
 - 若文档已有 `lightrag_doc_id`，后台任务调用 `LightRAG.adelete_by_doc_id`；底层返回 `success` 或 `not_found` 都视为删除成功，适配尚未入库或已被清理的文档。
 - **共享图谱删除策略 `strategy`**（`safe` / `rebuild_doc_scope` / `rebuild_kb` / `rebuild_subgraph`，默认 `safe`）：`safe` 与 `rebuild_doc_scope` 复用 `adelete_by_doc_id` 内建的 source-attribution（按剩余来源判定）+ 共享实体保守重建，仅清除失去最后来源的实体/关系；`rebuild_kb` 在删除成功后对 KB 内剩余**全部**可构建文档执行一次保守 force-reindex；`rebuild_subgraph` 是**精确子图局部重建**：在删除前先快照被删文档贡献的实体名/关系对（`full_entities`/`full_relations`），删除成功后**只对与该足迹有交集的幸存文档**做 force-reindex，未触及被删文档子图的文档完全不动。两种 rebuild 的结果都记录在 job `result.rebuild`（`rebuild_subgraph` 额外返回 `affected_documents` / `footprint_entities` / `footprint_relations`）。`rebuild_kb` 与 `rebuild_subgraph` 都需路由注入 `IndexBuildService`，否则返回 `503`。
 - **`delete_graph_orphans`**（默认 `true`）：引擎始终修剪失去最后来源的孤立实体/关系；显式传 `false` 暂不支持，返回 `400`。
+- `idempotency_key` 在 `(kb_id, job_type=delete)` 维度唯一；请求指纹包含 `delete_source_file`、`delete_artifacts`、`delete_llm_cache`、`delete_graph_orphans` 与 `strategy`。同 key 同策略复用原 job；同 key 不同清理/图谱策略返回 `409`。
 - `delete_source_file=true` / `delete_artifacts=true` 时仅允许删除 `INPUT_DIR/<workspace>/<document_id>/...` 内的 source/artifact 文件或目录（source 与 artifact 均锚定到规范化的 `<workspace>/<document_id>` 目录做 containment 校验），路径逃逸会使 job 失败并保留文档为 `delete_failed`。启用对象存储时会同步删除 `metadata.source_object_uri`、artifact `metadata.object_uri` / `metadata.object_prefix_uri`，并在 job result 的 `file_delete_result.deleted_objects[]` 中返回已清理对象 URI/prefix。
 
 批量删除：
@@ -404,6 +405,7 @@ Content-Type: application/json
 - 任一 item 失败时聚合 job 终态为 `failed`，但已成功 item 不回滚。
 - 每个 item 使用与单文档解析相同的解析指令优先级；请求级 `engine/process_options` 会覆盖文档 metadata 和 active config 默认值。
 - **`auto_index` 是 parse-only 预留 no-op**：`:batch-parse` 始终只解析、不构建，持久化的聚合 job payload 固定 `auto_index=false`，因此 durable worker 续跑（`_run_aggregate` 仅当 `payload["auto_index"]` 为真才构建）与 in-process 路径行为一致。要在解析后构建请调用 `:batch-build-kg`。
+- in-process 路径与 durable worker 续跑均按 `MAX_PARALLEL_PARSE_MINERU` 并发解析文档；单个文档失败会作为 per-item failure 写入聚合结果，不阻塞其他文档继续解析。
 
 ---
 
@@ -655,13 +657,13 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 列表示例：`GET /kbs/{kb_id}/documents/{document_id}/artifacts?artifact_type=markdown&limit=50&offset=0`。
 
 下载约束：
-- 企业模式权限：artifact list/detail/preview 按 `kb_viewer` 或更高角色读取；`:download` 与 `:download-url` 的最低角色由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 控制，默认 `kb_viewer` 保持旧行为，可提升为 `kb_editor`、`kb_admin` 或 `kb_owner`。提升后低角色仍可读取列表/详情/预览，但下载和预签名 URL 返回 `403`。
+- 企业模式权限：artifact list/detail 按 `kb_viewer` 或更高角色读取。`:download` 与 `:download-url` 的默认最低角色由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 控制，默认 `kb_viewer` 保持旧行为，可提升为 `kb_editor`、`kb_admin` 或 `kb_owner`；`LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY` 可用 JSON object 按 artifact type 覆盖（如 `{"original":"kb_editor","*":"kb_viewer"}`），并同时作用于显式匹配类型的 `:preview`。低于要求的角色返回 `403`。
 - 文件型产物（`original` / `blocks` / `markdown` / `content_list` / `middle_json` / `model_json` / `image` / `layout_pdf`）以 `FileResponse` 直接返回。
 - 目录型产物（`sidecar` / `raw_dir`）以流式 zip 返回（`Content-Type: application/zip`），单次下载 zip 内未压缩字节上限 512 MB，超限返回 `413`。
 - 路径必须位于 `inputs/<workspace>/<document_id>` 内；跨 KB、缺失文件、路径逃逸均返回 `404` / `400`。
 - 启用对象存储时，如果本地 cache path 缺失，`:download` 接口会先从 `metadata.object_uri` / `metadata.object_prefix_uri` restore 到原 cache path，再返回文件或 zip，保持旧客户端兼容。
 - `:preview` 仅支持文件型 artifact，目录返回 `400`；支持 `text/*`、`application/json`、`application/ld+json`、`application/markdown`、`application/x-ndjson`、普通图片（不含 `image/svg+xml`）和 `application/pdf`，以 `inline` content-disposition 返回；单次 preview 上限 10 MB，超出返回 `413`，不支持的 media type 返回 `415`。本地 cache 缺失时同样按对象存储 metadata restore。
-- `:download-url` 仅对 metadata 中存在 `object_uri` 的**文件型** artifact 生效，返回 `{artifact_id,url,object_uri,expires_in_seconds,filename,media_type}`；服务端使用对象存储后端生成 `GET Object` 预签名 URL，不会触发本地 cache restore。`expires_in_seconds` 默认 3600 秒，服务端限制在 `[1, 604800]`。目录型 artifact（`sidecar` / `raw_dir`，metadata 中为 `object_prefix_uri`）仍需走 `:download` 的 zip 代理下载。
+- `:download-url` 仅对 metadata 中存在 `object_uri` 的**文件型** artifact 生效，返回 `{artifact_id,url,object_uri,expires_in_seconds,filename,media_type}`；服务端使用对象存储后端生成 `GET Object` 预签名 URL，不会触发本地 cache restore。`expires_in_seconds` 默认 3600 秒，服务端限制在 `[1, 604800]`。目录型 artifact（`sidecar` / `raw_dir`，metadata 中为 `object_prefix_uri`）仍需走 `:download` 的 zip 代理下载。企业模式且 `LIGHTRAG_ENTERPRISE_MASK_STORAGE_URIS=true`（默认）时，文档 `source_uri`、artifact `uri`、响应中的 storage metadata 与 `download-url.object_uri` 会返回 `"<masked>"`，不泄露本地路径或对象存储 URI；下载/预览/预签名内部仍使用真实 metadata。
 
 ---
 
@@ -924,7 +926,7 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/health` | 系统健康、配置和队列状态；默认 whitelist 放行 |
-| `GET` | `/metrics` | Prometheus text format 基础指标；受 `combined_auth` 保护，默认不在 whitelist |
+| `GET` | `/metrics` | Prometheus text format 指标（KB/doc/job/audit gauge + process-local HTTP counter/histogram）；受 `combined_auth` 保护，默认不在 whitelist |
 | `GET` | `/auth-status` | 认证模式状态；非企业模式下可能签发 guest token |
 | `POST` | `/login` | 非企业模式下使用 `AUTH_ACCOUNTS`；企业模式下使用企业用户表 |
 
@@ -948,6 +950,10 @@ LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES=true
 LIGHTRAG_ENTERPRISE_LEGACY_API_KEY_SUPERADMIN=false
 # artifact 下载/预签名 URL 的最低 KB role；默认 kb_viewer 保持旧行为，可设 kb_editor/kb_admin/kb_owner
 LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE=kb_viewer
+# artifact type 级别最低角色覆盖，JSON object；key 可为 original/markdown/raw_dir/... 或 *
+LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY={"original":"kb_editor"}
+# 企业响应中默认隐藏本地 path / object_uri / object_prefix_uri
+LIGHTRAG_ENTERPRISE_MASK_STORAGE_URIS=true
 
 # 默认关闭的企业请求限流/配额；开启后在认证与 RBAC 通过后计数
 LIGHTRAG_ENTERPRISE_RATE_LIMIT_ENABLED=false
@@ -968,6 +974,10 @@ LIGHTRAG_ENTERPRISE_TENANT_QUOTA_WINDOW_SECONDS=86400
 LIGHTRAG_ENTERPRISE_LOGIN_MAX_ATTEMPTS=10
 LIGHTRAG_ENTERPRISE_LOGIN_WINDOW_SECONDS=300
 LIGHTRAG_ENTERPRISE_LOGIN_LOCKOUT_SECONDS=900
+# 注册失败锁定（企业 /auth/register）；默认开启，MAX_ATTEMPTS=0 关闭
+LIGHTRAG_ENTERPRISE_REGISTRATION_MAX_ATTEMPTS=10
+LIGHTRAG_ENTERPRISE_REGISTRATION_WINDOW_SECONDS=300
+LIGHTRAG_ENTERPRISE_REGISTRATION_LOCKOUT_SECONDS=900
 # 每 principal / tenant 的在途 job 并发配额；0 表示禁用
 LIGHTRAG_ENTERPRISE_MAX_CONCURRENT_JOBS=0
 LIGHTRAG_ENTERPRISE_TENANT_MAX_CONCURRENT_JOBS=0
@@ -981,8 +991,8 @@ LIGHTRAG_ENTERPRISE_TENANT_MAX_CONCURRENT_JOBS=0
 |---|---|---|
 | `GET` | `/auth-status` | 企业模式返回 `auth_mode=enterprise` 和当前注册开关；不签发 guest token |
 | `POST` | `/login` | 使用企业用户表认证，返回带 `user_id`、`system_role`、`token_version` metadata 的 JWT；同一用户名连续登录失败达 `LIGHTRAG_ENTERPRISE_LOGIN_MAX_ATTEMPTS`（默认 10）后锁定 `LIGHTRAG_ENTERPRISE_LOGIN_LOCKOUT_SECONDS`（默认 900s），期间返回 `429` + `Retry-After`；成功登录清零计数，`MAX_ATTEMPTS=0` 关闭锁定 |
-| `POST` | `/auth/register` | 注册新用户；行为随注册模式而定：`open` 直接创建 active 用户并返回 token；`invite_only` 必须携带有效 `invitation_token`；`admin_approval` 创建 `pending` 用户、待管理员 `:enable` 审批后才能登录（响应不含 token）；`disabled` 返回 `403`。新用户默认无 KB 权限且不可创建 KB |
-| `GET` | `/auth/me` | 返回当前用户与 principal 权限信息 |
+| `POST` | `/auth/register` | 注册新用户；行为随注册模式而定：`open` 直接创建 active 用户并返回 token；`invite_only` 必须携带有效 `invitation_token`；`admin_approval` 创建 `pending` 用户、待管理员 `:enable` 审批后才能登录（响应不含 token）；`disabled` 返回 `403`。注册失败按 `LIGHTRAG_ENTERPRISE_REGISTRATION_*` 做单进程 per-username 锁定，失败/触发锁定写审计。新用户默认无 KB 权限且不可创建 KB |
+| `GET` | `/auth/me` | 返回当前用户与 principal 权限信息；service API key 请求返回 `user:null` 与 service-key principal payload |
 | `POST` | `/auth/change-password` | 当前用户修改密码；成功后 `token_version` 增加，旧 token 失效 |
 
 `GET /auth-status` 响应形态：企业模式返回 `auth_mode="enterprise"` 与注册开关且不签发 guest token；禁用认证时返回 guest bearer token；普通认证模式返回认证开关与登录入口信息。
@@ -1041,6 +1051,7 @@ username=admin&password=change-me
 | `DELETE` | `/admin/kbs/{kb_id}/acl/tenants/{tenant_id}` | 撤销 tenant 对 KB 的 ACL；KB 不存在时返回 404 |
 | `GET` | `/admin/service-api-keys` | 列出 service/scoped API key；响应不包含 raw key 或 hash |
 | `POST` | `/admin/service-api-keys` | 创建 service/scoped API key；raw key 仅在创建响应返回一次；可选 `expires_in_seconds` 设置过期 |
+| `POST` | `/admin/service-api-keys/{key_id}:rotate` | 轮换 service/scoped API key；返回新 raw key 一次，可选撤销旧 key |
 | `POST` | `/admin/service-api-keys/{key_id}:revoke` | 撤销 service/scoped API key；撤销后下一次请求立即失效 |
 | `GET` | `/admin/invitations` | 列出注册邀请（不含 raw token，仅 `token_preview`） |
 | `POST` | `/admin/invitations` | 颁发单次注册邀请（`invite_only` 模式用）；raw `invitation_token` 仅创建响应返回一次，可选 `expires_in_seconds` |
@@ -1074,10 +1085,10 @@ KB ACL 请求/响应约束：
 
 企业模式已实现的审计事件类型包括：
 
-- 登录/注册设置：`login_success`、`login_failed`、`registration_setting_updated`
+- 登录/注册设置：`login_success`、`login_failed`、`registration_failed`、`registration_locked`、`registration_setting_updated`
 - super admin bootstrap/sync：`super_admin_bootstrapped`、`super_admin_synced`
 - 用户管理：`user_created`、`user_updated`、`user_password_changed`
-- service API key：`service_api_key_created`、`service_api_key_revoked`
+- service API key：`service_api_key_created`、`service_api_key_rotated`、`service_api_key_revoked`
 - KB ACL / tenant：`kb_acl_granted`、`kb_acl_revoked`、`tenant_membership_granted`、`tenant_membership_revoked`、`tenant_kb_acl_granted`、`tenant_kb_acl_revoked`
 - 权限/限流/配额：`permission_denied`、`rate_limited`、`quota_exceeded`
 - KB/config/query：`kb_created`、`kb_deleted`、`kb_hard_deleted`、`kb_config_activated`、`query_executed`、`query_stream_started`、`retrieve_executed`
@@ -1120,6 +1131,10 @@ KB ACL 请求/响应约束：
 // POST /admin/service-api-keys
 {"name":"ci-reader","kb_roles":{"kb_123":"kb_viewer"},"can_use_bypass_query":false,"metadata":{"purpose":"ci"}}
 // 返回：{"api_key":"lrsk_svc_key_...","key":{"id":"svc_key_...","key_preview":"...","status":"active", ...}}
+
+// POST /admin/service-api-keys/{key_id}:rotate
+{"expires_in_seconds":2592000,"revoke_old":true}
+// 返回：{"api_key":"lrsk_svc_key_...","key":{"id":"svc_key_...","metadata":{"rotated_from":"svc_key_old"},"status":"active", ...}}
 
 // POST /admin/service-api-keys/{key_id}:revoke
 // 返回的 key.status 为 "revoked"
@@ -1170,8 +1185,9 @@ Service API key 行为约束：
 ```
 
 - 认证时若 `expires_at` 已过期，key 视为无效（返回 `401`），与撤销同等效果。
+- 轮换接口 `POST /admin/service-api-keys/{key_id}:rotate` 会复制旧 key 的 scopes / metadata / tenant 归属创建新 key；`revoke_old` 默认 `true`，会立即撤销旧 key。新 raw key 只在轮换响应中返回一次；新 key metadata 包含 `rotated_from`，审计写 `service_api_key_rotated`。
 
-- `GET /admin/service-api-keys` 与 revoke 响应只返回 `key` 对象形态，不返回 `api_key` 明文。
+- `GET /admin/service-api-keys` 与 revoke 响应只返回 `key` 对象形态，不返回 `api_key` 明文；create/rotate 响应会在顶层返回一次新 raw `api_key`。
 - `POST /admin/service-api-keys` 会校验 `kb_roles` 中每个 KB 是否存在；任一 KB 不存在返回 `404`。
 - Service key 认证成功时会更新 `last_used_at`。
 - 只存储 `sha256:<hex>` lookup hash 和 `key_preview`，不存储 raw key；raw key 只在创建响应返回一次。
@@ -1202,7 +1218,7 @@ KB 路由角色矩阵：
 |---|---|
 | `POST /kbs` | super admin 或 `can_create_kb=true` |
 | `GET /kbs` | super admin 看全部；普通用户仅看 direct user ACL 或 tenant ACL 授权 KB；service key 仅看 `kb_roles` scope |
-| `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高；artifact `:download` / `:download-url` 可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 提升最低角色 |
+| `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高；artifact `:download` / `:download-url` 可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 全局提升最低角色，也可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY` 按 artifact type 覆盖 |
 | `/kbs/{kb_id}/query`、`/query/stream`、`/query/data`、`/retrieve` | `kb_viewer` 或更高；最终 `mode="bypass"` 额外需要 `can_use_bypass_query=true` |
 | 文档上传/解析/构建/删除/替换/sync、job wait/cancel/retry 等写操作 | `kb_editor` 或更高 |
 | KB 配置创建/激活/diff、`PATCH /kbs/{kb_id}` | `kb_admin` 或更高 |

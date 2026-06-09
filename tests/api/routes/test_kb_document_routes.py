@@ -3,6 +3,7 @@ import importlib
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -34,6 +35,21 @@ pytestmark = pytest.mark.offline
 
 _API_KEY = "test-key"
 _HEADERS = {"X-API-Key": _API_KEY}
+
+
+@pytest.fixture(autouse=True)
+def _disable_enterprise_auth_for_non_enterprise_route_tests(monkeypatch):
+    from lightrag.api import config as api_config
+
+    monkeypatch.setattr(
+        api_config,
+        "global_args",
+        SimpleNamespace(
+            enterprise_auth_enabled=False,
+            token_auto_renew=False,
+            token_renew_threshold=0.5,
+        ),
+    )
 
 
 class FakeRAG:
@@ -634,6 +650,12 @@ def test_delete_uploaded_unindexed_document_soft_deletes_without_lightrag(tmp_pa
         headers=_HEADERS,
     )
     assert conflict.status_code == 409
+    strategy_conflict = client.delete(
+        f"/kbs/kb_delete_uploaded/documents/{document['id']}"
+        "?idempotency_key=delete-draft&strategy=rebuild_doc_scope",
+        headers=_HEADERS,
+    )
+    assert strategy_conflict.status_code == 409
     job = client.get(f"/kbs/kb_delete_uploaded/jobs/{job_id}", headers=_HEADERS)
     assert job.status_code == 200
     assert job.json()["status"] == "succeeded"
@@ -653,6 +675,35 @@ def test_delete_uploaded_unindexed_document_soft_deletes_without_lightrag(tmp_pa
     assert listed.status_code == 200
     assert listed.json()["total"] == 0
     assert Path(document["source_uri"]).exists()
+
+
+def test_delete_idempotency_key_detects_delete_graph_policy_mismatch(tmp_path):
+    client, _kb_service, _store, _document_service, job_service = _build_client(tmp_path)
+    _create_kb(client, "kb_delete_graph_idem")
+    upload = client.post(
+        "/kbs/kb_delete_graph_idem/documents:upload",
+        files=[("files", ("draft.txt", b"draft", "text/plain"))],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200
+    document = upload.json()["documents"][0]
+    asyncio.run(
+        job_service.create_delete_job_once(
+            "kb_delete_graph_idem",
+            document_id=document["id"],
+            lightrag_doc_id=document["lightrag_doc_id"],
+            delete_graph_orphans=False,
+            idempotency_key="delete-graph-policy",
+        )
+    )
+
+    response = client.delete(
+        f"/kbs/kb_delete_graph_idem/documents/{document['id']}"
+        "?idempotency_key=delete-graph-policy",
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 409
 
 
 def test_delete_ready_document_invokes_lightrag_and_removes_files_when_requested(
@@ -2826,6 +2877,57 @@ def test_url_ingestion_success_persists_url_metadata_and_content(tmp_path, monke
     assert _FakeAsyncClient.requests == [("GET", "https://example.com/docs/ignored")]
 
 
+def test_url_ingestion_auto_parse_idempotency_reuses_existing_batch(
+    tmp_path, monkeypatch
+):
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path, wire_document_registry=False
+    )
+    _create_kb(client, "kb_url_auto_idem")
+    _FakeAsyncClient.requests = []
+    _FakeAsyncClient.response = _FakeUrlResponse(chunks=[b"url content"])
+    monkeypatch.setattr(
+        _kb_document_routes, "_validate_public_hostname", lambda hostname: asyncio.sleep(0)
+    )
+    monkeypatch.setattr(_kb_document_routes.httpx, "AsyncClient", _FakeAsyncClient)
+    payload = {
+        "documents": [{"url": "https://example.com/remote.md"}],
+        "auto_parse": True,
+        "parser_engine": "mineru",
+        "process_options": "iF",
+        "idempotency_key": "idem-url-auto-1",
+    }
+
+    first = client.post(
+        "/kbs/kb_url_auto_idem/documents:urls", json=payload, headers=_HEADERS
+    )
+    second = client.post(
+        "/kbs/kb_url_auto_idem/documents:urls", json=payload, headers=_HEADERS
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert second.json()["job_id"] == first.json()["job_id"]
+    assert second.json()["batch_id"] == first.json()["batch_id"]
+    document = second.json()["documents"][0]
+    assert document["id"] == first.json()["documents"][0]["id"]
+    assert document["status"] == "parse_queued"
+    assert document["metadata"]["pending_parse_job_id"] == first.json()["job_id"]
+    assert document["metadata"]["parser_engine"] == "mineru"
+
+    listing = client.get("/kbs/kb_url_auto_idem/documents", headers=_HEADERS)
+    assert listing.json()["total"] == 1
+    jobs = client.get("/kbs/kb_url_auto_idem/jobs", headers=_HEADERS)
+    assert jobs.json()["total"] == 1
+
+    conflict = client.post(
+        "/kbs/kb_url_auto_idem/documents:urls",
+        json={**payload, "documents": [{"url": "https://example.com/other.md"}]},
+        headers=_HEADERS,
+    )
+    assert conflict.status_code == 409
+
+
 def test_url_ingestion_rejects_localhost_before_request(tmp_path, monkeypatch):
     client, _kb_service, _store, _document_service, _job_service = _build_client(
         tmp_path
@@ -2928,6 +3030,44 @@ def test_local_import_success_persists_import_metadata_and_content(tmp_path):
     assert Path(document["source_uri"]).read_text(encoding="utf-8") == "imported"
 
 
+def test_local_import_auto_parse_idempotency_reuses_existing_batch(tmp_path):
+    client, _kb_service, _store, document_service, _job_service = _build_client(
+        tmp_path, wire_document_registry=False
+    )
+    _create_kb(client, "kb_import_auto_idem")
+    staged = document_service.source_root / "staged" / "idem-import.md"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("imported", encoding="utf-8")
+    payload = {
+        "documents": [{"path": str(staged), "metadata": {"kind": "manual"}}],
+        "auto_parse": True,
+        "parser_engine": "mineru",
+        "process_options": "iF",
+        "idempotency_key": "idem-import-auto-1",
+    }
+
+    first = client.post(
+        "/kbs/kb_import_auto_idem/documents:import", json=payload, headers=_HEADERS
+    )
+    second = client.post(
+        "/kbs/kb_import_auto_idem/documents:import", json=payload, headers=_HEADERS
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert second.json()["job_id"] == first.json()["job_id"]
+    assert second.json()["batch_id"] == first.json()["batch_id"]
+    assert second.json()["documents"][0]["id"] == first.json()["documents"][0]["id"]
+    assert second.json()["documents"][0]["status"] == "parse_queued"
+    assert second.json()["documents"][0]["metadata"]["parser_engine"] == "mineru"
+    assert client.get(
+        "/kbs/kb_import_auto_idem/documents", headers=_HEADERS
+    ).json()["total"] == 1
+    assert client.get("/kbs/kb_import_auto_idem/jobs", headers=_HEADERS).json()[
+        "total"
+    ] == 1
+
+
 def test_local_import_rejects_escape_and_unsupported_extension(tmp_path):
     client, _kb_service, _store, document_service, _job_service = _build_client(
         tmp_path
@@ -2989,6 +3129,48 @@ def test_scan_success_discovers_supported_staged_files(tmp_path):
     assert metadata_by_name["a.txt"]["source_key"] == "scan:scan-stage/a.txt"
     assert metadata_by_name["b.md"]["scanned_source_path"] == "scan-stage/nested/b.md"
     assert metadata_by_name["b.md"]["source_key"] == "scan:scan-stage/nested/b.md"
+
+
+def test_scan_auto_parse_idempotency_reuses_existing_batch(tmp_path):
+    client, _kb_service, _store, document_service, _job_service = _build_client(
+        tmp_path, wire_document_registry=False
+    )
+    _create_kb(client, "kb_scan_auto_idem")
+    staged_dir = document_service.source_root / "idem-scan"
+    nested_dir = staged_dir / "nested"
+    nested_dir.mkdir(parents=True)
+    (staged_dir / "a.md").write_text("a", encoding="utf-8")
+    (nested_dir / "b.txt").write_text("b", encoding="utf-8")
+    payload = {
+        "directory": str(staged_dir),
+        "recursive": True,
+        "auto_parse": True,
+        "parser_engine": "mineru",
+        "process_options": "iF",
+        "idempotency_key": "idem-scan-auto-1",
+    }
+
+    first = client.post(
+        "/kbs/kb_scan_auto_idem/documents:scan", json=payload, headers=_HEADERS
+    )
+    second = client.post(
+        "/kbs/kb_scan_auto_idem/documents:scan", json=payload, headers=_HEADERS
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert second.json()["job_id"] == first.json()["job_id"]
+    assert second.json()["batch_id"] == first.json()["batch_id"]
+    assert {doc["id"] for doc in second.json()["documents"]} == {
+        doc["id"] for doc in first.json()["documents"]
+    }
+    assert {doc["status"] for doc in second.json()["documents"]} == {"parse_queued"}
+    assert client.get("/kbs/kb_scan_auto_idem/documents", headers=_HEADERS).json()[
+        "total"
+    ] == 2
+    assert client.get("/kbs/kb_scan_auto_idem/jobs", headers=_HEADERS).json()[
+        "total"
+    ] == 1
 
 
 def test_scan_rejects_root_input_dir_and_no_supported_files(tmp_path):

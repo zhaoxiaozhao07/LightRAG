@@ -12,6 +12,7 @@ from lightrag.api.enterprise_auth import (
     REGISTRATION_MODE_ADMIN_APPROVAL,
     REGISTRATION_MODE_INVITE_ONLY,
     REGISTRATION_MODE_OPEN,
+    SERVICE_API_KEY_AUTH_METHOD,
     USER_STATUS_ACTIVE,
     USER_STATUS_DISABLED,
     USER_STATUS_PENDING,
@@ -198,6 +199,11 @@ class EnterpriseServiceAPIKeyCreateResponse(BaseModel):
     key: EnterpriseServiceAPIKeyResponse
 
 
+class EnterpriseServiceAPIKeyRotateRequest(BaseModel):
+    expires_in_seconds: int | None = Field(default=None, ge=1)
+    revoke_old: bool = True
+
+
 class EnterpriseInvitationCreateRequest(BaseModel):
     expires_in_seconds: int | None = Field(default=None, ge=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -244,7 +250,7 @@ class EnterpriseAuditEventResponse(BaseModel):
 
 
 class EnterpriseMeResponse(BaseModel):
-    user: EnterpriseUserResponse
+    user: EnterpriseUserResponse | None
     principal: dict[str, Any]
 
 
@@ -305,11 +311,33 @@ def create_enterprise_routes(
         mode = await settings_service.registration_mode()
         user_service = get_enterprise_user_service(request)
         audit_service = get_enterprise_audit_service(request)
+        tracker = getattr(request.app.state, "enterprise_registration_tracker", None)
+        username = body.username.strip()
+        if tracker is not None:
+            tracker.check(username)
+
+        async def _record_registration_failure(error: str) -> None:
+            locked = tracker.record_failure(username) if tracker is not None else False
+            await audit_service.append(
+                "registration_locked" if locked else "registration_failed",
+                target_type="user",
+                target_id=username,
+                metadata={"mode": mode, "error": error},
+            )
+
+        async def _record_registration_success() -> None:
+            if tracker is not None:
+                tracker.record_success(username)
 
         if mode == REGISTRATION_MODE_OPEN:
-            user = await user_service.create_user(
-                username=body.username, password=body.password
-            )
+            try:
+                user = await user_service.create_user(
+                    username=body.username, password=body.password
+                )
+            except HTTPException as exc:
+                await _record_registration_failure(str(exc.detail))
+                raise
+            await _record_registration_success()
             await audit_service.append(
                 "user_registered",
                 actor_user_id=user.id,
@@ -323,12 +351,17 @@ def create_enterprise_routes(
             invitation_service = get_enterprise_invitation_service(request)
             # Consume the single-use token first so a failed downstream step
             # cannot mint a user without burning the invitation.
-            await invitation_service.consume_invitation(
-                body.invitation_token, used_by=body.username.strip()
-            )
-            user = await user_service.create_user(
-                username=body.username, password=body.password
-            )
+            try:
+                await invitation_service.consume_invitation(
+                    body.invitation_token, used_by=body.username.strip()
+                )
+                user = await user_service.create_user(
+                    username=body.username, password=body.password
+                )
+            except HTTPException as exc:
+                await _record_registration_failure(str(exc.detail))
+                raise
+            await _record_registration_success()
             await audit_service.append(
                 "user_registered",
                 actor_user_id=user.id,
@@ -339,11 +372,16 @@ def create_enterprise_routes(
             return login_response(user_service, user)
 
         if mode == REGISTRATION_MODE_ADMIN_APPROVAL:
-            user = await user_service.create_user(
-                username=body.username,
-                password=body.password,
-                status=USER_STATUS_PENDING,
-            )
+            try:
+                user = await user_service.create_user(
+                    username=body.username,
+                    password=body.password,
+                    status=USER_STATUS_PENDING,
+                )
+            except HTTPException as exc:
+                await _record_registration_failure(str(exc.detail))
+                raise
+            await _record_registration_success()
             await audit_service.append(
                 "user_registration_pending",
                 actor_user_id=user.id,
@@ -358,6 +396,7 @@ def create_enterprise_routes(
                 "message": "Registration submitted; awaiting administrator approval.",
             }
 
+        await _record_registration_failure("registration_disabled")
         raise HTTPException(status_code=403, detail="User registration is disabled")
 
     @router.get(
@@ -367,6 +406,8 @@ def create_enterprise_routes(
     )
     async def get_current_enterprise_user(request: Request):
         principal = require_principal(request)
+        if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
+            return EnterpriseMeResponse(user=None, principal=principal_payload(principal))
         user_service = get_enterprise_user_service(request)
         user = await user_service.get_user_or_404(principal.user_id)
         return EnterpriseMeResponse(
@@ -795,6 +836,33 @@ def create_enterprise_routes(
         api_key_service = get_enterprise_api_key_service(request)
         revoked = await api_key_service.revoke_key(key_id, revoked_by=principal.user_id)
         return EnterpriseServiceAPIKeyResponse.from_record(revoked)
+
+    @router.post(
+        "/admin/service-api-keys/{key_id}:rotate",
+        response_model=EnterpriseServiceAPIKeyCreateResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def rotate_service_api_key(
+        key_id: str, request: Request, body: EnterpriseServiceAPIKeyRotateRequest | None = None
+    ):
+        principal = require_principal(request)
+        api_key_service = get_enterprise_api_key_service(request)
+        expires_at = None
+        if body is not None and body.expires_in_seconds is not None:
+            expires_at = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=body.expires_in_seconds)
+            ).isoformat()
+        record, raw_key = await api_key_service.rotate_key(
+            key_id,
+            rotated_by=principal.user_id,
+            expires_at=expires_at,
+            revoke_old=True if body is None else body.revoke_old,
+        )
+        return EnterpriseServiceAPIKeyCreateResponse(
+            api_key=raw_key,
+            key=EnterpriseServiceAPIKeyResponse.from_record(record),
+        )
 
     @router.get(
         "/admin/invitations",
