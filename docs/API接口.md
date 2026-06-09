@@ -802,7 +802,8 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 | `POST` | `/kbs/{kb_id}/query/stream` | 流式问答，返回 NDJSON |
 | `POST` | `/kbs/{kb_id}/query/data` | 仅返回结构化检索数据，不调用 LLM |
 | `POST` | `/kbs/{kb_id}/retrieve` | `query/data` 的别名，语义等价 |
-| `POST` | `/kbs:query` | 跨多个知识库合并问答：扇出检索 → 跨库重排/轮询合并 → 单次 LLM 合成，references 标注来源 `kb_id` |
+| `POST` | `/kbs:query` | 跨多个知识库合并问答：扇出检索 → 共享 reranker 合并 → 单次 LLM 合成，references 标注来源 `kb_id` |
+| `POST` | `/kbs:query/stream` | 同上，流式返回 NDJSON（首行 `{kb_ids, metadata, references}`，后续 `{response}`） |
 | `POST` | `/kbs:retrieve` | 跨库检索-only：返回合并后的 chunks/references（带 `kb_id`），不调用 LLM |
 
 企业模式下，当前用户还可以为单个 KB 保存个人查询提示词：见 [10.2 登录与当前用户](#102-登录与当前用户) 的 `/auth/me/kbs/{kb_id}/query-settings`。KB query 最终 `user_prompt` 优先级为：请求体显式 `user_prompt` > 当前用户在该 KB 下持久化的 `user_prompt` > active KB config 的 `query_config.user_prompt` > 空字符串。
@@ -914,7 +915,9 @@ Content-Type: application/json
 - **企业模式鉴权**：对 `kb_ids` 中**每个** KB 都要求 `kb_viewer`+；任一无权 → **403（fail-closed）**。注意：中央 RBAC 中间件不覆盖 collection 级 `/kbs:query`/`/kbs:retrieve` 路径，鉴权由 handler 自行逐 KB 执行。审计事件 `multi_kb_query_executed` / `multi_kb_retrieve_executed`，仅记 `kb_ids`/`mode`/`query_hash`/计数，不记原文。
 - **容错**：单个 KB 检索失败（404/异常）记入 `metadata.skipped_kbs` 并跳过，其余照常；全部失败返回 502；命中 `deleting/replacing` 文档的 KB 触发 409。
 - **`/kbs:retrieve`**：同样的扇出+合并+重排，但不调用 LLM，返回 `data.chunks`（带 `kb_id`）+ `data.references`。
-- 流式与查询缓存为后续项（当前非流式）；当前版本不支持 per-KB `filters`。
+- **`/kbs:query/stream`**：与 `/kbs:query` 同入参，流式返回 `application/x-ndjson`：首行 `{kb_ids, metadata, references}`，随后每行 `{response: "..."}`，出错 `{error}`。合成阶段单次 LLM，故先完成检索/合并再流式输出答案。
+- **`filters`（可选，per-KB）**：`metadata` 过滤统一作用于每个 KB；`doc_ids` 按所属 KB 拆分（每个 KB 只应用属于它的 id），且每个 `doc_id` 必须至少属于一个目标 KB，否则 `400`（`detail.missing` 列出越界 id）。语义与单库 `filters` 一致，仅 doc_ids 改为跨库软交集。
+- 查询缓存为后续项。
 
 ---
 
@@ -1315,7 +1318,7 @@ KB 路由角色矩阵：
 | `GET /kbs` | super admin 看全部；普通用户仅看 direct user ACL 或 tenant ACL 授权 KB；service key 默认仅看 `kb_roles` scope，显式 `inherit_tenant_kb_acl` 时额外继承 tenant ACL |
 | `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高；artifact `:download` / `:download-url` 可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 全局提升最低角色，也可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY` 按 artifact type 覆盖；`:download` / `:download-url` / `:preview` 还可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY` 按 action + artifact type 覆盖 |
 | `/kbs/{kb_id}/query`、`/query/stream`、`/query/data`、`/retrieve` | `kb_viewer` 或更高；最终 `mode="bypass"` 额外需要 `can_use_bypass_query=true` |
-| `POST /kbs:query`、`/kbs:retrieve`（跨库合并查询） | `kb_ids` 中每个 KB 均需 `kb_viewer`+（handler 自鉴权，中央中间件不覆盖 collection 级路径）；`bypass` 不支持(400) |
+| `POST /kbs:query`、`/kbs:query/stream`、`/kbs:retrieve`（跨库合并查询） | `kb_ids` 中每个 KB 均需 `kb_viewer`+（handler 自鉴权，中央中间件不覆盖 collection 级路径）；`bypass` 不支持(400) |
 | 文档上传/解析/构建/替换/sync、job wait/cancel/retry 等写操作 | `kb_editor` 或更高 |
 | 文档删除（`DELETE …/documents/{id}`、`:batch-delete`） | `kb_editor` 仅删本人上传(`metadata.created_by`)的文档；删他人需 `can_delete_documents` 能力或 `kb_admin`+/`super_admin` |
 | KB 配置创建/激活/diff、`PATCH /kbs/{kb_id}` | `kb_admin` 或更高 |

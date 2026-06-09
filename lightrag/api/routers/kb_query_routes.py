@@ -535,6 +535,7 @@ class MultiKBQueryRequest(BaseModel):
     enable_rerank: Optional[bool] = None
     include_references: Optional[bool] = True
     include_chunk_content: Optional[bool] = False
+    filters: Optional[KBQueryFilters] = None
 
     @field_validator("query", mode="after")
     @classmethod
@@ -579,6 +580,7 @@ class MultiKBQueryRequest(BaseModel):
             "kb_ids",
             "include_chunk_content",
             "include_references",
+            "filters",
         }
         request_data = self.model_dump(exclude_none=True, exclude=route_only_fields)
         explicit_fields = self.model_fields_set - route_only_fields
@@ -656,6 +658,138 @@ def _multi_kb_query_audit_metadata(
     }
 
 
+async def _resolve_multi_kb_doc_id_filters(
+    document_service: DocumentLifecycleService,
+    kb_ids: List[str],
+    filters: "KBQueryFilters | None",
+) -> Dict[str, "KBQueryFilters | None"]:
+    """Map each target KB to the filters it should apply.
+
+    ``metadata`` filters apply uniformly to every KB. ``doc_ids`` are KB-scoped:
+    each KB receives only the requested ids that actually belong to it, and
+    every requested id must belong to at least one target KB (otherwise 400 —
+    a genuine mistake). This avoids the single-KB strict validation rejecting
+    ids that legitimately live in a sibling target KB.
+    """
+    if not _has_doc_id_filter(filters):
+        return {kb_id: filters for kb_id in kb_ids}
+    requested = list(filters.doc_ids or []) if filters else []
+    per_kb: Dict[str, "KBQueryFilters | None"] = {}
+    belonging_union: set[str] = set()
+    metadata = filters.metadata if filters else None
+    for kb_id in kb_ids:
+        docs = await document_service.get_documents_by_ids(kb_id, requested)
+        ids_here = [doc.id for doc in docs]
+        belonging_union.update(ids_here)
+        per_kb[kb_id] = KBQueryFilters(doc_ids=ids_here, metadata=metadata)
+    missing = [doc_id for doc_id in requested if doc_id not in belonging_union]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "doc_ids_not_in_kb",
+                "missing": missing,
+                "message": "filters.doc_ids reference documents outside all target KBs",
+            },
+        )
+    return per_kb
+
+
+async def _prepare_multi_kb_synthesis(
+    request: "MultiKBQueryRequest",
+    merged: List[Dict[str, Any]],
+    synth_rag: Any,
+    synth_param: QueryParam | None,
+):
+    """Process merged chunks and build the single-synthesis system prompt.
+
+    Returns ``(sys_prompt, use_model_func, references, reranked, final_count)``;
+    ``sys_prompt``/``use_model_func`` are ``None`` when there is nothing to
+    synthesize (no merged chunks). The caller invokes ``use_model_func`` with
+    the desired ``stream`` flag so non-streaming and streaming share this logic.
+    """
+    if not (merged and synth_rag is not None and synth_param is not None):
+        return None, None, [], False, 0
+
+    global_config = synth_rag._build_global_config()
+    tokenizer = global_config.get("tokenizer")
+    response_type = synth_param.response_type or "Multiple Paragraphs"
+    user_prompt = (
+        f"\n\n{synth_param.user_prompt}" if synth_param.user_prompt else "n/a"
+    )
+    max_total_tokens = (
+        getattr(synth_param, "max_total_tokens", None)
+        or global_config.get("max_total_tokens")
+        or 30000
+    )
+    chunk_token_limit: int | None = None
+    if tokenizer:
+        pre_sys = PROMPTS["naive_rag_response"].format(
+            response_type=response_type, user_prompt=user_prompt, content_data=""
+        )
+        chunk_token_limit = max_total_tokens - (
+            len(tokenizer.encode(pre_sys)) + len(tokenizer.encode(request.query)) + 200
+        )
+
+    processed = await process_chunks_unified(
+        query=request.query,
+        unique_chunks=merged,
+        query_param=synth_param,
+        global_config=global_config,
+        source_type="multi_kb",
+        chunk_token_limit=chunk_token_limit,
+    )
+    reranked = bool(global_config.get("rerank_model_func")) and bool(
+        synth_param.enable_rerank
+    )
+    final_count = len(processed)
+
+    reference_list, processed_with_ids = generate_reference_list_from_chunks(processed)
+    chunks_context = [
+        {"reference_id": c["reference_id"], "content": c["content"]}
+        for c in processed_with_ids
+        if c.get("reference_id")
+    ]
+    text_units_str = "\n".join(
+        json.dumps(unit, ensure_ascii=False) for unit in chunks_context
+    )
+    reference_list_str = "\n".join(
+        f"[{ref['reference_id']}] {ref['file_path']}"
+        for ref in reference_list
+        if ref["reference_id"]
+    )
+    content_data = PROMPTS["naive_query_context"].format(
+        text_chunks_str=text_units_str, reference_list_str=reference_list_str
+    )
+    sys_prompt = PROMPTS["naive_rag_response"].format(
+        response_type=response_type, user_prompt=user_prompt, content_data=content_data
+    )
+
+    ref_kb: Dict[str, str] = {}
+    ref_content: Dict[str, List[str]] = {}
+    for chunk in processed_with_ids:
+        rid = chunk.get("reference_id")
+        if not rid:
+            continue
+        ref_kb.setdefault(rid, chunk.get("kb_id", ""))
+        if request.include_chunk_content:
+            ref_content.setdefault(rid, []).append(chunk.get("content", ""))
+    references = [
+        MultiKBReferenceItem(
+            reference_id=ref["reference_id"],
+            file_path=ref["file_path"],
+            kb_id=ref_kb.get(ref["reference_id"], ""),
+            content=ref_content.get(ref["reference_id"])
+            if request.include_chunk_content
+            else None,
+        )
+        for ref in reference_list
+        if ref["reference_id"]
+    ]
+    use_model_func = global_config["role_llm_funcs"]["query"]
+    return sys_prompt, use_model_func, references, reranked, final_count
+
+
 async def _multi_kb_retrieve(
     document_service: DocumentLifecycleService,
     registry: LightRAGInstanceRegistry,
@@ -693,15 +827,24 @@ async def _multi_kb_retrieve(
         for kb_id in kb_ids:
             await authz.require_kb_role(principal, kb_id, KB_ROLE_VIEWER)
 
+    # Per-KB filters: metadata applies uniformly; doc_ids are split to the KB
+    # they belong to (with union validation). None when no filters supplied.
+    per_kb_filters = await _resolve_multi_kb_doc_id_filters(
+        document_service, kb_ids, request.filters
+    )
+
     async def _retrieve_one(kb_id: str):
-        await _ensure_query_documents_available(document_service, kb_id, None)
+        kb_filters = per_kb_filters.get(kb_id)
+        await _ensure_query_filter_documents_available(
+            document_service, kb_id, kb_filters
+        )
         rag = cast(Any, await registry.get(kb_id))
         # All KBs share one model service, so retrieve every KB with the SAME
         # request-level params (not each KB's own active query_config) for a
         # fair, consistent cross-KB merge.
         param = request.to_query_params()
         param.stream = False
-        param.ids = await _resolve_doc_id_scope(document_service, kb_id, None)
+        param.ids = await _resolve_doc_id_scope(document_service, kb_id, kb_filters)
         data = await rag.aquery_data(request.query, param=param)
         return rag, param, data
 
@@ -1034,78 +1177,17 @@ def create_kb_query_routes(
                 document_service, registry, request, http_request
             )
 
-            reranked = False
-            final_count = 0
             response_text = "No relevant context found for the query."
-            references_out: List[MultiKBReferenceItem] = []
-
-            if merged and synth_rag is not None and synth_param is not None:
-                global_config = synth_rag._build_global_config()
-                tokenizer = global_config.get("tokenizer")
-                response_type = synth_param.response_type or "Multiple Paragraphs"
-                user_prompt = (
-                    f"\n\n{synth_param.user_prompt}"
-                    if synth_param.user_prompt
-                    else "n/a"
-                )
-                max_total_tokens = (
-                    getattr(synth_param, "max_total_tokens", None)
-                    or global_config.get("max_total_tokens")
-                    or 30000
-                )
-                chunk_token_limit: int | None = None
-                if tokenizer:
-                    pre_sys = PROMPTS["naive_rag_response"].format(
-                        response_type=response_type,
-                        user_prompt=user_prompt,
-                        content_data="",
-                    )
-                    chunk_token_limit = max_total_tokens - (
-                        len(tokenizer.encode(pre_sys))
-                        + len(tokenizer.encode(request.query))
-                        + 200
-                    )
-
-                ordered = merged
-                processed = await process_chunks_unified(
-                    query=request.query,
-                    unique_chunks=ordered,
-                    query_param=synth_param,
-                    global_config=global_config,
-                    source_type="multi_kb",
-                    chunk_token_limit=chunk_token_limit,
-                )
-                reranked = bool(global_config.get("rerank_model_func")) and bool(
-                    synth_param.enable_rerank
-                )
-                final_count = len(processed)
-
-                reference_list, processed_with_ids = (
-                    generate_reference_list_from_chunks(processed)
-                )
-                chunks_context = [
-                    {"reference_id": c["reference_id"], "content": c["content"]}
-                    for c in processed_with_ids
-                    if c.get("reference_id")
-                ]
-                text_units_str = "\n".join(
-                    json.dumps(unit, ensure_ascii=False) for unit in chunks_context
-                )
-                reference_list_str = "\n".join(
-                    f"[{ref['reference_id']}] {ref['file_path']}"
-                    for ref in reference_list
-                    if ref["reference_id"]
-                )
-                content_data = PROMPTS["naive_query_context"].format(
-                    text_chunks_str=text_units_str,
-                    reference_list_str=reference_list_str,
-                )
-                sys_prompt = PROMPTS["naive_rag_response"].format(
-                    response_type=response_type,
-                    user_prompt=user_prompt,
-                    content_data=content_data,
-                )
-                use_model_func = global_config["role_llm_funcs"]["query"]
+            (
+                sys_prompt,
+                use_model_func,
+                references_out,
+                reranked,
+                final_count,
+            ) = await _prepare_multi_kb_synthesis(
+                request, merged, synth_rag, synth_param
+            )
+            if sys_prompt is not None and use_model_func is not None:
                 llm_out = await use_model_func(
                     request.query,
                     system_prompt=sys_prompt,
@@ -1115,30 +1197,6 @@ def create_kb_query_routes(
                 )
                 if isinstance(llm_out, str) and llm_out.strip():
                     response_text = llm_out.strip()
-
-                ref_kb: Dict[str, str] = {}
-                ref_content: Dict[str, List[str]] = {}
-                for chunk in processed_with_ids:
-                    rid = chunk.get("reference_id")
-                    if not rid:
-                        continue
-                    ref_kb.setdefault(rid, chunk.get("kb_id", ""))
-                    if request.include_chunk_content:
-                        ref_content.setdefault(rid, []).append(
-                            chunk.get("content", "")
-                        )
-                references_out = [
-                    MultiKBReferenceItem(
-                        reference_id=ref["reference_id"],
-                        file_path=ref["file_path"],
-                        kb_id=ref_kb.get(ref["reference_id"], ""),
-                        content=ref_content.get(ref["reference_id"])
-                        if request.include_chunk_content
-                        else None,
-                    )
-                    for ref in reference_list
-                    if ref["reference_id"]
-                ]
 
             metadata = {
                 "requested_kb_count": len(request.kb_ids),
@@ -1179,6 +1237,107 @@ def create_kb_query_routes(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             logger.error("Multi-KB query failed: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.post(
+        ":query/stream",
+        dependencies=[Depends(combined_auth)],
+        summary="Stream one synthesized RAG answer across multiple KBs (NDJSON)",
+    )
+    async def multi_kb_query_stream(
+        request: MultiKBQueryRequest, http_request: Request
+    ):
+        try:
+            (
+                merged,
+                synth_rag,
+                synth_param,
+                queried,
+                skipped,
+                per_kb_counts,
+            ) = await _multi_kb_retrieve(
+                document_service, registry, request, http_request
+            )
+            (
+                sys_prompt,
+                use_model_func,
+                references_out,
+                reranked,
+                final_count,
+            ) = await _prepare_multi_kb_synthesis(
+                request, merged, synth_rag, synth_param
+            )
+            metadata = {
+                "requested_kb_count": len(request.kb_ids),
+                "per_kb_chunk_counts": per_kb_counts,
+                "merged_chunk_count": len(merged),
+                "final_chunk_count": final_count,
+                "reranked": reranked,
+                "skipped_kbs": skipped,
+                "synthesis_kb_id": queried[0] if queried else None,
+            }
+            await append_enterprise_audit_event(
+                http_request,
+                "multi_kb_query_stream_started",
+                target_type="kb_group",
+                target_id=None,
+                metadata=_multi_kb_query_audit_metadata(
+                    request,
+                    synth_param,
+                    kb_ids=queried,
+                    skipped=skipped,
+                    reranked=reranked,
+                    final_count=final_count,
+                ),
+            )
+
+            async def stream_generator():
+                head: Dict[str, Any] = {"kb_ids": queried, "metadata": metadata}
+                if request.include_references:
+                    head["references"] = [ref.model_dump() for ref in references_out]
+                yield f"{json.dumps(head)}\n"
+                if sys_prompt is None or use_model_func is None:
+                    yield (
+                        f"{json.dumps({'response': 'No relevant context found for the query.'})}\n"
+                    )
+                    return
+                llm_out = await use_model_func(
+                    request.query,
+                    system_prompt=sys_prompt,
+                    history_messages=synth_param.conversation_history,
+                    enable_cot=True,
+                    stream=True,
+                )
+                if isinstance(llm_out, str):
+                    if llm_out.strip():
+                        yield f"{json.dumps({'response': llm_out.strip()})}\n"
+                    return
+                try:
+                    async for chunk in llm_out:
+                        if chunk:
+                            yield f"{json.dumps({'response': chunk})}\n"
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Multi-KB stream error: %s", exc)
+                    yield f"{json.dumps({'error': str(exc)})}\n"
+
+            return StreamingResponse(
+                stream_generator(),
+                media_type="application/x-ndjson",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "Content-Type": "application/x-ndjson",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        except HTTPException:
+            raise
+        except KnowledgeBaseNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Multi-KB streaming query failed: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @router.post(

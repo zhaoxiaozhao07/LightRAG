@@ -1056,12 +1056,19 @@ class MultiKBFakeRAG(FakeRAG):
         async def fake_query_llm(
             query, *, system_prompt=None, history_messages=None, enable_cot=True, stream=False
         ):
-            import re
-
             seen = sorted(
                 set(re.findall(r"chunk content from ([\w\-]+)", system_prompt or ""))
             )
-            return "synth[" + ",".join(seen) + "]: " + query
+            answer = "synth[" + ",".join(seen) + "]: " + query
+            if stream:
+
+                async def _gen():
+                    mid = len(answer) // 2
+                    for piece in (answer[:mid], answer[mid:]):
+                        yield piece
+
+                return _gen()
+            return answer
 
         return {
             "role_llm_funcs": {"query": fake_query_llm},
@@ -1278,4 +1285,84 @@ def test_multi_kb_retrieve_returns_merged_chunks_without_llm(tmp_path):
     assert len(body["data"]["chunks"]) == 2
     assert len(body["data"]["references"]) == 2
     assert {r["kb_id"] for r in body["data"]["references"]} == {"kb_a", "kb_b"}
+
+
+def test_multi_kb_query_stream_merges_two_kbs(tmp_path):
+    client, _ = _build_multi_kb_client(tmp_path)
+    alpha = _create_kb(client, "kb_alpha")
+    beta = _create_kb(client, "kb_beta")
+    resp = client.post(
+        "/kbs:query/stream",
+        json={"kb_ids": ["kb_alpha", "kb_beta"], "query": "stream across kbs"},
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("application/x-ndjson")
+    lines = [json.loads(ln) for ln in resp.text.splitlines() if ln.strip()]
+    head = lines[0]
+    assert head["kb_ids"] == ["kb_alpha", "kb_beta"]
+    assert "metadata" in head
+    assert {r["kb_id"] for r in head["references"]} == {"kb_alpha", "kb_beta"}
+    streamed = "".join(ln.get("response", "") for ln in lines[1:])
+    assert alpha["workspace"] in streamed
+    assert beta["workspace"] in streamed
+
+
+def _upload_text_doc(client, kb_id, source_name="n.md"):
+    r = client.post(
+        f"/kbs/{kb_id}/documents:texts",
+        json={"documents": [{"text": "hello world", "source_name": source_name}]},
+        headers=_HEADERS,
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["documents"][0]["id"]
+
+
+def test_multi_kb_query_doc_id_filter_outside_all_kbs_rejected(tmp_path):
+    client, _ = _build_multi_kb_client(tmp_path)
+    _create_kb(client, "kb_a")
+    _create_kb(client, "kb_b")
+    doc_a = _upload_text_doc(client, "kb_a")
+
+    # "ghost" belongs to no target KB -> 400 union validation.
+    bad = client.post(
+        "/kbs:query",
+        json={
+            "kb_ids": ["kb_a", "kb_b"],
+            "query": "filter test",
+            "filters": {"doc_ids": [doc_a, "ghost"]},
+        },
+        headers=_HEADERS,
+    )
+    assert bad.status_code == 400
+    assert "ghost" in bad.json()["detail"]["missing"]
+
+    # doc_a belongs to kb_a (and applies to no other KB) -> accepted.
+    ok = client.post(
+        "/kbs:query",
+        json={
+            "kb_ids": ["kb_a", "kb_b"],
+            "query": "filter test",
+            "filters": {"doc_ids": [doc_a]},
+        },
+        headers=_HEADERS,
+    )
+    assert ok.status_code == 200, ok.text
+
+
+def test_multi_kb_query_metadata_filter_smoke(tmp_path):
+    client, _ = _build_multi_kb_client(tmp_path)
+    _create_kb(client, "kb_a")
+    _create_kb(client, "kb_b")
+    resp = client.post(
+        "/kbs:query",
+        json={
+            "kb_ids": ["kb_a", "kb_b"],
+            "query": "metadata filter",
+            "filters": {"metadata": {"tag": "x"}},
+        },
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+
 
