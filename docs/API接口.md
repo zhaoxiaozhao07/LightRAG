@@ -1440,16 +1440,17 @@ lightrag-migrate-kb-metadata --working-dir ./rag_storage --strategy fail --yes
 
 可用参数包括 `--postgres-dsn`（覆盖环境变量）、`--kb-id`（只迁移指定 KB，可重复）、`--strategy fail|skip|overwrite`、`--json`。该工具只迁移 KB catalog、documents、jobs、artifacts、config_versions 与 `source_key` projection；不会复制源文件、解析产物、向量库、图存储或 text chunks，这些仍需依赖既有 `INPUT_DIR` / 对象存储 / LightRAG engine storage 运维流程。
 
-> 测试覆盖：`PostgresMetadataStore` 与 `SQLiteMetadataStore` 由 `tests/api/test_metadata_store_contract.py` 用同一组用例参数化校验行为等价。SQLite 参数始终运行；设置 `LIGHTRAG_KB_POSTGRES_TEST_DSN`（或 `POSTGRES_TEST_DSN`）后会对**真实 PostgreSQL** 执行同一契约（每次唯一 `kb_id` + 结束 `purge`，对共享库安全），例如：
+> 测试覆盖：`PostgresMetadataStore` 与 `SQLiteMetadataStore` 由 `tests/api/test_metadata_store_contract.py` 用同一组用例参数化校验行为等价。SQLite 参数始终运行；设置 `LIGHTRAG_KB_POSTGRES_TEST_DSN`（或 `POSTGRES_TEST_DSN`）后会对**真实 PostgreSQL** 执行同一契约。**注意：KB 维度记录用唯一 `kb_id` + 结束 `purge`，但企业用户/租户/成员/审计记录用固定标识、不随之清理**——务必把 DSN 指向**一次性测试库**（勿用生产 `knowledge_base`，重复跑会残留并撞唯一用户名）。例：
 >
 > ```bash
-> LIGHTRAG_KB_POSTGRES_TEST_DSN=postgresql://admin:123456@<host>:5433/knowledge_base \
+> # 在同台 PG 上建一次性库再跑，跑完可 DROP
+> LIGHTRAG_KB_POSTGRES_TEST_DSN=postgresql://admin:123456@<host>:5433/lightrag_contract_test \
 >     uv run pytest tests/api/test_metadata_store_contract.py -q
 > ```
 >
 > 注：`source_name` 文档过滤在 Postgres 后端的 `ESCAPE` 子句此前误用两字符转义串（`InvalidEscapeSequenceError`），已修复为单字符并由该 live 契约测试守护。
 >
-> live 验证记录（2026-06-10，PG 15）：对真实 `192.168.1.66:5433/knowledge_base` 运行 `tests/api/test_metadata_store_contract.py` **38 passed**，覆盖 KB/文档/任务/配置版本/企业用户·租户实体·成员·KB ACL·审计 全套，且包含新增的租户实体 CRUD/删除与审计过滤分页契约——确认 Postgres 路径与 SQLite 行为一致。
+> live 验证记录（2026-06-10，PG 15.17）：在 `192.168.1.66:5433` 上新建一次性库 `lightrag_contract_test` 运行 `tests/api/test_metadata_store_contract.py` **38 passed**，覆盖 KB/文档/任务/配置版本/企业用户·租户实体·成员·KB ACL·审计 全套（含新增的租户实体 CRUD/删除与审计过滤分页契约），用后即 DROP，未污染生产 `knowledge_base`——确认 Postgres 路径与 SQLite 行为一致。
 
 ### 12.2 MinIO / S3 source 与 artifact 存储
 

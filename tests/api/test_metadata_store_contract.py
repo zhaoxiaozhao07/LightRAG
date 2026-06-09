@@ -11,13 +11,17 @@ Every test here is parametrized over both backends:
   logic end to end.
 * ``postgres`` runs **live** against a real PostgreSQL only when
   ``LIGHTRAG_KB_POSTGRES_TEST_DSN`` (or ``POSTGRES_TEST_DSN``) is set; otherwise
-  it is skipped with a clear reason. Each run uses a unique ``kb_id`` and purges
-  it at the end, so it is safe against a shared database.
+  it is skipped with a clear reason. KB-scoped records use a unique ``kb_id``
+  purged at the end, but enterprise records (users/tenants/memberships/audit)
+  use fixed identifiers and are NOT purged — so point the DSN at a **disposable
+  test database**, never production (re-running against the same DB would leave
+  residue and collide on unique usernames).
 
 This closes the gap where the Postgres backend previously had zero behavioral
-coverage (all KB tests instantiated SQLite only). Run live coverage with e.g.::
+coverage (all KB tests instantiated SQLite only). Run live coverage against a
+throwaway DB on the same server, e.g.::
 
-    LIGHTRAG_KB_POSTGRES_TEST_DSN=postgresql://admin:123456@127.0.0.1:5433/knowledge_base \
+    LIGHTRAG_KB_POSTGRES_TEST_DSN=postgresql://admin:123456@127.0.0.1:5433/lightrag_contract_test \
         uv run pytest tests/api/test_metadata_store_contract.py -q
 """
 
