@@ -16,6 +16,7 @@ routes with a per-KB edge:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from typing import Any, Dict, List, Literal, Optional, Protocol, cast
@@ -30,6 +31,7 @@ from lightrag.api.config_version_service import (
 )
 from lightrag.api.document_lifecycle_service import DocumentLifecycleService
 from lightrag.api.enterprise_auth import (
+    KB_ROLE_VIEWER,
     UserKBQuerySettingsService,
     append_enterprise_audit_event,
     enterprise_auth_enabled,
@@ -41,7 +43,12 @@ from lightrag.api.lightrag_registry import LightRAGInstanceRegistry
 from lightrag.api.metadata_store import DocumentRecord
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.base import QueryParam
-from lightrag.utils import logger
+from lightrag.prompt import PROMPTS
+from lightrag.utils import (
+    generate_reference_list_from_chunks,
+    logger,
+    process_chunks_unified,
+)
 
 QueryMode = Literal["local", "global", "hybrid", "naive", "mix", "bypass"]
 
@@ -505,6 +512,243 @@ async def _resolve_doc_id_scope(
     ]
 
 
+_MAX_MULTI_KB = 10
+
+
+class MultiKBQueryRequest(BaseModel):
+    """Query several knowledge bases at once and synthesize one answer.
+
+    All target KBs must share the same embedding model/dim (so cross-KB
+    relevance is comparable); KB isolation is preserved — each KB is retrieved
+    through its own instance and results are merged at the retrieval layer.
+    """
+
+    kb_ids: List[str] = Field(min_length=1, max_length=_MAX_MULTI_KB)
+    query: str = Field(min_length=3)
+    mode: QueryMode = Field(default="mix")
+    response_type: Optional[str] = Field(default=None, min_length=1)
+    top_k: Optional[int] = Field(default=None, ge=1)
+    chunk_top_k: Optional[int] = Field(default=None, ge=1)
+    max_total_tokens: Optional[int] = Field(default=None, ge=1)
+    conversation_history: Optional[List[Dict[str, Any]]] = None
+    user_prompt: Optional[str] = None
+    enable_rerank: Optional[bool] = None
+    include_references: Optional[bool] = True
+    include_chunk_content: Optional[bool] = False
+
+    @field_validator("query", mode="after")
+    @classmethod
+    def _strip_query(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("kb_ids", mode="after")
+    @classmethod
+    def _dedup_kb_ids(cls, value: List[str]) -> List[str]:
+        seen: set[str] = set()
+        result: List[str] = []
+        for raw in value:
+            kb_id = raw.strip()
+            if not kb_id:
+                raise ValueError("kb_ids entries must be non-empty strings")
+            if kb_id not in seen:
+                seen.add(kb_id)
+                result.append(kb_id)
+        if not result:
+            raise ValueError("kb_ids must contain at least one knowledge base id")
+        return result
+
+    @field_validator("conversation_history", mode="after")
+    @classmethod
+    def _validate_history(
+        cls, value: Optional[List[Dict[str, Any]]]
+    ) -> Optional[List[Dict[str, Any]]]:
+        if value is None:
+            return None
+        for message in value:
+            if "role" not in message:
+                raise ValueError("Each message must have a 'role' key.")
+            if not isinstance(message["role"], str) or not message["role"].strip():
+                raise ValueError("Each message 'role' must be a non-empty string.")
+        return value
+
+    def to_query_params(
+        self, *, active_defaults: dict[str, Any] | None = None
+    ) -> QueryParam:
+        route_only_fields = {
+            "query",
+            "kb_ids",
+            "include_chunk_content",
+            "include_references",
+        }
+        request_data = self.model_dump(exclude_none=True, exclude=route_only_fields)
+        explicit_fields = self.model_fields_set - route_only_fields
+        data = dict(request_data)
+        for key, value in (active_defaults or {}).items():
+            if key not in route_only_fields and key not in explicit_fields:
+                data[key] = value
+        param = QueryParam(**data)
+        param.stream = False
+        return param
+
+
+class MultiKBReferenceItem(BaseModel):
+    reference_id: str
+    file_path: str
+    kb_id: str
+    content: Optional[List[str]] = None
+
+
+class MultiKBQueryResponse(BaseModel):
+    kb_ids: List[str]
+    mode: QueryMode
+    response: str
+    references: Optional[List[MultiKBReferenceItem]] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class MultiKBQueryDataResponse(BaseModel):
+    kb_ids: List[str]
+    status: str
+    message: str
+    data: Dict[str, Any]
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+def _dedup_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop chunks that are exact duplicates across KBs, keeping first seen."""
+    seen: set = set()
+    result: List[Dict[str, Any]] = []
+    for chunk in chunks:
+        chunk_id = chunk.get("chunk_id")
+        if chunk_id:
+            key = ("id", chunk.get("file_path"), chunk_id)
+        else:
+            key = ("content", chunk.get("content"))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(chunk)
+    return result
+
+
+def _multi_kb_query_audit_metadata(
+    request: MultiKBQueryRequest,
+    param: QueryParam | None,
+    *,
+    kb_ids: List[str],
+    skipped: List[Dict[str, Any]],
+    reranked: bool,
+    final_count: int,
+) -> Dict[str, Any]:
+    return {
+        "route": "multi_query",
+        "mode": param.mode if param is not None else request.mode,
+        "kb_ids": kb_ids,
+        "kb_count": len(kb_ids),
+        "skipped_count": len(skipped),
+        "query_hash": hashlib.sha256(request.query.encode("utf-8")).hexdigest(),
+        "top_k": getattr(param, "top_k", None) if param is not None else None,
+        "chunk_top_k": getattr(param, "chunk_top_k", None)
+        if param is not None
+        else None,
+        "reranked": reranked,
+        "final_chunk_count": final_count,
+    }
+
+
+async def _multi_kb_retrieve(
+    document_service: DocumentLifecycleService,
+    registry: LightRAGInstanceRegistry,
+    request: MultiKBQueryRequest,
+    http_request: Request,
+) -> tuple[
+    List[Dict[str, Any]],
+    Any,
+    QueryParam | None,
+    List[str],
+    List[Dict[str, Any]],
+    Dict[str, int],
+]:
+    """Fan out retrieval across ``request.kb_ids`` and merge the chunks.
+
+    Returns ``(merged_chunks, synth_rag, synth_param, queried_kb_ids,
+    skipped_kbs, per_kb_chunk_counts)``. ``synth_rag``/``synth_param`` come from
+    the first KB that retrieved successfully (drive synthesis).
+
+    SECURITY: the central middleware ``enforce_enterprise_request_access`` does
+    NOT cover the collection-level ``/kbs:query`` / ``/kbs:retrieve`` paths
+    (``_extract_kb_id`` returns ``None`` for them), so this function MUST
+    enforce ``kb_viewer`` on every target KB itself — fail closed.
+    """
+    if request.mode == "bypass":
+        raise HTTPException(
+            status_code=400,
+            detail="bypass mode is not supported for multi-KB query",
+        )
+
+    kb_ids = request.kb_ids
+    if enterprise_auth_enabled():
+        principal = get_request_principal(http_request)
+        authz = get_enterprise_authorization_service(http_request)
+        for kb_id in kb_ids:
+            await authz.require_kb_role(principal, kb_id, KB_ROLE_VIEWER)
+
+    async def _retrieve_one(kb_id: str):
+        await _ensure_query_documents_available(document_service, kb_id, None)
+        rag = cast(Any, await registry.get(kb_id))
+        # All KBs share one model service, so retrieve every KB with the SAME
+        # request-level params (not each KB's own active query_config) for a
+        # fair, consistent cross-KB merge.
+        param = request.to_query_params()
+        param.stream = False
+        param.ids = await _resolve_doc_id_scope(document_service, kb_id, None)
+        data = await rag.aquery_data(request.query, param=param)
+        return rag, param, data
+
+    gathered = await asyncio.gather(
+        *(_retrieve_one(kb_id) for kb_id in kb_ids), return_exceptions=True
+    )
+
+    merged: List[Dict[str, Any]] = []
+    per_kb_counts: Dict[str, int] = {}
+    skipped: List[Dict[str, Any]] = []
+    synth_rag: Any = None
+    synth_param: QueryParam | None = None
+    for kb_id, outcome in zip(kb_ids, gathered):
+        if isinstance(outcome, BaseException):
+            # A KB mid delete/replace (409) must not be silently answered over.
+            if isinstance(outcome, HTTPException) and outcome.status_code == 409:
+                raise outcome
+            if isinstance(outcome, KnowledgeBaseNotFoundError) or (
+                isinstance(outcome, HTTPException) and outcome.status_code == 404
+            ):
+                skipped.append({"kb_id": kb_id, "reason": "not_found"})
+            else:
+                logger.error(
+                    "Multi-KB retrieve failed for '%s': %s", kb_id, outcome
+                )
+                skipped.append({"kb_id": kb_id, "reason": "error"})
+            continue
+        rag, param, data = outcome
+        if synth_rag is None:
+            synth_rag, synth_param = rag, param
+        chunks = ((data or {}).get("data", {}) or {}).get("chunks", []) or []
+        per_kb_counts[kb_id] = len(chunks)
+        for chunk in chunks:
+            tagged = dict(chunk)
+            tagged["kb_id"] = kb_id
+            merged.append(tagged)
+
+    skipped_ids = {entry["kb_id"] for entry in skipped}
+    queried = [kb_id for kb_id in kb_ids if kb_id not in skipped_ids]
+    if not queried:
+        raise HTTPException(
+            status_code=502,
+            detail="All target knowledge bases failed to retrieve",
+        )
+    return _dedup_chunks(merged), synth_rag, synth_param, queried, skipped, per_kb_counts
+
+
 def create_kb_query_routes(
     document_service: DocumentLifecycleService,
     registry: LightRAGInstanceRegistry,
@@ -770,5 +1014,264 @@ def create_kb_query_routes(
     )
     async def kb_retrieve(kb_id: str, request: KBQueryRequest, http_request: Request):
         return await kb_query_data(kb_id, request, http_request)
+
+    @router.post(
+        ":query",
+        response_model=MultiKBQueryResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Run one synthesized RAG answer across multiple knowledge bases",
+    )
+    async def multi_kb_query(request: MultiKBQueryRequest, http_request: Request):
+        try:
+            (
+                merged,
+                synth_rag,
+                synth_param,
+                queried,
+                skipped,
+                per_kb_counts,
+            ) = await _multi_kb_retrieve(
+                document_service, registry, request, http_request
+            )
+
+            reranked = False
+            final_count = 0
+            response_text = "No relevant context found for the query."
+            references_out: List[MultiKBReferenceItem] = []
+
+            if merged and synth_rag is not None and synth_param is not None:
+                global_config = synth_rag._build_global_config()
+                tokenizer = global_config.get("tokenizer")
+                response_type = synth_param.response_type or "Multiple Paragraphs"
+                user_prompt = (
+                    f"\n\n{synth_param.user_prompt}"
+                    if synth_param.user_prompt
+                    else "n/a"
+                )
+                max_total_tokens = (
+                    getattr(synth_param, "max_total_tokens", None)
+                    or global_config.get("max_total_tokens")
+                    or 30000
+                )
+                chunk_token_limit: int | None = None
+                if tokenizer:
+                    pre_sys = PROMPTS["naive_rag_response"].format(
+                        response_type=response_type,
+                        user_prompt=user_prompt,
+                        content_data="",
+                    )
+                    chunk_token_limit = max_total_tokens - (
+                        len(tokenizer.encode(pre_sys))
+                        + len(tokenizer.encode(request.query))
+                        + 200
+                    )
+
+                ordered = merged
+                processed = await process_chunks_unified(
+                    query=request.query,
+                    unique_chunks=ordered,
+                    query_param=synth_param,
+                    global_config=global_config,
+                    source_type="multi_kb",
+                    chunk_token_limit=chunk_token_limit,
+                )
+                reranked = bool(global_config.get("rerank_model_func")) and bool(
+                    synth_param.enable_rerank
+                )
+                final_count = len(processed)
+
+                reference_list, processed_with_ids = (
+                    generate_reference_list_from_chunks(processed)
+                )
+                chunks_context = [
+                    {"reference_id": c["reference_id"], "content": c["content"]}
+                    for c in processed_with_ids
+                    if c.get("reference_id")
+                ]
+                text_units_str = "\n".join(
+                    json.dumps(unit, ensure_ascii=False) for unit in chunks_context
+                )
+                reference_list_str = "\n".join(
+                    f"[{ref['reference_id']}] {ref['file_path']}"
+                    for ref in reference_list
+                    if ref["reference_id"]
+                )
+                content_data = PROMPTS["naive_query_context"].format(
+                    text_chunks_str=text_units_str,
+                    reference_list_str=reference_list_str,
+                )
+                sys_prompt = PROMPTS["naive_rag_response"].format(
+                    response_type=response_type,
+                    user_prompt=user_prompt,
+                    content_data=content_data,
+                )
+                use_model_func = global_config["role_llm_funcs"]["query"]
+                llm_out = await use_model_func(
+                    request.query,
+                    system_prompt=sys_prompt,
+                    history_messages=synth_param.conversation_history,
+                    enable_cot=True,
+                    stream=False,
+                )
+                if isinstance(llm_out, str) and llm_out.strip():
+                    response_text = llm_out.strip()
+
+                ref_kb: Dict[str, str] = {}
+                ref_content: Dict[str, List[str]] = {}
+                for chunk in processed_with_ids:
+                    rid = chunk.get("reference_id")
+                    if not rid:
+                        continue
+                    ref_kb.setdefault(rid, chunk.get("kb_id", ""))
+                    if request.include_chunk_content:
+                        ref_content.setdefault(rid, []).append(
+                            chunk.get("content", "")
+                        )
+                references_out = [
+                    MultiKBReferenceItem(
+                        reference_id=ref["reference_id"],
+                        file_path=ref["file_path"],
+                        kb_id=ref_kb.get(ref["reference_id"], ""),
+                        content=ref_content.get(ref["reference_id"])
+                        if request.include_chunk_content
+                        else None,
+                    )
+                    for ref in reference_list
+                    if ref["reference_id"]
+                ]
+
+            metadata = {
+                "requested_kb_count": len(request.kb_ids),
+                "per_kb_chunk_counts": per_kb_counts,
+                "merged_chunk_count": len(merged),
+                "final_chunk_count": final_count,
+                "reranked": reranked,
+                "skipped_kbs": skipped,
+                "synthesis_kb_id": queried[0] if queried else None,
+            }
+
+            await append_enterprise_audit_event(
+                http_request,
+                "multi_kb_query_executed",
+                target_type="kb_group",
+                target_id=None,
+                metadata=_multi_kb_query_audit_metadata(
+                    request,
+                    synth_param,
+                    kb_ids=queried,
+                    skipped=skipped,
+                    reranked=reranked,
+                    final_count=final_count,
+                ),
+            )
+            return MultiKBQueryResponse(
+                kb_ids=queried,
+                mode=cast(QueryMode, request.mode),
+                response=response_text,
+                references=references_out if request.include_references else None,
+                metadata=metadata,
+            )
+        except HTTPException:
+            raise
+        except KnowledgeBaseNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Multi-KB query failed: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.post(
+        ":retrieve",
+        response_model=MultiKBQueryDataResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Retrieve and merge chunks across multiple knowledge bases (no LLM)",
+    )
+    async def multi_kb_retrieve(request: MultiKBQueryRequest, http_request: Request):
+        try:
+            (
+                merged,
+                synth_rag,
+                synth_param,
+                queried,
+                skipped,
+                per_kb_counts,
+            ) = await _multi_kb_retrieve(
+                document_service, registry, request, http_request
+            )
+
+            reranked = False
+            processed: List[Dict[str, Any]] = merged
+            if merged and synth_rag is not None and synth_param is not None:
+                global_config = synth_rag._build_global_config()
+                processed = await process_chunks_unified(
+                    query=request.query,
+                    unique_chunks=merged,
+                    query_param=synth_param,
+                    global_config=global_config,
+                    source_type="multi_kb",
+                    chunk_token_limit=None,
+                )
+                reranked = bool(global_config.get("rerank_model_func")) and bool(
+                    synth_param.enable_rerank
+                )
+
+            reference_list, processed_with_ids = (
+                generate_reference_list_from_chunks(processed)
+                if processed
+                else ([], [])
+            )
+            ref_kb: Dict[str, str] = {}
+            for chunk in processed_with_ids:
+                rid = chunk.get("reference_id")
+                if rid:
+                    ref_kb.setdefault(rid, chunk.get("kb_id", ""))
+            references = [
+                {
+                    "reference_id": ref["reference_id"],
+                    "file_path": ref["file_path"],
+                    "kb_id": ref_kb.get(ref["reference_id"], ""),
+                }
+                for ref in reference_list
+                if ref["reference_id"]
+            ]
+            metadata = {
+                "requested_kb_count": len(request.kb_ids),
+                "per_kb_chunk_counts": per_kb_counts,
+                "merged_chunk_count": len(merged),
+                "final_chunk_count": len(processed_with_ids),
+                "reranked": reranked,
+                "skipped_kbs": skipped,
+            }
+            await append_enterprise_audit_event(
+                http_request,
+                "multi_kb_retrieve_executed",
+                target_type="kb_group",
+                target_id=None,
+                metadata=_multi_kb_query_audit_metadata(
+                    request,
+                    synth_param,
+                    kb_ids=queried,
+                    skipped=skipped,
+                    reranked=reranked,
+                    final_count=len(processed_with_ids),
+                ),
+            )
+            return MultiKBQueryDataResponse(
+                kb_ids=queried,
+                status="success",
+                message="ok",
+                data={"chunks": processed_with_ids, "references": references},
+                metadata=metadata,
+            )
+        except HTTPException:
+            raise
+        except KnowledgeBaseNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Multi-KB retrieve failed: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return router

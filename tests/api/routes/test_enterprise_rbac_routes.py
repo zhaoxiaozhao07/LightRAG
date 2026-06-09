@@ -2571,3 +2571,77 @@ def test_authorize_document_delete_decision_matrix(tmp_path):
         assert denied_service.value.status_code == 403
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Multi-KB query ACL (handler self-enforces viewer on every target KB)
+# ---------------------------------------------------------------------------
+
+
+def test_multi_kb_query_requires_viewer_on_every_kb(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, _alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+    _dd_create_kb(client, admin_headers, "kb_m1")
+    _dd_create_kb(client, admin_headers, "kb_m2")
+    _dd_grant(client, admin_headers, "kb_m1", bob.id, "kb_viewer")
+
+    # bob has viewer on kb_m1 but NOT kb_m2 → fail closed (the central
+    # middleware does not cover /kbs:query, so the handler must enforce this).
+    denied = client.post(
+        "/kbs:query",
+        json={"kb_ids": ["kb_m1", "kb_m2"], "query": "cross kb question"},
+        headers=bob_headers,
+    )
+    assert denied.status_code == 403
+
+    _dd_grant(client, admin_headers, "kb_m2", bob.id, "kb_viewer")
+    ok = client.post(
+        "/kbs:query",
+        json={"kb_ids": ["kb_m1", "kb_m2"], "query": "cross kb question"},
+        headers=bob_headers,
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["kb_ids"] == ["kb_m1", "kb_m2"]
+
+
+def test_multi_kb_query_bypass_denied(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, _alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+    _dd_create_kb(client, admin_headers, "kb_bp")
+    _dd_grant(client, admin_headers, "kb_bp", bob.id, "kb_viewer")
+    resp = client.post(
+        "/kbs:query",
+        json={"kb_ids": ["kb_bp"], "query": "raw model please", "mode": "bypass"},
+        headers=bob_headers,
+    )
+    assert resp.status_code == 400
+
+
+def test_multi_kb_query_writes_audit(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, _alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+    _dd_create_kb(client, admin_headers, "kb_au")
+    _dd_grant(client, admin_headers, "kb_au", bob.id, "kb_viewer")
+    resp = client.post(
+        "/kbs:query",
+        json={"kb_ids": ["kb_au"], "query": "please audit this question"},
+        headers=bob_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    events = _dd_audit(client, admin_headers)
+    audit = [e for e in events if e["event_type"] == "multi_kb_query_executed"]
+    assert audit, "expected a multi_kb_query_executed audit event"
+    meta = audit[0]["metadata"]
+    assert meta["kb_ids"] == ["kb_au"]
+    assert "query_hash" in meta
+    # The raw query text must never be logged.
+    assert "please audit this question" not in json.dumps(meta)

@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -38,6 +40,25 @@ pytestmark = pytest.mark.offline
 
 _API_KEY = "test-key"
 _HEADERS = {"X-API-Key": _API_KEY}
+
+
+@pytest.fixture(autouse=True)
+def _disable_enterprise_auth_for_kb_query_tests(monkeypatch):
+    # These are non-enterprise KB-query route tests. A deployment .env that sets
+    # LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true would otherwise flip config to
+    # enterprise mode and make the global API key 403. Pin it off (mirrors
+    # tests/api/routes/test_kb_document_routes.py).
+    from lightrag.api import config as api_config
+
+    monkeypatch.setattr(
+        api_config,
+        "global_args",
+        SimpleNamespace(
+            enterprise_auth_enabled=False,
+            token_auto_renew=False,
+            token_renew_threshold=0.5,
+        ),
+    )
 
 
 class FakeRAG:
@@ -970,3 +991,291 @@ async def test_find_related_text_unit_from_relations_filters_by_doc_id_allowlist
         edge_datas, QueryParam(ids=None), cast(BaseKVStorage, text_chunks_db)
     )
     assert {chunk["chunk_id"] for chunk in unscoped} == {"c_in", "c_out"}
+
+
+# ---------------------------------------------------------------------------
+# Multi-KB (cross-KB) query: scatter-gather + merge + single synthesis
+# ---------------------------------------------------------------------------
+
+
+class _LenTokenizer:
+    def encode(self, text: str):
+        return (text or "").split()
+
+
+class MultiKBFakeRAG(FakeRAG):
+    """FakeRAG that returns chunks WITH file_path and exposes _build_global_config
+    so the multi-KB synthesis path (rerank → context → query LLM) can run."""
+
+    def __init__(self, workspace: str, *, rerank: bool = False, empty: bool = False):
+        super().__init__(workspace)
+        self._rerank = rerank
+        self._empty = empty
+
+    async def aquery_data(self, query: str, *, param):
+        self.queries.append((query, param.mode))
+        self.query_params.append(param)
+        chunks = (
+            []
+            if self._empty
+            else [
+                {
+                    "reference_id": "1",  # intentionally collides across KBs
+                    "chunk_id": f"{self.workspace}-c0",
+                    "content": f"chunk content from {self.workspace}",
+                    "file_path": f"{self.workspace}/source.pdf",
+                }
+            ]
+        )
+        return {
+            "status": "success",
+            "message": "ok",
+            "data": {
+                "entities": [],
+                "relationships": [],
+                "chunks": chunks,
+                "references": [
+                    {"reference_id": "1", "file_path": f"{self.workspace}/source.pdf"}
+                ],
+            },
+            "metadata": {"query_mode": param.mode},
+        }
+
+    def _build_global_config(self):
+        rerank_func = None
+        if self._rerank:
+
+            async def fake_rerank(*, query, documents, top_n=None):
+                order = sorted(range(len(documents)), key=lambda i: -len(documents[i]))
+                if top_n:
+                    order = order[:top_n]
+                return [{"index": i, "relevance_score": 0.9} for i in order]
+
+            rerank_func = fake_rerank
+
+        async def fake_query_llm(
+            query, *, system_prompt=None, history_messages=None, enable_cot=True, stream=False
+        ):
+            import re
+
+            seen = sorted(
+                set(re.findall(r"chunk content from ([\w\-]+)", system_prompt or ""))
+            )
+            return "synth[" + ",".join(seen) + "]: " + query
+
+        return {
+            "role_llm_funcs": {"query": fake_query_llm},
+            "tokenizer": _LenTokenizer(),
+            "max_total_tokens": 30000,
+            "min_rerank_score": 0.0,
+            "rerank_model_func": rerank_func,
+        }
+
+
+def _build_multi_kb_client(tmp_path: Path, *, rerank: bool = False, empty: bool = False):
+    kb_service = KnowledgeBaseService(tmp_path / "metadata" / "kb.json")
+    metadata_store = SQLiteMetadataStore(tmp_path / "metadata" / "metadata.sqlite3")
+    document_service = DocumentLifecycleService(
+        kb_service, metadata_store, tmp_path / "inputs"
+    )
+    job_service = JobService(kb_service, metadata_store)
+    instances: dict[str, MultiKBFakeRAG] = {}
+
+    async def build(record):
+        rag = MultiKBFakeRAG(record.workspace, rerank=rerank, empty=empty)
+        instances[record.id] = rag
+        return rag
+
+    async def finalize(rag):
+        return None
+
+    registry = LightRAGInstanceRegistry(kb_service, build, finalize)
+    app = FastAPI()
+    app.include_router(
+        create_kb_routes(kb_service, registry, api_key=_API_KEY, job_service=job_service)
+    )
+    app.include_router(
+        create_kb_document_routes(
+            document_service, job_service, api_key=_API_KEY, registry=registry
+        )
+    )
+    app.include_router(
+        create_kb_query_routes(document_service, registry, api_key=_API_KEY)
+    )
+    return TestClient(app), instances
+
+
+def test_multi_kb_query_merges_two_kbs_with_provenance(tmp_path):
+    client, instances = _build_multi_kb_client(tmp_path)
+    alpha = _create_kb(client, "kb_alpha")
+    beta = _create_kb(client, "kb_beta")
+
+    resp = client.post(
+        "/kbs:query",
+        json={"kb_ids": ["kb_alpha", "kb_beta"], "query": "compare alpha and beta", "mode": "mix"},
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["kb_ids"] == ["kb_alpha", "kb_beta"]
+    # The single synthesized answer saw chunks from BOTH KBs.
+    assert alpha["workspace"] in body["response"]
+    assert beta["workspace"] in body["response"]
+    # References are tagged with their source kb_id and re-keyed to distinct ids
+    # (both KBs internally used reference_id "1" — collision must be resolved).
+    refs = body["references"]
+    assert len(refs) == 2
+    assert {r["reference_id"] for r in refs} == {"1", "2"}
+    ref_paths = {r["file_path"] for r in refs}
+    assert ref_paths == {f"{alpha['workspace']}/source.pdf", f"{beta['workspace']}/source.pdf"}
+    for r in refs:
+        assert r["kb_id"] in {"kb_alpha", "kb_beta"}
+    assert body["metadata"]["per_kb_chunk_counts"] == {"kb_alpha": 1, "kb_beta": 1}
+    assert body["metadata"]["reranked"] is False
+    assert body["metadata"]["synthesis_kb_id"] == "kb_alpha"
+    # Each KB instance was queried exactly once, in isolation.
+    assert instances["kb_alpha"].queries == [("compare alpha and beta", "mix")]
+    assert instances["kb_beta"].queries == [("compare alpha and beta", "mix")]
+
+
+def test_multi_kb_query_rerank_flag(tmp_path):
+    client, _ = _build_multi_kb_client(tmp_path, rerank=True)
+    _create_kb(client, "kb_a")
+    _create_kb(client, "kb_b")
+    resp = client.post(
+        "/kbs:query",
+        json={"kb_ids": ["kb_a", "kb_b"], "query": "rerank please", "enable_rerank": True},
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["metadata"]["reranked"] is True
+
+
+def test_multi_kb_query_chunk_top_k_limits_final(tmp_path):
+    client, _ = _build_multi_kb_client(tmp_path)
+    _create_kb(client, "kb_a")
+    _create_kb(client, "kb_b")
+    resp = client.post(
+        "/kbs:query",
+        json={"kb_ids": ["kb_a", "kb_b"], "query": "limit me", "chunk_top_k": 1},
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["metadata"]["merged_chunk_count"] == 2
+    assert body["metadata"]["final_chunk_count"] == 1
+    assert len(body["references"]) == 1
+
+
+def test_multi_kb_query_unknown_kb_is_skipped(tmp_path):
+    client, _ = _build_multi_kb_client(tmp_path)
+    _create_kb(client, "kb_real")
+    resp = client.post(
+        "/kbs:query",
+        json={"kb_ids": ["kb_real", "kb_ghost"], "query": "where is ghost"},
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["kb_ids"] == ["kb_real"]
+    assert body["metadata"]["skipped_kbs"] == [{"kb_id": "kb_ghost", "reason": "not_found"}]
+
+
+def test_multi_kb_query_one_kb_error_others_succeed(tmp_path):
+    client, instances = _build_multi_kb_client(tmp_path)
+    alpha = _create_kb(client, "kb_alpha")
+    _create_kb(client, "kb_beta")
+    # Warm up instances, then make kb_beta raise on retrieval.
+    client.post("/kbs/kb_beta/query", json={"query": "warm up"}, headers=_HEADERS)
+
+    async def boom(query, *, param):
+        raise RuntimeError("retrieval exploded")
+
+    instances["kb_beta"].aquery_data = boom
+
+    resp = client.post(
+        "/kbs:query",
+        json={"kb_ids": ["kb_alpha", "kb_beta"], "query": "resilient query"},
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["kb_ids"] == ["kb_alpha"]
+    assert body["metadata"]["skipped_kbs"] == [{"kb_id": "kb_beta", "reason": "error"}]
+    assert alpha["workspace"] in body["response"]
+
+
+def test_multi_kb_query_all_fail_returns_502(tmp_path):
+    client, _ = _build_multi_kb_client(tmp_path)
+    resp = client.post(
+        "/kbs:query",
+        json={"kb_ids": ["ghost_a", "ghost_b"], "query": "nothing here"},
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 502
+
+
+def test_multi_kb_query_bypass_rejected(tmp_path):
+    client, _ = _build_multi_kb_client(tmp_path)
+    _create_kb(client, "kb_a")
+    resp = client.post(
+        "/kbs:query",
+        json={"kb_ids": ["kb_a"], "query": "raw model please", "mode": "bypass"},
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 400
+
+
+def test_multi_kb_query_empty_results(tmp_path):
+    client, _ = _build_multi_kb_client(tmp_path, empty=True)
+    _create_kb(client, "kb_a")
+    _create_kb(client, "kb_b")
+    resp = client.post(
+        "/kbs:query",
+        json={"kb_ids": ["kb_a", "kb_b"], "query": "no chunks anywhere"},
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["response"] == "No relevant context found for the query."
+    assert body["references"] == []
+    assert body["metadata"]["merged_chunk_count"] == 0
+
+
+def test_multi_kb_query_cap_enforced(tmp_path):
+    client, _ = _build_multi_kb_client(tmp_path)
+    resp = client.post(
+        "/kbs:query",
+        json={"kb_ids": [f"kb_{i}" for i in range(11)], "query": "too many kbs"},
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 422
+
+
+def test_multi_kb_query_short_query_rejected(tmp_path):
+    client, _ = _build_multi_kb_client(tmp_path)
+    _create_kb(client, "kb_a")
+    resp = client.post(
+        "/kbs:query",
+        json={"kb_ids": ["kb_a"], "query": "hi"},
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 422
+
+
+def test_multi_kb_retrieve_returns_merged_chunks_without_llm(tmp_path):
+    client, _ = _build_multi_kb_client(tmp_path)
+    _create_kb(client, "kb_a")
+    _create_kb(client, "kb_b")
+    resp = client.post(
+        "/kbs:retrieve",
+        json={"kb_ids": ["kb_a", "kb_b"], "query": "retrieve only"},
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "success"
+    assert len(body["data"]["chunks"]) == 2
+    assert len(body["data"]["references"]) == 2
+    assert {r["kb_id"] for r in body["data"]["references"]} == {"kb_a", "kb_b"}
+
