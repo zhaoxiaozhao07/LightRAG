@@ -2763,17 +2763,49 @@ class SQLiteMetadataStore:
 
         return await self._write(write)
 
-    async def list_audit_events(self, *, limit: int = 100) -> list[AuditEventRecord]:
+    async def list_audit_events(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        event_type: str | None = None,
+        actor_user_id: str | None = None,
+        target_type: str | None = None,
+        target_id: str | None = None,
+        created_after: str | None = None,
+        created_before: str | None = None,
+    ) -> list[AuditEventRecord]:
         await self._ensure_initialized()
         limit = max(1, min(limit, 500))
+        offset = max(0, offset)
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("event_type", event_type),
+            ("actor_user_id", actor_user_id),
+            ("target_type", target_type),
+            ("target_id", target_id),
+        ):
+            if value:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        if created_after:
+            clauses.append("created_at >= ?")
+            params.append(created_after)
+        if created_before:
+            clauses.append("created_at <= ?")
+            params.append(created_before)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.extend([limit, offset])
         with self._connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT * FROM enterprise_audit_events
+                {where}
                 ORDER BY created_at DESC, id DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (limit,),
+                tuple(params),
             ).fetchall()
         return [AuditEventRecord.from_row(row) for row in rows]
 

@@ -1152,11 +1152,30 @@ def create_enterprise_routes(
         response_model=list[EnterpriseAuditEventResponse],
         dependencies=[Depends(combined_auth)],
     )
-    async def list_audit_events(request: Request, limit: int = 100):
+    async def list_audit_events(
+        request: Request,
+        limit: int = 100,
+        offset: int = 0,
+        event_type: str | None = None,
+        actor_user_id: str | None = None,
+        target_type: str | None = None,
+        target_id: str | None = None,
+        created_after: str | None = None,
+        created_before: str | None = None,
+    ):
         audit_service = get_enterprise_audit_service(request)
         return [
             EnterpriseAuditEventResponse.from_record(event)
-            for event in await audit_service.list(limit=limit)
+            for event in await audit_service.list(
+                limit=limit,
+                offset=offset,
+                event_type=event_type,
+                actor_user_id=actor_user_id,
+                target_type=target_type,
+                target_id=target_id,
+                created_after=created_after,
+                created_before=created_before,
+            )
         ]
 
     return router

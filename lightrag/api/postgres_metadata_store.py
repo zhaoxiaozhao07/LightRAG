@@ -2059,17 +2059,54 @@ class PostgresMetadataStore:
 
         return await self._write(write)
 
-    async def list_audit_events(self, *, limit: int = 100) -> list[AuditEventRecord]:
+    async def list_audit_events(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        event_type: str | None = None,
+        actor_user_id: str | None = None,
+        target_type: str | None = None,
+        target_id: str | None = None,
+        created_after: str | None = None,
+        created_before: str | None = None,
+    ) -> list[AuditEventRecord]:
         await self._ensure_initialized()
         limit = max(1, min(limit, 500))
+        offset = max(0, offset)
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        def _add(expr_tmpl: str, value: Any) -> None:
+            params.append(value)
+            clauses.append(expr_tmpl.format(idx=len(params)))
+
+        for column, value in (
+            ("event_type", event_type),
+            ("actor_user_id", actor_user_id),
+            ("target_type", target_type),
+            ("target_id", target_id),
+        ):
+            if value:
+                _add(f"{column} = ${{idx}}", value)
+        if created_after:
+            _add("created_at >= ${idx}", created_after)
+        if created_before:
+            _add("created_at <= ${idx}", created_before)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        limit_idx = len(params)
+        params.append(offset)
+        offset_idx = len(params)
         async with self._pool_or_raise().acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT data_json FROM enterprise_audit_events
+                {where}
                 ORDER BY created_at DESC, id DESC
-                LIMIT $1
+                LIMIT ${limit_idx} OFFSET ${offset_idx}
                 """,
-                limit,
+                *params,
             )
         return [_audit_event_from_row(row) for row in rows]
 

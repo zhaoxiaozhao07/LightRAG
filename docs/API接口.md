@@ -1138,7 +1138,7 @@ username=admin&password=change-me
 | `GET` | `/admin/invitations` | 列出注册邀请（不含 raw token，仅 `token_preview`） |
 | `POST` | `/admin/invitations` | 颁发单次注册邀请（`invite_only` 模式用）；raw `invitation_token` 仅创建响应返回一次，可选 `expires_in_seconds` |
 | `POST` | `/admin/invitations/{invitation_id}:revoke` | 撤销邀请；已 used/revoked 的邀请保持终态 |
-| `GET` | `/admin/audit-events` | 查看最近审计事件；支持 `?limit=100` 限制返回条数 |
+| `GET` | `/admin/audit-events` | 查询审计事件；支持 `limit`/`offset` 分页与 `event_type`/`actor_user_id`/`target_type`/`target_id`/`created_after`/`created_before` 过滤 |
 
 以下 self-service tenant 接口需当前用户是目标 tenant 的 `tenant_admin` 或 `tenant_owner`（super admin 也可用）：
 
@@ -1157,7 +1157,7 @@ KB ACL 请求/响应约束：
 - ACL 响应对象字段为：`kb_id`、`user_id`、`tenant_id`、`principal_type`（`user` / `tenant`）、`role`、`granted_by`、`created_at`、`updated_at`。
 - `batch-set` 响应中 `granted` 为 ACL 响应对象数组；`revoked` 为本次实际删除成功的 user id 或 tenant id 字符串数组。
 
-`GET /admin/audit-events` 返回最近审计事件，按 `created_at DESC, id DESC` 排序；`limit` 默认 `100`，服务端会 clamp 到 `1..500`。
+`GET /admin/audit-events` 返回审计事件，按 `created_at DESC, id DESC` 排序；`limit` 默认 `100`，服务端会 clamp 到 `1..500`，`offset` 默认 `0` 用于分页。可选过滤参数（精确匹配，组合为 AND）：`event_type`、`actor_user_id`、`target_type`、`target_id`；时间范围 `created_after` / `created_before` 为 ISO-8601 字符串，按字典序与 `created_at` 比较（`>=` / `<=`）。例：`GET /admin/audit-events?event_type=kb_deleted&actor_user_id=usr_x&created_after=2026-06-01T00:00:00Z&limit=50&offset=50`。
 
 审计事件响应字段：
 

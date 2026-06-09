@@ -207,7 +207,18 @@ class EnterpriseMetadataStore(Protocol):
         self, event: AuditEventRecord
     ) -> AuditEventRecord: ...
 
-    async def list_audit_events(self, *, limit: int = 100) -> list[AuditEventRecord]: ...
+    async def list_audit_events(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        event_type: str | None = None,
+        actor_user_id: str | None = None,
+        target_type: str | None = None,
+        target_id: str | None = None,
+        created_after: str | None = None,
+        created_before: str | None = None,
+    ) -> list[AuditEventRecord]: ...
 
     async def create_enterprise_invitation(
         self, record: EnterpriseInvitationRecord
@@ -431,8 +442,28 @@ class AuditService:
         )
         return await self._metadata_store.append_audit_event(event)
 
-    async def list(self, *, limit: int = 100) -> list[AuditEventRecord]:
-        return await self._metadata_store.list_audit_events(limit=limit)
+    async def list(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        event_type: str | None = None,
+        actor_user_id: str | None = None,
+        target_type: str | None = None,
+        target_id: str | None = None,
+        created_after: str | None = None,
+        created_before: str | None = None,
+    ) -> list[AuditEventRecord]:
+        return await self._metadata_store.list_audit_events(
+            limit=limit,
+            offset=offset,
+            event_type=event_type,
+            actor_user_id=actor_user_id,
+            target_type=target_type,
+            target_id=target_id,
+            created_after=created_after,
+            created_before=created_before,
+        )
 
 
 @dataclass(frozen=True, slots=True)

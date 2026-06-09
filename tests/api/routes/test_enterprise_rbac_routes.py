@@ -2645,3 +2645,52 @@ def test_multi_kb_query_writes_audit(monkeypatch, tmp_path):
     assert "query_hash" in meta
     # The raw query text must never be logged.
     assert "please audit this question" not in json.dumps(meta)
+
+
+def test_admin_audit_events_filtering_and_pagination(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, _alice, _bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    _dd_create_kb(client, admin_headers, "kb_x")
+    _dd_create_kb(client, admin_headers, "kb_y")
+    created = client.post(
+        "/admin/users",
+        json={"username": "carol", "password": "carol-pass"},
+        headers=admin_headers,
+    )
+    assert created.status_code == 200, created.text
+
+    # Filter by event_type — exact match only.
+    kb_created = client.get(
+        "/admin/audit-events", params={"event_type": "kb_created"}, headers=admin_headers
+    )
+    assert kb_created.status_code == 200
+    assert {e["event_type"] for e in kb_created.json()} == {"kb_created"}
+    assert len(kb_created.json()) >= 2
+
+    # Filter by target_type.
+    user_events = client.get(
+        "/admin/audit-events", params={"target_type": "user"}, headers=admin_headers
+    ).json()
+    assert user_events and all(e["target_type"] == "user" for e in user_events)
+
+    # Pagination (newest-first) yields distinct rows.
+    page1 = client.get(
+        "/admin/audit-events",
+        params={"event_type": "kb_created", "limit": 1},
+        headers=admin_headers,
+    ).json()
+    page2 = client.get(
+        "/admin/audit-events",
+        params={"event_type": "kb_created", "limit": 1, "offset": 1},
+        headers=admin_headers,
+    ).json()
+    assert len(page1) == 1 and len(page2) == 1
+    assert page1[0]["id"] != page2[0]["id"]
+
+    # Filter by actor.
+    by_actor = client.get(
+        "/admin/audit-events", params={"actor_user_id": admin.id}, headers=admin_headers
+    ).json()
+    assert by_actor and all(e["actor_user_id"] == admin.id for e in by_actor)

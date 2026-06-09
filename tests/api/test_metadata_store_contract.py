@@ -336,6 +336,36 @@ async def test_enterprise_metadata_contract(store):
     assert events[0].id == event.id
     assert events[0].metadata == {"role": "editor"}
 
+    other = await store.append_audit_event(
+        AuditEventRecord(
+            id=f"audit_{uuid.uuid4().hex[:10]}",
+            event_type="kb_acl_revoked",
+            actor_user_id=user.id,
+            target_type="kb",
+            target_id=kb_id,
+            metadata={},
+            created_at=utc_now_iso(),
+        )
+    )
+    # Filter by event_type (scoped to this test's unique actor).
+    granted = await store.list_audit_events(
+        event_type="kb_acl_granted", actor_user_id=user.id
+    )
+    assert {e.id for e in granted} == {event.id}
+    # Filter by actor + target returns both events for this test.
+    by_actor = await store.list_audit_events(actor_user_id=user.id, target_id=kb_id)
+    assert {e.id for e in by_actor} == {event.id, other.id}
+    assert all(
+        e.actor_user_id == user.id and e.target_id == kb_id for e in by_actor
+    )
+    # Pagination over the (newest-first) matches.
+    first = await store.list_audit_events(limit=1, actor_user_id=user.id, target_id=kb_id)
+    second = await store.list_audit_events(
+        limit=1, offset=1, actor_user_id=user.id, target_id=kb_id
+    )
+    assert len(first) == 1 and len(second) == 1
+    assert first[0].id != second[0].id
+
     assert await store.delete_kb_acl(kb_id, user.id) is True
     assert await store.get_kb_acl_role(kb_id, user.id) is None
 
