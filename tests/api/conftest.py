@@ -13,7 +13,15 @@ reads ``config.global_args.enterprise_auth_enabled``. Flip just that one attribu
 off by default — preserving every other real attribute (no missing-attr risk).
 Enterprise tests replace ``global_args`` wholesale inside their own bodies and so
 override this default for themselves.
+
+NOTE: ``config.global_args`` is a lazy proxy whose attribute access/assignment
+auto-runs ``parse_args()`` on first touch. If config has not been initialized yet
+in this test session (e.g. running this directory's tests in isolation), that
+parse would consume pytest's own ``sys.argv`` and crash with "unrecognized
+arguments". We therefore neutralize ``sys.argv`` while touching the proxy.
 """
+
+import sys
 
 import pytest
 
@@ -22,10 +30,15 @@ import pytest
 def _disable_leaked_enterprise_auth(monkeypatch):
     from lightrag.api import config as api_config
 
-    if getattr(api_config.global_args, "enterprise_auth_enabled", False):
-        monkeypatch.setattr(
-            api_config.global_args,
-            "enterprise_auth_enabled",
-            False,
-            raising=False,
-        )
+    saved_argv = sys.argv
+    sys.argv = [saved_argv[0]]
+    try:
+        if getattr(api_config.global_args, "enterprise_auth_enabled", False):
+            monkeypatch.setattr(
+                api_config.global_args,
+                "enterprise_auth_enabled",
+                False,
+                raising=False,
+            )
+    finally:
+        sys.argv = saved_argv
