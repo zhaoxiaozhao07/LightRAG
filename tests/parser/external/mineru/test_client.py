@@ -567,6 +567,73 @@ async def test_client_local_failed_state_raises(
         await MinerURawClient().download_into(raw, src)
 
 
+class _LocalNeverCompletesDispatcher(_Dispatcher):
+    def post(self, url: str, **_: Any) -> _FakeResponse:
+        if url == "http://127.0.0.1:8000/tasks":
+            return _FakeResponse(text=json.dumps({"task_id": "L-timeout"}))
+        raise AssertionError(f"unexpected POST {url}")
+
+    def get(self, url: str, **_: Any) -> _FakeResponse:
+        if url == "http://127.0.0.1:8000/tasks/L-timeout":
+            return _FakeResponse(
+                text=json.dumps({"task_id": "L-timeout", "status": "running"})
+            )
+        raise AssertionError(f"unexpected GET {url}")
+
+
+@pytest.mark.offline
+async def test_client_local_polling_timeout_raises_clear_error(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://127.0.0.1:8000")
+    monkeypatch.setenv("MINERU_POLL_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("MINERU_MAX_POLLS", "2")
+
+    src = tmp_path / "demo.pdf"
+    src.write_bytes(b"PDFBYTES" * 200)
+    raw = tmp_path / "demo.mineru_raw"
+    raw.mkdir()
+
+    _CURRENT.dispatcher = _LocalNeverCompletesDispatcher()
+    with pytest.raises(TimeoutError, match="MinerU local task polling timeout: L-timeout"):
+        await MinerURawClient().download_into(raw, src)
+
+
+class _LocalNetworkDropDispatcher(_Dispatcher):
+    def post(self, url: str, **_: Any) -> _FakeResponse:
+        if url == "http://127.0.0.1:8000/tasks":
+            return _FakeResponse(text=json.dumps({"task_id": "L-network"}))
+        raise AssertionError(f"unexpected POST {url}")
+
+    def get(self, url: str, **_: Any) -> _FakeResponse:
+        if url == "http://127.0.0.1:8000/tasks/L-network":
+            raise ConnectionError("connection reset by peer")
+        raise AssertionError(f"unexpected GET {url}")
+
+
+@pytest.mark.offline
+async def test_client_local_network_interruption_propagates(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://127.0.0.1:8000")
+    monkeypatch.setenv("MINERU_POLL_INTERVAL_SECONDS", "0")
+
+    src = tmp_path / "demo.pdf"
+    src.write_bytes(b"PDFBYTES" * 200)
+    raw = tmp_path / "demo.mineru_raw"
+    raw.mkdir()
+
+    _CURRENT.dispatcher = _LocalNetworkDropDispatcher()
+    with pytest.raises(ConnectionError, match="connection reset by peer"):
+        await MinerURawClient().download_into(raw, src)
+
+
 class _LocalRedirectDispatcher(_Dispatcher):
     def post(self, url: str, **_: Any) -> _FakeResponse:
         if url == "http://127.0.0.1:8000/tasks":

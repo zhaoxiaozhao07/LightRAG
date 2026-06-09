@@ -926,7 +926,7 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/health` | 系统健康、配置和队列状态；默认 whitelist 放行 |
-| `GET` | `/metrics` | Prometheus text format 指标（KB/doc/job/audit gauge + process-local HTTP counter/histogram）；受 `combined_auth` 保护，默认不在 whitelist |
+| `GET` | `/metrics` | Prometheus text format 指标（KB/doc/job/audit gauge + process-local HTTP counter/histogram）；受 `combined_auth` 保护，默认不在 whitelist；单服务器部署配套告警/SLO/dashboard 见 `deploy/monitoring/` |
 | `GET` | `/auth-status` | 认证模式状态；非企业模式下可能签发 guest token |
 | `POST` | `/login` | 非企业模式下使用 `AUTH_ACCOUNTS`；企业模式下使用企业用户表 |
 

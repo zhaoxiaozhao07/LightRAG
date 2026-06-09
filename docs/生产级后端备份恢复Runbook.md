@@ -1,6 +1,6 @@
 # LightRAG 生产级后端备份恢复 Runbook
 
-> 适用范围：KB 控制面 metadata（local SQLite / PostgreSQL）、对象存储（MinIO/S3）、LightRAG 引擎外部后端（PostgreSQL KV/doc_status、Neo4j/Memgraph 图、Milvus/Qdrant 向量、Redis/Mongo/OpenSearch）以及文件型本地缓存。本文是生产演练模板；实际执行前必须替换占位符、确认停机窗口和凭据来源。
+> 适用范围：单服务器部署下的 KB 控制面 metadata（local SQLite / PostgreSQL）、对象存储（MinIO/S3）、LightRAG 引擎外部后端（PostgreSQL KV/doc_status、Neo4j/Memgraph 图、Milvus/Qdrant 向量、Redis/Mongo/OpenSearch）以及文件型本地缓存。本文是生产演练模板；实际执行前必须替换占位符、确认停机窗口和凭据来源。
 
 ## 1. 恢复目标与一致性原则
 
@@ -197,11 +197,34 @@ curl -H "Authorization: Bearer <admin-token>" "$LIGHTRAG_BASE_URL/kbs/<kb_id>/do
 
 # 引擎一致性：检查 KB status、graph、query
 curl -H "Authorization: Bearer <admin-token>" "$LIGHTRAG_BASE_URL/kbs/<kb_id>/status"
-curl -H "Authorization: Bearer <admin-token>" "$LIGHTRAG_BASE_URL/kbs/<kb_id>/graph/labels"
+curl -H "Authorization: Bearer <admin-token>" "$LIGHTRAG_BASE_URL/kbs/<kb_id>/graph/status"
 curl -H "Authorization: Bearer <admin-token>" \
   -H 'Content-Type: application/json' \
   -d '{"query":"restore smoke test","mode":"mix"}' \
   "$LIGHTRAG_BASE_URL/kbs/<kb_id>/query"
+```
+
+也可以直接执行单机恢复 smoke 脚本，脚本会检查 `/health`、`/metrics`、KB/document/graph/query 采样，并把结果写成 JSON 报告：
+
+```bash
+uv run python scripts/run_single_server_ops_drill.py \
+  --backup-id "$BACKUP_ID" \
+  --base-url "$LIGHTRAG_BASE_URL" \
+  --api-key "$LIGHTRAG_API_KEY" \
+  --kb-id "<kb_id>" \
+  --report-path "backups/${BACKUP_ID}/restore-smoke-report.json"
+```
+
+如需验证硬删除 workspace 复用清理一致性，可使用一次性 disposable KB（会创建、硬删除、重建并断言文档/图谱为空）：
+
+```bash
+uv run python scripts/run_single_server_ops_drill.py \
+  --backup-id "$BACKUP_ID" \
+  --base-url "$LIGHTRAG_BASE_URL" \
+  --api-key "$LIGHTRAG_API_KEY" \
+  --skip-query \
+  --hard-delete-drill-kb-id "ops_hard_delete_drill_${BACKUP_ID}" \
+  --report-path "backups/${BACKUP_ID}/hard-delete-drill-report.json"
 ```
 
 必须确认：
@@ -218,8 +241,8 @@ curl -H "Authorization: Bearer <admin-token>" \
 
 1. 在生产执行只读备份，记录 `BACKUP_ID`。
 2. 在隔离环境恢复 metadata、对象存储和外部引擎后端。
-3. 使用只读 service key 或管理员 JWT 执行第 6 节 smoke tests。
-4. 随机抽样 3 个 KB：下载 artifact、执行 query、检查 graph labels。
+3. 使用只读 service key 或管理员 JWT 执行第 6 节 smoke tests；推荐运行 `scripts/run_single_server_ops_drill.py` 并保存 JSON 报告。
+4. 随机抽样 3 个 KB：下载 artifact、执行 query、检查 `graph/status` 与必要的 `graph/entities` / `graph/relations`。
 5. 记录耗时、失败项、RPO/RTO 和需要自动化的步骤。
 
-演练完成后把结果追加到团队运维日志，至少包含：`BACKUP_ID`、备份时间、恢复开始/结束时间、恢复环境、通过/失败检查项、需要轮换的凭据。
+演练完成后把结果追加到团队运维日志，至少包含：`BACKUP_ID`、备份时间、恢复开始/结束时间、恢复环境、`restore-smoke-report.json` / `hard-delete-drill-report.json` 路径、通过/失败检查项、需要轮换的凭据。
