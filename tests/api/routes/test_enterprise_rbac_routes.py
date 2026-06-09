@@ -2769,3 +2769,83 @@ def test_admin_tenant_crud_and_overview(monkeypatch, tmp_path):
     assert (
         client.get("/admin/tenants/ghost", headers=admin_headers).status_code == 404
     )
+
+
+def test_admin_users_list_filtering(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, _alice, _bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    asyncio.run(user_service.create_user(username="carol", password="p", tenant_id="t1"))
+    asyncio.run(user_service.create_user(username="dave", password="p", tenant_id="t1"))
+    asyncio.run(user_service.create_user(username="erin", password="p", tenant_id="t2"))
+
+    by_tenant = client.get(
+        "/admin/users", params={"tenant_id": "t1"}, headers=admin_headers
+    ).json()
+    assert {u["username"] for u in by_tenant} == {"carol", "dave"}
+
+    by_q = client.get("/admin/users", params={"q": "ar"}, headers=admin_headers).json()
+    assert {u["username"] for u in by_q} == {"carol"}
+
+    by_status = client.get(
+        "/admin/users", params={"status": "active"}, headers=admin_headers
+    ).json()
+    assert by_status and all(u["status"] == "active" for u in by_status)
+
+    page = client.get(
+        "/admin/users", params={"limit": 2, "offset": 0}, headers=admin_headers
+    ).json()
+    assert len(page) == 2
+
+
+def test_admin_tenant_delete_requires_empty(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, _alice, _bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+
+    # Empty tenant is deletable.
+    client.post(
+        "/admin/tenants",
+        json={"name": "Empty", "tenant_id": "t-empty"},
+        headers=admin_headers,
+    )
+    deleted = client.delete("/admin/tenants/t-empty", headers=admin_headers)
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["deleted"] is True
+    assert (
+        client.get("/admin/tenants/t-empty", headers=admin_headers).status_code == 404
+    )
+
+    # A tenant with a member + user + KB cannot be deleted (no cascade).
+    client.post(
+        "/admin/tenants",
+        json={"name": "Full", "tenant_id": "t-full"},
+        headers=admin_headers,
+    )
+    dave = asyncio.run(
+        user_service.create_user(
+            username="dave", password="p", tenant_id="t-full", can_create_kb=True
+        )
+    )
+    client.put(
+        f"/admin/tenants/t-full/members/{dave.id}",
+        json={"role": "tenant_member"},
+        headers=admin_headers,
+    )
+    dave_headers = {"Authorization": f"Bearer {_token(user_service, dave)}"}
+    kb = client.post(
+        "/kbs", json={"id": "kb_full", "name": "KB"}, headers=dave_headers
+    )
+    assert kb.status_code == 200, kb.text
+
+    blocked = client.delete("/admin/tenants/t-full", headers=admin_headers)
+    assert blocked.status_code == 409
+    detail = blocked.json()["detail"]
+    assert detail["error_code"] == "tenant_not_empty"
+    assert detail["member_count"] == 1
+    assert detail["kb_count"] == 1
+    assert detail["user_count"] == 1
+
+    assert client.delete("/admin/tenants/ghost", headers=admin_headers).status_code == 404

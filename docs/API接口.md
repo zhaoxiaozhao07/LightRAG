@@ -1115,7 +1115,7 @@ username=admin&password=change-me
 |---|---|---|
 | `GET` | `/admin/settings/registration` | 读取实时注册策略，返回 `enabled` 与 `mode` |
 | `PATCH` / `PUT` | `/admin/settings/registration` | 更新实时注册策略，body：`{"enabled": true}` 或 `{"mode":"open"}` |
-| `GET` | `/admin/users` | 列出企业用户 |
+| `GET` | `/admin/users` | 列出企业用户；支持 `status`/`tenant_id`/`q`(用户名子串) 过滤与 `limit`/`offset` 分页 |
 | `POST` | `/admin/users` | 创建用户，可设置 `can_create_kb`、`can_use_bypass_query`、`can_delete_documents`、`tenant_id` |
 | `GET` | `/admin/users/{user_id}` | 查询用户详情 |
 | `PATCH` | `/admin/users/{user_id}` | 更新用户状态/能力/tenant/password；请求体包含 `status`、`can_create_kb`、`can_use_bypass_query`、`can_delete_documents`、`tenant_id` 中任一非 null 字段并通过 `update_user()`，或修改 `password`，都会增加 `token_version` 并使旧 token 失效；当前实现中 `tenant_id:null` 表示不变而非清空 |
@@ -1127,6 +1127,7 @@ username=admin&password=change-me
 | `GET` | `/admin/tenants` | 列出所有租户 |
 | `GET` | `/admin/tenants/{tenant_id}` | 租户详情 + 总览（含 `member_count` / `kb_count`） |
 | `PATCH` | `/admin/tenants/{tenant_id}` | 更新租户 `name`/`description`/`status`（`active`/`disabled`） |
+| `DELETE` | `/admin/tenants/{tenant_id}` | 删除租户实体；仅当无任何引用（成员/租户内 KB/归属用户/tenant-KB ACL）时允许，否则 `409`（不级联） |
 | `GET` | `/admin/tenants/{tenant_id}/kbs` | 列出该租户下的 KB（`id`/`name`/`status`/`visibility`/`owner_id`） |
 | `GET` | `/admin/tenants/{tenant_id}/members` | 列出 tenant 成员与 tenant role |
 | `PUT` | `/admin/tenants/{tenant_id}/members/{user_id}` | 写入/更新 tenant membership，body：`{"role":"tenant_member"}` |
@@ -1184,7 +1185,7 @@ KB ACL 请求/响应约束：
 - super admin bootstrap/sync：`super_admin_bootstrapped`、`super_admin_synced`
 - 用户管理：`user_created`、`user_updated`、`user_password_changed`
 - service API key：`service_api_key_created`、`service_api_key_rotated`、`service_api_key_revoked`
-- KB ACL / tenant：`kb_acl_granted`、`kb_acl_revoked`、`tenant_created`、`tenant_updated`、`tenant_membership_granted`、`tenant_membership_revoked`、`tenant_kb_acl_granted`、`tenant_kb_acl_revoked`
+- KB ACL / tenant：`kb_acl_granted`、`kb_acl_revoked`、`tenant_created`、`tenant_updated`、`tenant_deleted`、`tenant_membership_granted`、`tenant_membership_revoked`、`tenant_kb_acl_granted`、`tenant_kb_acl_revoked`
 - 权限/限流/配额：`permission_denied`、`rate_limited`、`quota_exceeded`
 - KB/config/query：`kb_created`、`kb_deleted`、`kb_hard_deleted`、`kb_config_activated`、`query_executed`、`query_stream_started`、`retrieve_executed`
 - artifact/job/document 类事件：`artifact_downloaded`、`artifact_previewed`、`artifact_download_url_created`、`kb_rebuild_queued`、`job_cancel_requested`、`job_retry_queued`，以及文档 upload/texts/urls/import/scan/sync/patch/enable/disable/replace/delete/batch-delete/parse/batch-parse/build/reindex/batch-build/batch-reindex/rebuild 相关事件。

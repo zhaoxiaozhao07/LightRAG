@@ -1885,6 +1885,17 @@ class PostgresMetadataStore:
             )
         return [_enterprise_tenant_from_row(row) for row in rows]
 
+    async def delete_enterprise_tenant(self, tenant_id: str) -> bool:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> bool:
+            status = await conn.execute(
+                "DELETE FROM enterprise_tenants WHERE id = $1", tenant_id
+            )
+            return _rowcount(status) > 0
+
+        return await self._write(write)
+
     async def upsert_tenant_membership(
         self, membership: EnterpriseTenantMembershipRecord
     ) -> EnterpriseTenantMembershipRecord:

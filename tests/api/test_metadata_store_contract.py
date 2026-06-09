@@ -411,6 +411,10 @@ async def test_enterprise_tenant_entity_contract(store):
     assert tid in {t.id for t in listed}
     assert await store.get_enterprise_tenant_by_id("does-not-exist") is None
 
+    assert await store.delete_enterprise_tenant(tid) is True
+    assert await store.get_enterprise_tenant_by_id(tid) is None
+    assert await store.delete_enterprise_tenant(tid) is False
+
 
 async def test_enterprise_tenant_membership_and_kb_acl_contract(store):
     kb_id = _unique_kb(store)

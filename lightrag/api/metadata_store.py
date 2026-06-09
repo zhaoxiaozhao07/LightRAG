@@ -2627,6 +2627,17 @@ class SQLiteMetadataStore:
             ).fetchall()
         return [EnterpriseTenantRecord.from_row(row) for row in rows]
 
+    async def delete_enterprise_tenant(self, tenant_id: str) -> bool:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute(
+                "DELETE FROM enterprise_tenants WHERE id = ?", (tenant_id,)
+            )
+            return bool(cursor.rowcount)
+
+        return await self._write(write)
+
     async def upsert_tenant_membership(
         self, membership: EnterpriseTenantMembershipRecord
     ) -> EnterpriseTenantMembershipRecord:

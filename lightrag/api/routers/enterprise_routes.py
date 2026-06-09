@@ -647,12 +647,28 @@ def create_enterprise_routes(
         response_model=list[EnterpriseUserResponse],
         dependencies=[Depends(combined_auth)],
     )
-    async def list_enterprise_users(request: Request):
+    async def list_enterprise_users(
+        request: Request,
+        status: str | None = None,
+        tenant_id: str | None = None,
+        q: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ):
         user_service = get_enterprise_user_service(request)
-        return [
-            EnterpriseUserResponse.from_record(user)
-            for user in await user_service.list_users()
-        ]
+        users = await user_service.list_users()
+        if status:
+            users = [user for user in users if user.status == status]
+        if tenant_id:
+            users = [user for user in users if user.tenant_id == tenant_id]
+        if q:
+            needle = q.strip().lower()
+            users = [user for user in users if needle in user.username.lower()]
+        offset = max(0, offset)
+        users = users[offset:]
+        if limit is not None and limit > 0:
+            users = users[:limit]
+        return [EnterpriseUserResponse.from_record(user) for user in users]
 
     @router.post(
         "/admin/users",
@@ -890,6 +906,45 @@ def create_enterprise_routes(
             actor_user_id=principal.user_id,
         )
         return EnterpriseTenantResponse.from_record(tenant)
+
+    @router.delete(
+        "/admin/tenants/{tenant_id}",
+        dependencies=[Depends(combined_auth)],
+    )
+    async def delete_tenant(tenant_id: str, request: Request):
+        principal = require_principal(request)
+        authz_service = get_enterprise_authorization_service(request)
+        await authz_service.get_tenant_or_404(tenant_id)
+        # No cascade: refuse while anything still references the tenant.
+        member_count = len(await authz_service.list_tenant_memberships(tenant_id))
+        acl_kb_ids = await authz_service.list_kb_ids_for_tenants([tenant_id])
+        kb_count = 0
+        if kb_service is not None:
+            kb_count = sum(
+                1 for kb in await kb_service.list() if kb.tenant_id == tenant_id
+            )
+        user_service = get_enterprise_user_service(request)
+        user_count = sum(
+            1 for user in await user_service.list_users() if user.tenant_id == tenant_id
+        )
+        if member_count or kb_count or user_count or acl_kb_ids:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_code": "tenant_not_empty",
+                    "message": (
+                        "Tenant still has references; reassign or remove them first"
+                    ),
+                    "member_count": member_count,
+                    "kb_count": kb_count,
+                    "user_count": user_count,
+                    "tenant_kb_acl_count": len(acl_kb_ids),
+                },
+            )
+        deleted = await authz_service.delete_tenant(
+            tenant_id, actor_user_id=principal.user_id
+        )
+        return {"deleted": deleted}
 
     @router.get(
         "/admin/tenants/{tenant_id}/kbs",

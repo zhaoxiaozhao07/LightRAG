@@ -182,6 +182,8 @@ class EnterpriseMetadataStore(Protocol):
 
     async def list_enterprise_tenants(self) -> list[EnterpriseTenantRecord]: ...
 
+    async def delete_enterprise_tenant(self, tenant_id: str) -> bool: ...
+
     async def upsert_tenant_membership(
         self, membership: EnterpriseTenantMembershipRecord
     ) -> EnterpriseTenantMembershipRecord: ...
@@ -1524,6 +1526,23 @@ class AuthorizationService:
                 target_id=saved.id,
             )
         return saved
+
+    async def delete_tenant(
+        self, tenant_id: str, *, actor_user_id: str | None = None
+    ) -> bool:
+        tenant_id = _normalize_required_id(tenant_id, "Tenant id")
+        deleted = await self._metadata_store.delete_enterprise_tenant(tenant_id)
+        if deleted and self._audit_service is not None:
+            await self._audit_service.append(
+                "tenant_deleted",
+                actor_user_id=actor_user_id,
+                target_type="tenant",
+                target_id=tenant_id,
+            )
+        return deleted
+
+    async def list_kb_ids_for_tenants(self, tenant_ids: list[str]) -> list[str]:
+        return await self._metadata_store.list_kb_ids_for_tenants(tenant_ids)
 
     async def require_tenant_role(
         self, principal: Principal | None, tenant_id: str, minimum_role: str
