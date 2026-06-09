@@ -13,6 +13,8 @@ from lightrag.api.enterprise_auth import (
     REGISTRATION_MODE_INVITE_ONLY,
     REGISTRATION_MODE_OPEN,
     SERVICE_API_KEY_AUTH_METHOD,
+    TENANT_ROLE_ADMIN,
+    TENANT_ROLE_MEMBER,
     USER_STATUS_ACTIVE,
     USER_STATUS_DISABLED,
     USER_STATUS_PENDING,
@@ -143,6 +145,21 @@ class EnterpriseACLBatchSetResponse(BaseModel):
     revoked: list[str]
 
 
+class EnterpriseUserKBAccessBatchEntry(BaseModel):
+    kb_id: str = Field(min_length=1)
+    role: str | None = Field(default=None)
+    action: Literal["grant", "revoke"] = "grant"
+
+
+class EnterpriseUserKBAccessBatchSetRequest(BaseModel):
+    entries: list[EnterpriseUserKBAccessBatchEntry] = Field(min_length=1)
+
+
+class EnterpriseUserKBAccessBatchSetResponse(BaseModel):
+    granted: list[EnterpriseACLResponse]
+    revoked: list[str]
+
+
 class EnterpriseTenantMembershipGrantRequest(BaseModel):
     role: str = Field(min_length=1)
 
@@ -166,6 +183,7 @@ class EnterpriseServiceAPIKeyCreateRequest(BaseModel):
     name: str = Field(min_length=1)
     kb_roles: dict[str, str] = Field(default_factory=dict)
     can_use_bypass_query: bool = False
+    inherit_tenant_kb_acl: bool = False
     tenant_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     expires_in_seconds: int | None = Field(default=None, ge=1)
@@ -289,6 +307,14 @@ def create_enterprise_routes(
             await service.get(kb_id)
         except KnowledgeBaseNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Knowledge base not found") from exc
+
+    async def require_tenant_admin(request: Request, tenant_id: str) -> Principal:
+        principal = require_principal(request)
+        return await get_enterprise_authorization_service(request).require_tenant_role(
+            principal,
+            tenant_id,
+            TENANT_ROLE_ADMIN,
+        )
 
     def login_response(user_service, user: EnterpriseUserRecord) -> dict[str, Any]:
         token = auth_handler.create_token(
@@ -609,6 +635,43 @@ def create_enterprise_routes(
             )
         return EnterpriseUserResponse.from_record(user)
 
+    @router.post(
+        "/admin/users/{user_id}/kb-access:batch-set",
+        response_model=EnterpriseUserKBAccessBatchSetResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def batch_set_user_kb_access(
+        user_id: str, request: Request, body: EnterpriseUserKBAccessBatchSetRequest
+    ):
+        principal = require_principal(request)
+        await get_enterprise_user_service(request).get_user_or_404(user_id)
+        authz_service = get_enterprise_authorization_service(request)
+        for entry in body.entries:
+            await require_kb_exists(request, entry.kb_id)
+            if entry.action == "grant" and entry.role is None:
+                raise HTTPException(status_code=400, detail="Role is required for ACL grants")
+
+        granted: list[EnterpriseACLResponse] = []
+        revoked: list[str] = []
+        for entry in body.entries:
+            if entry.action == "revoke":
+                if await authz_service.revoke_kb_role(
+                    entry.kb_id,
+                    user_id,
+                    actor_user_id=principal.user_id,
+                ):
+                    revoked.append(entry.kb_id)
+                continue
+            assert entry.role is not None
+            record = await authz_service.grant_kb_role(
+                entry.kb_id,
+                user_id,
+                entry.role,
+                granted_by=principal.user_id,
+            )
+            granted.append(EnterpriseACLResponse.from_record(record))
+        return EnterpriseUserKBAccessBatchSetResponse(granted=granted, revoked=revoked)
+
     @router.get(
         "/admin/kbs/{kb_id}/acl",
         response_model=list[EnterpriseACLResponse],
@@ -667,6 +730,84 @@ def create_enterprise_routes(
     async def revoke_tenant_membership(tenant_id: str, user_id: str, request: Request):
         principal = require_principal(request)
         authz_service = get_enterprise_authorization_service(request)
+        deleted = await authz_service.revoke_tenant_membership(
+            tenant_id,
+            user_id,
+            actor_user_id=principal.user_id,
+        )
+        return {"deleted": deleted}
+
+    @router.get(
+        "/tenants/{tenant_id}/members",
+        response_model=list[EnterpriseTenantMembershipResponse],
+        dependencies=[Depends(combined_auth)],
+    )
+    async def self_service_list_tenant_members(tenant_id: str, request: Request):
+        await require_tenant_admin(request, tenant_id)
+        authz_service = get_enterprise_authorization_service(request)
+        return [
+            EnterpriseTenantMembershipResponse.from_record(item)
+            for item in await authz_service.list_tenant_memberships(tenant_id)
+        ]
+
+    @router.put(
+        "/tenants/{tenant_id}/members/{user_id}",
+        response_model=EnterpriseTenantMembershipResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def self_service_grant_tenant_membership(
+        tenant_id: str,
+        user_id: str,
+        request: Request,
+        body: EnterpriseTenantMembershipGrantRequest,
+    ):
+        principal = await require_tenant_admin(request, tenant_id)
+        if not principal.is_super_admin and body.role.strip() not in {
+            TENANT_ROLE_MEMBER,
+            "member",
+        }:
+            raise HTTPException(
+                status_code=403,
+                detail="Tenant admins can only grant tenant_member via self-service",
+            )
+        authz_service = get_enterprise_authorization_service(request)
+        existing = await authz_service.get_tenant_membership(tenant_id, user_id)
+        if (
+            not principal.is_super_admin
+            and existing is not None
+            and existing.role != TENANT_ROLE_MEMBER
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Tenant admins cannot modify tenant admins or tenant owners via self-service",
+            )
+        record = await authz_service.grant_tenant_membership(
+            tenant_id,
+            user_id,
+            body.role,
+            granted_by=principal.user_id,
+        )
+        return EnterpriseTenantMembershipResponse.from_record(record)
+
+    @router.delete(
+        "/tenants/{tenant_id}/members/{user_id}",
+        dependencies=[Depends(combined_auth)],
+    )
+    async def self_service_revoke_tenant_membership(
+        tenant_id: str, user_id: str, request: Request
+    ):
+        principal = await require_tenant_admin(request, tenant_id)
+        authz_service = get_enterprise_authorization_service(request)
+        existing = await authz_service.get_tenant_membership(tenant_id, user_id)
+        if (
+            not principal.is_super_admin
+            and existing is not None
+            and existing.role != TENANT_ROLE_MEMBER
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Tenant admins cannot revoke tenant admins or tenant owners via self-service",
+            )
         deleted = await authz_service.revoke_tenant_membership(
             tenant_id,
             user_id,
@@ -803,6 +944,11 @@ def create_enterprise_routes(
         principal = require_principal(request)
         for kb_id in body.kb_roles:
             await require_kb_exists(request, kb_id)
+        if body.inherit_tenant_kb_acl and not body.tenant_id:
+            raise HTTPException(
+                status_code=400,
+                detail="tenant_id is required when inherit_tenant_kb_acl is true",
+            )
         api_key_service = get_enterprise_api_key_service(request)
         expires_at = None
         if body.expires_in_seconds is not None:
@@ -815,6 +961,7 @@ def create_enterprise_routes(
             scopes={
                 "kb_roles": body.kb_roles,
                 "can_use_bypass_query": body.can_use_bypass_query,
+                "inherit_tenant_kb_acl": body.inherit_tenant_kb_acl,
             },
             metadata=body.metadata,
             created_by=principal.user_id,

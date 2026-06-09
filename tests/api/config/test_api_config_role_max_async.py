@@ -28,6 +28,7 @@ ENTERPRISE_LIMIT_ENV_KEYS = (
     "LIGHTRAG_ENTERPRISE_TENANT_QUOTA_WINDOW_SECONDS",
     "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE",
     "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY",
+    "LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY",
     "LIGHTRAG_ENTERPRISE_MASK_STORAGE_URIS",
     "LIGHTRAG_ENTERPRISE_REGISTRATION_MAX_ATTEMPTS",
     "LIGHTRAG_ENTERPRISE_REGISTRATION_WINDOW_SECONDS",
@@ -100,6 +101,7 @@ def test_enterprise_limit_config_defaults_disabled(monkeypatch):
     assert args.enterprise_tenant_quota_requests == 0
     assert args.enterprise_artifact_download_min_role == "kb_viewer"
     assert args.enterprise_artifact_download_policy == ""
+    assert args.enterprise_artifact_action_policy == ""
     assert args.enterprise_mask_storage_uris is True
     assert args.enterprise_registration_max_attempts == 10
     assert args.enterprise_registration_window_seconds == 300.0
@@ -123,6 +125,10 @@ def test_enterprise_limit_config_reads_env_overrides(monkeypatch):
         "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY",
         '{"original":"kb_editor"}',
     )
+    monkeypatch.setenv(
+        "LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY",
+        '{"preview":{"*":"kb_editor"}}',
+    )
     monkeypatch.setenv("LIGHTRAG_ENTERPRISE_MASK_STORAGE_URIS", "false")
     monkeypatch.setenv("LIGHTRAG_ENTERPRISE_REGISTRATION_MAX_ATTEMPTS", "5")
     monkeypatch.setenv("LIGHTRAG_ENTERPRISE_REGISTRATION_WINDOW_SECONDS", "15")
@@ -141,6 +147,7 @@ def test_enterprise_limit_config_reads_env_overrides(monkeypatch):
     assert args.enterprise_tenant_quota_window_seconds == 7200.0
     assert args.enterprise_artifact_download_min_role == "kb_admin"
     assert args.enterprise_artifact_download_policy == '{"original":"kb_editor"}'
+    assert args.enterprise_artifact_action_policy == '{"preview":{"*":"kb_editor"}}'
     assert args.enterprise_mask_storage_uris is False
     assert args.enterprise_registration_max_attempts == 5
     assert args.enterprise_registration_window_seconds == 15.0
@@ -186,4 +193,36 @@ def test_enterprise_artifact_download_policy_rejects_invalid_json(monkeypatch):
     monkeypatch.setenv("LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY", "not-json")
 
     with pytest.raises(ValueError, match="ARTIFACT_DOWNLOAD_POLICY"):
+        parse_args()
+
+
+def test_enterprise_artifact_action_policy_validation(monkeypatch):
+    _clear_enterprise_limit_env(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["lightrag-server"])
+    monkeypatch.setenv("LIGHTRAG_ENTERPRISE_AUTH_ENABLED", "true")
+    monkeypatch.setenv("TOKEN_SECRET", "test-token-secret")
+    monkeypatch.setenv("LIGHTRAG_SUPER_ADMIN_USERNAME", "admin")
+    monkeypatch.setenv("LIGHTRAG_SUPER_ADMIN_PASSWORD", "admin-pass")
+    monkeypatch.setenv(
+        "LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY",
+        '{"preview":{"*":"viewer"}}',
+    )
+
+    with pytest.raises(ValueError, match="ARTIFACT_ACTION_POLICY"):
+        parse_args()
+
+
+def test_enterprise_artifact_action_policy_rejects_invalid_action(monkeypatch):
+    _clear_enterprise_limit_env(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["lightrag-server"])
+    monkeypatch.setenv("LIGHTRAG_ENTERPRISE_AUTH_ENABLED", "true")
+    monkeypatch.setenv("TOKEN_SECRET", "test-token-secret")
+    monkeypatch.setenv("LIGHTRAG_SUPER_ADMIN_USERNAME", "admin")
+    monkeypatch.setenv("LIGHTRAG_SUPER_ADMIN_PASSWORD", "admin-pass")
+    monkeypatch.setenv(
+        "LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY",
+        '{"delete":{"*":"kb_admin"}}',
+    )
+
+    with pytest.raises(ValueError, match="ARTIFACT_ACTION_POLICY"):
         parse_args()

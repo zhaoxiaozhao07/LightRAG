@@ -657,13 +657,13 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 列表示例：`GET /kbs/{kb_id}/documents/{document_id}/artifacts?artifact_type=markdown&limit=50&offset=0`。
 
 下载约束：
-- 企业模式权限：artifact list/detail 按 `kb_viewer` 或更高角色读取。`:download` 与 `:download-url` 的默认最低角色由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 控制，默认 `kb_viewer` 保持旧行为，可提升为 `kb_editor`、`kb_admin` 或 `kb_owner`；`LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY` 可用 JSON object 按 artifact type 覆盖（如 `{"original":"kb_editor","*":"kb_viewer"}`），并同时作用于显式匹配类型的 `:preview`。低于要求的角色返回 `403`。
+- 企业模式权限：artifact list/detail 按 `kb_viewer` 或更高角色读取。`:download` 与 `:download-url` 的默认最低角色由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 控制，默认 `kb_viewer` 保持旧行为，可提升为 `kb_editor`、`kb_admin` 或 `kb_owner`；`LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY` 可用 JSON object 按 artifact type 覆盖（如 `{"original":"kb_editor","*":"kb_viewer"}`），并同时作用于显式匹配类型的 `:preview`。更细粒度时可使用 `LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY`，按 action 分别设置 artifact type policy，例如 `{"preview":{"*":"kb_editor"},"download":{"original":"kb_editor"},"download-url":{"original":"kb_admin"}}`。action policy 优先于 download policy；低于要求的角色返回 `403`。
 - 文件型产物（`original` / `blocks` / `markdown` / `content_list` / `middle_json` / `model_json` / `image` / `layout_pdf`）以 `FileResponse` 直接返回。
 - 目录型产物（`sidecar` / `raw_dir`）以流式 zip 返回（`Content-Type: application/zip`），单次下载 zip 内未压缩字节上限 512 MB，超限返回 `413`。
 - 路径必须位于 `inputs/<workspace>/<document_id>` 内；跨 KB、缺失文件、路径逃逸均返回 `404` / `400`。
 - 启用对象存储时，如果本地 cache path 缺失，`:download` 接口会先从 `metadata.object_uri` / `metadata.object_prefix_uri` restore 到原 cache path，再返回文件或 zip，保持旧客户端兼容。
 - `:preview` 仅支持文件型 artifact，目录返回 `400`；支持 `text/*`、`application/json`、`application/ld+json`、`application/markdown`、`application/x-ndjson`、普通图片（不含 `image/svg+xml`）和 `application/pdf`，以 `inline` content-disposition 返回；单次 preview 上限 10 MB，超出返回 `413`，不支持的 media type 返回 `415`。本地 cache 缺失时同样按对象存储 metadata restore。
-- `:download-url` 仅对 metadata 中存在 `object_uri` 的**文件型** artifact 生效，返回 `{artifact_id,url,object_uri,expires_in_seconds,filename,media_type}`；服务端使用对象存储后端生成 `GET Object` 预签名 URL，不会触发本地 cache restore。`expires_in_seconds` 默认 3600 秒，服务端限制在 `[1, 604800]`。目录型 artifact（`sidecar` / `raw_dir`，metadata 中为 `object_prefix_uri`）仍需走 `:download` 的 zip 代理下载。企业模式且 `LIGHTRAG_ENTERPRISE_MASK_STORAGE_URIS=true`（默认）时，文档 `source_uri`、artifact `uri`、响应中的 storage metadata 与 `download-url.object_uri` 会返回 `"<masked>"`，不泄露本地路径或对象存储 URI；下载/预览/预签名内部仍使用真实 metadata。
+- `:download-url` 仅对 metadata 中存在 `object_uri` 的**文件型** artifact 生效，返回 `{artifact_id,url,object_uri,expires_in_seconds,filename,media_type}`；服务端使用对象存储后端生成 `GET Object` 预签名 URL，不会触发本地 cache restore。`expires_in_seconds` 默认 3600 秒，服务端限制在 `[1, 604800]`。目录型 artifact（`sidecar` / `raw_dir`，metadata 中为 `object_prefix_uri`）仍需走 `:download` 的 zip 代理下载。企业模式且 `LIGHTRAG_ENTERPRISE_MASK_STORAGE_URIS=true`（默认）时，文档 `source_uri`、artifact `uri`、响应中的 storage metadata、job payload/result 中的路径字段与 `download-url.object_uri` 会返回 `"<masked>"` 或被递归移除，不泄露本地路径或对象存储 URI；下载/预览/预签名内部仍使用真实 metadata。
 
 ---
 
@@ -934,7 +934,7 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 
 ## 十、企业模式 Auth / Admin
 
-本节接口仅在 `LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true` 时挂载或启用。企业模式默认禁用 guest 对受保护 API 的访问；`LIGHTRAG_API_KEY` 默认不能绕过 RBAC；`WHITELIST_PATHS` 不能放行 `/kbs`、`/documents`、`/query`、`/graph`、`/api` 等受保护前缀。企业 service API key 使用同一 `X-API-Key` 请求头，但与全局 `LIGHTRAG_API_KEY` 分离：只按持久化 hash 查找、只拥有创建时授予的 KB role scope，不能成为 super admin，撤销后立即失效。
+本节接口仅在 `LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true` 时挂载或启用。企业模式默认禁用 guest 对受保护 API 的访问；`LIGHTRAG_API_KEY` 默认不能绕过 RBAC；`WHITELIST_PATHS` 不能放行 `/kbs`、`/documents`、`/query`、`/graph`、`/api` 等受保护前缀。企业 service API key 使用同一 `X-API-Key` 请求头，但与全局 `LIGHTRAG_API_KEY` 分离：只按持久化 hash 查找，默认只拥有创建时授予的 `kb_roles` scope；设置 `tenant_id + inherit_tenant_kb_acl=true` 时可显式继承 tenant-scoped KB ACL。service key 不能成为 super admin，撤销后立即失效。
 
 ### 10.1 配置项
 
@@ -952,6 +952,8 @@ LIGHTRAG_ENTERPRISE_LEGACY_API_KEY_SUPERADMIN=false
 LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE=kb_viewer
 # artifact type 级别最低角色覆盖，JSON object；key 可为 original/markdown/raw_dir/... 或 *
 LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY={"original":"kb_editor"}
+# artifact action 级别最低角色覆盖，JSON object；action 为 download/download-url/preview，内层 key 可为 artifact type 或 *
+LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY={"preview":{"*":"kb_editor"},"download":{"original":"kb_editor"}}
 # 企业响应中默认隐藏本地 path / object_uri / object_prefix_uri
 LIGHTRAG_ENTERPRISE_MASK_STORAGE_URIS=true
 
@@ -1041,6 +1043,7 @@ username=admin&password=change-me
 | `POST` | `/admin/users/{user_id}:disable` | 禁用用户并递增 `token_version`，旧 token 失效 |
 | `POST` | `/admin/users/{user_id}:enable` | 启用用户并递增 `token_version` |
 | `POST` | `/admin/users/{user_id}:reset-password` | 重置用户密码并递增 `token_version` |
+| `POST` | `/admin/users/{user_id}/kb-access:batch-set` | 按用户维度批量 grant/revoke 多个 KB ACL；与按 KB 维度 `/admin/kbs/{kb_id}/acl:batch-set` 互补 |
 | `GET` | `/admin/tenants/{tenant_id}/members` | 列出 tenant 成员与 tenant role |
 | `PUT` | `/admin/tenants/{tenant_id}/members/{user_id}` | 写入/更新 tenant membership，body：`{"role":"tenant_member"}` |
 | `DELETE` | `/admin/tenants/{tenant_id}/members/{user_id}` | 删除 tenant membership |
@@ -1058,7 +1061,15 @@ username=admin&password=change-me
 | `POST` | `/admin/invitations/{invitation_id}:revoke` | 撤销邀请；已 used/revoked 的邀请保持终态 |
 | `GET` | `/admin/audit-events` | 查看最近审计事件；支持 `?limit=100` 限制返回条数 |
 
-KB ACL 角色使用规范名称：`kb_viewer`、`kb_editor`、`kb_admin`、`kb_owner`。用户 effective KB role 取 direct user ACL 与其 tenant memberships 命中的 tenant-scoped KB ACL 的最高角色；没有 direct/tenant ACL 时跨 tenant 默认拒绝。Service/scoped API key 只按自身 `kb_roles` scope 授权，不会因为 `tenant_id` 隐式继承 tenant ACL。第一期中 KB ACL 与 tenant membership 管理由 super admin 统一执行；普通 KB owner 不具备删除 KB 的平台权限。
+以下 self-service tenant 接口需当前用户是目标 tenant 的 `tenant_admin` 或 `tenant_owner`（super admin 也可用）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/tenants/{tenant_id}/members` | tenant admin 查看本 tenant 成员 |
+| `PUT` | `/tenants/{tenant_id}/members/{user_id}` | tenant admin 仅可授予/更新普通 `tenant_member`；不能提升为 admin/owner，也不能修改已有 admin/owner |
+| `DELETE` | `/tenants/{tenant_id}/members/{user_id}` | tenant admin 仅可撤销普通 `tenant_member`；不能撤销 tenant admin/owner |
+
+KB ACL 角色使用规范名称：`kb_viewer`、`kb_editor`、`kb_admin`、`kb_owner`。用户 effective KB role 取 direct user ACL 与其 tenant memberships 命中的 tenant-scoped KB ACL 的最高角色；没有 direct/tenant ACL 时跨 tenant 默认拒绝。Service/scoped API key 默认只按自身 `kb_roles` scope 授权；若创建时同时设置 `tenant_id` 与 `inherit_tenant_kb_acl=true`，则显式继承该 tenant 命中的 tenant-scoped KB ACL，并与 `kb_roles` 取最高角色。第一期中 KB ACL 仍由 super admin 统一执行；tenant admin 只具备本 tenant 成员自助管理权限，不具备 KB ACL 管理或删除 KB 的平台权限。
 
 KB ACL 请求/响应约束：
 
@@ -1128,8 +1139,12 @@ KB ACL 请求/响应约束：
 {"entries":[{"user_id":"usr_1","role":"kb_editor"},{"tenant_id":"tenant-a","role":"kb_viewer"},{"user_id":"usr_2","action":"revoke"},{"tenant_id":"tenant-b","action":"revoke"}]}
 // 返回：{"granted":[...],"revoked":["usr_2","tenant-b"]}
 
+// POST /admin/users/{user_id}/kb-access:batch-set
+{"entries":[{"kb_id":"kb_a","role":"kb_viewer"},{"kb_id":"kb_b","role":"kb_editor"},{"kb_id":"kb_c","action":"revoke"}]}
+// 返回：{"granted":[...],"revoked":["kb_c"]}
+
 // POST /admin/service-api-keys
-{"name":"ci-reader","kb_roles":{"kb_123":"kb_viewer"},"can_use_bypass_query":false,"metadata":{"purpose":"ci"}}
+{"name":"ci-reader","kb_roles":{"kb_123":"kb_viewer"},"can_use_bypass_query":false,"inherit_tenant_kb_acl":false,"metadata":{"purpose":"ci"}}
 // 返回：{"api_key":"lrsk_svc_key_...","key":{"id":"svc_key_...","key_preview":"...","status":"active", ...}}
 
 // POST /admin/service-api-keys/{key_id}:rotate
@@ -1149,6 +1164,7 @@ Service API key 行为约束：
   "name": "ci-reader",
   "kb_roles": {"kb_123": "kb_viewer"},
   "can_use_bypass_query": false,
+  "inherit_tenant_kb_acl": false,
   "tenant_id": null,
   "metadata": {"purpose": "ci"},
   "expires_in_seconds": 2592000
@@ -1171,7 +1187,8 @@ Service API key 行为约束：
     "tenant_id": null,
     "scopes": {
       "kb_roles": {"kb_123": "kb_viewer"},
-      "can_use_bypass_query": false
+      "can_use_bypass_query": false,
+      "inherit_tenant_kb_acl": false
     },
     "metadata": {"purpose": "ci"},
     "created_at": "2026-06-08T...Z",
@@ -1192,7 +1209,7 @@ Service API key 行为约束：
 - Service key 认证成功时会更新 `last_used_at`。
 - 只存储 `sha256:<hex>` lookup hash 和 `key_preview`，不存储 raw key；raw key 只在创建响应返回一次。
 - 支持 `kb_roles` scope，角色名按 `kb_viewer` / `kb_editor` / `kb_admin` / `kb_owner` 规范化并复用同一角色阶梯。
-- `tenant_id` 仅作为 service key 的归属/审计/配额维度；service key 不会隐式继承 tenant-scoped KB ACL，必须在 `kb_roles` 中显式列出可访问 KB。
+- `tenant_id` 默认仅作为 service key 的归属/审计/配额维度；service key 不会隐式继承 tenant-scoped KB ACL，必须在 `kb_roles` 中显式列出可访问 KB。若创建时设置 `inherit_tenant_kb_acl=true`，则必须同时提供 `tenant_id`，认证时会显式继承该 tenant 的 tenant-scoped KB ACL，并与 `kb_roles` scope 取最高角色。
 - 当前最小闭环**不允许 service key 创建 KB 或成为 super admin**；`POST /kbs` 仍要求 super admin 或普通用户 `can_create_kb=true`。
 - `can_use_bypass_query=true` 只授予 bypass 查询能力，仍必须同时拥有目标 KB 的 `kb_viewer` 或更高 role。
 - 撤销通过 `status=revoked` 持久化；认证每次从 metadata store 查 hash，因此撤销无需等待 token 过期。
@@ -1200,6 +1217,7 @@ Service API key 行为约束：
 企业请求限流/配额行为约束：
 
 - 默认关闭；只有 `LIGHTRAG_ENTERPRISE_RATE_LIMIT_ENABLED=true` 且对应 request 阈值大于 0 时生效。
+- 当前项目 LLM 本地部署，不做 token/cost 预算、计费或成本结算；本节配额只表示单机 request quota 与并发 job 限额。
 - 计数发生在企业认证成功且 RBAC/bypass 权限校验通过之后；未认证或无权限请求不会消耗额度。
 - principal 维度覆盖普通用户、service API key 和显式启用的 legacy enterprise API key；tenant 维度仅在 principal 带 `tenant_id` 时额外计数。
 - 超过 request rate limit 返回 `429`、`Retry-After`，并写 `rate_limited` 审计事件；超过 quota 返回 `429`、`Retry-After`，并写 `quota_exceeded` 审计事件。
@@ -1210,15 +1228,15 @@ Service API key 行为约束：
 - `mode="bypass"` 查询需要 KB read ACL 加 `can_use_bypass_query=true` 或 super admin；按最终解析后的查询模式判断，包括 active query config 默认值。
 - legacy/global `/documents`、`/query`、`/graph`、Ollama `/api/*` 在 `LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES=true` 时默认拒绝；关闭该开关后仍需 super admin。
 - super admin bootstrap 来自 `.env`，启动后同步为 active super admin；企业模式要求非默认 `TOKEN_SECRET`。
-- Tenant membership 与 tenant-scoped KB ACL 已接入用户 principal hydration；用户请求按 direct user ACL 与 tenant ACL 最高角色授权，service key 请求仍只按显式 `kb_roles` scope 授权。
+- Tenant membership 与 tenant-scoped KB ACL 已接入用户 principal hydration；用户请求按 direct user ACL 与 tenant ACL 最高角色授权。Service key 请求默认只按显式 `kb_roles` scope 授权；设置 `tenant_id + inherit_tenant_kb_acl=true` 时显式继承 tenant ACL。
 
 KB 路由角色矩阵：
 
 | 范围 | 最低角色 / 能力 |
 |---|---|
 | `POST /kbs` | super admin 或 `can_create_kb=true` |
-| `GET /kbs` | super admin 看全部；普通用户仅看 direct user ACL 或 tenant ACL 授权 KB；service key 仅看 `kb_roles` scope |
-| `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高；artifact `:download` / `:download-url` 可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 全局提升最低角色，也可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY` 按 artifact type 覆盖 |
+| `GET /kbs` | super admin 看全部；普通用户仅看 direct user ACL 或 tenant ACL 授权 KB；service key 默认仅看 `kb_roles` scope，显式 `inherit_tenant_kb_acl` 时额外继承 tenant ACL |
+| `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高；artifact `:download` / `:download-url` 可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 全局提升最低角色，也可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY` 按 artifact type 覆盖；`:download` / `:download-url` / `:preview` 还可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY` 按 action + artifact type 覆盖 |
 | `/kbs/{kb_id}/query`、`/query/stream`、`/query/data`、`/retrieve` | `kb_viewer` 或更高；最终 `mode="bypass"` 额外需要 `can_use_bypass_query=true` |
 | 文档上传/解析/构建/删除/替换/sync、job wait/cancel/retry 等写操作 | `kb_editor` 或更高 |
 | KB 配置创建/激活/diff、`PATCH /kbs/{kb_id}` | `kb_admin` 或更高 |

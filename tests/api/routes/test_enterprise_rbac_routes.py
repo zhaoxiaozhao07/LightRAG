@@ -138,6 +138,7 @@ def _enterprise_args(**overrides):
         "enterprise_tenant_quota_window_seconds": 86400.0,
         "enterprise_artifact_download_min_role": "kb_viewer",
         "enterprise_artifact_download_policy": "",
+        "enterprise_artifact_action_policy": "",
         "enterprise_mask_storage_uris": True,
         "enterprise_registration_max_attempts": 10,
         "enterprise_registration_window_seconds": 300.0,
@@ -369,16 +370,23 @@ def test_enterprise_tenant_kb_acl_authorizes_members_only(monkeypatch, tmp_path)
     admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
     alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
 
-    async def create_carol():
-        return await user_service.create_user(
+    async def create_carol_and_dave():
+        carol = await user_service.create_user(
             username="carol",
             password="carol-pass",
             created_by=admin.id,
         )
+        dave = await user_service.create_user(
+            username="dave",
+            password="dave-pass",
+            created_by=admin.id,
+        )
+        return carol, dave
 
-    carol = asyncio.run(create_carol())
+    carol, dave = asyncio.run(create_carol_and_dave())
     bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
     carol_headers = {"Authorization": f"Bearer {_token(user_service, carol)}"}
+    dave_headers = {"Authorization": f"Bearer {_token(user_service, dave)}"}
 
     created = client.post(
         "/kbs",
@@ -400,10 +408,16 @@ def test_enterprise_tenant_kb_acl_authorizes_members_only(monkeypatch, tmp_path)
         headers=admin_headers,
     )
     assert carol_membership.status_code == 200, carol_membership.text
+    dave_membership = client.put(
+        f"/admin/tenants/tenant-a/members/{dave.id}",
+        json={"role": "tenant_admin"},
+        headers=admin_headers,
+    )
+    assert dave_membership.status_code == 200, dave_membership.text
 
     members = client.get("/admin/tenants/tenant-a/members", headers=admin_headers)
     assert members.status_code == 200, members.text
-    assert [item["user_id"] for item in members.json()] == [bob.id]
+    assert {item["user_id"] for item in members.json()} == {bob.id, dave.id}
 
     tenant_grant = client.put(
         "/admin/kbs/kb_tenant_acl/acl",
@@ -432,6 +446,41 @@ def test_enterprise_tenant_kb_acl_authorizes_members_only(monkeypatch, tmp_path)
         headers=carol_headers,
     )
     assert carol_query_denied.status_code == 403
+
+    tenant_admin_members = client.get(
+        "/tenants/tenant-a/members",
+        headers=dave_headers,
+    )
+    assert tenant_admin_members.status_code == 200, tenant_admin_members.text
+    assert {item["user_id"] for item in tenant_admin_members.json()} == {bob.id, dave.id}
+    tenant_admin_add_member = client.put(
+        f"/tenants/tenant-a/members/{carol.id}",
+        json={"role": "tenant_member"},
+        headers=dave_headers,
+    )
+    assert tenant_admin_add_member.status_code == 200, tenant_admin_add_member.text
+    tenant_admin_promote_denied = client.put(
+        f"/tenants/tenant-a/members/{carol.id}",
+        json={"role": "tenant_admin"},
+        headers=dave_headers,
+    )
+    assert tenant_admin_promote_denied.status_code == 403
+    tenant_admin_self_revoke_denied = client.delete(
+        f"/tenants/tenant-a/members/{dave.id}",
+        headers=dave_headers,
+    )
+    assert tenant_admin_self_revoke_denied.status_code == 403
+    cross_tenant_admin_denied = client.get(
+        "/tenants/tenant-b/members",
+        headers=dave_headers,
+    )
+    assert cross_tenant_admin_denied.status_code == 403
+    carol_query_via_self_service = client.post(
+        "/kbs/kb_tenant_acl/query",
+        json={"query": "tenant admin added member", "mode": "mix"},
+        headers=carol_headers,
+    )
+    assert carol_query_via_self_service.status_code == 200, carol_query_via_self_service.text
 
     direct_grant = client.put(
         "/admin/kbs/kb_tenant_acl/acl",
@@ -472,7 +521,7 @@ def test_enterprise_tenant_kb_acl_authorizes_members_only(monkeypatch, tmp_path)
     }.issubset(event_types)
 
 
-def test_enterprise_service_key_tenant_id_does_not_inherit_tenant_acl(
+def test_enterprise_service_key_tenant_id_inherits_tenant_acl_only_when_requested(
     monkeypatch, tmp_path
 ):
     client, user_service, _authz, admin, alice, bob, _probe = _build_enterprise_client(
@@ -522,10 +571,41 @@ def test_enterprise_service_key_tenant_id_does_not_inherit_tenant_acl(
     assert service_list.json()["knowledge_bases"] == []
     inherited_query = client.post(
         "/kbs/kb_service_tenant_acl/query",
-        json={"query": "must not inherit", "mode": "mix"},
+        json={"query": "must not inherit by default", "mode": "mix"},
         headers=inherited_headers,
     )
     assert inherited_query.status_code == 403
+
+    opt_in_key = client.post(
+        "/admin/service-api-keys",
+        json={
+            "name": "tenant-inherited-reader",
+            "tenant_id": "tenant-service",
+            "inherit_tenant_kb_acl": True,
+        },
+        headers=admin_headers,
+    )
+    assert opt_in_key.status_code == 200, opt_in_key.text
+    assert opt_in_key.json()["key"]["scopes"]["inherit_tenant_kb_acl"] is True
+    opt_in_headers = {"X-API-Key": opt_in_key.json()["api_key"]}
+    opt_in_list = client.get("/kbs", headers=opt_in_headers)
+    assert opt_in_list.status_code == 200, opt_in_list.text
+    assert [item["id"] for item in opt_in_list.json()["knowledge_bases"]] == [
+        "kb_service_tenant_acl"
+    ]
+    opt_in_query = client.post(
+        "/kbs/kb_service_tenant_acl/query",
+        json={"query": "inherits when requested", "mode": "mix"},
+        headers=opt_in_headers,
+    )
+    assert opt_in_query.status_code == 200, opt_in_query.text
+
+    missing_tenant = client.post(
+        "/admin/service-api-keys",
+        json={"name": "bad-inherit", "inherit_tenant_kb_acl": True},
+        headers=admin_headers,
+    )
+    assert missing_tenant.status_code == 400
 
     explicit_key = client.post(
         "/admin/service-api-keys",
@@ -824,6 +904,12 @@ def test_enterprise_artifact_per_type_policy_and_storage_uri_masking(
     blocks = next(item for item in artifact_items if item["artifact_type"] == "blocks")
     assert original["uri"] == "<masked>"
     assert "object_uri" not in original["metadata"]
+    jobs = client.get("/kbs/kb_artifact_type_policy/jobs", headers=bob_headers)
+    assert jobs.status_code == 200, jobs.text
+    jobs_json = json.dumps(jobs.json(), ensure_ascii=False)
+    assert "source_uri" not in jobs_json
+    assert "blocks_path" not in jobs_json
+    assert str(tmp_path) not in jobs_json
 
     viewer_original_download = client.get(
         f"/kbs/kb_artifact_type_policy/documents/{document_id}/artifacts/{original['id']}:download",
@@ -853,6 +939,98 @@ def test_enterprise_artifact_per_type_policy_and_storage_uri_masking(
         headers=bob_headers,
     )
     assert editor_original_download.status_code == 200, editor_original_download.text
+
+
+def test_enterprise_artifact_action_policy_overrides_per_action(
+    monkeypatch, tmp_path
+):
+    args = _enterprise_args(
+        enterprise_artifact_action_policy=json.dumps(
+            {
+                "preview": {"*": "kb_editor"},
+                "download": {"blocks": "kb_admin"},
+            }
+        )
+    )
+    client, user_service, _authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path, args=args
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_artifact_action_policy", "name": "Artifact Action Policy"},
+        headers=alice_headers,
+    )
+    assert created.status_code == 200, created.text
+    grant_viewer = client.put(
+        "/admin/kbs/kb_artifact_action_policy/acl",
+        json={"user_id": bob.id, "role": "kb_viewer"},
+        headers=admin_headers,
+    )
+    assert grant_viewer.status_code == 200, grant_viewer.text
+
+    uploaded = client.post(
+        "/kbs/kb_artifact_action_policy/documents:upload",
+        files=[("files", ("artifact.pdf", b"pdf", "application/pdf"))],
+        headers=alice_headers,
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    document_id = uploaded.json()["documents"][0]["id"]
+    parsed = client.post(
+        f"/kbs/kb_artifact_action_policy/documents/{document_id}:parse",
+        json={"engine": "mineru", "process_options": "iF"},
+        headers=alice_headers,
+    )
+    assert parsed.status_code == 200, parsed.text
+    artifact_items = client.get(
+        f"/kbs/kb_artifact_action_policy/documents/{document_id}/artifacts",
+        headers=bob_headers,
+    ).json()["artifacts"]
+    original = next(item for item in artifact_items if item["artifact_type"] == "original")
+    blocks = next(item for item in artifact_items if item["artifact_type"] == "blocks")
+
+    viewer_preview = client.get(
+        f"/kbs/kb_artifact_action_policy/documents/{document_id}/artifacts/{original['id']}:preview",
+        headers=bob_headers,
+    )
+    assert viewer_preview.status_code == 403
+    viewer_blocks_download = client.get(
+        f"/kbs/kb_artifact_action_policy/documents/{document_id}/artifacts/{blocks['id']}:download",
+        headers=bob_headers,
+    )
+    assert viewer_blocks_download.status_code == 403
+
+    grant_editor = client.put(
+        "/admin/kbs/kb_artifact_action_policy/acl",
+        json={"user_id": bob.id, "role": "kb_editor"},
+        headers=admin_headers,
+    )
+    assert grant_editor.status_code == 200, grant_editor.text
+    editor_preview = client.get(
+        f"/kbs/kb_artifact_action_policy/documents/{document_id}/artifacts/{original['id']}:preview",
+        headers=bob_headers,
+    )
+    assert editor_preview.status_code == 200, editor_preview.text
+    editor_blocks_download = client.get(
+        f"/kbs/kb_artifact_action_policy/documents/{document_id}/artifacts/{blocks['id']}:download",
+        headers=bob_headers,
+    )
+    assert editor_blocks_download.status_code == 403
+
+    grant_admin = client.put(
+        "/admin/kbs/kb_artifact_action_policy/acl",
+        json={"user_id": bob.id, "role": "kb_admin"},
+        headers=admin_headers,
+    )
+    assert grant_admin.status_code == 200, grant_admin.text
+    admin_blocks_download = client.get(
+        f"/kbs/kb_artifact_action_policy/documents/{document_id}/artifacts/{blocks['id']}:download",
+        headers=bob_headers,
+    )
+    assert admin_blocks_download.status_code == 200, admin_blocks_download.text
 
 
 def test_enterprise_registration_patch_and_disabled_token_rejection(monkeypatch, tmp_path):
@@ -997,7 +1175,9 @@ def test_enterprise_admin_user_lifecycle_and_acl_batch(monkeypatch, tmp_path):
     assert reset.status_code == 200, reset.text
     assert reset.json()["token_version"] > bob.token_version
     assert asyncio.run(user_service.authenticate("bob", "bob-pass")) is None
-    assert asyncio.run(user_service.authenticate("bob", "bob-new-pass")) is not None
+    refreshed_bob = asyncio.run(user_service.authenticate("bob", "bob-new-pass"))
+    assert refreshed_bob is not None
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, refreshed_bob)}"}
 
     missing_acl = client.put(
         "/admin/kbs/missing/acl",
@@ -1039,6 +1219,34 @@ def test_enterprise_admin_user_lifecycle_and_acl_batch(monkeypatch, tmp_path):
     assert [(item["principal_type"], item.get("user_id"), item.get("tenant_id"), item["role"]) for item in acl.json()] == [
         ("user", bob.id, None, "kb_editor"),
         ("tenant", None, "tenant-batch", "kb_viewer"),
+    ]
+
+    secondary = client.post(
+        "/kbs",
+        json={"id": "kb_user_batch_secondary", "name": "User Batch Secondary"},
+        headers=alice_headers,
+    )
+    assert secondary.status_code == 200, secondary.text
+    user_batch = client.post(
+        f"/admin/users/{bob.id}/kb-access:batch-set",
+        json={
+            "entries": [
+                {"kb_id": "kb_acl_batch", "action": "revoke"},
+                {"kb_id": "kb_user_batch_secondary", "role": "kb_viewer"},
+            ]
+        },
+        headers=admin_headers,
+    )
+    assert user_batch.status_code == 200, user_batch.text
+    user_batch_body = user_batch.json()
+    assert user_batch_body["revoked"] == ["kb_acl_batch"]
+    assert [(item["kb_id"], item["user_id"], item["role"]) for item in user_batch_body["granted"]] == [
+        ("kb_user_batch_secondary", bob.id, "kb_viewer")
+    ]
+    bob_kbs = client.get("/kbs", headers=bob_headers)
+    assert bob_kbs.status_code == 200, bob_kbs.text
+    assert [item["id"] for item in bob_kbs.json()["knowledge_bases"]] == [
+        "kb_user_batch_secondary"
     ]
 
 

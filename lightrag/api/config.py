@@ -228,6 +228,44 @@ def validate_auth_configuration(args: argparse.Namespace) -> None:
                         "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY roles must be one of: "
                         f"{', '.join(sorted(ENTERPRISE_KB_ROLES))}."
                     )
+        artifact_action_policy = getattr(
+            args, "enterprise_artifact_action_policy", None
+        )
+        if artifact_action_policy:
+            try:
+                parsed_action_policy = (
+                    json.loads(artifact_action_policy)
+                    if isinstance(artifact_action_policy, str)
+                    else artifact_action_policy
+                )
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY must be a JSON object."
+                ) from exc
+            if not isinstance(parsed_action_policy, dict):
+                raise ValueError(
+                    "LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY must be a JSON object."
+                )
+            for action, type_policy in parsed_action_policy.items():
+                if action not in {"download", "download-url", "preview"}:
+                    raise ValueError(
+                        "LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY actions must be one of: download, download-url, preview."
+                    )
+                if not isinstance(type_policy, dict):
+                    raise ValueError(
+                        "LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY action values must be JSON objects."
+                    )
+                for artifact_type, role in type_policy.items():
+                    if not isinstance(artifact_type, str) or not artifact_type.strip():
+                        raise ValueError(
+                            "LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY artifact type keys must be non-empty strings."
+                        )
+                    normalized_role = str(role or "").strip()
+                    if normalized_role not in ENTERPRISE_KB_ROLES:
+                        raise ValueError(
+                            "LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY roles must be one of: "
+                            f"{', '.join(sorted(ENTERPRISE_KB_ROLES))}."
+                        )
 
 
 def _is_set(value: str | None) -> bool:
@@ -736,6 +774,9 @@ def parse_args() -> argparse.Namespace:
     )
     args.enterprise_artifact_download_policy = get_env_value(
         "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY", ""
+    )
+    args.enterprise_artifact_action_policy = get_env_value(
+        "LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY", ""
     )
     args.enterprise_mask_storage_uris = get_env_value(
         "LIGHTRAG_ENTERPRISE_MASK_STORAGE_URIS", True, bool

@@ -59,6 +59,9 @@ KB_ROLE_VIEWER = "kb_viewer"
 KB_ROLE_EDITOR = "kb_editor"
 KB_ROLE_ADMIN = "kb_admin"
 KB_ROLE_OWNER = "kb_owner"
+TENANT_ROLE_MEMBER = "tenant_member"
+TENANT_ROLE_ADMIN = "tenant_admin"
+TENANT_ROLE_OWNER = "tenant_owner"
 
 _KB_ROLE_RANK = {
     KB_ROLE_VIEWER: 1,
@@ -72,6 +75,17 @@ _KB_ROLE_ALIASES = {
     "admin": KB_ROLE_ADMIN,
     "owner": KB_ROLE_OWNER,
 }
+_TENANT_ROLE_RANK = {
+    TENANT_ROLE_MEMBER: 1,
+    TENANT_ROLE_ADMIN: 2,
+    TENANT_ROLE_OWNER: 3,
+}
+_TENANT_ROLE_ALIASES = {
+    "member": TENANT_ROLE_MEMBER,
+    "admin": TENANT_ROLE_ADMIN,
+    "owner": TENANT_ROLE_OWNER,
+}
+_ARTIFACT_POLICY_ACTIONS = {"download", "download-url", "preview"}
 _ENTERPRISE_PROTECTED_PREFIXES = (
     "/admin",
     "/kbs",
@@ -274,13 +288,34 @@ def enterprise_artifact_download_policy() -> dict[str, str]:
         parsed = configured
     else:
         return {}
-    policy: dict[str, str] = {}
-    for artifact_type, role in parsed.items():
-        if not isinstance(artifact_type, str) or not artifact_type.strip():
+    return _normalize_artifact_type_policy(parsed)
+
+
+def enterprise_artifact_action_policy() -> dict[str, dict[str, str]]:
+    configured = getattr(_global_args(), "enterprise_artifact_action_policy", "")
+    if not configured:
+        return {}
+    if isinstance(configured, str):
+        try:
+            parsed = json.loads(configured)
+        except json.JSONDecodeError:
+            return {}
+    elif isinstance(configured, dict):
+        parsed = configured
+    else:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    policy: dict[str, dict[str, str]] = {}
+    for action, action_policy in parsed.items():
+        if not isinstance(action, str):
             continue
-        normalized = _normalize_kb_role(str(role or ""))
-        if normalized is not None:
-            policy[artifact_type.strip()] = normalized
+        normalized_action = action.strip()
+        if normalized_action not in _ARTIFACT_POLICY_ACTIONS:
+            continue
+        normalized_policy = _normalize_artifact_type_policy(action_policy)
+        if normalized_policy:
+            policy[normalized_action] = normalized_policy
     return policy
 
 
@@ -289,15 +324,41 @@ def enterprise_artifact_min_role_for_type(
     *,
     action: str = "download",
 ) -> str:
-    policy = enterprise_artifact_download_policy()
+    normalized_action = action.strip()
     normalized_type = (artifact_type or "").strip()
-    if normalized_type in policy:
-        return policy[normalized_type]
-    if "*" in policy:
-        return policy["*"]
-    if action == "preview":
+    action_policy = enterprise_artifact_action_policy().get(normalized_action, {})
+    action_role = _artifact_policy_role_for_type(action_policy, normalized_type)
+    if action_role is not None:
+        return action_role
+
+    policy = enterprise_artifact_download_policy()
+    legacy_role = _artifact_policy_role_for_type(policy, normalized_type)
+    if legacy_role is not None:
+        return legacy_role
+    if normalized_action == "preview":
         return KB_ROLE_VIEWER
     return enterprise_artifact_download_min_role()
+
+
+def _normalize_artifact_type_policy(raw_policy: Any) -> dict[str, str]:
+    if not isinstance(raw_policy, dict):
+        return {}
+    policy: dict[str, str] = {}
+    for artifact_type, role in raw_policy.items():
+        if not isinstance(artifact_type, str) or not artifact_type.strip():
+            continue
+        normalized = _normalize_kb_role(str(role or ""))
+        if normalized is not None:
+            policy[artifact_type.strip()] = normalized
+    return policy
+
+
+def _artifact_policy_role_for_type(
+    policy: dict[str, str], artifact_type: str
+) -> str | None:
+    if artifact_type in policy:
+        return policy[artifact_type]
+    return policy.get("*")
 
 
 def enterprise_mask_storage_uris() -> bool:
@@ -1181,12 +1242,29 @@ class AuthorizationService:
         if principal.is_super_admin:
             return principal
         if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
-            role = _service_api_key_kb_role(principal, kb_id)
+            role = await self._effective_service_api_key_kb_role(principal, kb_id)
         else:
             role = await self._effective_user_kb_role(principal, kb_id)
         if role is None or _KB_ROLE_RANK.get(role, 0) < _KB_ROLE_RANK[minimum_role]:
             await self._audit_denied(principal, kb_id, minimum_role)
             raise HTTPException(status_code=403, detail="Knowledge-base access denied")
+        return principal
+
+    async def require_tenant_role(
+        self, principal: Principal | None, tenant_id: str, minimum_role: str
+    ) -> Principal:
+        principal = _require_principal(principal)
+        tenant_id = _normalize_required_id(tenant_id, "Tenant id")
+        minimum_role = _normalize_tenant_role(minimum_role)
+        if principal.is_super_admin:
+            return principal
+        if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
+            await self._audit_tenant_denied(principal, tenant_id, minimum_role)
+            raise HTTPException(status_code=403, detail="Tenant access denied")
+        role = principal.tenant_roles.get(tenant_id)
+        if _tenant_role_rank(role) < _tenant_role_rank(minimum_role):
+            await self._audit_tenant_denied(principal, tenant_id, minimum_role)
+            raise HTTPException(status_code=403, detail="Tenant access denied")
         return principal
 
     async def filter_kbs_for_principal(
@@ -1197,6 +1275,12 @@ class AuthorizationService:
             return records
         if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
             allowed_ids = _service_api_key_kb_ids(principal)
+            if _service_api_key_inherits_tenant_kb_acl(principal) and principal.tenant_id:
+                allowed_ids.update(
+                    await self._metadata_store.list_kb_ids_for_tenants(
+                        [principal.tenant_id]
+                    )
+                )
         else:
             allowed_ids = set(await self._metadata_store.list_kb_ids_for_user(principal.user_id))
             tenant_ids = list(principal.tenant_roles)
@@ -1308,6 +1392,12 @@ class AuthorizationService:
         tenant_id = _normalize_required_id(tenant_id, "Tenant id")
         return await self._metadata_store.list_tenant_memberships(tenant_id)
 
+    async def get_tenant_membership(
+        self, tenant_id: str, user_id: str
+    ) -> EnterpriseTenantMembershipRecord | None:
+        tenant_id = _normalize_required_id(tenant_id, "Tenant id")
+        return await self._metadata_store.get_tenant_membership(tenant_id, user_id)
+
     async def grant_tenant_kb_role(
         self,
         kb_id: str,
@@ -1375,6 +1465,26 @@ class AuthorizationService:
             return None
         return max(roles, key=lambda item: _KB_ROLE_RANK.get(item, 0))
 
+    async def _effective_service_api_key_kb_role(
+        self, principal: Principal, kb_id: str
+    ) -> str | None:
+        roles: list[str] = []
+        explicit_role = _service_api_key_kb_role(principal, kb_id)
+        if explicit_role is not None:
+            roles.append(explicit_role)
+        if _service_api_key_inherits_tenant_kb_acl(principal) and principal.tenant_id:
+            tenant_role = _normalize_kb_role(
+                await self._metadata_store.get_tenant_kb_acl_role(
+                    principal.tenant_id,
+                    kb_id,
+                )
+            )
+            if tenant_role is not None:
+                roles.append(tenant_role)
+        if not roles:
+            return None
+        return max(roles, key=lambda item: _KB_ROLE_RANK.get(item, 0))
+
     async def _audit_denied(
         self, principal: Principal, kb_id: str, minimum_role: str
     ) -> None:
@@ -1384,6 +1494,18 @@ class AuthorizationService:
                 actor_user_id=principal.user_id,
                 target_type="kb",
                 target_id=kb_id,
+                metadata={"minimum_role": minimum_role},
+            )
+
+    async def _audit_tenant_denied(
+        self, principal: Principal, tenant_id: str, minimum_role: str
+    ) -> None:
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                "permission_denied",
+                actor_user_id=principal.user_id,
+                target_type="tenant",
+                target_id=tenant_id,
                 metadata={"minimum_role": minimum_role},
             )
 
@@ -1574,10 +1696,26 @@ def _normalize_kb_role(role: str | None) -> str | None:
 
 
 def _normalize_tenant_role(role: str) -> str:
-    normalized = role.strip()
-    if not normalized:
+    normalized = _canonical_tenant_role(role)
+    if normalized is None:
         raise HTTPException(status_code=400, detail="Invalid tenant role")
     return normalized
+
+
+def _canonical_tenant_role(role: str | None) -> str | None:
+    if role is None:
+        return None
+    normalized = role.strip()
+    if not normalized:
+        return None
+    return _TENANT_ROLE_ALIASES.get(normalized, normalized)
+
+
+def _tenant_role_rank(role: str | None) -> int:
+    normalized = _canonical_tenant_role(role)
+    if normalized is None:
+        return 0
+    return _TENANT_ROLE_RANK.get(normalized, 0)
 
 
 def _normalize_required_id(value: str, label: str) -> str:
@@ -1648,6 +1786,7 @@ def _normalize_service_api_key_scopes(scopes: dict[str, Any]) -> dict[str, Any]:
     return {
         "kb_roles": kb_roles,
         "can_use_bypass_query": bool(scopes.get("can_use_bypass_query", False)),
+        "inherit_tenant_kb_acl": bool(scopes.get("inherit_tenant_kb_acl", False)),
     }
 
 
@@ -1665,6 +1804,11 @@ def _service_api_key_kb_role(principal: Principal, kb_id: str) -> str | None:
         return None
     role = kb_roles.get(kb_id)
     return _normalize_kb_role(role) if isinstance(role, str) else None
+
+
+def _service_api_key_inherits_tenant_kb_acl(principal: Principal) -> bool:
+    scopes = _service_api_key_scopes(principal)
+    return bool(scopes.get("inherit_tenant_kb_acl", False))
 
 
 def _service_api_key_kb_ids(principal: Principal) -> set[str]:

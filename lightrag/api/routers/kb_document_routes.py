@@ -146,18 +146,32 @@ def _artifact_audit_metadata(artifact: ArtifactRecord, **extra: Any) -> dict[str
 
 
 def _masked_storage_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    masked = dict(metadata)
-    for key in (
-        "source_uri",
-        "source_object_uri",
-        "object_uri",
-        "object_prefix_uri",
-        "blocks_path",
-        "local_path",
-        "path",
-    ):
-        masked.pop(key, None)
-    return masked
+    masked = _mask_storage_uris(metadata)
+    return masked if isinstance(masked, dict) else {}
+
+
+def _mask_storage_uris(value: Any) -> Any:
+    if isinstance(value, dict):
+        masked: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in _STORAGE_URI_KEYS:
+                continue
+            masked[key] = _mask_storage_uris(item)
+        return masked
+    if isinstance(value, list):
+        return [_mask_storage_uris(item) for item in value]
+    return value
+
+
+_STORAGE_URI_KEYS = {
+    "source_uri",
+    "source_object_uri",
+    "object_uri",
+    "object_prefix_uri",
+    "blocks_path",
+    "local_path",
+    "path",
+}
 
 
 async def _enforce_artifact_content_policy(
@@ -671,7 +685,12 @@ class JobResponse(BaseModel):
 
     @classmethod
     def from_record(cls, record: JobRecord) -> "JobResponse":
-        return cls(**record.to_dict())
+        data = record.to_dict()
+        if enterprise_mask_storage_uris():
+            data["payload"] = _mask_storage_uris(data.get("payload") or {})
+            if data.get("result") is not None:
+                data["result"] = _mask_storage_uris(data["result"])
+        return cls(**data)
 
 
 class JobListResponse(BaseModel):

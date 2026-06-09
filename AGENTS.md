@@ -148,7 +148,7 @@ bun test src/api/lightrag.test.ts  # Single test file
 
 ```bash
 # Preferred for fresh shells and automation; resolves PYTHON, venv, uv, .venv, venv, python, python3
-./scripts/test.sh tests
+./scripts/test.sh tests （only in linux system，when Windows is system, don't run sh script and can't use wsl in winwods, should use windows instruct.）
 
 # Run specific test file
 ./scripts/test.sh tests/kg/test_graph_storage.py
