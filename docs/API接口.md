@@ -1118,6 +1118,7 @@ username=admin&password=change-me
 | `GET` | `/admin/users` | 列出企业用户；支持 `status`/`tenant_id`/`q`(用户名子串) 过滤与 `limit`/`offset` 分页 |
 | `POST` | `/admin/users` | 创建用户，可设置 `can_create_kb`、`can_use_bypass_query`、`can_delete_documents`、`tenant_id` |
 | `GET` | `/admin/users/{user_id}` | 查询用户详情 |
+| `GET` | `/admin/users/{user_id}/access` | 查看用户的访问总览：全局能力 + 租户成员关系(role) + 直接 KB ACL(kb_id/role，不含租户继承的有效角色) |
 | `PATCH` | `/admin/users/{user_id}` | 更新用户状态/能力/tenant/password；请求体包含 `status`、`can_create_kb`、`can_use_bypass_query`、`can_delete_documents`、`tenant_id` 中任一非 null 字段并通过 `update_user()`，或修改 `password`，都会增加 `token_version` 并使旧 token 失效；当前实现中 `tenant_id:null` 表示不变而非清空 |
 | `POST` | `/admin/users/{user_id}:disable` | 禁用用户并递增 `token_version`，旧 token 失效 |
 | `POST` | `/admin/users/{user_id}:enable` | 启用用户并递增 `token_version` |

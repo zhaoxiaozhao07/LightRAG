@@ -233,6 +233,18 @@ class EnterpriseTenantKBSummaryResponse(BaseModel):
     owner_id: str | None = None
 
 
+class EnterpriseUserAccessResponse(BaseModel):
+    user_id: str
+    username: str
+    system_role: str
+    tenant_id: str | None
+    can_create_kb: bool
+    can_use_bypass_query: bool
+    can_delete_documents: bool
+    tenant_memberships: list[dict[str, str]]
+    kb_acls: list[dict[str, str]]
+
+
 class EnterpriseServiceAPIKeyCreateRequest(BaseModel):
     name: str = Field(min_length=1)
     kb_roles: dict[str, str] = Field(default_factory=dict)
@@ -700,6 +712,31 @@ def create_enterprise_routes(
         user_service = get_enterprise_user_service(request)
         return EnterpriseUserResponse.from_record(
             await user_service.get_user_or_404(user_id)
+        )
+
+    @router.get(
+        "/admin/users/{user_id}/access",
+        response_model=EnterpriseUserAccessResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def get_enterprise_user_access(user_id: str, request: Request):
+        user_service = get_enterprise_user_service(request)
+        user = await user_service.get_user_or_404(user_id)
+        authz_service = get_enterprise_authorization_service(request)
+        memberships = await authz_service.list_user_tenant_memberships(user_id)
+        kb_acls = await authz_service.list_user_kb_acls(user_id)
+        return EnterpriseUserAccessResponse(
+            user_id=user.id,
+            username=user.username,
+            system_role=user.system_role,
+            tenant_id=user.tenant_id,
+            can_create_kb=user.can_create_kb,
+            can_use_bypass_query=user.can_use_bypass_query,
+            can_delete_documents=user.can_delete_documents,
+            tenant_memberships=[
+                {"tenant_id": m.tenant_id, "role": m.role} for m in memberships
+            ],
+            kb_acls=kb_acls,
         )
 
     @router.post(

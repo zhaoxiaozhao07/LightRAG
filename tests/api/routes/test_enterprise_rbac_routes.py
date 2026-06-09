@@ -2849,3 +2849,38 @@ def test_admin_tenant_delete_requires_empty(monkeypatch, tmp_path):
     assert detail["user_count"] == 1
 
     assert client.delete("/admin/tenants/ghost", headers=admin_headers).status_code == 404
+
+
+def test_admin_user_access_view(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+
+    created = client.post(
+        "/kbs", json={"id": "kb_acc", "name": "Acc"}, headers=alice_headers
+    )
+    assert created.status_code == 200, created.text
+    _dd_grant(client, admin_headers, "kb_acc", bob.id, "kb_editor")
+    grant_t = client.put(
+        f"/admin/tenants/t-acc/members/{bob.id}",
+        json={"role": "tenant_member"},
+        headers=admin_headers,
+    )
+    assert grant_t.status_code == 200, grant_t.text
+
+    resp = client.get(f"/admin/users/{bob.id}/access", headers=admin_headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["user_id"] == bob.id
+    assert body["can_delete_documents"] is False
+    assert {m["tenant_id"]: m["role"] for m in body["tenant_memberships"]} == {
+        "t-acc": "tenant_member"
+    }
+    assert {a["kb_id"]: a["role"] for a in body["kb_acls"]} == {"kb_acc": "kb_editor"}
+
+    assert (
+        client.get("/admin/users/usr_ghost/access", headers=admin_headers).status_code
+        == 404
+    )

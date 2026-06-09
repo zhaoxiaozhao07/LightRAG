@@ -1544,6 +1544,20 @@ class AuthorizationService:
     async def list_kb_ids_for_tenants(self, tenant_ids: list[str]) -> list[str]:
         return await self._metadata_store.list_kb_ids_for_tenants(tenant_ids)
 
+    async def list_user_tenant_memberships(
+        self, user_id: str
+    ) -> list[EnterpriseTenantMembershipRecord]:
+        return await self._metadata_store.list_user_tenant_memberships(user_id)
+
+    async def list_user_kb_acls(self, user_id: str) -> list[dict[str, str]]:
+        """Direct (non tenant-inherited) KB ACLs for a user, as {kb_id, role}."""
+        acls: list[dict[str, str]] = []
+        for kb_id in await self._metadata_store.list_kb_ids_for_user(user_id):
+            role = await self._metadata_store.get_kb_acl_role(kb_id, user_id)
+            if role:
+                acls.append({"kb_id": kb_id, "role": role})
+        return acls
+
     async def require_tenant_role(
         self, principal: Principal | None, tenant_id: str, minimum_role: str
     ) -> Principal:
