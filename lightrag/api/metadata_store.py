@@ -545,6 +545,34 @@ class EnterpriseTenantKBACLRecord:
 
 
 @dataclass(slots=True)
+class EnterpriseTenantRecord:
+    id: str
+    name: str
+    description: str | None
+    status: str
+    metadata: dict[str, Any]
+    created_by: str | None
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "EnterpriseTenantRecord":
+        return cls(
+            id=str(row["id"]),
+            name=str(row["name"]),
+            description=row["description"],
+            status=str(row["status"]),
+            metadata=_loads_json_object(row["metadata_json"]),
+            created_by=row["created_by"],
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class AuditEventRecord:
     id: str
     event_type: str
@@ -2540,6 +2568,65 @@ class SQLiteMetadataStore:
             ).fetchall()
         return [str(row["kb_id"]) for row in rows]
 
+    async def upsert_enterprise_tenant(
+        self, tenant: EnterpriseTenantRecord
+    ) -> EnterpriseTenantRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterpriseTenantRecord:
+            conn.execute(
+                """
+                INSERT INTO enterprise_tenants (
+                    id, name, description, status, metadata_json,
+                    created_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    description = excluded.description,
+                    status = excluded.status,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    tenant.id,
+                    tenant.name,
+                    tenant.description,
+                    tenant.status,
+                    _dumps_json(tenant.metadata),
+                    tenant.created_by,
+                    tenant.created_at,
+                    tenant.updated_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_tenants WHERE id = ?", (tenant.id,)
+            ).fetchone()
+            assert row is not None
+            return EnterpriseTenantRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def get_enterprise_tenant_by_id(
+        self, tenant_id: str
+    ) -> EnterpriseTenantRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_tenants WHERE id = ?", (tenant_id,)
+            ).fetchone()
+        return EnterpriseTenantRecord.from_row(row) if row is not None else None
+
+    async def list_enterprise_tenants(self) -> list[EnterpriseTenantRecord]:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM enterprise_tenants
+                ORDER BY created_at ASC, id ASC
+                """
+            ).fetchall()
+        return [EnterpriseTenantRecord.from_row(row) for row in rows]
+
     async def upsert_tenant_membership(
         self, membership: EnterpriseTenantMembershipRecord
     ) -> EnterpriseTenantMembershipRecord:
@@ -3256,6 +3343,17 @@ class SQLiteMetadataStore:
 
             CREATE INDEX IF NOT EXISTS idx_enterprise_kb_acl_user
                 ON enterprise_kb_acl (user_id, kb_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_tenants (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS enterprise_tenant_memberships (
                 tenant_id TEXT NOT NULL,

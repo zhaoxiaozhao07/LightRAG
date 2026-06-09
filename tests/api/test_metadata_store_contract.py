@@ -41,6 +41,7 @@ from lightrag.api.metadata_store import (
     EnterpriseUserKBQuerySettingsRecord,
     EnterpriseTenantKBACLRecord,
     EnterpriseTenantMembershipRecord,
+    EnterpriseTenantRecord,
     IdempotencyKeyConflictError,
     InvalidJobTransitionError,
     JobRecord,
@@ -368,6 +369,47 @@ async def test_enterprise_metadata_contract(store):
 
     assert await store.delete_kb_acl(kb_id, user.id) is True
     assert await store.get_kb_acl_role(kb_id, user.id) is None
+
+
+async def test_enterprise_tenant_entity_contract(store):
+    now = utc_now_iso()
+    tid = f"tenant-{uuid.uuid4().hex[:8]}"
+    saved = await store.upsert_enterprise_tenant(
+        EnterpriseTenantRecord(
+            id=tid,
+            name="Acme",
+            description="desc",
+            status="active",
+            metadata={"k": "v"},
+            created_by="admin",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    assert saved.id == tid and saved.name == "Acme"
+
+    got = await store.get_enterprise_tenant_by_id(tid)
+    assert got is not None
+    assert got.metadata == {"k": "v"}
+    assert got.description == "desc"
+
+    updated = await store.upsert_enterprise_tenant(
+        EnterpriseTenantRecord(
+            id=tid,
+            name="Acme2",
+            description=None,
+            status="disabled",
+            metadata={},
+            created_by="admin",
+            created_at=now,
+            updated_at=utc_now_iso(),
+        )
+    )
+    assert updated.name == "Acme2" and updated.status == "disabled"
+
+    listed = await store.list_enterprise_tenants()
+    assert tid in {t.id for t in listed}
+    assert await store.get_enterprise_tenant_by_id("does-not-exist") is None
 
 
 async def test_enterprise_tenant_membership_and_kb_acl_contract(store):

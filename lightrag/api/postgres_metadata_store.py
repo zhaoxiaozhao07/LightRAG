@@ -32,6 +32,7 @@ from lightrag.api.metadata_store import (
     KBACLRecord,
     EnterpriseTenantKBACLRecord,
     EnterpriseTenantMembershipRecord,
+    EnterpriseTenantRecord,
     MetadataJobStatus,
     MetadataRecordNotFoundError,
 )
@@ -118,6 +119,10 @@ def _kb_acl_from_row(row: Any) -> KBACLRecord:
 def _tenant_membership_from_row(row: Any) -> EnterpriseTenantMembershipRecord:
     data = _loads_json_object(row["data_json"])
     return EnterpriseTenantMembershipRecord(**data)
+
+
+def _enterprise_tenant_from_row(row: Any) -> EnterpriseTenantRecord:
+    return EnterpriseTenantRecord(**_loads_json_object(row["data_json"]))
 
 
 def _tenant_kb_acl_from_row(row: Any) -> EnterpriseTenantKBACLRecord:
@@ -1829,6 +1834,57 @@ class PostgresMetadataStore:
             )
         return [str(row["kb_id"]) for row in rows]
 
+    async def upsert_enterprise_tenant(
+        self, tenant: EnterpriseTenantRecord
+    ) -> EnterpriseTenantRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> EnterpriseTenantRecord:
+            await conn.execute(
+                """
+                INSERT INTO enterprise_tenants (id, name, status, created_at, data_json)
+                VALUES ($1, $2, $3, $4, $5::jsonb)
+                ON CONFLICT (id) DO UPDATE SET
+                    name = excluded.name,
+                    status = excluded.status,
+                    data_json = excluded.data_json
+                """,
+                tenant.id,
+                tenant.name,
+                tenant.status,
+                tenant.created_at,
+                _record_json(tenant),
+            )
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_tenants WHERE id = $1", tenant.id
+            )
+            if row is None:
+                raise MetadataRecordNotFoundError(f"Tenant '{tenant.id}' not found")
+            return _enterprise_tenant_from_row(row)
+
+        return await self._write(write)
+
+    async def get_enterprise_tenant_by_id(
+        self, tenant_id: str
+    ) -> EnterpriseTenantRecord | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_tenants WHERE id = $1", tenant_id
+            )
+        return _enterprise_tenant_from_row(row) if row is not None else None
+
+    async def list_enterprise_tenants(self) -> list[EnterpriseTenantRecord]:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT data_json FROM enterprise_tenants
+                ORDER BY created_at ASC, id ASC
+                """
+            )
+        return [_enterprise_tenant_from_row(row) for row in rows]
+
     async def upsert_tenant_membership(
         self, membership: EnterpriseTenantMembershipRecord
     ) -> EnterpriseTenantMembershipRecord:
@@ -2409,6 +2465,14 @@ class PostgresMetadataStore:
             );
             CREATE INDEX IF NOT EXISTS idx_enterprise_kb_acl_user
                 ON enterprise_kb_acl (user_id, kb_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_tenants (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                data_json JSONB NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS enterprise_tenant_memberships (
                 tenant_id TEXT NOT NULL,

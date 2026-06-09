@@ -25,6 +25,7 @@ from lightrag.api.metadata_store import (
     KBACLRecord,
     EnterpriseTenantKBACLRecord,
     EnterpriseTenantMembershipRecord,
+    EnterpriseTenantRecord,
 )
 from lightrag.api.passwords import hash_password, verify_password
 
@@ -170,6 +171,16 @@ class EnterpriseMetadataStore(Protocol):
     async def get_kb_acl_role(self, kb_id: str, user_id: str) -> str | None: ...
 
     async def list_kb_ids_for_user(self, user_id: str) -> list[str]: ...
+
+    async def upsert_enterprise_tenant(
+        self, tenant: EnterpriseTenantRecord
+    ) -> EnterpriseTenantRecord: ...
+
+    async def get_enterprise_tenant_by_id(
+        self, tenant_id: str
+    ) -> EnterpriseTenantRecord | None: ...
+
+    async def list_enterprise_tenants(self) -> list[EnterpriseTenantRecord]: ...
 
     async def upsert_tenant_membership(
         self, membership: EnterpriseTenantMembershipRecord
@@ -1430,6 +1441,89 @@ class AuthorizationService:
                 return "self"
         await self._audit_denied(principal, kb_id, KB_ROLE_ADMIN)
         raise HTTPException(status_code=403, detail="Document delete denied")
+
+    async def create_tenant(
+        self,
+        *,
+        name: str,
+        description: str | None = None,
+        tenant_id: str | None = None,
+        created_by: str | None = None,
+    ) -> EnterpriseTenantRecord:
+        normalized_name = name.strip()
+        if not normalized_name:
+            raise HTTPException(status_code=400, detail="Tenant name is required")
+        tid = (tenant_id or f"tenant_{uuid4().hex[:12]}").strip()
+        if not tid:
+            raise HTTPException(status_code=400, detail="Tenant id cannot be empty")
+        if await self._metadata_store.get_enterprise_tenant_by_id(tid) is not None:
+            raise HTTPException(status_code=409, detail="Tenant already exists")
+        now = utc_now_iso()
+        tenant = EnterpriseTenantRecord(
+            id=tid,
+            name=normalized_name,
+            description=description,
+            status=USER_STATUS_ACTIVE,
+            metadata={},
+            created_by=created_by,
+            created_at=now,
+            updated_at=now,
+        )
+        saved = await self._metadata_store.upsert_enterprise_tenant(tenant)
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                "tenant_created",
+                actor_user_id=created_by,
+                target_type="tenant",
+                target_id=saved.id,
+                metadata={"name": saved.name},
+            )
+        return saved
+
+    async def list_tenants(self) -> list[EnterpriseTenantRecord]:
+        return await self._metadata_store.list_enterprise_tenants()
+
+    async def get_tenant_or_404(self, tenant_id: str) -> EnterpriseTenantRecord:
+        tenant = await self._metadata_store.get_enterprise_tenant_by_id(
+            _normalize_required_id(tenant_id, "Tenant id")
+        )
+        if tenant is None:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+        return tenant
+
+    async def update_tenant(
+        self,
+        tenant_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        status_value: str | None = None,
+        actor_user_id: str | None = None,
+    ) -> EnterpriseTenantRecord:
+        tenant = await self.get_tenant_or_404(tenant_id)
+        if status_value is not None and status_value not in {
+            USER_STATUS_ACTIVE,
+            USER_STATUS_DISABLED,
+        }:
+            raise HTTPException(status_code=400, detail="Invalid tenant status")
+        if name is not None and not name.strip():
+            raise HTTPException(status_code=400, detail="Tenant name cannot be empty")
+        updated = replace(
+            tenant,
+            name=name.strip() if name is not None else tenant.name,
+            description=tenant.description if description is None else description,
+            status=status_value or tenant.status,
+            updated_at=utc_now_iso(),
+        )
+        saved = await self._metadata_store.upsert_enterprise_tenant(updated)
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                "tenant_updated",
+                actor_user_id=actor_user_id,
+                target_type="tenant",
+                target_id=saved.id,
+            )
+        return saved
 
     async def require_tenant_role(
         self, principal: Principal | None, tenant_id: str, minimum_role: str

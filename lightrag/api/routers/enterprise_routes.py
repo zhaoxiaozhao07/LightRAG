@@ -37,6 +37,7 @@ from lightrag.api.metadata_store import (
     KBACLRecord,
     EnterpriseTenantKBACLRecord,
     EnterpriseTenantMembershipRecord,
+    EnterpriseTenantRecord,
 )
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag import __version__ as core_version
@@ -182,6 +183,54 @@ class EnterpriseTenantMembershipResponse(BaseModel):
         cls, record: EnterpriseTenantMembershipRecord
     ) -> "EnterpriseTenantMembershipResponse":
         return cls(**record.to_dict())
+
+
+class EnterpriseTenantCreateRequest(BaseModel):
+    name: str = Field(min_length=1)
+    description: str | None = None
+    tenant_id: str | None = None
+
+
+class EnterpriseTenantUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    status: str | None = None
+
+
+class EnterpriseTenantResponse(BaseModel):
+    id: str
+    name: str
+    description: str | None
+    status: str
+    created_by: str | None
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_record(cls, record: EnterpriseTenantRecord) -> "EnterpriseTenantResponse":
+        data = record.to_dict()
+        data.pop("metadata", None)
+        return cls(**data)
+
+
+class EnterpriseTenantDetailResponse(BaseModel):
+    id: str
+    name: str
+    description: str | None
+    status: str
+    created_by: str | None
+    created_at: str
+    updated_at: str
+    member_count: int
+    kb_count: int
+
+
+class EnterpriseTenantKBSummaryResponse(BaseModel):
+    id: str
+    name: str
+    status: str
+    visibility: str | None = None
+    owner_id: str | None = None
 
 
 class EnterpriseServiceAPIKeyCreateRequest(BaseModel):
@@ -774,6 +823,95 @@ def create_enterprise_routes(
             for item in await authz_service.list_kb_tenant_acl(kb_id)
         ]
         return [*user_acl, *tenant_acl]
+
+    @router.post(
+        "/admin/tenants",
+        response_model=EnterpriseTenantResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def create_tenant(request: Request, body: EnterpriseTenantCreateRequest):
+        principal = require_principal(request)
+        authz_service = get_enterprise_authorization_service(request)
+        tenant = await authz_service.create_tenant(
+            name=body.name,
+            description=body.description,
+            tenant_id=body.tenant_id,
+            created_by=principal.user_id,
+        )
+        return EnterpriseTenantResponse.from_record(tenant)
+
+    @router.get(
+        "/admin/tenants",
+        response_model=list[EnterpriseTenantResponse],
+        dependencies=[Depends(combined_auth)],
+    )
+    async def list_tenants(request: Request):
+        authz_service = get_enterprise_authorization_service(request)
+        return [
+            EnterpriseTenantResponse.from_record(tenant)
+            for tenant in await authz_service.list_tenants()
+        ]
+
+    @router.get(
+        "/admin/tenants/{tenant_id}",
+        response_model=EnterpriseTenantDetailResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def get_tenant(tenant_id: str, request: Request):
+        authz_service = get_enterprise_authorization_service(request)
+        tenant = await authz_service.get_tenant_or_404(tenant_id)
+        members = await authz_service.list_tenant_memberships(tenant_id)
+        kb_count = 0
+        if kb_service is not None:
+            kb_count = sum(
+                1 for kb in await kb_service.list() if kb.tenant_id == tenant_id
+            )
+        data = tenant.to_dict()
+        data.pop("metadata", None)
+        return EnterpriseTenantDetailResponse(
+            **data, member_count=len(members), kb_count=kb_count
+        )
+
+    @router.patch(
+        "/admin/tenants/{tenant_id}",
+        response_model=EnterpriseTenantResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def update_tenant(
+        tenant_id: str, request: Request, body: EnterpriseTenantUpdateRequest
+    ):
+        principal = require_principal(request)
+        authz_service = get_enterprise_authorization_service(request)
+        tenant = await authz_service.update_tenant(
+            tenant_id,
+            name=body.name,
+            description=body.description,
+            status_value=body.status,
+            actor_user_id=principal.user_id,
+        )
+        return EnterpriseTenantResponse.from_record(tenant)
+
+    @router.get(
+        "/admin/tenants/{tenant_id}/kbs",
+        response_model=list[EnterpriseTenantKBSummaryResponse],
+        dependencies=[Depends(combined_auth)],
+    )
+    async def list_tenant_kbs(tenant_id: str, request: Request):
+        authz_service = get_enterprise_authorization_service(request)
+        await authz_service.get_tenant_or_404(tenant_id)
+        if kb_service is None:
+            return []
+        return [
+            EnterpriseTenantKBSummaryResponse(
+                id=kb.id,
+                name=kb.name,
+                status=kb.status,
+                visibility=getattr(kb, "visibility", None),
+                owner_id=getattr(kb, "owner_id", None),
+            )
+            for kb in await kb_service.list()
+            if kb.tenant_id == tenant_id
+        ]
 
     @router.get(
         "/admin/tenants/{tenant_id}/members",

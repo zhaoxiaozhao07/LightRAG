@@ -1123,6 +1123,11 @@ username=admin&password=change-me
 | `POST` | `/admin/users/{user_id}:enable` | 启用用户并递增 `token_version` |
 | `POST` | `/admin/users/{user_id}:reset-password` | 重置用户密码并递增 `token_version` |
 | `POST` | `/admin/users/{user_id}/kb-access:batch-set` | 按用户维度批量 grant/revoke 多个 KB ACL；与按 KB 维度 `/admin/kbs/{kb_id}/acl:batch-set` 互补 |
+| `POST` | `/admin/tenants` | 创建租户实体（可指定 `tenant_id`，省略则生成 `tenant_<hex>`；重复 `409`） |
+| `GET` | `/admin/tenants` | 列出所有租户 |
+| `GET` | `/admin/tenants/{tenant_id}` | 租户详情 + 总览（含 `member_count` / `kb_count`） |
+| `PATCH` | `/admin/tenants/{tenant_id}` | 更新租户 `name`/`description`/`status`（`active`/`disabled`） |
+| `GET` | `/admin/tenants/{tenant_id}/kbs` | 列出该租户下的 KB（`id`/`name`/`status`/`visibility`/`owner_id`） |
 | `GET` | `/admin/tenants/{tenant_id}/members` | 列出 tenant 成员与 tenant role |
 | `PUT` | `/admin/tenants/{tenant_id}/members/{user_id}` | 写入/更新 tenant membership，body：`{"role":"tenant_member"}` |
 | `DELETE` | `/admin/tenants/{tenant_id}/members/{user_id}` | 删除 tenant membership |
@@ -1179,7 +1184,7 @@ KB ACL 请求/响应约束：
 - super admin bootstrap/sync：`super_admin_bootstrapped`、`super_admin_synced`
 - 用户管理：`user_created`、`user_updated`、`user_password_changed`
 - service API key：`service_api_key_created`、`service_api_key_rotated`、`service_api_key_revoked`
-- KB ACL / tenant：`kb_acl_granted`、`kb_acl_revoked`、`tenant_membership_granted`、`tenant_membership_revoked`、`tenant_kb_acl_granted`、`tenant_kb_acl_revoked`
+- KB ACL / tenant：`kb_acl_granted`、`kb_acl_revoked`、`tenant_created`、`tenant_updated`、`tenant_membership_granted`、`tenant_membership_revoked`、`tenant_kb_acl_granted`、`tenant_kb_acl_revoked`
 - 权限/限流/配额：`permission_denied`、`rate_limited`、`quota_exceeded`
 - KB/config/query：`kb_created`、`kb_deleted`、`kb_hard_deleted`、`kb_config_activated`、`query_executed`、`query_stream_started`、`retrieve_executed`
 - artifact/job/document 类事件：`artifact_downloaded`、`artifact_previewed`、`artifact_download_url_created`、`kb_rebuild_queued`、`job_cancel_requested`、`job_retry_queued`，以及文档 upload/texts/urls/import/scan/sync/patch/enable/disable/replace/delete/batch-delete/parse/batch-parse/build/reindex/batch-build/batch-reindex/rebuild 相关事件。

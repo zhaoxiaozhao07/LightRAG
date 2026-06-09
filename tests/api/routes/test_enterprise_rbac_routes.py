@@ -2694,3 +2694,78 @@ def test_admin_audit_events_filtering_and_pagination(monkeypatch, tmp_path):
         "/admin/audit-events", params={"actor_user_id": admin.id}, headers=admin_headers
     ).json()
     assert by_actor and all(e["actor_user_id"] == admin.id for e in by_actor)
+
+
+def test_admin_tenant_crud_and_overview(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, _alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    # Tenant management is super-admin only (enforced by the /admin middleware).
+    denied = client.post("/admin/tenants", json={"name": "X"}, headers=bob_headers)
+    assert denied.status_code == 403
+
+    created = client.post(
+        "/admin/tenants",
+        json={"name": "Acme", "tenant_id": "tenant-acme"},
+        headers=admin_headers,
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["id"] == "tenant-acme"
+    assert created.json()["status"] == "active"
+
+    dup = client.post(
+        "/admin/tenants",
+        json={"name": "Acme2", "tenant_id": "tenant-acme"},
+        headers=admin_headers,
+    )
+    assert dup.status_code == 409
+
+    listed = client.get("/admin/tenants", headers=admin_headers)
+    assert listed.status_code == 200
+    assert "tenant-acme" in [t["id"] for t in listed.json()]
+
+    # A user in the tenant creates a KB; tenant overview should reflect it.
+    dave = asyncio.run(
+        user_service.create_user(
+            username="dave",
+            password="dave-pass",
+            tenant_id="tenant-acme",
+            can_create_kb=True,
+        )
+    )
+    dave_headers = {"Authorization": f"Bearer {_token(user_service, dave)}"}
+    grant = client.put(
+        f"/admin/tenants/tenant-acme/members/{dave.id}",
+        json={"role": "tenant_member"},
+        headers=admin_headers,
+    )
+    assert grant.status_code == 200, grant.text
+    kb = client.post(
+        "/kbs", json={"id": "kb_acme", "name": "Acme KB"}, headers=dave_headers
+    )
+    assert kb.status_code == 200, kb.text
+
+    detail = client.get("/admin/tenants/tenant-acme", headers=admin_headers)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["member_count"] == 1
+    assert detail.json()["kb_count"] == 1
+
+    kbs = client.get("/admin/tenants/tenant-acme/kbs", headers=admin_headers)
+    assert kbs.status_code == 200
+    assert [k["id"] for k in kbs.json()] == ["kb_acme"]
+
+    updated = client.patch(
+        "/admin/tenants/tenant-acme",
+        json={"status": "disabled", "name": "Acme Inc"},
+        headers=admin_headers,
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["status"] == "disabled"
+    assert updated.json()["name"] == "Acme Inc"
+
+    assert (
+        client.get("/admin/tenants/ghost", headers=admin_headers).status_code == 404
+    )
