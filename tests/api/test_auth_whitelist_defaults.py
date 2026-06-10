@@ -29,6 +29,11 @@ def _fresh_client(monkeypatch, tmp_path, *, whitelist_paths: str | None = None):
     monkeypatch.setenv("LIGHTRAG_API_KEY", "test-key")
     monkeypatch.setenv("AUTH_ACCOUNTS", "")
     monkeypatch.delenv("TOKEN_SECRET", raising=False)
+    # A developer .env may leak LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true into the
+    # process env (load_dotenv at config import time); these tests exercise the
+    # NON-enterprise whitelist behavior and re-run parse_args, which would
+    # otherwise fail the enterprise TOKEN_SECRET startup validation.
+    monkeypatch.delenv("LIGHTRAG_ENTERPRISE_AUTH_ENABLED", raising=False)
     monkeypatch.setenv("LLM_BINDING", "openai")
     monkeypatch.setenv("LLM_BINDING_HOST", "https://api.openai.com/v1")
     monkeypatch.setenv("LLM_BINDING_API_KEY", "llm-key")

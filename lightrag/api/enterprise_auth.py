@@ -15,7 +15,11 @@ from uuid import uuid4
 
 from fastapi import HTTPException, Request, status
 
-from lightrag.api.kb_service import KnowledgeBaseRecord, utc_now_iso
+from lightrag.api.kb_service import (
+    KnowledgeBaseNotFoundError,
+    KnowledgeBaseRecord,
+    utc_now_iso,
+)
 from lightrag.api.metadata_store import (
     AuditEventRecord,
     EnterpriseAPIKeyRecord,
@@ -64,6 +68,12 @@ KB_ROLE_OWNER = "kb_owner"
 TENANT_ROLE_MEMBER = "tenant_member"
 TENANT_ROLE_ADMIN = "tenant_admin"
 TENANT_ROLE_OWNER = "tenant_owner"
+KB_VISIBILITY_INTERNAL = "internal"
+KB_VISIBILITY_PUBLIC = "public"
+
+# Sentinel for update calls that need to distinguish "field omitted" from an
+# explicit ``None`` (mirrors the ``_UNSET`` idiom in kb_service updates).
+UNSET: Any = object()
 
 _KB_ROLE_RANK = {
     KB_ROLE_VIEWER: 1,
@@ -1251,7 +1261,7 @@ class UserService:
         can_create_kb: bool | None = None,
         can_use_bypass_query: bool | None = None,
         can_delete_documents: bool | None = None,
-        tenant_id: str | None = None,
+        tenant_id: Any = UNSET,
         actor_user_id: str | None = None,
     ) -> EnterpriseUserRecord:
         user = await self.get_user_or_404(user_id)
@@ -1259,6 +1269,20 @@ class UserService:
             raise HTTPException(status_code=400, detail="Invalid user status")
         if user.system_role == SYSTEM_ROLE_SUPER_ADMIN and status_value == USER_STATUS_DISABLED:
             raise HTTPException(status_code=400, detail="Cannot disable a super admin")
+        # ``UNSET`` keeps the current tenant, an explicit ``None`` clears it,
+        # and a non-empty string reassigns it. Empty strings are rejected so a
+        # cleared tenant is always represented as ``None``.
+        if tenant_id is UNSET:
+            new_tenant_id = user.tenant_id
+        elif tenant_id is None:
+            new_tenant_id = None
+        elif isinstance(tenant_id, str) and tenant_id.strip():
+            new_tenant_id = tenant_id.strip()
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Tenant id cannot be empty; use null to clear it",
+            )
         updated = replace(
             user,
             status=status_value or user.status,
@@ -1271,7 +1295,7 @@ class UserService:
             can_delete_documents=user.can_delete_documents
             if can_delete_documents is None
             else can_delete_documents,
-            tenant_id=user.tenant_id if tenant_id is None else tenant_id,
+            tenant_id=new_tenant_id,
             token_version=user.token_version + 1,
             updated_at=utc_now_iso(),
         )
@@ -1356,9 +1380,13 @@ class AuthorizationService:
         self,
         metadata_store: EnterpriseMetadataStore,
         audit_service: AuditService | None = None,
+        kb_service: Any = None,
     ):
         self._metadata_store = metadata_store
         self._audit_service = audit_service
+        # KnowledgeBaseService-like object (``await .get(kb_id)``) used to
+        # resolve KB visibility; when absent, visibility implies nothing.
+        self._kb_service = kb_service
 
     def require_super_admin(self, principal: Principal | None) -> Principal:
         principal = _require_principal(principal)
@@ -1593,7 +1621,12 @@ class AuthorizationService:
             allowed_ids = set(await self._metadata_store.list_kb_ids_for_user(principal.user_id))
             tenant_ids = list(principal.tenant_roles)
             allowed_ids.update(await self._metadata_store.list_kb_ids_for_tenants(tenant_ids))
-        return [record for record in records if record.id in allowed_ids]
+        return [
+            record
+            for record in records
+            if record.id in allowed_ids
+            or self._visibility_grants_view(principal, record)
+        ]
 
     async def grant_kb_role(
         self,
@@ -1770,8 +1803,46 @@ class AuthorizationService:
             if tenant_role is not None:
                 roles.append(tenant_role)
         if not roles:
-            return None
+            # Visibility only ever implies the lowest role, so it can never
+            # raise the max of an explicit grant — consult it only when no
+            # direct/tenant ACL matched.
+            return await self._visibility_implied_role(principal, kb_id)
         return max(roles, key=lambda item: _KB_ROLE_RANK.get(item, 0))
+
+    @staticmethod
+    def _visibility_grants_view(principal: Principal, record: Any) -> bool:
+        """Return True when KB visibility implies read access for the principal.
+
+        Only interactive (non service-key) principals qualify: ``public``
+        grants every authenticated enterprise user, ``internal`` grants users
+        belonging to the KB's tenant via direct assignment or membership.
+        Service/scoped API keys keep explicit-scope-only semantics.
+        """
+        if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
+            return False
+        visibility = getattr(record, "visibility", None)
+        if visibility == KB_VISIBILITY_PUBLIC:
+            return True
+        if visibility == KB_VISIBILITY_INTERNAL:
+            kb_tenant = getattr(record, "tenant_id", None)
+            return bool(kb_tenant) and (
+                principal.tenant_id == kb_tenant
+                or kb_tenant in principal.tenant_roles
+            )
+        return False
+
+    async def _visibility_implied_role(
+        self, principal: Principal, kb_id: str
+    ) -> str | None:
+        if self._kb_service is None:
+            return None
+        try:
+            record = await self._kb_service.get(kb_id)
+        except (KnowledgeBaseNotFoundError, ValueError):
+            return None
+        if self._visibility_grants_view(principal, record):
+            return KB_ROLE_VIEWER
+        return None
 
     async def _effective_service_api_key_kb_role(
         self, principal: Principal, kb_id: str

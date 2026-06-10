@@ -212,7 +212,9 @@ def _build_enterprise_client(
     api_key_service = ServiceAPIKeyService(metadata_store, audit_service)
     invitation_service = InvitationService(metadata_store, audit_service)
     limit_service = EnterpriseLimitService(audit_service)
-    authz_service = AuthorizationService(metadata_store, audit_service)
+    authz_service = AuthorizationService(
+        metadata_store, audit_service, kb_service=kb_service
+    )
     probe = BuilderProbe()
     registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
     config_service = ConfigVersionService(kb_service, metadata_store, registry)
@@ -2883,4 +2885,199 @@ def test_admin_user_access_view(monkeypatch, tmp_path):
     assert (
         client.get("/admin/users/usr_ghost/access", headers=admin_headers).status_code
         == 404
+    )
+
+
+def test_enterprise_kb_visibility_public_grants_viewer_read_only(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path, api_key=None
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_pub", "name": "Public KB", "visibility": "private"},
+        headers=alice_headers,
+    )
+    assert created.status_code == 200, created.text
+
+    # Private baseline: no ACL means no access and no listing for bob.
+    assert client.get("/kbs/kb_pub", headers=bob_headers).status_code == 403
+    assert client.get("/kbs", headers=bob_headers).json()["knowledge_bases"] == []
+
+    patched = client.patch(
+        "/kbs/kb_pub", json={"visibility": "public"}, headers=alice_headers
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["visibility"] == "public"
+
+    # Public implies kb_viewer for any authenticated interactive user.
+    assert client.get("/kbs/kb_pub", headers=bob_headers).status_code == 200
+    bob_list = client.get("/kbs", headers=bob_headers)
+    assert [item["id"] for item in bob_list.json()["knowledge_bases"]] == ["kb_pub"]
+    bob_query = client.post(
+        "/kbs/kb_pub/query",
+        json={"query": "what is public", "mode": "mix"},
+        headers=bob_headers,
+    )
+    assert bob_query.status_code == 200, bob_query.text
+
+    # Viewer only: writes and KB config stay denied without explicit ACL.
+    assert (
+        client.patch(
+            "/kbs/kb_pub", json={"name": "Nope"}, headers=bob_headers
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            "/kbs/kb_pub/documents:texts",
+            json={"documents": [{"text": "hello", "source_name": "x.md"}]},
+            headers=bob_headers,
+        ).status_code
+        == 403
+    )
+
+    # Service keys keep explicit-scope-only semantics: public grants nothing.
+    key_created = client.post(
+        "/admin/service-api-keys",
+        json={"name": "no-scope", "kb_roles": {}},
+        headers=admin_headers,
+    )
+    assert key_created.status_code == 200, key_created.text
+    service_headers = {"X-API-Key": key_created.json()["api_key"]}
+    assert client.get("/kbs/kb_pub", headers=service_headers).status_code == 403
+    service_list = client.get("/kbs", headers=service_headers)
+    assert service_list.status_code == 200
+    assert service_list.json()["knowledge_bases"] == []
+
+
+def test_enterprise_kb_visibility_internal_same_tenant_only(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    carol_created = client.post(
+        "/admin/users",
+        json={
+            "username": "carol",
+            "password": "carol-pass",
+            "can_create_kb": True,
+            "tenant_id": "tenant-a",
+        },
+        headers=admin_headers,
+    )
+    assert carol_created.status_code == 200, carol_created.text
+    carol = asyncio.run(user_service.get_user_or_404(carol_created.json()["id"]))
+    carol_headers = {"Authorization": f"Bearer {_token(user_service, carol)}"}
+
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_internal", "name": "Internal KB", "visibility": "internal"},
+        headers=carol_headers,
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["tenant_id"] == "tenant-a"
+
+    # No tenant and a different tenant both stay denied.
+    assert client.get("/kbs/kb_internal", headers=bob_headers).status_code == 403
+    other_tenant = client.patch(
+        f"/admin/users/{bob.id}", json={"tenant_id": "tenant-b"}, headers=admin_headers
+    )
+    assert other_tenant.status_code == 200, other_tenant.text
+    bob_b = asyncio.run(user_service.get_user_or_404(bob.id))
+    bob_b_headers = {"Authorization": f"Bearer {_token(user_service, bob_b)}"}
+    assert client.get("/kbs/kb_internal", headers=bob_b_headers).status_code == 403
+
+    # Direct user.tenant_id assignment to the KB tenant implies kb_viewer.
+    same_tenant = client.patch(
+        f"/admin/users/{bob.id}", json={"tenant_id": "tenant-a"}, headers=admin_headers
+    )
+    assert same_tenant.status_code == 200, same_tenant.text
+    bob_a = asyncio.run(user_service.get_user_or_404(bob.id))
+    bob_a_headers = {"Authorization": f"Bearer {_token(user_service, bob_a)}"}
+    assert client.get("/kbs/kb_internal", headers=bob_a_headers).status_code == 200
+    bob_list = client.get("/kbs", headers=bob_a_headers)
+    assert [item["id"] for item in bob_list.json()["knowledge_bases"]] == [
+        "kb_internal"
+    ]
+    assert (
+        client.patch(
+            "/kbs/kb_internal", json={"name": "Nope"}, headers=bob_a_headers
+        ).status_code
+        == 403
+    )
+
+    # Tenant membership (without user.tenant_id) implies kb_viewer as well.
+    membership = client.put(
+        f"/admin/tenants/tenant-a/members/{alice.id}",
+        json={"role": "tenant_member"},
+        headers=admin_headers,
+    )
+    assert membership.status_code == 200, membership.text
+    assert client.get("/kbs/kb_internal", headers=alice_headers).status_code == 200
+
+    # Clearing the tenant assignment revokes the implied access.
+    cleared = client.patch(
+        f"/admin/users/{bob.id}", json={"tenant_id": None}, headers=admin_headers
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["tenant_id"] is None
+    bob_cleared = asyncio.run(user_service.get_user_or_404(bob.id))
+    bob_cleared_headers = {"Authorization": f"Bearer {_token(user_service, bob_cleared)}"}
+    assert client.get("/kbs/kb_internal", headers=bob_cleared_headers).status_code == 403
+    assert client.get("/kbs", headers=bob_cleared_headers).json()["knowledge_bases"] == []
+
+
+def test_admin_patch_user_tenant_id_null_clears_and_empty_rejected(
+    monkeypatch, tmp_path
+):
+    client, user_service, _authz, admin, _alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+
+    assigned = client.patch(
+        f"/admin/users/{bob.id}", json={"tenant_id": "tenant-x"}, headers=admin_headers
+    )
+    assert assigned.status_code == 200, assigned.text
+    assert assigned.json()["tenant_id"] == "tenant-x"
+
+    # Omitted tenant_id leaves the assignment unchanged.
+    unrelated = client.patch(
+        f"/admin/users/{bob.id}", json={"can_create_kb": True}, headers=admin_headers
+    )
+    assert unrelated.status_code == 200, unrelated.text
+    assert unrelated.json()["tenant_id"] == "tenant-x"
+
+    pre_clear = asyncio.run(user_service.get_user_or_404(bob.id))
+    stale_headers = {"Authorization": f"Bearer {_token(user_service, pre_clear)}"}
+    assert client.get("/auth/me", headers=stale_headers).status_code == 200
+
+    # Explicit null clears the tenant and invalidates outstanding tokens.
+    cleared = client.patch(
+        f"/admin/users/{bob.id}", json={"tenant_id": None}, headers=admin_headers
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["tenant_id"] is None
+    assert cleared.json()["token_version"] == pre_clear.token_version + 1
+    assert client.get("/auth/me", headers=stale_headers).status_code == 401
+
+    # Empty/whitespace strings are rejected instead of storing a bogus tenant.
+    assert (
+        client.patch(
+            f"/admin/users/{bob.id}", json={"tenant_id": ""}, headers=admin_headers
+        ).status_code
+        == 400
+    )
+    assert (
+        client.patch(
+            f"/admin/users/{bob.id}", json={"tenant_id": "   "}, headers=admin_headers
+        ).status_code
+        == 400
     )

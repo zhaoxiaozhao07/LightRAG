@@ -16,6 +16,7 @@ from lightrag.api.enterprise_auth import (
     SERVICE_API_KEY_AUTH_METHOD,
     TENANT_ROLE_ADMIN,
     TENANT_ROLE_MEMBER,
+    UNSET,
     USER_STATUS_ACTIVE,
     USER_STATUS_DISABLED,
     USER_STATUS_PENDING,
@@ -797,15 +798,20 @@ def create_enterprise_routes(
         principal = require_principal(request)
         user_service = get_enterprise_user_service(request)
         user = await user_service.get_user_or_404(user_id)
-        if any(
-            value is not None
-            for value in (
-                body.status,
-                body.can_create_kb,
-                body.can_use_bypass_query,
-                body.can_delete_documents,
-                body.tenant_id,
+        # ``tenant_id`` distinguishes omitted (unchanged) from an explicit
+        # ``null`` (clear the tenant assignment), mirroring KB PATCH semantics.
+        tenant_provided = "tenant_id" in body.model_fields_set
+        if (
+            any(
+                value is not None
+                for value in (
+                    body.status,
+                    body.can_create_kb,
+                    body.can_use_bypass_query,
+                    body.can_delete_documents,
+                )
             )
+            or tenant_provided
         ):
             user = await user_service.update_user(
                 user_id,
@@ -813,7 +819,7 @@ def create_enterprise_routes(
                 can_create_kb=body.can_create_kb,
                 can_use_bypass_query=body.can_use_bypass_query,
                 can_delete_documents=body.can_delete_documents,
-                tenant_id=body.tenant_id,
+                tenant_id=body.tenant_id if tenant_provided else UNSET,
                 actor_user_id=principal.user_id,
             )
         if body.password is not None:

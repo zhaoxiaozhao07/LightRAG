@@ -1,8 +1,9 @@
 # LightRAG API 接口文档
 
-> 文档版本：2026-06-09
+> 文档版本：2026-06-10
 > 文档定位：LightRAG 生产级 KB 后端与企业能力的**单一权威接口契约**（取代 `archive/API接口文档.md`，内容无损延续）。
 > 适用范围：当前已经合并到 `main` 分支并通过测试的接口。
+> 部署前提：单台服务器、内网使用；所有知识库共享同一组本地部署的模型与解析服务（LLM / VLM / Embedding / Rerank / MinerU / Docling），部署级服务参数统一由 `.env` / 部署编排管理；模型本地部署，无 token/cost 计费。
 > 路径前缀：所有路径均为相对路径；部署时通过 FastAPI `root_path` 或 `--api-prefix /api/v1` 暴露为 `/api/v1/...`。
 > 鉴权：除 `/health`、`/auth-status`、`/login` 等少数公开接口外，所有接口都受 `combined_auth` 依赖保护，需要在请求头携带 `X-API-Key: <api_key>` 或 JWT。企业模式启用后，`/kbs`、legacy `/documents`/`/query`/`/graph`、Ollama `/api/*` 会额外受企业 RBAC / anti-bypass 策略约束。
 > 配套文档：架构与功能状态见 [`docs/设计方案.md`](设计方案.md)；KB 配置字段速查见 [`docs/KB配置项速查表.md`](KB配置项速查表.md)；备份恢复见 [`docs/生产级后端备份恢复Runbook.md`](生产级后端备份恢复Runbook.md)。
@@ -51,7 +52,7 @@ Content-Type: application/json
   "description": "Optional",       // 可选
   "owner_id": null,                // 默认模式下为兼容 metadata；企业模式会忽略并由当前 principal 派生
   "tenant_id": null,               // 默认模式下为兼容 metadata；企业模式会忽略并由当前 principal 派生
-  "visibility": "private"          // 枚举：private / public / internal；企业模式实际访问以 KB ACL 为准
+  "visibility": "private"          // 枚举：private / internal / public；企业模式下 internal=同租户隐含只读、public=全员隐含只读（语义见 10.4），写权限仍以 KB ACL 为准
 }
 ```
 
@@ -75,7 +76,7 @@ Content-Type: application/json
 企业模式（`LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true`）下：
 
 - `POST /kbs` 需要 super admin 或 `can_create_kb=true`；服务端忽略请求体中的 `owner_id`/`tenant_id`，改用当前 principal，并自动授予创建者 `kb_owner` ACL。
-- `GET /kbs` 对普通用户只返回已授权 KB；super admin 返回全部。
+- `GET /kbs` 对普通用户返回已授权 KB（direct user ACL / tenant ACL）以及 visibility 命中的 KB（`public` / 同租户 `internal`，见 10.4）；super admin 返回全部；service key 仅按 `kb_roles` scope（可选显式 `inherit_tenant_kb_acl`），不受 visibility 影响。
 - `PATCH /kbs/{kb_id}` 忽略请求体中的 `owner_id`/`tenant_id`，避免客户端伪造所有权或租户。
 - `DELETE /kbs/{kb_id}` 与 `?hard=true` 仅 super admin 可执行，并写入审计事件。
 
@@ -1051,7 +1052,7 @@ LIGHTRAG_ENTERPRISE_TENANT_MAX_CONCURRENT_JOBS=0
 
 ### 10.2 登录与当前用户
 
-当前企业认证支持企业用户表登录、JWT、service/scoped API key。SSO/OIDC/SAML 未纳入本轮上线闭环；后续接入前需补 issuer/client/audience/redirect URI/certs 配置校验、回调 state/CSRF 校验、用户映射策略、审计与端到端回调测试。
+当前企业认证支持企业用户表登录、JWT、service/scoped API key。SSO/OIDC/SAML **明确不做**：本系统按单机内网部署，无外部 IdP 接入需求（见 `docs/设计方案.md` §2.2）。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -1119,7 +1120,7 @@ username=admin&password=change-me
 | `POST` | `/admin/users` | 创建用户，可设置 `can_create_kb`、`can_use_bypass_query`、`can_delete_documents`、`tenant_id` |
 | `GET` | `/admin/users/{user_id}` | 查询用户详情 |
 | `GET` | `/admin/users/{user_id}/access` | 查看用户的访问总览：全局能力 + 租户成员关系(role) + 直接 KB ACL(kb_id/role，不含租户继承的有效角色) |
-| `PATCH` | `/admin/users/{user_id}` | 更新用户状态/能力/tenant/password；请求体包含 `status`、`can_create_kb`、`can_use_bypass_query`、`can_delete_documents`、`tenant_id` 中任一非 null 字段并通过 `update_user()`，或修改 `password`，都会增加 `token_version` 并使旧 token 失效；当前实现中 `tenant_id:null` 表示不变而非清空 |
+| `PATCH` | `/admin/users/{user_id}` | 更新用户状态/能力/tenant/password；请求体包含 `status`、`can_create_kb`、`can_use_bypass_query`、`can_delete_documents` 任一非 null 字段、显式给出 `tenant_id` 或修改 `password`，都会增加 `token_version` 并使旧 token 失效。`tenant_id` 区分 omitted 与显式 null：省略=不变，显式 `null`=清空租户归属，空/空白字符串返回 `400` |
 | `POST` | `/admin/users/{user_id}:disable` | 禁用用户并递增 `token_version`，旧 token 失效 |
 | `POST` | `/admin/users/{user_id}:enable` | 启用用户并递增 `token_version` |
 | `POST` | `/admin/users/{user_id}:reset-password` | 重置用户密码并递增 `token_version` |
@@ -1315,6 +1316,7 @@ Service API key 行为约束：
 - legacy/global `/documents`、`/query`、`/graph`、Ollama `/api/*` 在 `LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES=true` 时默认拒绝；关闭该开关后仍需 super admin。
 - super admin bootstrap 来自 `.env`，启动后同步为 active super admin；企业模式要求非默认 `TOKEN_SECRET`。
 - Tenant membership 与 tenant-scoped KB ACL 已接入用户 principal hydration；用户请求按 direct user ACL 与 tenant ACL 最高角色授权。Service key 请求默认只按显式 `kb_roles` scope 授权；设置 `tenant_id + inherit_tenant_kb_acl=true` 时显式继承 tenant ACL。
+- **KB 可见性（visibility）语义**：`knowledge_bases.visibility ∈ {private, internal, public}`，默认 `private`。`private` 无隐含权限；`internal` 在 KB `tenant_id` 非空时对该租户用户（`user.tenant_id` 相同或拥有该租户 membership）隐含 `kb_viewer`；`public` 对全部已认证企业交互用户（JWT principal）隐含 `kb_viewer`。隐含角色仅为只读（读 + query），写/配置/删除仍需显式 ACL / super admin；effective role 取 direct ACL、tenant ACL 与 visibility 隐含角色的最高者。service/scoped API key 与 legacy enterprise API key 不受 visibility 影响。`GET /admin/users/{id}/access` 仅列显式授权，不枚举 visibility 隐含项。修改 visibility 走 `PATCH /kbs/{kb_id}`（`kb_admin`+）。
 - 文档删除为所有权感知模型：`kb_editor` 仅可删除本人上传（`metadata.created_by`）的文档；删除他人文档需用户级能力 `can_delete_documents`（super admin 通过 `/admin/users` 授予）或 `kb_admin`+/`super_admin`。service/scoped API key 不会获得 `can_delete_documents`：只能按 `kb_admin` scope 删任意，或按 `kb_editor` scope 删除该 key 自身上传的文档；无 `created_by` 的历史文档仅 privileged 主体可删。
 
 KB 路由角色矩阵：
@@ -1322,8 +1324,8 @@ KB 路由角色矩阵：
 | 范围 | 最低角色 / 能力 |
 |---|---|
 | `POST /kbs` | super admin 或 `can_create_kb=true` |
-| `GET /kbs` | super admin 看全部；普通用户仅看 direct user ACL 或 tenant ACL 授权 KB；service key 默认仅看 `kb_roles` scope，显式 `inherit_tenant_kb_acl` 时额外继承 tenant ACL |
-| `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高；artifact `:download` / `:download-url` 可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 全局提升最低角色，也可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY` 按 artifact type 覆盖；`:download` / `:download-url` / `:preview` 还可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY` 按 action + artifact type 覆盖 |
+| `GET /kbs` | super admin 看全部；普通用户看 direct user ACL / tenant ACL 授权 KB + visibility 命中 KB（`public` / 同租户 `internal`）；service key 默认仅看 `kb_roles` scope，显式 `inherit_tenant_kb_acl` 时额外继承 tenant ACL，不受 visibility 影响 |
+| `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高（可由 visibility 隐含，见上）；artifact `:download` / `:download-url` 可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 全局提升最低角色，也可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY` 按 artifact type 覆盖；`:download` / `:download-url` / `:preview` 还可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY` 按 action + artifact type 覆盖 |
 | `/kbs/{kb_id}/query`、`/query/stream`、`/query/data`、`/retrieve` | `kb_viewer` 或更高；最终 `mode="bypass"` 额外需要 `can_use_bypass_query=true` |
 | `POST /kbs:query`、`/kbs:query/stream`、`/kbs:retrieve`（跨库合并查询） | `kb_ids` 中每个 KB 均需 `kb_viewer`+（handler 自鉴权，中央中间件不覆盖 collection 级路径）；`bypass` 不支持(400) |
 | 文档上传/解析/构建/替换/sync、job wait/cancel/retry 等写操作 | `kb_editor` 或更高 |

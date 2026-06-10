@@ -936,7 +936,9 @@ def create_app(args):
         EnterpriseLimitService(enterprise_audit_service) if enterprise_enabled else None
     )
     enterprise_authorization_service = (
-        AuthorizationService(metadata_store, enterprise_audit_service)
+        AuthorizationService(
+            metadata_store, enterprise_audit_service, kb_service=kb_service
+        )
         if enterprise_enabled
         else None
     )
