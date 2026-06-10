@@ -57,6 +57,10 @@ class KnowledgeBaseCreateRequest(BaseModel):
     visibility: KnowledgeBaseVisibility = Field(
         default="private", description="Reserved visibility flag"
     )
+    metadata: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Free-form control-plane metadata (tags, grouping, frontend fields)",
+    )
 
     @field_validator("id", mode="after")
     @classmethod
@@ -91,6 +95,13 @@ class KnowledgeBaseUpdateRequest(BaseModel):
     tenant_id: Optional[str] = None
     visibility: Optional[KnowledgeBaseVisibility] = None
     active_config_version_id: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Merged into the stored metadata: provided keys overwrite, "
+            "null values delete the key"
+        ),
+    )
 
     @field_validator("name", mode="after")
     @classmethod
@@ -116,6 +127,7 @@ class KnowledgeBaseResponse(BaseModel):
     created_at: str
     updated_at: str
     deleted_at: Optional[str]
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod
     def from_record(cls, record: KnowledgeBaseRecord) -> "KnowledgeBaseResponse":
@@ -157,6 +169,14 @@ class KnowledgeBaseStatusResponse(BaseModel):
     pipeline_status: dict[str, Any]
     storage_workspaces: dict[str, Any]
     running_jobs: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class KnowledgeBaseStatsResponse(BaseModel):
+    kb_id: str
+    documents: dict[str, Any]
+    counters: dict[str, int]
+    jobs: dict[str, Any]
+    artifacts: dict[str, int]
 
 
 class ConfigVersionCreateRequest(BaseModel):
@@ -395,6 +415,7 @@ def create_kb_routes(
     job_service: JobService | None = None,
     config_service: ConfigVersionService | None = None,
     deletion_service: "KBDeletionService | None" = None,
+    metadata_store: Any | None = None,
 ):
     router = APIRouter(prefix="/kbs", tags=["knowledge-bases"])
     combined_auth = get_combined_auth_dependency(api_key)
@@ -422,6 +443,7 @@ def create_kb_routes(
                 owner_id=owner_id,
                 tenant_id=tenant_id,
                 visibility=body.visibility,
+                metadata=body.metadata,
             )
             if enterprise_auth_enabled() and principal is not None:
                 try:
@@ -604,6 +626,111 @@ def create_kb_routes(
         except Exception as exc:
             logger.error("Failed to delete knowledge base '%s': %s", kb_id, exc)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.post(
+        "/{kb_id}:restore",
+        response_model=KnowledgeBaseResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Restore a soft-deleted knowledge base",
+    )
+    async def restore_knowledge_base(kb_id: str, request: Request):
+        try:
+            try:
+                record = await kb_service.get(kb_id, include_deleted=True)
+            except KnowledgeBaseNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if record.status != "deleted":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Knowledge base is not deleted",
+                )
+            if job_service is not None:
+                # A queued/running clear_kb job will still wipe storages after
+                # the catalog row flips back to active — refuse to restore
+                # while a hard delete is in flight.
+                active_clears = [
+                    job
+                    for job in await job_service.list_running_jobs(
+                        record.id, include_deleted=True
+                    )
+                    if job.job_type == "clear_kb"
+                ]
+                if active_clears:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error_code": "kb_hard_delete_in_progress",
+                            "job_id": active_clears[0].id,
+                        },
+                    )
+            restored = await kb_service.restore(record.id)
+            if enterprise_auth_enabled():
+                principal = get_request_principal(request)
+                audit_service = get_enterprise_audit_service(request)
+                await audit_service.append(
+                    "kb_restored",
+                    actor_user_id=principal.user_id if principal else None,
+                    target_type="kb",
+                    target_id=restored.id,
+                )
+            return KnowledgeBaseResponse.from_record(restored)
+        except HTTPException:
+            raise
+        except KnowledgeBaseNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            # restore() raced with another state change — surface as conflict.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error("Failed to restore knowledge base '%s': %s", kb_id, exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.get(
+        "/{kb_id}/stats",
+        response_model=KnowledgeBaseStatsResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Control-plane statistics for one knowledge base",
+    )
+    async def get_knowledge_base_stats(kb_id: str):
+        """Aggregate document/job/artifact statistics from the metadata store.
+
+        Deliberately control-plane only: no LightRAG instance is loaded, so
+        the call is cheap and side-effect free. Graph-scale numbers remain on
+        ``GET /kbs/{kb_id}/graph/status``.
+        """
+        try:
+            record = await kb_service.get(kb_id)
+        except KnowledgeBaseNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if metadata_store is None:
+            raise HTTPException(
+                status_code=503, detail="Metadata store is not configured"
+            )
+        try:
+            stats = await metadata_store.aggregate_control_plane_stats(record.id)
+        except Exception as exc:
+            logger.error("Failed to aggregate stats for '%s': %s", kb_id, exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        documents_by_status = stats["documents_by_status"]
+        jobs_by_status = stats["jobs_by_status"]
+        return KnowledgeBaseStatsResponse(
+            kb_id=record.id,
+            documents={
+                "total": sum(documents_by_status.values()),
+                "by_status": documents_by_status,
+            },
+            counters=stats["document_counters"],
+            jobs={
+                "total": sum(jobs_by_status.values()),
+                "by_status": jobs_by_status,
+                "dead_letter": stats["dead_letter_jobs"],
+            },
+            artifacts={"total": stats["artifacts"]},
+        )
 
     @router.get(
         "/{kb_id}/status",

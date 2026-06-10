@@ -39,6 +39,8 @@
 | `PATCH` | `/kbs/{kb_id}` | 局部更新知识库（名称、描述、状态等） |
 | `DELETE` | `/kbs/{kb_id}` | 软删除知识库；附加 `?hard=true` 触发硬删除（durable worker 启用时入队 `clear_kb`，否则同步执行） |
 | `GET` | `/kbs/{kb_id}/status` | 知识库状态聚合（含运行中任务、pipeline 状态） |
+| `POST` | `/kbs/{kb_id}:restore` | 恢复软删除的知识库（`deleted`→`active`）；企业模式仅 super admin |
+| `GET` | `/kbs/{kb_id}/stats` | 控制面统计：文档状态分布、chunks/entity/relation 合计、job 状态分布、dead-letter、artifact 数 |
 
 ### 1.1 创建知识库
 
@@ -52,7 +54,8 @@ Content-Type: application/json
   "description": "Optional",       // 可选
   "owner_id": null,                // 默认模式下为兼容 metadata；企业模式会忽略并由当前 principal 派生
   "tenant_id": null,               // 默认模式下为兼容 metadata；企业模式会忽略并由当前 principal 派生
-  "visibility": "private"          // 枚举：private / internal / public；企业模式下 internal=同租户隐含只读、public=全员隐含只读（语义见 10.4），写权限仍以 KB ACL 为准
+  "visibility": "private",         // 枚举：private / internal / public；企业模式下 internal=同租户隐含只读、public=全员隐含只读（语义见 10.4），写权限仍以 KB ACL 为准
+  "metadata": {"tags": ["legal"]}  // 可选自由 dict（前端标签/分组/扩展字段），序列化 ≤16KB；响应与列表原样返回
 }
 ```
 
@@ -62,7 +65,7 @@ Content-Type: application/json
 
 - `GET /kbs?include_deleted=false`：默认排除软删除记录。
 - `GET /kbs/{kb_id}`：404 表示未找到或已软删除。
-- `PATCH /kbs/{kb_id}`：仅更新请求体显式给出的字段；`status` 不允许直接置为 `deleted`；`active_config_version_id` 不能通过 PATCH 修改，若请求体包含该字段返回 `400`，请改用 `POST /kbs/{kb_id}/configs/{version_id}:activate`。
+- `PATCH /kbs/{kb_id}`：仅更新请求体显式给出的字段；`status` 不允许直接置为 `deleted`；`active_config_version_id` 不能通过 PATCH 修改，若请求体包含该字段返回 `400`，请改用 `POST /kbs/{kb_id}/configs/{version_id}:activate`。`metadata` 为**合并**语义：给出的 key 覆盖现值、value=null 删除该 key、未提及的 key 保留；顶层 `metadata: null` 返回 `400`；合并后序列化超 16KB 返回 `400`。
 - `DELETE /kbs/{kb_id}`：默认软删除，同步从 `LightRAGInstanceRegistry` 卸载实例。
 - `DELETE /kbs/{kb_id}?hard=true`：触发硬删除。若服务端启用 durable worker 且 `clear_kb` 在 `job_worker.resumable_job_types` 中，路由会先 soft-delete/tombstone KB，再调用 `KBDeletionService.enqueue_hard_delete()` 创建 queued `clear_kb` job，并返回 `KnowledgeBaseDeleteResponse` 中的 `hard_delete_queued=true`、`hard_delete_job_id`、`hard_delete_job_type="clear_kb"`、`hard_delete_job_status="queued"`；后续由 worker 通过 `resume_hard_delete` 幂等执行，且 job 查询/取消/重试端点对 soft-deleted KB 使用 `include_deleted=true`，因此硬删除 job 在 KB tombstone 后仍可观察和控制。若 durable worker 未启用，保持兼容的同步硬删除流程：`KBDeletionService` 在 destructive lock 下依次执行：
   1. `force_evict` 在内存中的 LightRAG 实例并调用 `finalize_storages`（关闭存储句柄，不删数据）；
@@ -103,6 +106,40 @@ GET /kbs/{kb_id}/status
 }
 ```
 
+### 1.4 恢复软删除的知识库
+
+```http
+POST /kbs/{kb_id}:restore
+```
+
+- 仅对 `status="deleted"` 的软删除 KB 生效：恢复为 `active`、清空 `deleted_at`，返回 `KnowledgeBaseResponse`。
+- KB 不存在返回 `404`；KB 当前不是 deleted 状态返回 `409`。
+- 存在在途（queued/running/retrying/cancelling）`clear_kb` 硬删除任务时返回 `409`，`detail.error_code="kb_hard_delete_in_progress"` 并携带 `job_id`——此时数据即将被硬删 worker 清除，恢复无意义；硬删除完成后控制面已 purge，`:restore` 返回 `404`。
+- 企业模式仅 super admin 可调用（与 `DELETE /kbs/{kb_id}` 同级），写入 `kb_restored` 审计事件。
+
+### 1.5 知识库控制面统计
+
+```http
+GET /kbs/{kb_id}/stats
+```
+
+返回字段：
+
+```json
+{
+  "kb_id": "kb_research",
+  "documents": {"total": 12, "by_status": {"ready": 10, "parse_failed": 2}},
+  "counters": {"chunks": 340, "entities": 1200, "relations": 980},
+  "jobs": {"total": 25, "by_status": {"succeeded": 23, "failed": 2}, "dead_letter": 1},
+  "artifacts": {"total": 96}
+}
+```
+
+- **仅查控制面 metadata store**，不加载 LightRAG 实例，调用廉价且无副作用；图谱规模（节点/边数）继续使用 `GET /kbs/{kb_id}/graph/status`。
+- `counters` 为各文档构建回填计数的合计；已删除文档的计数在删除时已清零，不计入。
+- `dead_letter` 为 `failed` 且重试耗尽的任务数（与 `/jobs/dead-letter` 口径一致）。
+- 企业模式 `kb_viewer`+ 可读；KB 不存在返回 `404`。
+
 ---
 
 ## 二、知识库文档 Documents
@@ -125,6 +162,9 @@ GET /kbs/{kb_id}/status
 | `DELETE` | `/kbs/{kb_id}/documents/{document_id}` | 单文档任务化删除 |
 | `POST` | `/kbs/{kb_id}/documents/{document_id}:replace` | 单文档任务化替换 |
 | `POST` | `/kbs/{kb_id}/documents:batch-delete` | 批量任务化删除 |
+| `POST` | `/kbs/{kb_id}/documents:batch-enable` | 批量启用文档（同步 metadata 操作，per-item 结果） |
+| `POST` | `/kbs/{kb_id}/documents:batch-disable` | 批量禁用文档（同步 metadata 操作，per-item 结果） |
+| `GET` | `/kbs/{kb_id}/documents/{document_id}/chunks` | 查看该文档构建出的引擎 text chunks（分页，检索可解释性） |
 
 ### 2.1 多文件上传
 
@@ -300,6 +340,33 @@ POST /kbs/{kb_id}/documents/{document_id}:enable
 ```
 
 返回 `DocumentResponse`。这两个动作只更新 metadata 控制面 `enabled` 字段，不删除 source/artifact，也不触发 LightRAG storage 变更。`enabled` 现已接入检索层：禁用文档会被排除出 `QueryParam.ids` 白名单，因此不再参与 KB 级问答检索（无需删除即可临时下线一篇文档）。
+
+批量启停（前端多选场景）：
+
+```http
+POST /kbs/{kb_id}/documents:batch-enable
+POST /kbs/{kb_id}/documents:batch-disable
+Content-Type: application/json
+
+{"document_ids": ["doc_a", "doc_b"]}
+```
+
+- 与单文档 `:enable`/`:disable` 同语义的同步控制面操作，不创建 job。
+- `document_ids` 非空、≤100、不允许重复（重复返回 `422`）；KB 不存在返回 `404`。
+- 响应：`{"enabled": false, "updated": 2, "not_found": 1, "items": [{"document_id": "...", "status": "updated" | "not_found"}]}`；缺失文档按 per-item `not_found` 报告，不阻塞其它文档；重复应用当前状态仍计 `updated`（幂等）。
+- 企业模式 `kb_editor`+；审计 `document_batch_enabled` / `document_batch_disabled`。
+
+### 2.7.1 文档 chunks 查看（检索可解释性）
+
+```http
+GET /kbs/{kb_id}/documents/{document_id}/chunks?limit=50&offset=0
+```
+
+- 经文档 `lightrag_doc_id` → 引擎 doc_status `chunks_list` → text_chunks 批量取回，按 `chunk_order_index` 升序返回；`limit` 默认 50（上限 200）。
+- 尚未构建（无 `lightrag_doc_id`）的文档返回 `total=0` 空列表，且**不加载引擎实例**；已构建文档首次调用会按需加载该 KB 实例。
+- 引擎中已被清理的 chunk 行自动跳过；`total` 为实际可取回的 chunk 数。
+- 响应：`{"kb_id", "document_id", "lightrag_doc_id", "total", "limit", "offset", "chunks": [{"id", "chunk_order_index", "tokens", "content", "file_path"}]}`。
+- 用途：核对 `chunk_config` 分块效果、排查"为什么没检索到"；企业模式 `kb_viewer`+。
 
 ### 2.8 文档删除
 
@@ -501,9 +568,11 @@ Content-Type: application/json
 - KB 内没有可构建文档时返回 no-op（`job_id=""`、`documents=[]`），不报 400。
 - KB 不存在返回 404；注册表/构建服务未配置返回 503。
 
-### 4.5 KB 级图谱查询
+### 4.5 KB 级图谱查询与编辑
 
-> 通过 `LightRAGInstanceRegistry` 解析到该 KB 的 LightRAG 实例，因此图谱统计/标签/子图均按 workspace 隔离到单个知识库。
+> 通过 `LightRAGInstanceRegistry` 解析到该 KB 的 LightRAG 实例，因此图谱统计/标签/子图/编辑均按 workspace 隔离到单个知识库。企业模式默认禁用全局 `/graph/*` 路由后，写端点是图谱人工纠错（合并重复实体、改名、删错误关系）的唯一入口。
+
+只读端点（企业模式 `kb_viewer`+）：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -512,9 +581,24 @@ Content-Type: application/json
 | `GET` | `/kbs/{kb_id}/graph/relations` | 关系（edge）分页列表，返回 `id/type/source/target/properties` |
 | `GET` | `/kbs/{kb_id}/graph` | 指定 `label` 的连通子图（`*` 表示整图），支持 `max_depth` / `max_nodes` |
 
+编辑端点（企业模式 `kb_admin`+，包装引擎 curation 方法）：
+
+| 方法 | 路径 | 请求体 | 说明 |
+|---|---|---|---|
+| `POST` | `/kbs/{kb_id}/graph/entity:edit` | `{entity_name, updated_data, allow_rename=false, allow_merge=false}` | 更新实体属性；`updated_data.entity_name` + `allow_rename=true` 改名；改名撞已有实体且 `allow_merge=true` 时自动合并。响应含 `data` 与 `operation_summary`（`operation_status`/`merged`/`final_entity` 等） |
+| `POST` | `/kbs/{kb_id}/graph/entity:create` | `{entity_name, entity_data}` | 新建独立实体（常用字段 `description`/`entity_type`）；同名已存在返回 `400` |
+| `POST` | `/kbs/{kb_id}/graph/entity:delete` | `{entity_name}` | 删除实体及其全部关系；不存在返回 `404`，返回 `DeletionResult` |
+| `POST` | `/kbs/{kb_id}/graph/entities:merge` | `{source_entities: [...], target_entity}` | 把多个重复/错拼实体合并进目标实体，关系全部转移、来源实体删除 |
+| `POST` | `/kbs/{kb_id}/graph/relation:edit` | `{source_entity, target_entity, updated_data}` | 更新关系属性（`description`/`keywords`/`weight` 等） |
+| `POST` | `/kbs/{kb_id}/graph/relation:create` | `{source_entity, target_entity, relation_data}` | 在两个**已存在**实体间新建关系（无向边，返回时端点可能交换） |
+| `POST` | `/kbs/{kb_id}/graph/relation:delete` | `{source_entity, target_entity}` | 删除一条关系；不存在返回 `404`，返回 `DeletionResult` |
+
 约束：
-- 这些接口为只读，复用全局 `/graph/*` 同款 LightRAG 方法，但带 KB workspace 边界。
+- 只读端点复用全局 `/graph/*` 同款 LightRAG 方法，但带 KB workspace 边界。
 - `graph/status` 与 `graph/relations` 使用 `"*"` 通配做有界全图扫描（默认上限 100,000 节点）；超限时 `is_truncated=true`。
+- 编辑端点在文档 pipeline 忙碌（构建/删除进行中）时返回 `409`，等任务完成后重试；引擎参数校验失败（实体不存在/已存在等）返回 `400`。
+- **手工编辑结果存放在引擎存储中，会被该文档的 force `:reindex` / `:rebuild` 重新抽取覆盖**——图谱纠错建议在文档集稳定后进行，或纠错后避免对相关文档强制重建。
+- 企业模式下所有编辑动作写审计：`kb_graph_entity_edited/created/deleted`、`kb_graph_entities_merged`、`kb_graph_relation_edited/created/deleted`（metadata 记录实体名/数量，不含正文）。
 - KB 不存在返回 404。
 
 ---
@@ -1059,7 +1143,9 @@ LIGHTRAG_ENTERPRISE_TENANT_MAX_CONCURRENT_JOBS=0
 | `GET` | `/auth-status` | 企业模式返回 `auth_mode=enterprise` 和当前注册开关；不签发 guest token |
 | `POST` | `/login` | 使用企业用户表认证，返回带 `user_id`、`system_role`、`token_version` metadata 的 JWT；同一用户名连续登录失败达 `LIGHTRAG_ENTERPRISE_LOGIN_MAX_ATTEMPTS`（默认 10）后锁定 `LIGHTRAG_ENTERPRISE_LOGIN_LOCKOUT_SECONDS`（默认 900s），期间返回 `429` + `Retry-After`；成功登录清零计数，`MAX_ATTEMPTS=0` 关闭锁定 |
 | `POST` | `/auth/register` | 注册新用户；行为随注册模式而定：`open` 直接创建 active 用户并返回 token；`invite_only` 必须携带有效 `invitation_token`；`admin_approval` 创建 `pending` 用户、待管理员 `:enable` 审批后才能登录（响应不含 token）；`disabled` 返回 `403`。注册失败按 `LIGHTRAG_ENTERPRISE_REGISTRATION_*` 做单进程 per-username 锁定，失败/触发锁定写审计。新用户默认无 KB 权限且不可创建 KB |
-| `GET` | `/auth/me` | 返回当前用户与 principal 权限信息；service API key 请求返回 `user:null` 与 service-key principal payload |
+| `GET` | `/auth/me` | 返回当前用户与 principal 权限信息；service API key 请求返回 `user:null` 与 service-key principal payload；用户对象含只读 `display_name` / `email` 个人资料字段 |
+| `PATCH` | `/auth/me` | 当前用户维护个人资料：`display_name`（≤64 字符）/ `email`（≤254 字符、需含 `@`）。omitted=不变、显式 `null`=清除、空白串 `400`；存入 `enterprise_users.metadata`，**不**递增 `token_version`（当前 token 继续有效）；仅交互式 JWT 用户，API-key principal 返回 `403`；审计 `user_profile_updated` |
+| `POST` | `/auth/logout` | 全设备登出：递增本人 `token_version`，使包括当前 token 在内的全部已签发 JWT 立即失效；返回 `{"status":"logged_out","token_version":N}`；仅交互式 JWT 用户，service key 返回 `403`（撤销 key 请用 `:revoke`）；审计 `user_logged_out` |
 | `POST` | `/auth/change-password` | 当前用户修改密码；成功后 `token_version` 增加，旧 token 失效 |
 | `GET` | `/auth/me/kbs/{kb_id}/query-settings` | 读取当前用户在指定 KB 下的个人查询设置；需 `kb_viewer`+；非交互式用户/API-key principal 返回 `403` |
 | `PUT` | `/auth/me/kbs/{kb_id}/query-settings` | 写入/覆盖当前用户在指定 KB 下的个人 `user_prompt`；需 `kb_viewer`+；非交互式用户/API-key principal 返回 `403` |
@@ -1115,6 +1201,7 @@ username=admin&password=change-me
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/admin/settings/registration` | 读取实时注册策略，返回 `enabled` 与 `mode` |
+| `GET` | `/admin/overview` | 平台总览 JSON 聚合：KB 状态分布、文档/job/artifact 全局聚合与计数器合计、dead-letter 总数、企业用户/租户/service key/审计事件计数；仅查控制面，不加载引擎实例（面向管理台 dashboard，替代解析 `/metrics` 文本） |
 | `PATCH` / `PUT` | `/admin/settings/registration` | 更新实时注册策略，body：`{"enabled": true}` 或 `{"mode":"open"}` |
 | `GET` | `/admin/users` | 列出企业用户；支持 `status`/`tenant_id`/`q`(用户名子串) 过滤与 `limit`/`offset` 分页 |
 | `POST` | `/admin/users` | 创建用户，可设置 `can_create_kb`、`can_use_bypass_query`、`can_delete_documents`、`tenant_id` |
@@ -1185,12 +1272,13 @@ KB ACL 请求/响应约束：
 
 - 登录/注册设置：`login_success`、`login_failed`、`registration_failed`、`registration_locked`、`registration_setting_updated`
 - super admin bootstrap/sync：`super_admin_bootstrapped`、`super_admin_synced`
-- 用户管理：`user_created`、`user_updated`、`user_password_changed`
+- 用户管理：`user_created`、`user_updated`、`user_password_changed`、`user_profile_updated`、`user_logged_out`
 - service API key：`service_api_key_created`、`service_api_key_rotated`、`service_api_key_revoked`
 - KB ACL / tenant：`kb_acl_granted`、`kb_acl_revoked`、`tenant_created`、`tenant_updated`、`tenant_deleted`、`tenant_membership_granted`、`tenant_membership_revoked`、`tenant_kb_acl_granted`、`tenant_kb_acl_revoked`
 - 权限/限流/配额：`permission_denied`、`rate_limited`、`quota_exceeded`
-- KB/config/query：`kb_created`、`kb_deleted`、`kb_hard_deleted`、`kb_config_activated`、`query_executed`、`query_stream_started`、`retrieve_executed`
-- artifact/job/document 类事件：`artifact_downloaded`、`artifact_previewed`、`artifact_download_url_created`、`kb_rebuild_queued`、`job_cancel_requested`、`job_retry_queued`，以及文档 upload/texts/urls/import/scan/sync/patch/enable/disable/replace/delete/batch-delete/parse/batch-parse/build/reindex/batch-build/batch-reindex/rebuild 相关事件。
+- KB/config/query：`kb_created`、`kb_deleted`、`kb_hard_deleted`、`kb_restored`、`kb_config_activated`、`query_executed`、`query_stream_started`、`retrieve_executed`
+- KB 图谱编辑：`kb_graph_entity_edited`、`kb_graph_entity_created`、`kb_graph_entity_deleted`、`kb_graph_entities_merged`、`kb_graph_relation_edited`、`kb_graph_relation_created`、`kb_graph_relation_deleted`
+- artifact/job/document 类事件：`artifact_downloaded`、`artifact_previewed`、`artifact_download_url_created`、`kb_rebuild_queued`、`job_cancel_requested`、`job_retry_queued`、`document_batch_enabled`、`document_batch_disabled`，以及文档 upload/texts/urls/import/scan/sync/patch/enable/disable/replace/delete/batch-delete/parse/batch-parse/build/reindex/batch-build/batch-reindex/rebuild 相关事件。
 
 审计覆盖：企业模式下，KB 创建/删除、config 激活、query/query-stream/retrieve、artifact download/preview/download-url、文档 upload/texts/urls/import/scan/sync/patch/enable/disable/replace/delete/batch-delete/parse/batch-parse/build/reindex/batch-build/batch-reindex/rebuild，以及 job cancel/retry 均写入 audit event。审计 metadata 采用白名单字段：query 仅记录 `query_hash`、mode、过滤摘要；文档与 artifact 事件仅记录 job/batch/document/artifact id、count、flag、hash、size/type 等，不记录 raw query、上传正文、URL、local path、presigned URL、密码/token/API key 明文。
 
@@ -1325,13 +1413,13 @@ KB 路由角色矩阵：
 |---|---|
 | `POST /kbs` | super admin 或 `can_create_kb=true` |
 | `GET /kbs` | super admin 看全部；普通用户看 direct user ACL / tenant ACL 授权 KB + visibility 命中 KB（`public` / 同租户 `internal`）；service key 默认仅看 `kb_roles` scope，显式 `inherit_tenant_kb_acl` 时额外继承 tenant ACL，不受 visibility 影响 |
-| `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高（可由 visibility 隐含，见上）；artifact `:download` / `:download-url` 可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 全局提升最低角色，也可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY` 按 artifact type 覆盖；`:download` / `:download-url` / `:preview` 还可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY` 按 action + artifact type 覆盖 |
+| `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、`/stats`、`/documents/{id}/chunks`、graph 读取、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高（可由 visibility 隐含，见上）；artifact `:download` / `:download-url` 可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 全局提升最低角色，也可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY` 按 artifact type 覆盖；`:download` / `:download-url` / `:preview` 还可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY` 按 action + artifact type 覆盖 |
 | `/kbs/{kb_id}/query`、`/query/stream`、`/query/data`、`/retrieve` | `kb_viewer` 或更高；最终 `mode="bypass"` 额外需要 `can_use_bypass_query=true` |
 | `POST /kbs:query`、`/kbs:query/stream`、`/kbs:retrieve`（跨库合并查询） | `kb_ids` 中每个 KB 均需 `kb_viewer`+（handler 自鉴权，中央中间件不覆盖 collection 级路径）；`bypass` 不支持(400) |
-| 文档上传/解析/构建/替换/sync、job wait/cancel/retry 等写操作 | `kb_editor` 或更高 |
+| 文档上传/解析/构建/替换/sync、批量启停（`:batch-enable`/`:batch-disable`）、`:rebuild`、job wait/cancel/retry 等写操作 | `kb_editor` 或更高 |
 | 文档删除（`DELETE …/documents/{id}`、`:batch-delete`） | `kb_editor` 仅删本人上传(`metadata.created_by`)的文档；删他人需 `can_delete_documents` 能力或 `kb_admin`+/`super_admin` |
-| KB 配置创建/激活/diff、`PATCH /kbs/{kb_id}` | `kb_admin` 或更高 |
-| `DELETE /kbs/{kb_id}`、`?hard=true`、`/admin/...` | super admin |
+| KB 配置创建/激活/diff、`PATCH /kbs/{kb_id}`、图谱编辑（`/graph` 下全部非 GET 端点） | `kb_admin` 或更高 |
+| `DELETE /kbs/{kb_id}`、`?hard=true`、`POST /kbs/{kb_id}:restore`、`/admin/...` | super admin |
 
 ---
 

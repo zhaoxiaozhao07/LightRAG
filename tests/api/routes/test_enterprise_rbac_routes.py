@@ -35,10 +35,12 @@ from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLik
 from lightrag.api.metadata_store import SQLiteMetadataStore
 from lightrag.api.routers.enterprise_routes import create_enterprise_routes
 from lightrag.api.routers.kb_document_routes import create_kb_document_routes
+from lightrag.api.routers.kb_graph_routes import create_kb_graph_routes
 from lightrag.api.routers.kb_query_routes import create_kb_query_routes
 from lightrag.api.routers.kb_routes import create_kb_routes
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.base import QueryParam
+from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
 sys.argv = _original_argv
 
 pytestmark = pytest.mark.offline
@@ -86,6 +88,18 @@ class FakeRAG:
 
     async def adrop_all_storages(self) -> dict:
         return {"dropped": 0, "failed": 0, "errors": []}
+
+    async def get_graph_labels(self) -> list[str]:
+        return []
+
+    async def aedit_entity(
+        self,
+        entity_name: str,
+        updated_data: dict,
+        allow_rename: bool = True,
+        allow_merge: bool = False,
+    ) -> dict:
+        return {"entity_name": updated_data.get("entity_name", entity_name)}
 
     async def aquery_llm(self, query: str, *, param: QueryParam):
         self.query_params.append(param)
@@ -243,6 +257,7 @@ def _build_enterprise_client(
 
     app = FastAPI()
     app.state.enterprise_enabled = True
+    app.state.metadata_store = metadata_store
     app.state.enterprise_user_service = user_service
     app.state.enterprise_settings_service = settings_service
     app.state.enterprise_user_kb_query_settings_service = user_kb_query_settings_service
@@ -258,6 +273,7 @@ def _build_enterprise_client(
             api_key=api_key,
             job_service=job_service,
             config_service=config_service,
+            metadata_store=metadata_store,
         )
     )
     app.include_router(
@@ -269,6 +285,7 @@ def _build_enterprise_client(
         )
     )
     app.include_router(create_kb_query_routes(document_service, registry, api_key=api_key))
+    app.include_router(create_kb_graph_routes(registry, api_key=api_key))
     app.include_router(create_enterprise_routes(api_key=api_key, kb_service=kb_service))
     return (
         TestClient(app),
@@ -3080,4 +3097,233 @@ def test_admin_patch_user_tenant_id_null_clears_and_empty_rejected(
             f"/admin/users/{bob.id}", json={"tenant_id": "   "}, headers=admin_headers
         ).status_code
         == 400
+    )
+
+
+def test_enterprise_kb_restore_super_admin_only_and_rebuild_editor_allowed(
+    monkeypatch, tmp_path
+):
+    client, user_service, _authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    created = client.post(
+        "/kbs", json={"id": "kb_restorable", "name": "Restorable"}, headers=alice_headers
+    )
+    assert created.status_code == 200, created.text
+
+    # Middleware regression: the ":action" suffix used to leak into the
+    # extracted kb_id ("kb_restorable:rebuild"), making :rebuild 403 for every
+    # non-super-admin. An editor must reach the route (empty KB -> no-op 200).
+    grant = client.put(
+        "/admin/kbs/kb_restorable/acl",
+        json={"user_id": bob.id, "role": "kb_editor"},
+        headers=admin_headers,
+    )
+    assert grant.status_code == 200, grant.text
+    rebuild = client.post("/kbs/kb_restorable:rebuild", json={}, headers=bob_headers)
+    assert rebuild.status_code == 200, rebuild.text
+    assert rebuild.json()["documents"] == []
+
+    deleted = client.delete("/kbs/kb_restorable", headers=admin_headers)
+    assert deleted.status_code == 200, deleted.text
+
+    # Restore mirrors DELETE: super admin only — even the kb_owner is denied.
+    assert (
+        client.post("/kbs/kb_restorable:restore", headers=alice_headers).status_code
+        == 403
+    )
+
+    restored = client.post("/kbs/kb_restorable:restore", headers=admin_headers)
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["status"] == "active"
+    assert client.get("/kbs/kb_restorable", headers=alice_headers).status_code == 200
+
+    events = client.get("/admin/audit-events", headers=admin_headers)
+    assert any(event["event_type"] == "kb_restored" for event in events.json())
+
+
+def test_auth_me_profile_patch_and_logout(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, _alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path, api_key=None
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    # Profile fields default to null and PATCH sets them without invalidating
+    # the current token (token_version untouched).
+    me_before = client.get("/auth/me", headers=bob_headers)
+    assert me_before.status_code == 200
+    assert me_before.json()["user"]["display_name"] is None
+    version_before = me_before.json()["user"]["token_version"]
+
+    patched = client.patch(
+        "/auth/me",
+        json={"display_name": "  Bob B.  ", "email": "bob@corp.local"},
+        headers=bob_headers,
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["user"]["display_name"] == "Bob B."
+    assert patched.json()["user"]["email"] == "bob@corp.local"
+    assert patched.json()["user"]["token_version"] == version_before
+    assert client.get("/auth/me", headers=bob_headers).status_code == 200
+
+    # Omitted fields stay; explicit null clears; bad values are rejected.
+    cleared = client.patch("/auth/me", json={"email": None}, headers=bob_headers)
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["user"]["email"] is None
+    assert cleared.json()["user"]["display_name"] == "Bob B."
+    assert (
+        client.patch("/auth/me", json={"email": "not-an-email"}, headers=bob_headers).status_code
+        == 400
+    )
+    assert (
+        client.patch("/auth/me", json={"display_name": "   "}, headers=bob_headers).status_code
+        == 400
+    )
+
+    # Logout bumps token_version: the very token used is rejected afterwards.
+    logged_out = client.post("/auth/logout", headers=bob_headers)
+    assert logged_out.status_code == 200, logged_out.text
+    assert logged_out.json()["status"] == "logged_out"
+    assert client.get("/auth/me", headers=bob_headers).status_code == 401
+
+    bob_after = asyncio.run(user_service.get_user_or_404(bob.id))
+    fresh_headers = {"Authorization": f"Bearer {_token(user_service, bob_after)}"}
+    assert client.get("/auth/me", headers=fresh_headers).status_code == 200
+
+    events = client.get("/admin/audit-events", headers=admin_headers)
+    event_types = [event["event_type"] for event in events.json()]
+    assert "user_profile_updated" in event_types
+    assert "user_logged_out" in event_types
+
+    # Service keys have no interactive session: both endpoints refuse them.
+    key_created = client.post(
+        "/admin/service-api-keys",
+        json={"name": "svc", "kb_roles": {}},
+        headers=admin_headers,
+    )
+    assert key_created.status_code == 200, key_created.text
+    service_headers = {"X-API-Key": key_created.json()["api_key"]}
+    assert client.post("/auth/logout", headers=service_headers).status_code == 403
+    assert (
+        client.patch(
+            "/auth/me", json={"display_name": "svc"}, headers=service_headers
+        ).status_code
+        == 403
+    )
+
+
+def test_admin_overview_aggregates_platform(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, alice, _bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+
+    created = client.post(
+        "/kbs", json={"id": "kb_ov", "name": "Overview"}, headers=alice_headers
+    )
+    assert created.status_code == 200, created.text
+    texts = client.post(
+        "/kbs/kb_ov/documents:texts",
+        json={"documents": [{"text": "hello overview", "source_name": "n.md"}]},
+        headers=alice_headers,
+    )
+    assert texts.status_code == 200, texts.text
+
+    overview = client.get("/admin/overview", headers=admin_headers)
+    assert overview.status_code == 200, overview.text
+    body = overview.json()
+    assert body["kbs"]["by_status"].get("active", 0) >= 1
+    assert body["kbs"]["total"] >= 1
+    assert body["documents"]["total"] >= 1
+    assert body["jobs"]["total"] >= 1
+    assert body["counters"] == {"chunks": 0, "entities": 0, "relations": 0}
+    # admin + alice + bob from the harness seed.
+    assert body["enterprise"]["users_by_status"].get("active", 0) >= 3
+    assert body["enterprise"]["audit_events"] >= 1
+
+    # /admin prefix stays super-admin gated.
+    assert client.get("/admin/overview", headers=alice_headers).status_code == 403
+
+
+def test_enterprise_kb_graph_write_requires_admin(monkeypatch, tmp_path):
+    # The graph-write busy-guard reads shared pipeline state; bootstrap it
+    # like the real server lifespan does.
+    initialize_share_data()
+    try:
+        _run_enterprise_kb_graph_write_requires_admin(monkeypatch, tmp_path)
+    finally:
+        finalize_share_data()
+
+
+def _run_enterprise_kb_graph_write_requires_admin(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    created = client.post(
+        "/kbs", json={"id": "kb_graph_rbac", "name": "Graph RBAC"}, headers=alice_headers
+    )
+    assert created.status_code == 200, created.text
+
+    edit_payload = {
+        "entity_name": "Tesla",
+        "updated_data": {"description": "fixed description"},
+    }
+
+    # Graph reads stay viewer-level; graph writes escalate to kb_admin.
+    grant_viewer = client.put(
+        "/admin/kbs/kb_graph_rbac/acl",
+        json={"user_id": bob.id, "role": "kb_viewer"},
+        headers=admin_headers,
+    )
+    assert grant_viewer.status_code == 200, grant_viewer.text
+    assert (
+        client.get("/kbs/kb_graph_rbac/graph/entities", headers=bob_headers).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/kbs/kb_graph_rbac/graph/entity:edit",
+            json=edit_payload,
+            headers=bob_headers,
+        ).status_code
+        == 403
+    )
+
+    grant_editor = client.put(
+        "/admin/kbs/kb_graph_rbac/acl",
+        json={"user_id": bob.id, "role": "kb_editor"},
+        headers=admin_headers,
+    )
+    assert grant_editor.status_code == 200, grant_editor.text
+    assert (
+        client.post(
+            "/kbs/kb_graph_rbac/graph/entity:edit",
+            json=edit_payload,
+            headers=bob_headers,
+        ).status_code
+        == 403
+    )
+
+    # The kb_owner (rank above kb_admin) may curate the graph; audited.
+    edited = client.post(
+        "/kbs/kb_graph_rbac/graph/entity:edit",
+        json=edit_payload,
+        headers=alice_headers,
+    )
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["data"]["entity_name"] == "Tesla"
+
+    events = client.get("/admin/audit-events", headers=admin_headers)
+    assert any(
+        event["event_type"] == "kb_graph_entity_edited" for event in events.json()
     )

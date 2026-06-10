@@ -57,12 +57,18 @@ class EnterpriseUserResponse(BaseModel):
     token_version: int
     created_at: str
     updated_at: str
+    display_name: str | None = None
+    email: str | None = None
 
     @classmethod
     def from_record(cls, record: EnterpriseUserRecord) -> "EnterpriseUserResponse":
         data = record.to_dict()
         data.pop("password_hash", None)
-        data.pop("metadata", None)
+        metadata = data.pop("metadata", None) or {}
+        # Self-service profile fields live in user metadata; surface them as
+        # read-only response fields without exposing the raw metadata dict.
+        data.setdefault("display_name", metadata.get("display_name"))
+        data.setdefault("email", metadata.get("email"))
         return cls(**data)
 
 
@@ -107,6 +113,11 @@ class EnterpriseUserUpdateRequest(BaseModel):
 
 class EnterpriseUserResetPasswordRequest(BaseModel):
     password: str = Field(min_length=1)
+
+
+class EnterpriseProfileUpdateRequest(BaseModel):
+    display_name: str | None = None
+    email: str | None = None
 
 
 class EnterpriseACLGrantRequest(BaseModel):
@@ -382,7 +393,7 @@ def create_enterprise_routes(
         if principal.auth_method != "jwt":
             raise HTTPException(
                 status_code=403,
-                detail="User query settings are only available for interactive users",
+                detail="Only available for interactive users",
             )
         return principal
 
@@ -527,6 +538,41 @@ def create_enterprise_routes(
             user=EnterpriseUserResponse.from_record(user),
             principal=principal_payload(principal),
         )
+
+    @router.patch(
+        "/auth/me",
+        response_model=EnterpriseMeResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def update_current_enterprise_user(
+        request: Request, body: EnterpriseProfileUpdateRequest
+    ):
+        principal = require_interactive_user_principal(request)
+        user_service = get_enterprise_user_service(request)
+        # Omitted fields stay unchanged; explicit null clears (KB-PATCH style).
+        user = await user_service.update_own_profile(
+            principal.user_id,
+            display_name=body.display_name
+            if "display_name" in body.model_fields_set
+            else UNSET,
+            email=body.email if "email" in body.model_fields_set else UNSET,
+        )
+        return EnterpriseMeResponse(
+            user=EnterpriseUserResponse.from_record(user),
+            principal=principal_payload(principal),
+        )
+
+    @router.post(
+        "/auth/logout",
+        dependencies=[Depends(combined_auth)],
+    )
+    async def logout_current_user(request: Request):
+        """Log out everywhere: bump the caller's token_version so every
+        outstanding JWT (this one included) stops validating."""
+        principal = require_interactive_user_principal(request)
+        user_service = get_enterprise_user_service(request)
+        user = await user_service.logout_all_sessions(principal.user_id)
+        return {"status": "logged_out", "token_version": user.token_version}
 
     @router.get(
         "/auth/me/kbs/{kb_id}/query-settings",
@@ -739,6 +785,46 @@ def create_enterprise_routes(
             ],
             kb_acls=kb_acls,
         )
+
+    @router.get(
+        "/admin/overview",
+        dependencies=[Depends(combined_auth)],
+    )
+    async def admin_platform_overview(request: Request):
+        """Platform-wide JSON aggregates for an admin dashboard.
+
+        Super-admin gated via the /admin prefix guard. Control-plane only:
+        counts come from the metadata store and KB catalog, no LightRAG
+        instance is loaded (graph scale stays on per-KB ``graph/status``).
+        """
+        require_principal(request)
+        store = getattr(request.app.state, "metadata_store", None)
+        if store is None:
+            raise HTTPException(status_code=500, detail="Metadata store unavailable")
+        service = kb_service or getattr(request.app.state, "kb_service", None)
+        kbs_by_status: dict[str, int] = {}
+        if isinstance(service, KnowledgeBaseService):
+            for record in await service.list(include_deleted=True):
+                kbs_by_status[record.status] = kbs_by_status.get(record.status, 0) + 1
+        control = await store.aggregate_control_plane_stats(None)
+        enterprise = await store.aggregate_enterprise_stats()
+        documents_by_status = control["documents_by_status"]
+        jobs_by_status = control["jobs_by_status"]
+        return {
+            "kbs": {"total": sum(kbs_by_status.values()), "by_status": kbs_by_status},
+            "documents": {
+                "total": sum(documents_by_status.values()),
+                "by_status": documents_by_status,
+            },
+            "counters": control["document_counters"],
+            "jobs": {
+                "total": sum(jobs_by_status.values()),
+                "by_status": jobs_by_status,
+                "dead_letter": control["dead_letter_jobs"],
+            },
+            "artifacts": {"total": control["artifacts"]},
+            "enterprise": enterprise,
+        }
 
     @router.post(
         "/admin/users/{user_id}:disable",

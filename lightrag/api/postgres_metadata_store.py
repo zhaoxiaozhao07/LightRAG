@@ -903,6 +903,92 @@ class PostgresMetadataStore:
             raise MetadataRecordNotFoundError(f"Artifact '{artifact_id}' not found")
         return _artifact_from_row(row)
 
+    async def aggregate_control_plane_stats(
+        self, kb_id: str | None = None
+    ) -> dict[str, Any]:
+        """Control-plane aggregates for the stats endpoints.
+
+        Mirrors ``SQLiteMetadataStore.aggregate_control_plane_stats``; document
+        counters are not projected columns in PostgreSQL so they are summed
+        from ``data_json``.
+        """
+        await self._ensure_initialized()
+        where = "" if kb_id is None else " WHERE kb_id = $1"
+        params: list[Any] = [] if kb_id is None else [kb_id]
+        async with self._pool_or_raise().acquire() as conn:
+            documents_by_status = {
+                str(row["status"]): int(row["count"])
+                for row in await conn.fetch(
+                    "SELECT status, COUNT(*) AS count FROM kb_documents"
+                    f"{where} GROUP BY status",
+                    *params,
+                )
+            }
+            counter_row = await conn.fetchrow(
+                "SELECT "
+                "COALESCE(SUM((data_json->>'chunks_count')::bigint), 0) AS chunks, "
+                "COALESCE(SUM((data_json->>'entity_count')::bigint), 0) AS entities, "
+                "COALESCE(SUM((data_json->>'relation_count')::bigint), 0) AS relations "
+                f"FROM kb_documents{where}",
+                *params,
+            )
+            jobs_by_status = {
+                str(row["status"]): int(row["count"])
+                for row in await conn.fetch(
+                    f"SELECT status, COUNT(*) AS count FROM kb_jobs{where} GROUP BY status",
+                    *params,
+                )
+            }
+            dead_letter_where = (
+                " WHERE kb_id = $1 AND " if kb_id is not None else " WHERE "
+            )
+            dead_letter = await conn.fetchval(
+                f"SELECT COUNT(*) FROM kb_jobs{dead_letter_where}"
+                "status = 'failed' AND retry_count >= max_retries",
+                *params,
+            )
+            artifacts = await conn.fetchval(
+                f"SELECT COUNT(*) FROM kb_document_artifacts{where}", *params
+            )
+        return {
+            "documents_by_status": documents_by_status,
+            "document_counters": {
+                "chunks": int(counter_row["chunks"]),
+                "entities": int(counter_row["entities"]),
+                "relations": int(counter_row["relations"]),
+            },
+            "jobs_by_status": jobs_by_status,
+            "dead_letter_jobs": int(dead_letter or 0),
+            "artifacts": int(artifacts or 0),
+        }
+
+    async def aggregate_enterprise_stats(self) -> dict[str, Any]:
+        """Platform-wide enterprise aggregates for ``GET /admin/overview``."""
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            users_by_status = {
+                str(row["status"]): int(row["count"])
+                for row in await conn.fetch(
+                    "SELECT status, COUNT(*) AS count FROM enterprise_users GROUP BY status"
+                )
+            }
+            tenants = await conn.fetchval("SELECT COUNT(*) FROM enterprise_tenants")
+            api_keys_by_status = {
+                str(row["status"]): int(row["count"])
+                for row in await conn.fetch(
+                    "SELECT status, COUNT(*) AS count FROM enterprise_api_keys GROUP BY status"
+                )
+            }
+            audit_events = await conn.fetchval(
+                "SELECT COUNT(*) FROM enterprise_audit_events"
+            )
+        return {
+            "users_by_status": users_by_status,
+            "tenants": int(tenants or 0),
+            "api_keys_by_status": api_keys_by_status,
+            "audit_events": int(audit_events or 0),
+        }
+
     async def count_active_jobs_for_principal(self, subject_id: str) -> int:
         """Count in-flight jobs (queued/running/retrying/cancelling) across all
         KBs attributed to a principal via ``payload._principal.subject_id``."""

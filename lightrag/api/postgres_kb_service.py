@@ -10,8 +10,10 @@ from lightrag.api.kb_service import (
     KB_STATUS_VALUES,
     VISIBILITY_VALUES,
     _UNSET,
+    _merge_kb_metadata,
     _optional_string,
     _require_string,
+    _validate_kb_metadata,
     KnowledgeBaseConflictError,
     KnowledgeBaseNotFoundError,
     KnowledgeBaseRecord,
@@ -137,6 +139,7 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
         owner_id: str | None = None,
         tenant_id: str | None = None,
         visibility: KnowledgeBaseVisibility = "private",
+        metadata: dict[str, Any] | None = None,
     ) -> KnowledgeBaseRecord:
         await self._ensure_initialized()
         import uuid
@@ -147,6 +150,9 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
             raise ValueError("Knowledge base name cannot be empty")
         if visibility not in VISIBILITY_VALUES:
             raise ValueError("Invalid knowledge base visibility")
+        normalized_metadata = (
+            _validate_kb_metadata(dict(metadata)) if metadata else {}
+        )
         now = utc_now_iso()
         record = KnowledgeBaseRecord(
             id=normalized_id,
@@ -161,6 +167,7 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
             created_at=now,
             updated_at=now,
             deleted_at=None,
+            metadata=normalized_metadata,
         )
         async with self._pool_or_raise().acquire() as conn:
             async with conn.transaction():
@@ -214,6 +221,7 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
         tenant_id: UpdateField = _UNSET,
         visibility: UpdateField = _UNSET,
         active_config_version_id: UpdateField = _UNSET,
+        metadata: Any = _UNSET,
     ) -> KnowledgeBaseRecord:
         await self._ensure_initialized()
         normalized_id = validate_kb_id(kb_id)
@@ -260,6 +268,8 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
                     updated["active_config_version_id"] = _optional_string(
                         active_config_version_id, "Active config version id"
                     )
+                if metadata is not _UNSET:
+                    updated["metadata"] = _merge_kb_metadata(record.metadata, metadata)
                 updated["updated_at"] = utc_now_iso()
                 next_record = KnowledgeBaseRecord.from_dict(updated)
                 await self._save_record(conn, next_record)
@@ -291,6 +301,38 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
                 deleted_record = KnowledgeBaseRecord.from_dict(updated)
                 await self._save_record(conn, deleted_record)
                 return deleted_record
+
+    async def restore(self, kb_id: str) -> KnowledgeBaseRecord:
+        """Restore a soft-deleted knowledge base back to ``active``.
+
+        Raises ``KnowledgeBaseNotFoundError`` for an unknown id and
+        ``ValueError`` when the record is not currently soft-deleted (the
+        caller maps that to HTTP 409).
+        """
+        await self._ensure_initialized()
+        normalized_id = validate_kb_id(kb_id)
+        async with self._pool_or_raise().acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT data_json FROM kb_catalog WHERE id = $1 FOR UPDATE",
+                    normalized_id,
+                )
+                if row is None:
+                    raise KnowledgeBaseNotFoundError(
+                        f"Knowledge base '{normalized_id}' not found"
+                    )
+                record = _record_from_row(row)
+                if record.status != "deleted":
+                    raise ValueError(
+                        f"Knowledge base '{normalized_id}' is not deleted"
+                    )
+                updated = record.to_dict()
+                updated["status"] = "active"
+                updated["updated_at"] = utc_now_iso()
+                updated["deleted_at"] = None
+                restored_record = KnowledgeBaseRecord.from_dict(updated)
+                await self._save_record(conn, restored_record)
+                return restored_record
 
     async def purge(self, kb_id: str) -> bool:
         """Hard-remove the kb_catalog row so the kb_id (and its workspace)

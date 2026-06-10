@@ -1327,6 +1327,75 @@ class UserService:
         )
         return saved
 
+    async def logout_all_sessions(self, user_id: str) -> EnterpriseUserRecord:
+        """Invalidate every outstanding token for the user ("log out all
+        devices") by bumping ``token_version``."""
+        user = await self.get_user_or_404(user_id)
+        updated = replace(
+            user,
+            token_version=user.token_version + 1,
+            updated_at=utc_now_iso(),
+        )
+        saved = await self._metadata_store.upsert_enterprise_user(updated)
+        await self._audit(
+            "user_logged_out",
+            actor_user_id=user_id,
+            target_type="user",
+            target_id=saved.id,
+        )
+        return saved
+
+    async def update_own_profile(
+        self,
+        user_id: str,
+        *,
+        display_name: Any = UNSET,
+        email: Any = UNSET,
+    ) -> EnterpriseUserRecord:
+        """Update self-service profile fields stored in user metadata.
+
+        ``UNSET`` keeps a field, an explicit ``None`` clears it, and a
+        non-blank string sets it. Profile changes do NOT bump
+        ``token_version`` — they are not security-relevant.
+        """
+        user = await self.get_user_or_404(user_id)
+        metadata = dict(user.metadata)
+
+        def _apply(key: str, value: Any, max_length: int) -> None:
+            if value is UNSET:
+                return
+            if value is None:
+                metadata.pop(key, None)
+                return
+            if not isinstance(value, str) or not value.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{key} must be a non-empty string or null to clear it",
+                )
+            normalized = value.strip()
+            if len(normalized) > max_length:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{key} must be at most {max_length} characters",
+                )
+            if key == "email" and "@" not in normalized:
+                raise HTTPException(status_code=400, detail="Invalid email address")
+            metadata[key] = normalized
+
+        _apply("display_name", display_name, 64)
+        _apply("email", email, 254)
+        if metadata == user.metadata:
+            return user
+        updated = replace(user, metadata=metadata, updated_at=utc_now_iso())
+        saved = await self._metadata_store.upsert_enterprise_user(updated)
+        await self._audit(
+            "user_profile_updated",
+            actor_user_id=user_id,
+            target_type="user",
+            target_id=saved.id,
+        )
+        return saved
+
     async def principal_from_token_info(self, token_info: dict[str, Any]) -> Principal:
         metadata = token_info.get("metadata", {})
         if not isinstance(metadata, dict):
@@ -2037,6 +2106,11 @@ async def enforce_enterprise_request_access(
         authz.require_super_admin(principal)
         return
 
+    if method == "POST" and path.rstrip("/") == f"/kbs/{kb_id}:restore":
+        # Restoring a soft-deleted KB is the inverse of DELETE — same tier.
+        authz.require_super_admin(principal)
+        return
+
     if method == "PATCH" and path.rstrip("/") == f"/kbs/{kb_id}":
         await authz.require_kb_role(principal, kb_id, KB_ROLE_ADMIN)
         return
@@ -2048,7 +2122,10 @@ async def enforce_enterprise_request_access(
         return
 
     if "/graph" in path or path.endswith("/status"):
-        await authz.require_kb_role(principal, kb_id, KB_ROLE_VIEWER)
+        # Graph reads stay viewer-level; graph writes (entity/relation
+        # edit/create/merge/delete) are knowledge surgery and require admin.
+        minimum = KB_ROLE_VIEWER if method == "GET" else KB_ROLE_ADMIN
+        await authz.require_kb_role(principal, kb_id, minimum)
         return
 
     if "/configs" in path:
@@ -2499,7 +2576,12 @@ def _normalize_registration_mode(mode: str) -> str:
 def _extract_kb_id(path: str) -> str | None:
     parts = [part for part in path.split("/") if part]
     if len(parts) >= 2 and parts[0] == "kbs":
-        return parts[1]
+        # KB-level custom actions keep the verb in the same path segment
+        # ("/kbs/{kb_id}:rebuild", "/kbs/{kb_id}:restore"); kb ids themselves
+        # can never contain ":" (validate_kb_id), so strip the suffix instead
+        # of treating "kb_x:rebuild" as a (non-existent) kb id.
+        kb_segment = parts[1].split(":", 1)[0]
+        return kb_segment or None
     return None
 
 

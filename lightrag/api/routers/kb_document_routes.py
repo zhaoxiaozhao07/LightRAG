@@ -517,6 +517,49 @@ class BatchDeleteDocumentsRequest(BaseModel):
         return value
 
 
+class BatchSetDocumentsEnabledRequest(BaseModel):
+    document_ids: list[str] = Field(
+        min_length=1, max_length=_MAX_KB_BATCH_PARSE_DOCUMENTS
+    )
+
+    @field_validator("document_ids", mode="after")
+    @classmethod
+    def reject_duplicate_document_ids(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("Duplicate document_ids are not allowed")
+        return value
+
+
+class BatchSetDocumentsEnabledItem(BaseModel):
+    document_id: str
+    status: Literal["updated", "not_found"]
+
+
+class BatchSetDocumentsEnabledResponse(BaseModel):
+    enabled: bool
+    updated: int
+    not_found: int
+    items: list[BatchSetDocumentsEnabledItem]
+
+
+class DocumentChunkItem(BaseModel):
+    id: str
+    chunk_order_index: Optional[int] = None
+    tokens: Optional[int] = None
+    content: Optional[str] = None
+    file_path: Optional[str] = None
+
+
+class DocumentChunksResponse(BaseModel):
+    kb_id: str
+    document_id: str
+    lightrag_doc_id: Optional[str] = None
+    total: int
+    limit: int
+    offset: int
+    chunks: list[DocumentChunkItem]
+
+
 class JobCancelResponse(BaseModel):
     job: "JobResponse"
     cancelled: bool
@@ -3727,6 +3770,89 @@ def create_kb_document_routes(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @router.get(
+        "/{kb_id}/documents/{document_id}/chunks",
+        response_model=DocumentChunksResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="List the engine text chunks built from one document",
+    )
+    async def list_document_chunks(
+        kb_id: str,
+        document_id: str,
+        limit: int = 50,
+        offset: int = 0,
+    ):
+        """Retrieval-explainability view of a built document.
+
+        Resolves ``lightrag_doc_id`` -> engine doc_status ``chunks_list`` ->
+        ``text_chunks`` rows, ordered by ``chunk_order_index``. Documents that
+        have not been built yet (no ``lightrag_doc_id``) return an empty page
+        without loading the engine instance.
+        """
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        try:
+            document = await document_service.get_document(kb_id, document_id)
+        except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not document.lightrag_doc_id:
+            return DocumentChunksResponse(
+                kb_id=kb_id,
+                document_id=document.id,
+                lightrag_doc_id=None,
+                total=0,
+                limit=limit,
+                offset=offset,
+                chunks=[],
+            )
+        if registry is None:
+            raise HTTPException(
+                status_code=503, detail="LightRAG registry is not configured"
+            )
+        rag = cast(Any, await registry.get(kb_id))
+        doc_status_store = getattr(rag, "doc_status", None)
+        text_chunks_store = getattr(rag, "text_chunks", None)
+        if doc_status_store is None or text_chunks_store is None:
+            raise HTTPException(
+                status_code=503, detail="Engine chunk storages are unavailable"
+            )
+        status_row = await doc_status_store.get_by_id(document.lightrag_doc_id)
+        if isinstance(status_row, dict):
+            chunk_ids = list(status_row.get("chunks_list") or [])
+        else:
+            chunk_ids = list(getattr(status_row, "chunks_list", None) or [])
+        rows = await text_chunks_store.get_by_ids(chunk_ids) if chunk_ids else []
+        items: list[DocumentChunkItem] = []
+        for chunk_id, row in zip(chunk_ids, rows):
+            if not isinstance(row, dict):
+                continue
+            items.append(
+                DocumentChunkItem(
+                    id=chunk_id,
+                    chunk_order_index=row.get("chunk_order_index"),
+                    tokens=row.get("tokens"),
+                    content=row.get("content"),
+                    file_path=row.get("file_path"),
+                )
+            )
+        items.sort(
+            key=lambda item: (
+                item.chunk_order_index is None,
+                item.chunk_order_index or 0,
+            )
+        )
+        return DocumentChunksResponse(
+            kb_id=kb_id,
+            document_id=document.id,
+            lightrag_doc_id=document.lightrag_doc_id,
+            total=len(items),
+            limit=limit,
+            offset=offset,
+            chunks=items[offset : offset + limit],
+        )
+
     @router.post(
         "/{kb_id}/documents/{document_id}:enable",
         response_model=DocumentResponse,
@@ -3750,6 +3876,89 @@ def create_kb_document_routes(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def _batch_set_documents_enabled(
+        kb_id: str,
+        http_request: Request,
+        request: BatchSetDocumentsEnabledRequest,
+        *,
+        enabled: bool,
+    ) -> BatchSetDocumentsEnabledResponse:
+        """Synchronous control-plane bulk toggle (same semantics as the
+        single-document ``:enable`` / ``:disable`` actions, no job created).
+
+        Missing documents are reported per item instead of failing the batch;
+        re-applying the current state still counts as ``updated`` (idempotent).
+        """
+        items: list[BatchSetDocumentsEnabledItem] = []
+        updated_ids: list[str] = []
+        try:
+            for document_id in request.document_ids:
+                try:
+                    document = await document_service.update_document(
+                        kb_id, document_id, enabled=enabled
+                    )
+                except MetadataRecordNotFoundError:
+                    items.append(
+                        BatchSetDocumentsEnabledItem(
+                            document_id=document_id, status="not_found"
+                        )
+                    )
+                    continue
+                updated_ids.append(document.id)
+                items.append(
+                    BatchSetDocumentsEnabledItem(
+                        document_id=document.id, status="updated"
+                    )
+                )
+        except KnowledgeBaseNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await _append_kb_document_audit_event(
+            http_request,
+            "document_batch_enabled" if enabled else "document_batch_disabled",
+            kb_id,
+            _document_audit_metadata(
+                operation="batch_enable_documents"
+                if enabled
+                else "batch_disable_documents",
+                document_ids=updated_ids,
+                not_found_count=len(items) - len(updated_ids),
+            ),
+        )
+        return BatchSetDocumentsEnabledResponse(
+            enabled=enabled,
+            updated=len(updated_ids),
+            not_found=len(items) - len(updated_ids),
+            items=items,
+        )
+
+    @router.post(
+        "/{kb_id}/documents:batch-enable",
+        response_model=BatchSetDocumentsEnabledResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Enable a batch of knowledge base documents",
+    )
+    async def batch_enable_documents(
+        kb_id: str, http_request: Request, request: BatchSetDocumentsEnabledRequest
+    ):
+        return await _batch_set_documents_enabled(
+            kb_id, http_request, request, enabled=True
+        )
+
+    @router.post(
+        "/{kb_id}/documents:batch-disable",
+        response_model=BatchSetDocumentsEnabledResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Disable a batch of knowledge base documents",
+    )
+    async def batch_disable_documents(
+        kb_id: str, http_request: Request, request: BatchSetDocumentsEnabledRequest
+    ):
+        return await _batch_set_documents_enabled(
+            kb_id, http_request, request, enabled=False
+        )
 
     @router.post(
         "/{kb_id}/documents:sync",

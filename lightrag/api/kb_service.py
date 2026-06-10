@@ -5,7 +5,7 @@ import json
 import os
 import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -38,6 +38,45 @@ class _UnsetType:
 
 _UNSET = _UnsetType()
 UpdateField = str | None | _UnsetType
+
+_MAX_KB_METADATA_BYTES = 16 * 1024
+
+
+def _validate_kb_metadata(value: dict[str, Any]) -> dict[str, Any]:
+    """Validate a free-form KB metadata dict (string keys, bounded size)."""
+    if not isinstance(value, dict):
+        raise ValueError("Knowledge base metadata must be an object")
+    for key in value:
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("Knowledge base metadata keys must be non-empty strings")
+    size = len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+    if size > _MAX_KB_METADATA_BYTES:
+        raise ValueError(
+            "Knowledge base metadata too large. "
+            f"Maximum size: {_MAX_KB_METADATA_BYTES} bytes"
+        )
+    return value
+
+
+def _merge_kb_metadata(
+    existing: dict[str, Any], patch: Any
+) -> dict[str, Any]:
+    """Merge a PATCH metadata payload over the stored dict.
+
+    Document-PATCH semantics: provided keys overwrite, an explicit ``None``
+    value deletes the key; untouched keys are preserved.
+    """
+    if not isinstance(patch, dict):
+        raise ValueError("Knowledge base metadata must be an object")
+    merged = dict(existing)
+    for key, value in patch.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("Knowledge base metadata keys must be non-empty strings")
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    return _validate_kb_metadata(merged)
 
 
 def utc_now_iso() -> str:
@@ -161,6 +200,7 @@ class KnowledgeBaseRecord:
     created_at: str
     updated_at: str
     deleted_at: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "KnowledgeBaseRecord":
@@ -177,6 +217,7 @@ class KnowledgeBaseRecord:
             created_at=str(data["created_at"]),
             updated_at=str(data["updated_at"]),
             deleted_at=data.get("deleted_at"),
+            metadata=dict(data.get("metadata") or {}),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -223,6 +264,7 @@ class KnowledgeBaseService:
         owner_id: str | None = None,
         tenant_id: str | None = None,
         visibility: KnowledgeBaseVisibility = "private",
+        metadata: dict[str, Any] | None = None,
     ) -> KnowledgeBaseRecord:
         normalized_id = (
             validate_kb_id(kb_id) if kb_id is not None else f"kb_{uuid4().hex[:12]}"
@@ -232,6 +274,9 @@ class KnowledgeBaseService:
             raise ValueError("Knowledge base name cannot be empty")
         if visibility not in VISIBILITY_VALUES:
             raise ValueError("Invalid knowledge base visibility")
+        normalized_metadata = (
+            _validate_kb_metadata(dict(metadata)) if metadata else {}
+        )
 
         async with self._lock:
             with _MetadataFileLock(self.lock_path):
@@ -256,6 +301,7 @@ class KnowledgeBaseService:
                     created_at=now,
                     updated_at=now,
                     deleted_at=None,
+                    metadata=normalized_metadata,
                 )
                 self._records[normalized_id] = record
                 self._write_metadata_locked()
@@ -295,6 +341,7 @@ class KnowledgeBaseService:
         tenant_id: UpdateField = _UNSET,
         visibility: UpdateField = _UNSET,
         active_config_version_id: UpdateField = _UNSET,
+        metadata: Any = _UNSET,
     ) -> KnowledgeBaseRecord:
         normalized_id = validate_kb_id(kb_id)
         async with self._lock:
@@ -332,6 +379,8 @@ class KnowledgeBaseService:
                     updated["active_config_version_id"] = _optional_string(
                         active_config_version_id, "Active config version id"
                     )
+                if metadata is not _UNSET:
+                    updated["metadata"] = _merge_kb_metadata(record.metadata, metadata)
                 updated["updated_at"] = utc_now_iso()
 
                 next_record = KnowledgeBaseRecord.from_dict(updated)
@@ -359,6 +408,35 @@ class KnowledgeBaseService:
                 self._records[normalized_id] = deleted_record
                 self._write_metadata_locked()
                 return deleted_record
+
+    async def restore(self, kb_id: str) -> KnowledgeBaseRecord:
+        """Restore a soft-deleted knowledge base back to ``active``.
+
+        Raises ``KnowledgeBaseNotFoundError`` for an unknown id and
+        ``ValueError`` when the record is not currently soft-deleted (the
+        caller maps that to HTTP 409).
+        """
+        normalized_id = validate_kb_id(kb_id)
+        async with self._lock:
+            with _MetadataFileLock(self.lock_path):
+                self._reload_metadata_locked()
+                record = self._records.get(normalized_id)
+                if record is None:
+                    raise KnowledgeBaseNotFoundError(
+                        f"Knowledge base '{normalized_id}' not found"
+                    )
+                if record.status != "deleted":
+                    raise ValueError(
+                        f"Knowledge base '{normalized_id}' is not deleted"
+                    )
+                updated = record.to_dict()
+                updated["status"] = "active"
+                updated["updated_at"] = utc_now_iso()
+                updated["deleted_at"] = None
+                restored_record = KnowledgeBaseRecord.from_dict(updated)
+                self._records[normalized_id] = restored_record
+                self._write_metadata_locked()
+                return restored_record
 
     async def purge(self, kb_id: str) -> bool:
         """Hard-remove the catalog entry so the kb_id becomes reusable.

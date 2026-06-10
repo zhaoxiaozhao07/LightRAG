@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 
 from lightrag.api.kb_service import KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
+from lightrag.base import DeletionResult
+from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
 from lightrag.types import KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode
 
 _original_argv = sys.argv[:]
@@ -41,9 +43,98 @@ class FakeGraphRAG:
         self.workspace = workspace
         self._labels = labels if labels is not None else ["Alice", "Bob", "Acme", "Paris"]
         self.chunk_entity_relation_graph = _FakeGraphStore(self._labels)
+        self.edit_entity_calls: list[tuple] = []
+        self.relation_edit_calls: list[tuple] = []
 
     async def finalize_storages(self) -> None:
         return None
+
+    async def aedit_entity(
+        self,
+        entity_name: str,
+        updated_data: dict,
+        allow_rename: bool = True,
+        allow_merge: bool = False,
+    ) -> dict:
+        if entity_name not in self._labels:
+            raise ValueError(f"Entity '{entity_name}' does not exist")
+        self.edit_entity_calls.append(
+            (entity_name, updated_data, allow_rename, allow_merge)
+        )
+        final_name = updated_data.get("entity_name", entity_name)
+        return {
+            "entity_name": final_name,
+            "description": updated_data.get("description", "unchanged"),
+            "operation_summary": {
+                "merged": False,
+                "merge_status": "not_attempted",
+                "merge_error": None,
+                "operation_status": "success",
+                "target_entity": None,
+                "final_entity": final_name,
+                "renamed": final_name != entity_name,
+            },
+        }
+
+    async def acreate_entity(self, entity_name: str, entity_data: dict) -> dict:
+        if entity_name in self._labels:
+            raise ValueError(f"Entity '{entity_name}' already exists")
+        self._labels.append(entity_name)
+        return {"entity_name": entity_name, **entity_data}
+
+    async def amerge_entities(
+        self,
+        source_entities: list[str],
+        target_entity: str,
+        merge_strategy: dict | None = None,
+        target_entity_data: dict | None = None,
+    ) -> dict:
+        missing = [name for name in source_entities if name not in self._labels]
+        if missing:
+            raise ValueError(f"Entities do not exist: {missing}")
+        for name in source_entities:
+            self._labels.remove(name)
+        return {"entity_name": target_entity}
+
+    async def aedit_relation(
+        self, source_entity: str, target_entity: str, updated_data: dict
+    ) -> dict:
+        self.relation_edit_calls.append((source_entity, target_entity, updated_data))
+        return {"src_id": source_entity, "tgt_id": target_entity, **updated_data}
+
+    async def acreate_relation(
+        self, source_entity: str, target_entity: str, relation_data: dict
+    ) -> dict:
+        return {"src_id": source_entity, "tgt_id": target_entity, **relation_data}
+
+    async def adelete_by_entity(self, entity_name: str) -> DeletionResult:
+        if entity_name not in self._labels:
+            return DeletionResult(
+                status="not_found",
+                doc_id=entity_name,
+                message=f"Entity '{entity_name}' not found",
+                status_code=404,
+                file_path="",
+            )
+        self._labels.remove(entity_name)
+        return DeletionResult(
+            status="success",
+            doc_id=entity_name,
+            message="deleted",
+            status_code=200,
+            file_path="",
+        )
+
+    async def adelete_by_relation(
+        self, source_entity: str, target_entity: str
+    ) -> DeletionResult:
+        return DeletionResult(
+            status="success",
+            doc_id=f"{source_entity}->{target_entity}",
+            message="deleted",
+            status_code=200,
+            file_path="",
+        )
 
     async def get_graph_labels(self) -> list[str]:
         return list(self._labels)
@@ -256,4 +347,121 @@ def test_kb_graph_entities_relations_subgraph_404_for_unknown_kb(tmp_path):
     )
     assert (
         client.get("/kbs/nope/graph?label=*", headers=_HEADERS).status_code == 404
+    )
+
+
+def test_kb_graph_write_endpoints_roundtrip(tmp_path):
+    # The busy-guard reads shared pipeline state; bootstrap it like the real
+    # server lifespan does so the guard takes its silent no-op path.
+    initialize_share_data()
+    try:
+        _run_kb_graph_write_endpoints_roundtrip(tmp_path)
+    finally:
+        finalize_share_data()
+
+
+def _run_kb_graph_write_endpoints_roundtrip(tmp_path):
+    client, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_curate")
+
+    created = client.post(
+        "/kbs/kb_curate/graph/entity:create",
+        json={
+            "entity_name": "Tesla",
+            "entity_data": {"description": "EV maker", "entity_type": "ORGANIZATION"},
+        },
+        headers=_HEADERS,
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["data"]["entity_name"] == "Tesla"
+
+    # Engine ValueError (duplicate entity) maps to 400.
+    duplicate = client.post(
+        "/kbs/kb_curate/graph/entity:create",
+        json={"entity_name": "Tesla", "entity_data": {}},
+        headers=_HEADERS,
+    )
+    assert duplicate.status_code == 400
+
+    edited = client.post(
+        "/kbs/kb_curate/graph/entity:edit",
+        json={"entity_name": "Alice", "updated_data": {"description": "a person"}},
+        headers=_HEADERS,
+    )
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["operation_summary"]["operation_status"] == "success"
+    assert probe.instances["kb_curate"].edit_entity_calls[0][0] == "Alice"
+
+    missing_edit = client.post(
+        "/kbs/kb_curate/graph/entity:edit",
+        json={"entity_name": "Ghost", "updated_data": {"description": "x"}},
+        headers=_HEADERS,
+    )
+    assert missing_edit.status_code == 400
+
+    relation = client.post(
+        "/kbs/kb_curate/graph/relation:create",
+        json={
+            "source_entity": "Alice",
+            "target_entity": "Tesla",
+            "relation_data": {"description": "works at", "weight": 1.0},
+        },
+        headers=_HEADERS,
+    )
+    assert relation.status_code == 200, relation.text
+    assert relation.json()["data"]["src_id"] == "Alice"
+
+    relation_edit = client.post(
+        "/kbs/kb_curate/graph/relation:edit",
+        json={
+            "source_entity": "Alice",
+            "target_entity": "Tesla",
+            "updated_data": {"weight": 2.0},
+        },
+        headers=_HEADERS,
+    )
+    assert relation_edit.status_code == 200, relation_edit.text
+    assert probe.instances["kb_curate"].relation_edit_calls[0][2] == {"weight": 2.0}
+
+    merged = client.post(
+        "/kbs/kb_curate/graph/entities:merge",
+        json={"source_entities": ["Bob"], "target_entity": "Alice"},
+        headers=_HEADERS,
+    )
+    assert merged.status_code == 200, merged.text
+    assert merged.json()["data"]["entity_name"] == "Alice"
+
+    relation_deleted = client.post(
+        "/kbs/kb_curate/graph/relation:delete",
+        json={"source_entity": "Alice", "target_entity": "Tesla"},
+        headers=_HEADERS,
+    )
+    assert relation_deleted.status_code == 200, relation_deleted.text
+    assert relation_deleted.json()["status"] == "success"
+
+    entity_deleted = client.post(
+        "/kbs/kb_curate/graph/entity:delete",
+        json={"entity_name": "Tesla"},
+        headers=_HEADERS,
+    )
+    assert entity_deleted.status_code == 200, entity_deleted.text
+
+    # Deleting again maps the engine's not_found result to 404.
+    assert (
+        client.post(
+            "/kbs/kb_curate/graph/entity:delete",
+            json={"entity_name": "Tesla"},
+            headers=_HEADERS,
+        ).status_code
+        == 404
+    )
+
+    # Unknown KB is 404 before any engine work.
+    assert (
+        client.post(
+            "/kbs/kb_ghost/graph/entity:create",
+            json={"entity_name": "X", "entity_data": {}},
+            headers=_HEADERS,
+        ).status_code
+        == 404
     )

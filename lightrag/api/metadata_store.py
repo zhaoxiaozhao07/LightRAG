@@ -1618,6 +1618,92 @@ class SQLiteMetadataStore:
             ).fetchall()
         return [JobRecord.from_row(row) for row in rows], int(total)
 
+    async def aggregate_control_plane_stats(
+        self, kb_id: str | None = None
+    ) -> dict[str, Any]:
+        """Control-plane aggregates for the stats endpoints.
+
+        Single GROUP-BY round trips on projected columns; ``kb_id=None``
+        aggregates across every knowledge base. Soft-deleted documents keep
+        their ``deleted`` status bucket; their counters were reset on delete
+        so the counter sums only reflect live index state.
+        """
+        await self._ensure_initialized()
+        where = "" if kb_id is None else " WHERE kb_id = ?"
+        params: list[Any] = [] if kb_id is None else [kb_id]
+        with self._connect() as conn:
+            documents_by_status = {
+                str(row[0]): int(row[1])
+                for row in conn.execute(
+                    f"SELECT status, COUNT(*) FROM documents{where} GROUP BY status",
+                    params,
+                ).fetchall()
+            }
+            counter_row = conn.execute(
+                "SELECT COALESCE(SUM(chunks_count), 0), "
+                "COALESCE(SUM(entity_count), 0), "
+                f"COALESCE(SUM(relation_count), 0) FROM documents{where}",
+                params,
+            ).fetchone()
+            jobs_by_status = {
+                str(row[0]): int(row[1])
+                for row in conn.execute(
+                    f"SELECT status, COUNT(*) FROM jobs{where} GROUP BY status",
+                    params,
+                ).fetchall()
+            }
+            dead_letter_where = (
+                " WHERE kb_id = ? AND " if kb_id is not None else " WHERE "
+            )
+            dead_letter = conn.execute(
+                f"SELECT COUNT(*) FROM jobs{dead_letter_where}"
+                "status = 'failed' AND retry_count >= max_retries",
+                params,
+            ).fetchone()[0]
+            artifacts = conn.execute(
+                f"SELECT COUNT(*) FROM document_artifacts{where}", params
+            ).fetchone()[0]
+        return {
+            "documents_by_status": documents_by_status,
+            "document_counters": {
+                "chunks": int(counter_row[0]),
+                "entities": int(counter_row[1]),
+                "relations": int(counter_row[2]),
+            },
+            "jobs_by_status": jobs_by_status,
+            "dead_letter_jobs": int(dead_letter),
+            "artifacts": int(artifacts),
+        }
+
+    async def aggregate_enterprise_stats(self) -> dict[str, Any]:
+        """Platform-wide enterprise aggregates for ``GET /admin/overview``."""
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            users_by_status = {
+                str(row[0]): int(row[1])
+                for row in conn.execute(
+                    "SELECT status, COUNT(*) FROM enterprise_users GROUP BY status"
+                ).fetchall()
+            }
+            tenants = conn.execute(
+                "SELECT COUNT(*) FROM enterprise_tenants"
+            ).fetchone()[0]
+            api_keys_by_status = {
+                str(row[0]): int(row[1])
+                for row in conn.execute(
+                    "SELECT status, COUNT(*) FROM enterprise_api_keys GROUP BY status"
+                ).fetchall()
+            }
+            audit_events = conn.execute(
+                "SELECT COUNT(*) FROM enterprise_audit_events"
+            ).fetchone()[0]
+        return {
+            "users_by_status": users_by_status,
+            "tenants": int(tenants),
+            "api_keys_by_status": api_keys_by_status,
+            "audit_events": int(audit_events),
+        }
+
     async def count_active_jobs_for_principal(self, subject_id: str) -> int:
         """Count in-flight jobs (queued/running/retrying/cancelling) across all
         KBs attributed to a principal via ``payload._principal.subject_id``."""

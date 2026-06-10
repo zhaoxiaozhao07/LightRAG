@@ -777,6 +777,49 @@ async def test_dead_letter_listing(store):
     assert total >= 1
 
 
+async def test_aggregate_stats_contract(store):
+    kb_id = _unique_kb(store)
+    doc_ready = _doc(kb_id, "doc_stats_a", status="ready")
+    doc_ready.chunks_count = 3
+    doc_ready.entity_count = 5
+    doc_ready.relation_count = 7
+    await store.create_documents_and_job(
+        [doc_ready, _doc(kb_id, "doc_stats_b", status="uploaded")],
+        _job(kb_id, "job_stats_dl", document_id="doc_stats_a", max_retries=0),
+    )
+    await store.transition_job(kb_id, "job_stats_dl", status="running")
+    await store.transition_job(
+        kb_id, "job_stats_dl", status="failed", error_code="boom"
+    )
+
+    stats = await store.aggregate_control_plane_stats(kb_id)
+    assert stats["documents_by_status"] == {"ready": 1, "uploaded": 1}
+    assert stats["document_counters"] == {"chunks": 3, "entities": 5, "relations": 7}
+    assert stats["jobs_by_status"] == {"failed": 1}
+    assert stats["dead_letter_jobs"] == 1
+    assert stats["artifacts"] == 0
+
+    # Global aggregation includes (at least) this KB's rows; exact totals are
+    # not asserted so a shared live database stays safe.
+    global_stats = await store.aggregate_control_plane_stats(None)
+    assert global_stats["documents_by_status"].get("ready", 0) >= 1
+    assert global_stats["dead_letter_jobs"] >= 1
+    assert global_stats["document_counters"]["chunks"] >= 3
+
+    # Enterprise aggregates: delta-based for the same reason.
+    before = await store.aggregate_enterprise_stats()
+    await store.upsert_enterprise_user(
+        _enterprise_user(f"stats_user_{uuid.uuid4().hex[:8]}")
+    )
+    after = await store.aggregate_enterprise_stats()
+    assert (
+        after["users_by_status"].get("active", 0)
+        == before["users_by_status"].get("active", 0) + 1
+    )
+    assert after["tenants"] >= before["tenants"]
+    assert after["audit_events"] >= before["audit_events"]
+
+
 async def test_worker_claim_is_single_winner(store):
     kb_id = _unique_kb(store)
     # Single-document parse job is worker-claimable.

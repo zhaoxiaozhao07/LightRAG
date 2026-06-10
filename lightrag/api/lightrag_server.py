@@ -2425,6 +2425,7 @@ def create_app(args):
             job_service,
             config_service=config_version_service,
             deletion_service=kb_deletion_service,
+            metadata_store=metadata_store,
         )
     )
     app.include_router(

@@ -609,3 +609,105 @@ def test_patch_status_deleted_is_rejected(tmp_path):
     detail = client.get("/kbs/kb_no_delete_status", headers=_HEADERS)
     assert detail.status_code == 200
     assert detail.json()["status"] != "deleted"
+
+
+def test_kb_restore_roundtrip(tmp_path):
+    client, _service, _registry, _probe = _build_client(tmp_path)
+    created = client.post(
+        "/kbs", json={"id": "kb_res", "name": "Restorable"}, headers=_HEADERS
+    )
+    assert created.status_code == 200, created.text
+
+    deleted = client.delete("/kbs/kb_res", headers=_HEADERS)
+    assert deleted.status_code == 200
+    assert client.get("/kbs/kb_res", headers=_HEADERS).status_code == 404
+
+    restored = client.post("/kbs/kb_res:restore", headers=_HEADERS)
+    assert restored.status_code == 200, restored.text
+    body = restored.json()
+    assert body["status"] == "active"
+    assert body["deleted_at"] is None
+    assert client.get("/kbs/kb_res", headers=_HEADERS).status_code == 200
+
+    # Restoring a live KB conflicts; restoring an unknown id is 404.
+    assert client.post("/kbs/kb_res:restore", headers=_HEADERS).status_code == 409
+    assert client.post("/kbs/kb_ghost:restore", headers=_HEADERS).status_code == 404
+
+
+def test_kb_restore_blocked_while_clear_kb_in_flight(tmp_path):
+    client, _metadata_store, _job_service, _registry, _probe = (
+        _build_durable_hard_delete_client(tmp_path)
+    )
+    created = client.post(
+        "/kbs", json={"id": "kb_res_hard", "name": "Hard Pending"}, headers=_HEADERS
+    )
+    assert created.status_code == 200, created.text
+
+    delete_response = client.delete("/kbs/kb_res_hard?hard=true", headers=_HEADERS)
+    assert delete_response.status_code == 200, delete_response.text
+    assert delete_response.json()["hard_delete_job_status"] == "queued"
+
+    blocked = client.post("/kbs/kb_res_hard:restore", headers=_HEADERS)
+    assert blocked.status_code == 409, blocked.text
+    detail = blocked.json()["detail"]
+    assert detail["error_code"] == "kb_hard_delete_in_progress"
+    assert detail["job_id"] == delete_response.json()["hard_delete_job_id"]
+
+
+def test_kb_metadata_create_merge_and_size_cap(tmp_path):
+    client, _service, _registry, _probe = _build_client(tmp_path)
+
+    created = client.post(
+        "/kbs",
+        json={
+            "id": "kb_meta",
+            "name": "Meta",
+            "metadata": {"tags": ["legal", "hr"], "team": "ops"},
+        },
+        headers=_HEADERS,
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["metadata"] == {"tags": ["legal", "hr"], "team": "ops"}
+
+    # Old records / omitted metadata default to an empty dict.
+    plain = client.post(
+        "/kbs", json={"id": "kb_meta_plain", "name": "Plain"}, headers=_HEADERS
+    )
+    assert plain.status_code == 200
+    assert plain.json()["metadata"] == {}
+
+    # PATCH merges: provided keys overwrite, null values delete, others stay.
+    patched = client.patch(
+        "/kbs/kb_meta",
+        json={"metadata": {"team": None, "stage": "prod"}},
+        headers=_HEADERS,
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["metadata"] == {"tags": ["legal", "hr"], "stage": "prod"}
+
+    listed = client.get("/kbs", headers=_HEADERS)
+    by_id = {item["id"]: item for item in listed.json()["knowledge_bases"]}
+    assert by_id["kb_meta"]["metadata"]["stage"] == "prod"
+
+    # Top-level null is rejected (metadata must be an object).
+    null_patch = client.patch(
+        "/kbs/kb_meta", json={"metadata": None}, headers=_HEADERS
+    )
+    assert null_patch.status_code == 400
+
+    # Oversized metadata (>16KB serialized) is rejected on create and PATCH.
+    oversized = {"blob": "x" * (16 * 1024 + 1)}
+    assert (
+        client.post(
+            "/kbs",
+            json={"id": "kb_meta_big", "name": "Big", "metadata": oversized},
+            headers=_HEADERS,
+        ).status_code
+        == 400
+    )
+    assert (
+        client.patch(
+            "/kbs/kb_meta", json={"metadata": oversized}, headers=_HEADERS
+        ).status_code
+        == 400
+    )

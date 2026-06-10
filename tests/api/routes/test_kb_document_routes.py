@@ -276,6 +276,7 @@ def _build_client(
             api_key=_API_KEY,
             job_service=job_service,
             config_service=config_service,
+            metadata_store=metadata_store,
         )
     )
     # wire_document_registry=False mimics "no parse worker wired": auto_parse
@@ -615,6 +616,205 @@ def test_enable_disable_document_actions_update_metadata_only(tmp_path):
     assert enabled.status_code == 200
     assert enabled.json()["enabled"] is True
     assert enabled.json()["status"] == "uploaded"
+
+
+def test_batch_enable_disable_documents(tmp_path):
+    client, _kb_service, _store, document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_batch_toggle")
+    upload = client.post(
+        "/kbs/kb_batch_toggle/documents:upload",
+        files=[
+            ("files", ("a.pdf", b"pdf-a", "application/pdf")),
+            ("files", ("b.pdf", b"pdf-b", "application/pdf")),
+        ],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200
+    doc_ids = [doc["id"] for doc in upload.json()["documents"]]
+
+    disabled = client.post(
+        "/kbs/kb_batch_toggle/documents:batch-disable",
+        json={"document_ids": doc_ids + ["doc_ghost"]},
+        headers=_HEADERS,
+    )
+    assert disabled.status_code == 200, disabled.text
+    body = disabled.json()
+    assert body["enabled"] is False
+    assert body["updated"] == 2
+    assert body["not_found"] == 1
+    statuses = {item["document_id"]: item["status"] for item in body["items"]}
+    assert statuses["doc_ghost"] == "not_found"
+    assert all(statuses[doc_id] == "updated" for doc_id in doc_ids)
+    for doc_id in doc_ids:
+        detail = client.get(
+            f"/kbs/kb_batch_toggle/documents/{doc_id}", headers=_HEADERS
+        )
+        assert detail.json()["enabled"] is False
+
+    # Re-enabling is idempotent and re-applying counts as updated.
+    enabled = client.post(
+        "/kbs/kb_batch_toggle/documents:batch-enable",
+        json={"document_ids": doc_ids},
+        headers=_HEADERS,
+    )
+    assert enabled.status_code == 200, enabled.text
+    assert enabled.json()["updated"] == 2
+    assert enabled.json()["not_found"] == 0
+    for doc_id in doc_ids:
+        detail = client.get(
+            f"/kbs/kb_batch_toggle/documents/{doc_id}", headers=_HEADERS
+        )
+        assert detail.json()["enabled"] is True
+
+    # Validation: duplicates 422, empty list 422, unknown KB 404.
+    duplicate = client.post(
+        "/kbs/kb_batch_toggle/documents:batch-enable",
+        json={"document_ids": [doc_ids[0], doc_ids[0]]},
+        headers=_HEADERS,
+    )
+    assert duplicate.status_code == 422
+    empty = client.post(
+        "/kbs/kb_batch_toggle/documents:batch-enable",
+        json={"document_ids": []},
+        headers=_HEADERS,
+    )
+    assert empty.status_code == 422
+    missing_kb = client.post(
+        "/kbs/kb_ghost/documents:batch-enable",
+        json={"document_ids": ["doc_x"]},
+        headers=_HEADERS,
+    )
+    assert missing_kb.status_code == 404
+
+
+def test_kb_stats_endpoint_aggregates_control_plane(tmp_path):
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_stats")
+    upload = client.post(
+        "/kbs/kb_stats/documents:upload",
+        files=[
+            ("files", ("a.pdf", b"pdf-a", "application/pdf")),
+            ("files", ("b.pdf", b"pdf-b", "application/pdf")),
+        ],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200, upload.text
+
+    stats = client.get("/kbs/kb_stats/stats", headers=_HEADERS)
+    assert stats.status_code == 200, stats.text
+    body = stats.json()
+    assert body["kb_id"] == "kb_stats"
+    assert body["documents"]["total"] == 2
+    assert body["documents"]["by_status"] == {"uploaded": 2}
+    assert body["counters"] == {"chunks": 0, "entities": 0, "relations": 0}
+    assert body["jobs"]["total"] >= 1
+    assert body["jobs"]["dead_letter"] == 0
+    assert body["artifacts"]["total"] == 0
+
+    assert client.get("/kbs/kb_ghost/stats", headers=_HEADERS).status_code == 404
+
+
+class _FakeKVStore:
+    def __init__(self, rows: dict[str, dict]):
+        self._rows = rows
+
+    async def get_by_id(self, id: str):
+        return self._rows.get(id)
+
+    async def get_by_ids(self, ids: list[str]):
+        return [self._rows.get(item) for item in ids]
+
+
+def test_document_chunks_endpoint_lists_engine_chunks(tmp_path):
+    class ChunkRAG(FakeRAG):
+        def __init__(self, workspace: str):
+            super().__init__(workspace)
+            self.doc_status = _FakeKVStore(
+                {"doc-lr-1": {"chunks_list": ["c2", "c1", "c_missing"]}}
+            )
+            self.text_chunks = _FakeKVStore(
+                {
+                    "c1": {
+                        "content": "first chunk",
+                        "tokens": 3,
+                        "chunk_order_index": 0,
+                        "file_path": "a.pdf",
+                    },
+                    "c2": {
+                        "content": "second chunk",
+                        "tokens": 4,
+                        "chunk_order_index": 1,
+                        "file_path": "a.pdf",
+                    },
+                }
+            )
+
+    class ChunkProbe(BuilderProbe):
+        async def build(self, record):
+            rag = ChunkRAG(record.workspace)
+            self.instances.append(rag)
+            return rag
+
+    probe = ChunkProbe()
+    client, _kb_service, store, _document_service, _job_service = _build_client(
+        tmp_path, probe=probe
+    )
+    _create_kb(client, "kb_chunks")
+    upload = client.post(
+        "/kbs/kb_chunks/documents:upload",
+        files=[("files", ("a.pdf", b"pdf", "application/pdf"))],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200, upload.text
+    doc_id = upload.json()["documents"][0]["id"]
+
+    # Not built yet: empty page, no engine instance needed.
+    empty = client.get(f"/kbs/kb_chunks/documents/{doc_id}/chunks", headers=_HEADERS)
+    assert empty.status_code == 200, empty.text
+    assert empty.json()["total"] == 0
+    assert empty.json()["chunks"] == []
+    assert empty.json()["lightrag_doc_id"] is None
+
+    # Simulate a parsed document wired to the engine doc id.
+    asyncio.run(
+        store.complete_document_parse(
+            "kb_chunks",
+            doc_id,
+            parser_hash="sha256:p",
+            lightrag_doc_id="doc-lr-1",
+            metadata_patch={},
+            artifacts=[],
+        )
+    )
+
+    listed = client.get(f"/kbs/kb_chunks/documents/{doc_id}/chunks", headers=_HEADERS)
+    assert listed.status_code == 200, listed.text
+    body = listed.json()
+    assert body["lightrag_doc_id"] == "doc-lr-1"
+    # Missing chunk rows are skipped; the rest sort by chunk_order_index.
+    assert body["total"] == 2
+    assert [chunk["id"] for chunk in body["chunks"]] == ["c1", "c2"]
+    assert body["chunks"][0]["content"] == "first chunk"
+    assert body["chunks"][0]["tokens"] == 3
+
+    paged = client.get(
+        f"/kbs/kb_chunks/documents/{doc_id}/chunks?limit=1&offset=1",
+        headers=_HEADERS,
+    )
+    assert paged.status_code == 200
+    assert [chunk["id"] for chunk in paged.json()["chunks"]] == ["c2"]
+    assert paged.json()["total"] == 2
+
+    assert (
+        client.get(
+            "/kbs/kb_chunks/documents/doc_ghost/chunks", headers=_HEADERS
+        ).status_code
+        == 404
+    )
 
 
 def test_delete_uploaded_unindexed_document_soft_deletes_without_lightrag(tmp_path):
