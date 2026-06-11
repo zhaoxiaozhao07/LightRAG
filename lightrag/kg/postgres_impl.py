@@ -42,6 +42,7 @@ from ..utils import (
     compute_mdhash_id,
     _cooperative_yield,
     performance_timing_log,
+    validate_workspace,
 )
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
 
@@ -2521,6 +2522,7 @@ class PGKVStorage(BaseKVStorage):
     db: PostgreSQLDB = field(default=None)
 
     def __post_init__(self):
+        validate_workspace(self.workspace)
         self._max_batch_size = 200  # DB batch size, independent of embedding batch size
         (
             self._max_upsert_payload_bytes,
@@ -3252,6 +3254,7 @@ class PGVectorStorage(BaseVectorStorage):
     db: PostgreSQLDB | None = field(default=None)
 
     def __post_init__(self):
+        validate_workspace(self.workspace)
         self._validate_embedding_func()
         self._max_batch_size = self.global_config["embedding_batch_num"]
         # DB-write batching limits (distinct from the embedding batch size above).
@@ -4767,6 +4770,7 @@ class PGDocStatusStorage(DocStatusStorage):
     db: PostgreSQLDB = field(default=None)
 
     def __post_init__(self):
+        validate_workspace(self.workspace)
         (
             self._max_upsert_payload_bytes,
             self._max_upsert_records_per_batch,
@@ -5868,6 +5872,7 @@ _GRAPH_ADVISORY_LOCK_SHARED_SQL = (
 @dataclass
 class PGGraphStorage(BaseGraphStorage):
     def __post_init__(self):
+        validate_workspace(self.workspace)
         # Graph name will be dynamically generated in initialize() based on workspace
         self.db: PostgreSQLDB | None = None
         # Chunk-level batching limits for the batch upsert / remove paths. The

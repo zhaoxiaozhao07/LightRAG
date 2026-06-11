@@ -150,6 +150,8 @@ class NanoVectorDBStorage(BaseVectorStorage):
     """
 
     def __post_init__(self):
+        # Reject path traversal before using workspace in a file path
+        validate_workspace(self.workspace)
         self._validate_embedding_func()
         # Initialize basic attributes
         self._client = None

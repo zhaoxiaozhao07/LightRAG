@@ -200,6 +200,8 @@ class FaissVectorDBStorage(BaseVectorStorage):
     """
 
     def __post_init__(self):
+        # Reject path traversal before using workspace in a file path
+        validate_workspace(self.workspace)
         self._validate_embedding_func()
         # Grab config values if available
         kwargs = self.global_config.get("vector_db_storage_cls_kwargs", {})
