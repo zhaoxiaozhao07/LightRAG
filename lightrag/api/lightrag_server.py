@@ -4,6 +4,7 @@ LightRAG FastAPI Server
 
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse, Response
 from fastapi.openapi.docs import (
     get_swagger_ui_html,
@@ -827,6 +828,34 @@ def check_frontend_build():
         return (True, False)  # Assume assets exist and up-to-date on error
 
 
+def _coerce_binary_string_schemas(node: Any) -> None:
+    """Rewrite OpenAPI 3.1 binary encodings back to the ``format: binary`` marker.
+
+    FastAPI (OpenAPI 3.1) describes file uploads as
+    ``{"type": "string", "contentMediaType": "application/octet-stream"}``. Swagger
+    UI only switches a field to its file-picker widget when it sees the OpenAPI 3.0
+    style ``format: "binary"`` — it ignores ``contentMediaType`` — so ``UploadFile``
+    / ``list[UploadFile]`` parameters otherwise render as plain text inputs in
+    ``/docs`` (forcing users to type a path, which can never upload a file). Walk
+    the generated schema and restore ``format: binary`` on every binary string
+    node. Mutates ``node`` in place; behaviour of the endpoints is unchanged — this
+    only affects the rendered OpenAPI document.
+    """
+    if isinstance(node, dict):
+        if node.get("type") == "string" and (
+            node.get("contentMediaType") == "application/octet-stream"
+            or node.get("contentEncoding")
+        ):
+            node.pop("contentMediaType", None)
+            node.pop("contentEncoding", None)
+            node["format"] = "binary"
+        for value in node.values():
+            _coerce_binary_string_schemas(value)
+    elif isinstance(node, list):
+        for value in node:
+            _coerce_binary_string_schemas(value)
+
+
 def create_app(args):
     # Check frontend build first and get status
     webui_assets_exist, is_frontend_outdated = check_frontend_build()
@@ -1085,6 +1114,26 @@ def create_app(args):
     }
 
     app = FastAPI(**app_kwargs)
+
+    # Make file-upload fields (UploadFile / list[UploadFile]) render as a
+    # file-picker in the offline Swagger UI. FastAPI emits OpenAPI 3.1 binary
+    # encodings (contentMediaType) that Swagger UI does not map to its upload
+    # widget; post-process the generated document to restore format: binary.
+    # See _coerce_binary_string_schemas. Wraps the original generator so all
+    # FastAPI openapi settings are preserved, and relies on app.openapi_schema
+    # caching so the walk runs only once.
+    _default_openapi = app.openapi
+
+    def _openapi_with_binary_fields():
+        if app.openapi_schema:
+            return app.openapi_schema
+        schema = _default_openapi()
+        _coerce_binary_string_schemas(schema)
+        app.openapi_schema = schema
+        return schema
+
+    app.openapi = _openapi_with_binary_fields
+
     app.state.enterprise_enabled = enterprise_enabled
     if enterprise_enabled:
         app.state.enterprise_user_service = enterprise_user_service
@@ -1125,8 +1174,15 @@ def create_app(args):
                 },
             )
         else:
-            # For other endpoints, return the default FastAPI validation error
-            return JSONResponse(status_code=422, content={"detail": exc.errors()})
+            # For other endpoints, return the default FastAPI validation error.
+            # Run errors() through jsonable_encoder: Pydantic v2 puts the raw
+            # ValueError object in error["ctx"]["error"] (e.g. a failed UploadFile
+            # validation), which the stdlib json.dumps inside JSONResponse cannot
+            # serialize -> 500 "Object of type ValueError is not JSON serializable".
+            # This mirrors FastAPI's own default request-validation handler.
+            return JSONResponse(
+                status_code=422, content={"detail": jsonable_encoder(exc.errors())}
+            )
 
     def get_cors_origins():
         """Get allowed origins from global_args
