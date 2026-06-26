@@ -1211,6 +1211,7 @@ username=admin&password=change-me
 | `POST` | `/admin/users/{user_id}:disable` | 禁用用户并递增 `token_version`，旧 token 失效 |
 | `POST` | `/admin/users/{user_id}:enable` | 启用用户并递增 `token_version` |
 | `POST` | `/admin/users/{user_id}:reset-password` | 重置用户密码并递增 `token_version` |
+| `DELETE` | `/admin/users/{user_id}` | 删除用户；级联清理租户 membership、KB ACL、个人查询设置；不允许删除 super admin |
 | `POST` | `/admin/users/{user_id}/kb-access:batch-set` | 按用户维度批量 grant/revoke 多个 KB ACL；与按 KB 维度 `/admin/kbs/{kb_id}/acl:batch-set` 互补 |
 | `POST` | `/admin/tenants` | 创建租户实体（可指定 `tenant_id`，省略则生成 `tenant_<hex>`；重复 `409`） |
 | `GET` | `/admin/tenants` | 列出所有租户 |
@@ -1272,7 +1273,7 @@ KB ACL 请求/响应约束：
 
 - 登录/注册设置：`login_success`、`login_failed`、`registration_failed`、`registration_locked`、`registration_setting_updated`
 - super admin bootstrap/sync：`super_admin_bootstrapped`、`super_admin_synced`
-- 用户管理：`user_created`、`user_updated`、`user_password_changed`、`user_profile_updated`、`user_logged_out`
+- 用户管理：`user_created`、`user_updated`、`user_deleted`、`user_password_changed`、`user_profile_updated`、`user_logged_out`
 - service API key：`service_api_key_created`、`service_api_key_rotated`、`service_api_key_revoked`
 - KB ACL / tenant：`kb_acl_granted`、`kb_acl_revoked`、`tenant_created`、`tenant_updated`、`tenant_deleted`、`tenant_membership_granted`、`tenant_membership_revoked`、`tenant_kb_acl_granted`、`tenant_kb_acl_revoked`
 - 权限/限流/配额：`permission_denied`、`rate_limited`、`quota_exceeded`

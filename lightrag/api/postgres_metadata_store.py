@@ -1426,6 +1426,33 @@ class PostgresMetadataStore:
 
         return await self._write(write)
 
+    async def delete_enterprise_user(self, user_id: str) -> bool:
+        """Delete a user and cascade-remove related tenant memberships, KB ACLs
+        and per-user query settings.  Returns ``True`` if the user existed."""
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> bool:
+            # Cascade: remove related records first.
+            await conn.execute(
+                "DELETE FROM enterprise_tenant_memberships WHERE user_id = $1",
+                user_id,
+            )
+            await conn.execute(
+                "DELETE FROM enterprise_kb_acl WHERE user_id = $1",
+                user_id,
+            )
+            await conn.execute(
+                "DELETE FROM enterprise_user_kb_query_settings WHERE user_id = $1",
+                user_id,
+            )
+            status = await conn.execute(
+                "DELETE FROM enterprise_users WHERE id = $1",
+                user_id,
+            )
+            return _rowcount(status) > 0
+
+        return await self._write(write)
+
     async def get_enterprise_user_kb_query_settings(
         self, user_id: str, kb_id: str
     ) -> EnterpriseUserKBQuerySettingsRecord | None:

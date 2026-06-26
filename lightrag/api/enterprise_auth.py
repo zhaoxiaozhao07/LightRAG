@@ -1236,6 +1236,18 @@ class UserService:
             can_delete_documents=can_delete_documents,
         )
         created = await self._metadata_store.upsert_enterprise_user(user)
+        # Keep user.tenant_id and enterprise_tenant_memberships in sync.
+        if tenant_id:
+            await self._metadata_store.upsert_tenant_membership(
+                EnterpriseTenantMembershipRecord(
+                    tenant_id=tenant_id,
+                    user_id=created.id,
+                    role=TENANT_ROLE_MEMBER,
+                    granted_by=created_by,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
         await self._audit(
             "user_created",
             actor_user_id=created_by,
@@ -1252,6 +1264,24 @@ class UserService:
         if user is None:
             raise HTTPException(status_code=404, detail="User not found")
         return user
+
+    async def delete_user(
+        self, user_id: str, *, actor_user_id: str | None = None
+    ) -> bool:
+        user = await self.get_user_or_404(user_id)
+        if user.system_role == SYSTEM_ROLE_SUPER_ADMIN:
+            raise HTTPException(
+                status_code=400, detail="Cannot delete a super admin"
+            )
+        deleted = await self._metadata_store.delete_enterprise_user(user_id)
+        if deleted:
+            await self._audit(
+                "user_deleted",
+                actor_user_id=actor_user_id,
+                target_type="user",
+                target_id=user_id,
+            )
+        return deleted
 
     async def update_user(
         self,
@@ -1300,6 +1330,24 @@ class UserService:
             updated_at=utc_now_iso(),
         )
         saved = await self._metadata_store.upsert_enterprise_user(updated)
+        # Keep user.tenant_id and enterprise_tenant_memberships in sync.
+        old_tenant_id = user.tenant_id
+        if new_tenant_id != old_tenant_id:
+            if old_tenant_id:
+                await self._metadata_store.delete_tenant_membership(
+                    old_tenant_id, user.id
+                )
+            if new_tenant_id:
+                await self._metadata_store.upsert_tenant_membership(
+                    EnterpriseTenantMembershipRecord(
+                        tenant_id=new_tenant_id,
+                        user_id=user.id,
+                        role=TENANT_ROLE_MEMBER,
+                        granted_by=actor_user_id,
+                        created_at=utc_now_iso(),
+                        updated_at=utc_now_iso(),
+                    )
+                )
         await self._audit(
             "user_updated",
             actor_user_id=actor_user_id,
@@ -1771,6 +1819,18 @@ class AuthorizationService:
             updated_at=now,
         )
         saved = await self._metadata_store.upsert_tenant_membership(membership)
+        # Keep user.tenant_id in sync: clear old tenant membership if the user
+        # is being moved to a different tenant, then set the new tenant_id.
+        old_tenant_id = user.tenant_id
+        if old_tenant_id and old_tenant_id != tenant_id:
+            await self._metadata_store.delete_tenant_membership(
+                old_tenant_id, user_id
+            )
+        if old_tenant_id != tenant_id:
+            updated_user = replace(
+                user, tenant_id=tenant_id, updated_at=utc_now_iso()
+            )
+            await self._metadata_store.upsert_enterprise_user(updated_user)
         if self._audit_service is not None:
             await self._audit_service.append(
                 "tenant_membership_granted",
@@ -1786,14 +1846,22 @@ class AuthorizationService:
     ) -> bool:
         tenant_id = _normalize_required_id(tenant_id, "Tenant id")
         deleted = await self._metadata_store.delete_tenant_membership(tenant_id, user_id)
-        if deleted and self._audit_service is not None:
-            await self._audit_service.append(
-                "tenant_membership_revoked",
-                actor_user_id=actor_user_id,
-                target_type="tenant",
-                target_id=tenant_id,
-                metadata={"user_id": user_id},
-            )
+        if deleted:
+            # Clear user.tenant_id if it matches the revoked tenant.
+            user = await self._metadata_store.get_enterprise_user_by_id(user_id)
+            if user is not None and user.tenant_id == tenant_id:
+                updated_user = replace(
+                    user, tenant_id=None, updated_at=utc_now_iso()
+                )
+                await self._metadata_store.upsert_enterprise_user(updated_user)
+            if self._audit_service is not None:
+                await self._audit_service.append(
+                    "tenant_membership_revoked",
+                    actor_user_id=actor_user_id,
+                    target_type="tenant",
+                    target_id=tenant_id,
+                    metadata={"user_id": user_id},
+                )
         return deleted
 
     async def list_tenant_memberships(

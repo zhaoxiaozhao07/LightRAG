@@ -914,6 +914,18 @@ def create_enterprise_routes(
             )
         return EnterpriseUserResponse.from_record(user)
 
+    @router.delete(
+        "/admin/users/{user_id}",
+        dependencies=[Depends(combined_auth)],
+    )
+    async def delete_enterprise_user(user_id: str, request: Request):
+        principal = require_principal(request)
+        user_service = get_enterprise_user_service(request)
+        deleted = await user_service.delete_user(
+            user_id, actor_user_id=principal.user_id
+        )
+        return {"deleted": deleted}
+
     @router.post(
         "/admin/users/{user_id}/kb-access:batch-set",
         response_model=EnterpriseUserKBAccessBatchSetResponse,

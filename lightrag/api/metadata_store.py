@@ -2235,6 +2235,33 @@ class SQLiteMetadataStore:
 
         return await self._write(write)
 
+    async def delete_enterprise_user(self, user_id: str) -> bool:
+        """Delete a user and cascade-remove related tenant memberships, KB ACLs
+        and per-user query settings.  Returns ``True`` if the user existed."""
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> bool:
+            # Cascade: remove related records first.
+            conn.execute(
+                "DELETE FROM enterprise_tenant_memberships WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.execute(
+                "DELETE FROM enterprise_kb_acl WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.execute(
+                "DELETE FROM enterprise_user_kb_query_settings WHERE user_id = ?",
+                (user_id,),
+            )
+            cursor = conn.execute(
+                "DELETE FROM enterprise_users WHERE id = ?",
+                (user_id,),
+            )
+            return bool(cursor.rowcount)
+
+        return await self._write(write)
+
     async def get_enterprise_user_kb_query_settings(
         self, user_id: str, kb_id: str
     ) -> EnterpriseUserKBQuerySettingsRecord | None:
