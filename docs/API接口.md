@@ -1262,12 +1262,17 @@ KB ACL 请求/响应约束：
   "id": "audit_...",
   "event_type": "kb_created",
   "actor_user_id": "usr_...",
+  "actor_username": "张三",
   "target_type": "kb",
   "target_id": "kb_...",
+  "target_name": "橡胶研究知识库",
   "metadata": {},
   "created_at": "2026-06-08T...Z"
 }
 ```
+
+- `actor_username`：由 `actor_user_id` 在读取时动态解析（对齐 `EnterpriseUserResponse.username`），未找到时为 `null`。
+- `target_name`：根据 `target_type` 动态解析——`kb` 返回知识库名称、`user` 返回用户名、`tenant` 返回租户名称（对齐各实体的 `name` / `username` 字段）；未找到时为 `null`。
 
 企业模式已实现的审计事件类型包括：
 

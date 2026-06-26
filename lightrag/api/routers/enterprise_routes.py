@@ -335,14 +335,25 @@ class EnterpriseAuditEventResponse(BaseModel):
     id: str
     event_type: str
     actor_user_id: str | None
+    actor_username: str | None = None
     target_type: str | None
     target_id: str | None
+    target_name: str | None = None
     metadata: dict[str, Any]
     created_at: str
 
     @classmethod
-    def from_record(cls, record: AuditEventRecord) -> "EnterpriseAuditEventResponse":
-        return cls(**record.to_dict())
+    def from_record(
+        cls,
+        record: AuditEventRecord,
+        *,
+        actor_username: str | None = None,
+        target_name: str | None = None,
+    ) -> "EnterpriseAuditEventResponse":
+        data = record.to_dict()
+        data["actor_username"] = actor_username
+        data["target_name"] = target_name
+        return cls(**data)
 
 
 class EnterpriseMeResponse(BaseModel):
@@ -1498,18 +1509,63 @@ def create_enterprise_routes(
         created_before: str | None = None,
     ):
         audit_service = get_enterprise_audit_service(request)
-        return [
-            EnterpriseAuditEventResponse.from_record(event)
-            for event in await audit_service.list(
-                limit=limit,
-                offset=offset,
-                event_type=event_type,
-                actor_user_id=actor_user_id,
-                target_type=target_type,
-                target_id=target_id,
-                created_after=created_after,
-                created_before=created_before,
+        events = await audit_service.list(
+            limit=limit,
+            offset=offset,
+            event_type=event_type,
+            actor_user_id=actor_user_id,
+            target_type=target_type,
+            target_id=target_id,
+            created_after=created_after,
+            created_before=created_before,
+        )
+        # Batch-resolve human-readable names for the current page.
+        user_ids = {e.actor_user_id for e in events if e.actor_user_id}
+        kb_ids = {
+            e.target_id
+            for e in events
+            if e.target_type == "kb" and e.target_id
+        }
+        user_names: dict[str, str] = {}
+        kb_names: dict[str, str] = {}
+        if user_ids:
+            user_service = get_enterprise_user_service(request)
+            for u in await user_service.list_users():
+                if u.id in user_ids:
+                    user_names[u.id] = u.username
+        if kb_ids and kb_service is not None:
+            for kb in await kb_service.list(include_deleted=True):
+                if kb.id in kb_ids:
+                    kb_names[kb.id] = kb.name
+
+        results: list[EnterpriseAuditEventResponse] = []
+        for event in events:
+            actor_name = (
+                user_names.get(event.actor_user_id)
+                if event.actor_user_id
+                else None
             )
-        ]
+            tgt_name: str | None = None
+            if event.target_type == "user" and event.target_id:
+                tgt_name = user_names.get(event.target_id)
+                # Actor lookup may not have covered target user ids.
+                if tgt_name is None and event.target_id not in user_ids:
+                    store = getattr(request.app.state, "metadata_store", None)
+                    if store is not None:
+                        u = await store.get_enterprise_user_by_id(
+                            event.target_id
+                        )
+                        if u is not None:
+                            tgt_name = u.username
+            elif event.target_type == "kb" and event.target_id:
+                tgt_name = kb_names.get(event.target_id)
+            results.append(
+                EnterpriseAuditEventResponse.from_record(
+                    event,
+                    actor_username=actor_name,
+                    target_name=tgt_name,
+                )
+            )
+        return results
 
     return router
