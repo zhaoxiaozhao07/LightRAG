@@ -252,6 +252,7 @@ async def test_enterprise_metadata_contract(store):
             **user.to_dict(),
             "can_create_kb": True,
             "can_use_bypass_query": True,
+            "can_use_agent_query": True,
             "token_version": user.token_version + 1,
             "updated_at": utc_now_iso(),
         }
@@ -259,6 +260,7 @@ async def test_enterprise_metadata_contract(store):
     saved_user = await store.upsert_enterprise_user(updated_user)
     assert saved_user.can_create_kb is True
     assert saved_user.can_use_bypass_query is True
+    assert saved_user.can_use_agent_query is True
     assert saved_user.token_version == 2
 
     await store.set_enterprise_system_setting(

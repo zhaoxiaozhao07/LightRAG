@@ -13,6 +13,7 @@ ROLE_MAX_ASYNC_ENV_KEYS = (
     "EXTRACT_MAX_ASYNC_LLM",
     "KEYWORD_MAX_ASYNC_LLM",
     "QUERY_MAX_ASYNC_LLM",
+    "AGENT_MAX_ASYNC_LLM",
     "VLM_MAX_ASYNC_LLM",
 )
 
@@ -33,6 +34,9 @@ ENTERPRISE_LIMIT_ENV_KEYS = (
     "LIGHTRAG_ENTERPRISE_REGISTRATION_MAX_ATTEMPTS",
     "LIGHTRAG_ENTERPRISE_REGISTRATION_WINDOW_SECONDS",
     "LIGHTRAG_ENTERPRISE_REGISTRATION_LOCKOUT_SECONDS",
+    "LIGHTRAG_AGENT_QUERY_ENABLED",
+    "AGENT_MAX_ROUNDS",
+    "AGENT_WORKFLOW_PROMPT_MAX_LENGTH",
 )
 
 
@@ -57,6 +61,7 @@ def test_role_max_async_defaults_none_when_env_unset(monkeypatch):
     assert args.extract_llm_max_async is None
     assert args.keyword_llm_max_async is None
     assert args.query_llm_max_async is None
+    assert args.agent_llm_max_async is None
     assert args.vlm_llm_max_async is None
 
 
@@ -72,6 +77,7 @@ def test_role_max_async_env_override_keeps_other_roles_none(monkeypatch):
     assert args.extract_llm_max_async == 7
     assert args.keyword_llm_max_async is None
     assert args.query_llm_max_async is None
+    assert args.agent_llm_max_async is None
     assert args.vlm_llm_max_async is None
 
 

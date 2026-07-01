@@ -79,6 +79,7 @@ from lightrag.api.metrics import build_prometheus_metrics, record_http_request
 from lightrag.api.object_storage import create_object_storage_from_env
 from lightrag.api.postgres_kb_service import PostgresKnowledgeBaseService
 from lightrag.api.postgres_metadata_store import PostgresMetadataStore
+from lightrag.api.routers.agent_routes import create_agent_routes
 from lightrag.api.routers.kb_document_routes import create_kb_document_routes
 from lightrag.api.routers.kb_graph_routes import create_kb_graph_routes
 from lightrag.api.routers.kb_query_routes import create_kb_query_routes
@@ -102,6 +103,7 @@ from lightrag.api.enterprise_auth import (
     LoginAttemptTracker,
     ServiceAPIKeyService,
     SystemSettingsService,
+    UserAgentWorkflowPromptService,
     UserKBQuerySettingsService,
     UserService,
 )
@@ -956,6 +958,11 @@ def create_app(args):
         if enterprise_enabled
         else None
     )
+    enterprise_user_agent_workflow_prompt_service = (
+        UserAgentWorkflowPromptService(metadata_store, enterprise_audit_service)
+        if enterprise_enabled
+        else None
+    )
     enterprise_api_key_service = (
         ServiceAPIKeyService(metadata_store, enterprise_audit_service)
         if enterprise_enabled
@@ -1140,6 +1147,9 @@ def create_app(args):
         app.state.enterprise_settings_service = enterprise_settings_service
         app.state.enterprise_user_kb_query_settings_service = (
             enterprise_user_kb_query_settings_service
+        )
+        app.state.enterprise_user_agent_workflow_prompt_service = (
+            enterprise_user_agent_workflow_prompt_service
         )
         app.state.enterprise_api_key_service = enterprise_api_key_service
         app.state.enterprise_invitation_service = enterprise_invitation_service
@@ -2506,6 +2516,14 @@ def create_app(args):
             api_key=api_key,
         )
     )
+    app.include_router(
+        create_agent_routes(
+            kb_service=kb_service,
+            document_service=document_lifecycle_service,
+            registry=kb_registry,
+            api_key=api_key,
+        )
+    )
     if enterprise_enabled:
         app.include_router(create_enterprise_routes(api_key=api_key))
     app.include_router(create_document_routes(rag, doc_manager, api_key))
@@ -2663,6 +2681,7 @@ def create_app(args):
                     "tenant_id": user.tenant_id,
                     "can_create_kb": user.can_create_kb,
                     "can_use_bypass_query": user.can_use_bypass_query,
+                    "can_use_agent_query": user.can_use_agent_query,
                     "token_version": user.token_version,
                     "created_at": user.created_at,
                     "updated_at": user.updated_at,

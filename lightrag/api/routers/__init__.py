@@ -9,6 +9,12 @@ process (e.g. across tests), which produced "Duplicate Operation ID"
 warnings before the factories were converted to local routers.
 """
 
-from .ollama_api import OllamaAPI
-
 __all__ = ["OllamaAPI"]
+
+
+def __getattr__(name: str):
+    if name == "OllamaAPI":
+        from .ollama_api import OllamaAPI
+
+        return OllamaAPI
+    raise AttributeError(name)

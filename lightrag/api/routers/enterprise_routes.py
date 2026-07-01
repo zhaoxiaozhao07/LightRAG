@@ -20,11 +20,13 @@ from lightrag.api.enterprise_auth import (
     USER_STATUS_ACTIVE,
     USER_STATUS_DISABLED,
     USER_STATUS_PENDING,
+    agent_workflow_prompt_max_length,
     get_enterprise_api_key_service,
     get_enterprise_audit_service,
     get_enterprise_authorization_service,
     get_enterprise_invitation_service,
     get_enterprise_settings_service,
+    get_enterprise_user_agent_workflow_prompt_service,
     get_enterprise_user_kb_query_settings_service,
     get_enterprise_user_service,
     get_request_principal,
@@ -53,6 +55,7 @@ class EnterpriseUserResponse(BaseModel):
     tenant_id: str | None
     can_create_kb: bool
     can_use_bypass_query: bool
+    can_use_agent_query: bool
     can_delete_documents: bool
     token_version: int
     created_at: str
@@ -98,6 +101,7 @@ class EnterpriseUserCreateRequest(BaseModel):
     password: str = Field(min_length=1)
     can_create_kb: bool = False
     can_use_bypass_query: bool = False
+    can_use_agent_query: bool = False
     can_delete_documents: bool = False
     tenant_id: str | None = None
 
@@ -106,6 +110,7 @@ class EnterpriseUserUpdateRequest(BaseModel):
     status: str | None = None
     can_create_kb: bool | None = None
     can_use_bypass_query: bool | None = None
+    can_use_agent_query: bool | None = None
     can_delete_documents: bool | None = None
     tenant_id: str | None = None
     password: str | None = None
@@ -252,6 +257,7 @@ class EnterpriseUserAccessResponse(BaseModel):
     tenant_id: str | None
     can_create_kb: bool
     can_use_bypass_query: bool
+    can_use_agent_query: bool
     can_delete_documents: bool
     tenant_memberships: list[dict[str, str]]
     kb_acls: list[dict[str, str]]
@@ -261,6 +267,7 @@ class EnterpriseServiceAPIKeyCreateRequest(BaseModel):
     name: str = Field(min_length=1)
     kb_roles: dict[str, str] = Field(default_factory=dict)
     can_use_bypass_query: bool = False
+    can_use_agent_query: bool = False
     inherit_tenant_kb_acl: bool = False
     tenant_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -371,6 +378,15 @@ class EnterpriseUserKBQuerySettingsResponse(BaseModel):
     user_prompt: str
 
 
+class EnterpriseUserAgentWorkflowPromptRequest(BaseModel):
+    workflow_prompt: str = Field(default="", max_length=16384)
+
+
+class EnterpriseUserAgentWorkflowPromptResponse(BaseModel):
+    user_id: str
+    workflow_prompt: str
+
+
 def create_enterprise_routes(
     api_key: str | None = None,
     kb_service: KnowledgeBaseService | None = None,
@@ -388,6 +404,7 @@ def create_enterprise_routes(
             "tenant_roles": principal.tenant_roles,
             "can_create_kb": principal.can_create_kb,
             "can_use_bypass_query": principal.can_use_bypass_query,
+            "can_use_agent_query": principal.can_use_agent_query,
             "can_delete_documents": principal.can_delete_documents,
             "token_version": principal.token_version,
             "auth_method": principal.auth_method,
@@ -642,6 +659,54 @@ def create_enterprise_routes(
             user_prompt=settings.user_prompt,
         )
 
+    @router.get(
+        "/auth/me/agent-workflow-prompt",
+        response_model=EnterpriseUserAgentWorkflowPromptResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def get_my_agent_workflow_prompt(request: Request):
+        principal = require_interactive_user_principal(request)
+        prompt = await get_enterprise_user_agent_workflow_prompt_service(
+            request
+        ).get_prompt(principal.user_id)
+        return EnterpriseUserAgentWorkflowPromptResponse(
+            user_id=principal.user_id,
+            workflow_prompt=prompt,
+        )
+
+    @router.put(
+        "/auth/me/agent-workflow-prompt",
+        response_model=EnterpriseUserAgentWorkflowPromptResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def set_my_agent_workflow_prompt(
+        request: Request, body: EnterpriseUserAgentWorkflowPromptRequest
+    ):
+        principal = require_interactive_user_principal(request)
+        max_length = agent_workflow_prompt_max_length()
+        if len(body.workflow_prompt) > max_length:
+            raise HTTPException(
+                status_code=400,
+                detail=f"workflow_prompt exceeds maximum length {max_length}",
+            )
+        service = get_enterprise_user_agent_workflow_prompt_service(request)
+        if body.workflow_prompt == "":
+            await service.clear_prompt(
+                user_id=principal.user_id,
+                actor_user_id=principal.user_id,
+            )
+            prompt = ""
+        else:
+            prompt = await service.set_prompt(
+                user_id=principal.user_id,
+                workflow_prompt=body.workflow_prompt,
+                actor_user_id=principal.user_id,
+            )
+        return EnterpriseUserAgentWorkflowPromptResponse(
+            user_id=principal.user_id,
+            workflow_prompt=prompt,
+        )
+
     @router.post(
         "/auth/change-password",
         response_model=EnterpriseUserResponse,
@@ -756,6 +821,7 @@ def create_enterprise_routes(
             created_by=principal.user_id,
             can_create_kb=body.can_create_kb,
             can_use_bypass_query=body.can_use_bypass_query,
+            can_use_agent_query=body.can_use_agent_query,
             can_delete_documents=body.can_delete_documents,
             tenant_id=body.tenant_id,
         )
@@ -790,6 +856,7 @@ def create_enterprise_routes(
             tenant_id=user.tenant_id,
             can_create_kb=user.can_create_kb,
             can_use_bypass_query=user.can_use_bypass_query,
+            can_use_agent_query=user.can_use_agent_query,
             can_delete_documents=user.can_delete_documents,
             tenant_memberships=[
                 {"tenant_id": m.tenant_id, "role": m.role} for m in memberships
@@ -905,6 +972,7 @@ def create_enterprise_routes(
                     body.status,
                     body.can_create_kb,
                     body.can_use_bypass_query,
+                    body.can_use_agent_query,
                     body.can_delete_documents,
                 )
             )
@@ -915,6 +983,7 @@ def create_enterprise_routes(
                 status_value=body.status,
                 can_create_kb=body.can_create_kb,
                 can_use_bypass_query=body.can_use_bypass_query,
+                can_use_agent_query=body.can_use_agent_query,
                 can_delete_documents=body.can_delete_documents,
                 tenant_id=body.tenant_id if tenant_provided else UNSET,
                 actor_user_id=principal.user_id,
@@ -1391,6 +1460,7 @@ def create_enterprise_routes(
             scopes={
                 "kb_roles": body.kb_roles,
                 "can_use_bypass_query": body.can_use_bypass_query,
+                "can_use_agent_query": body.can_use_agent_query,
                 "inherit_tenant_kb_acl": body.inherit_tenant_kb_acl,
             },
             metadata=body.metadata,

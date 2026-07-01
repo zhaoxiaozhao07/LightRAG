@@ -103,6 +103,7 @@ _ENTERPRISE_PROTECTED_PREFIXES = (
     "/kbs",
     "/documents",
     "/query",
+    "/agent",
     "/graph",
     "/api",
 )
@@ -275,6 +276,7 @@ class Principal:
     token_version: int
     auth_method: str
     metadata: dict[str, Any]
+    can_use_agent_query: bool = False
     # Capability to delete documents uploaded by other users (delete-any).
     # Declared last with a default so existing keyword constructions and the
     # frozen-dataclass field ordering stay valid.
@@ -314,6 +316,21 @@ def enterprise_legacy_api_key_superadmin_enabled() -> bool:
 
 def enterprise_global_routes_disabled() -> bool:
     return bool(getattr(_global_args(), "enterprise_disable_global_routes", True))
+
+
+def agent_query_enabled() -> bool:
+    return bool(getattr(_global_args(), "agent_query_enabled", False))
+
+
+def agent_max_rounds() -> int:
+    return max(1, int(getattr(_global_args(), "agent_max_rounds", 5) or 5))
+
+
+def agent_workflow_prompt_max_length() -> int:
+    return max(
+        0,
+        int(getattr(_global_args(), "agent_workflow_prompt_max_length", 16384) or 16384),
+    )
 
 
 def enterprise_artifact_download_min_role() -> str:
@@ -437,6 +454,7 @@ def principal_from_api_key() -> Principal:
         token_version=1,
         auth_method="api_key",
         metadata={"auth_mode": "enterprise", "api_key_superadmin": True},
+        can_use_agent_query=True,
         can_delete_documents=True,
     )
 
@@ -877,6 +895,7 @@ class ServiceAPIKeyService:
                 "key_preview": record.key_preview,
                 "scopes": scopes,
             },
+            can_use_agent_query=bool(scopes.get("can_use_agent_query", False)),
             can_delete_documents=False,
         )
 
@@ -953,6 +972,65 @@ class UserKBQuerySettingsService:
                 },
             )
         return deleted
+
+
+class UserAgentWorkflowPromptService:
+    """Per-user Agent workflow prompt stored in enterprise system settings.
+
+    The prompt is user-owned policy text used by the Agent planner. Audit events
+    intentionally record only presence/absence, not the prompt body.
+    """
+
+    _KEY_PREFIX = "user_agent_workflow_prompt:"
+
+    def __init__(
+        self,
+        metadata_store: EnterpriseMetadataStore,
+        audit_service: AuditService | None = None,
+    ):
+        self._metadata_store = metadata_store
+        self._audit_service = audit_service
+
+    @classmethod
+    def _key(cls, user_id: str) -> str:
+        return f"{cls._KEY_PREFIX}{user_id}"
+
+    async def get_prompt(self, user_id: str) -> str:
+        return await self._metadata_store.get_enterprise_system_setting(
+            self._key(user_id), ""
+        ) or ""
+
+    async def set_prompt(
+        self,
+        *,
+        user_id: str,
+        workflow_prompt: str,
+        actor_user_id: str | None = None,
+    ) -> str:
+        await self._metadata_store.set_enterprise_system_setting(
+            self._key(user_id), workflow_prompt, updated_by=actor_user_id or user_id
+        )
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                "user_agent_workflow_prompt_updated",
+                actor_user_id=actor_user_id or user_id,
+                target_type="user",
+                target_id=user_id,
+                metadata={"has_custom_workflow_prompt": bool(workflow_prompt)},
+            )
+        return workflow_prompt
+
+    async def clear_prompt(
+        self,
+        *,
+        user_id: str,
+        actor_user_id: str | None = None,
+    ) -> None:
+        await self.set_prompt(
+            user_id=user_id,
+            workflow_prompt="",
+            actor_user_id=actor_user_id,
+        )
 
 
 class InvitationService:
@@ -1163,6 +1241,7 @@ class UserService:
                 tenant_id=None,
                 can_create_kb=True,
                 can_use_bypass_query=True,
+                can_use_agent_query=True,
                 token_version=1,
                 metadata={"bootstrap": True},
                 created_at=now,
@@ -1181,6 +1260,7 @@ class UserService:
             status=USER_STATUS_ACTIVE,
             can_create_kb=True,
             can_use_bypass_query=True,
+            can_use_agent_query=True,
             can_delete_documents=True,
             token_version=existing.token_version
             + (1 if new_hash != existing.password_hash else 0),
@@ -1212,6 +1292,7 @@ class UserService:
         created_by: str | None = None,
         can_create_kb: bool = False,
         can_use_bypass_query: bool = False,
+        can_use_agent_query: bool = False,
         can_delete_documents: bool = False,
         tenant_id: str | None = None,
         status: str = USER_STATUS_ACTIVE,
@@ -1229,6 +1310,7 @@ class UserService:
             tenant_id=tenant_id,
             can_create_kb=can_create_kb,
             can_use_bypass_query=can_use_bypass_query,
+            can_use_agent_query=can_use_agent_query,
             token_version=1,
             metadata={},
             created_at=now,
@@ -1290,6 +1372,7 @@ class UserService:
         status_value: str | None = None,
         can_create_kb: bool | None = None,
         can_use_bypass_query: bool | None = None,
+        can_use_agent_query: bool | None = None,
         can_delete_documents: bool | None = None,
         tenant_id: Any = UNSET,
         actor_user_id: str | None = None,
@@ -1322,6 +1405,9 @@ class UserService:
             can_use_bypass_query=user.can_use_bypass_query
             if can_use_bypass_query is None
             else can_use_bypass_query,
+            can_use_agent_query=user.can_use_agent_query
+            if can_use_agent_query is None
+            else can_use_agent_query,
             can_delete_documents=user.can_delete_documents
             if can_delete_documents is None
             else can_delete_documents,
@@ -1473,6 +1559,7 @@ class UserService:
             "token_version": user.token_version,
             "can_create_kb": user.can_create_kb,
             "can_use_bypass_query": user.can_use_bypass_query,
+            "can_use_agent_query": user.can_use_agent_query,
         }
 
     async def _audit(
@@ -1523,6 +1610,12 @@ class AuthorizationService:
         principal = _require_principal(principal)
         if not (principal.is_super_admin or principal.can_use_bypass_query):
             raise HTTPException(status_code=403, detail="Bypass-query permission required")
+        return principal
+
+    def require_agent_query(self, principal: Principal | None) -> Principal:
+        principal = _require_principal(principal)
+        if not (principal.is_super_admin or principal.can_use_agent_query):
+            raise HTTPException(status_code=403, detail="Agent-query permission required")
         return principal
 
     async def require_kb_role(
@@ -2045,6 +2138,7 @@ def principal_from_user(
         tenant_roles=tenant_roles,
         can_create_kb=user.can_create_kb,
         can_use_bypass_query=user.can_use_bypass_query,
+        can_use_agent_query=user.can_use_agent_query,
         token_version=user.token_version,
         auth_method=auth_method,
         metadata=dict(user.metadata),
@@ -2086,6 +2180,20 @@ def get_enterprise_user_kb_query_settings_service(
         raise HTTPException(
             status_code=500,
             detail="Enterprise user KB query settings service unavailable",
+        )
+    return service
+
+
+def get_enterprise_user_agent_workflow_prompt_service(
+    request: Request,
+) -> UserAgentWorkflowPromptService:
+    service = getattr(
+        request.app.state, "enterprise_user_agent_workflow_prompt_service", None
+    )
+    if not isinstance(service, UserAgentWorkflowPromptService):
+        raise HTTPException(
+            status_code=500,
+            detail="Enterprise user Agent workflow prompt service unavailable",
         )
     return service
 
@@ -2323,6 +2431,7 @@ def _normalize_service_api_key_scopes(scopes: dict[str, Any]) -> dict[str, Any]:
     return {
         "kb_roles": kb_roles,
         "can_use_bypass_query": bool(scopes.get("can_use_bypass_query", False)),
+        "can_use_agent_query": bool(scopes.get("can_use_agent_query", False)),
         "inherit_tenant_kb_acl": bool(scopes.get("inherit_tenant_kb_acl", False)),
     }
 
@@ -2557,6 +2666,11 @@ def _global_args() -> Any:
         ),
         enterprise_legacy_api_key_superadmin=_env_bool(
             "LIGHTRAG_ENTERPRISE_LEGACY_API_KEY_SUPERADMIN", False
+        ),
+        agent_query_enabled=_env_bool("LIGHTRAG_AGENT_QUERY_ENABLED", False),
+        agent_max_rounds=_env_int("AGENT_MAX_ROUNDS", 5),
+        agent_workflow_prompt_max_length=_env_int(
+            "AGENT_WORKFLOW_PROMPT_MAX_LENGTH", 16384
         ),
         enterprise_artifact_download_min_role=os.getenv(
             "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE", KB_ROLE_VIEWER

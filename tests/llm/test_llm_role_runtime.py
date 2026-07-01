@@ -114,6 +114,7 @@ ROLE_MAX_ASYNC_ENV_KEYS = (
     "EXTRACT_MAX_ASYNC_LLM",
     "KEYWORD_MAX_ASYNC_LLM",
     "QUERY_MAX_ASYNC_LLM",
+    "AGENT_MAX_ASYNC_LLM",
     "VLM_MAX_ASYNC_LLM",
 )
 
@@ -217,10 +218,12 @@ def test_role_max_async_defaults_inherit_base(tmp_path, monkeypatch):
     assert rag._role_llm_states["extract"].max_async is None
     assert rag._role_llm_states["keyword"].max_async is None
     assert rag._role_llm_states["query"].max_async is None
+    assert rag._role_llm_states["agent"].max_async is None
     assert rag._role_llm_states["vlm"].max_async is None
     assert rag._get_effective_role_llm_max_async("extract") == 10
     assert rag._get_effective_role_llm_max_async("keyword") == 10
     assert rag._get_effective_role_llm_max_async("query") == 10
+    assert rag._get_effective_role_llm_max_async("agent") == 10
     assert rag._get_effective_role_llm_max_async("vlm") == 10
 
 
@@ -237,10 +240,12 @@ def test_role_max_async_env_override_keeps_other_roles_inherited(tmp_path, monke
     assert rag._role_llm_states["extract"].max_async == 7
     assert rag._role_llm_states["keyword"].max_async is None
     assert rag._role_llm_states["query"].max_async is None
+    assert rag._role_llm_states["agent"].max_async is None
     assert rag._role_llm_states["vlm"].max_async is None
     assert rag._get_effective_role_llm_max_async("extract") == 7
     assert rag._get_effective_role_llm_max_async("keyword") == 10
     assert rag._get_effective_role_llm_max_async("query") == 10
+    assert rag._get_effective_role_llm_max_async("agent") == 10
     assert rag._get_effective_role_llm_max_async("vlm") == 10
 
 

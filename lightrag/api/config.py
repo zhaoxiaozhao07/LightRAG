@@ -832,6 +832,13 @@ def parse_args() -> argparse.Namespace:
     args.enterprise_tenant_max_concurrent_jobs = get_env_value(
         "LIGHTRAG_ENTERPRISE_TENANT_MAX_CONCURRENT_JOBS", 0, int
     )
+    args.agent_query_enabled = get_env_value(
+        "LIGHTRAG_AGENT_QUERY_ENABLED", False, bool
+    )
+    args.agent_max_rounds = get_env_value("AGENT_MAX_ROUNDS", 5, int)
+    args.agent_workflow_prompt_max_length = get_env_value(
+        "AGENT_WORKFLOW_PROMPT_MAX_LENGTH", 16384, int
+    )
 
     # Token auto-renewal configuration (sliding window expiration)
     args.token_auto_renew = get_env_value("TOKEN_AUTO_RENEW", True, bool)

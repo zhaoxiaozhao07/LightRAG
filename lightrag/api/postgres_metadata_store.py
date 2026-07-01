@@ -91,6 +91,7 @@ def _enterprise_user_from_row(row: Any) -> EnterpriseUserRecord:
     # Legacy JSONB rows predate can_delete_documents; default it so the
     # dataclass deserializes without raising on the missing key.
     data.setdefault("can_delete_documents", False)
+    data.setdefault("can_use_agent_query", False)
     return EnterpriseUserRecord(**data)
 
 
