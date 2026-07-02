@@ -6,7 +6,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from lightrag.api.document_lifecycle_service import DocumentLifecycleService
 from lightrag.api.kb_service import utc_now_iso
@@ -42,6 +42,8 @@ DEFAULT_BUILD_DRAIN_TIMEOUT_SECONDS = float(
 DEFAULT_BUILD_DRAIN_POLL_SECONDS = float(
     os.getenv("KB_BUILD_DRAIN_POLL_SECONDS", "1.0")
 )
+
+AgentProfileDirtyCallback = Callable[[str, str], Awaitable[None]]
 
 
 @dataclass(slots=True)
@@ -95,10 +97,17 @@ class IndexBuildService:
     def __init__(
         self,
         document_service: DocumentLifecycleService,
+        agent_profile_dirty_callback: AgentProfileDirtyCallback | None = None,
     ):
         self._document_service = document_service
         self._build_drain_timeout = DEFAULT_BUILD_DRAIN_TIMEOUT_SECONDS
         self._build_drain_poll = DEFAULT_BUILD_DRAIN_POLL_SECONDS
+        self._agent_profile_dirty_callback = agent_profile_dirty_callback
+
+    def set_agent_profile_dirty_callback(
+        self, callback: AgentProfileDirtyCallback | None
+    ) -> None:
+        self._agent_profile_dirty_callback = callback
 
     async def create_build_plan(
         self,
@@ -570,7 +579,7 @@ class IndexBuildService:
             "current_build_job_id": None,
             "pending_index_hash": None,
         }
-        return await self._document_service.metadata_store.complete_document_build(
+        document = await self._document_service.metadata_store.complete_document_build(
             kb_id,
             document_id,
             index_hash=plan.index_hash,
@@ -579,6 +588,8 @@ class IndexBuildService:
             relation_count=relation_count,
             metadata_patch=metadata_patch,
         )
+        await self._notify_agent_profile_dirty(kb_id, document_id)
+        return document
 
     async def fail_build(
         self,
@@ -617,6 +628,19 @@ class IndexBuildService:
         if sidecar_uri is None and blocks_path:
             sidecar_uri = _to_sidecar_uri(str(Path(blocks_path).parent))
         return sidecar_uri, blocks_path
+
+    async def _notify_agent_profile_dirty(self, kb_id: str, document_id: str) -> None:
+        if self._agent_profile_dirty_callback is None:
+            return
+        try:
+            await self._agent_profile_dirty_callback(kb_id, document_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Agent profile dirty callback failed for KB '%s' doc '%s': %s",
+                kb_id,
+                document_id,
+                exc,
+            )
 
 
 def compute_index_hash(rag: Any) -> str:

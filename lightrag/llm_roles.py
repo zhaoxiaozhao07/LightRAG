@@ -54,6 +54,7 @@ ROLES: tuple[RoleSpec, ...] = (
     RoleSpec("keyword", "KEYWORD", "keyword LLM func"),
     RoleSpec("query", "QUERY", "query LLM func"),
     RoleSpec("agent", "AGENT", "agent LLM func"),
+    RoleSpec("profile", "PROFILE", "profile LLM func"),
     RoleSpec("vlm", "VLM", "vlm LLM func"),
 )
 ROLE_NAMES: frozenset[str] = frozenset(spec.name for spec in ROLES)

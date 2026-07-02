@@ -4,13 +4,15 @@ LightRAG 支持为不同处理阶段配置不同的 LLM 或 VLM。这个机制�
 
 ## 角色说明
 
-当前支持四个角色：
+当前支持六个角色：
 
 | 角色 | 用途 |
 | --- | --- |
 | `EXTRACT` | 实体/关系抽取，以及实体/关系描述摘要。 |
 | `KEYWORD` | 查询关键词抽取，用于检索前的 high-level / low-level keyword 生成。 |
 | `QUERY` | 最终问答、普通查询、bypass 查询，以及 Ollama-compatible API 的查询路径。 |
+| `AGENT` | 服务端 Agent 查询规划与 JSON 决策。 |
+| `PROFILE` | 后台生成文档级与 KB 级 Agent 选库 profile。 |
 | `VLM` | 多模态分析阶段，用于图片、表格、公式等内容的 VLM 分析。 |
 
 如果某个角色没有专门配置，LightRAG 会使用基础 `LLM_*` 配置。
@@ -60,7 +62,7 @@ QUERY_LLM_TIMEOUT=240
 
 | 变量 | 说明 |
 | --- | --- |
-| `{ROLE}_LLM_BINDING` | 覆盖角色 provider。`ROLE` 可为 `EXTRACT`、`KEYWORD`、`QUERY`、`VLM`。 |
+| `{ROLE}_LLM_BINDING` | 覆盖角色 provider。`ROLE` 可为 `EXTRACT`、`KEYWORD`、`QUERY`、`AGENT`、`PROFILE`、`VLM`。 |
 | `{ROLE}_LLM_MODEL` | 覆盖角色模型名。 |
 | `{ROLE}_LLM_BINDING_HOST` | 覆盖角色 endpoint。 |
 | `{ROLE}_LLM_BINDING_API_KEY` | 覆盖角色 API key。Bedrock 不支持。 |

@@ -10,8 +10,9 @@ two gaps the audit called out:
    simply fails them.
 
 :class:`JobWorker` closes both gaps for job types that are *re-drivable from
-persisted state* (single-document ``parse`` / ``build_kg`` / ``reindex``
-plus single- and batch-document ``delete`` jobs).
+persisted state* (single-document ``parse`` / ``build_kg`` / ``reindex``,
+single- and batch-document ``delete`` jobs, KB hard-delete, and Agent profile
+refresh jobs).
 It polls the metadata store for eligible ``queued`` jobs, atomically claims
 each one (``queued → running`` single-winner CAS via
 :meth:`SQLiteMetadataStore.claim_next_worker_job`), and dispatches to a
@@ -1443,5 +1444,14 @@ def build_clear_kb_executor(*, deletion_service: Any) -> JobExecutor:
 
     async def _run(job: JobRecord) -> None:
         await deletion_service.resume_hard_delete(job)
+
+    return _run
+
+
+def build_agent_profile_executor(*, profile_service: Any) -> JobExecutor:
+    """Executor that re-drives queued KB Agent profile generation jobs."""
+
+    async def _run(job: JobRecord) -> None:
+        await profile_service.run_job(job)
 
     return _run

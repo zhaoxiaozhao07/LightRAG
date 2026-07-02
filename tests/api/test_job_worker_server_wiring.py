@@ -61,6 +61,7 @@ _EXPECTED_EXECUTORS = {
     "replace",
     "sync",
     "clear_kb",
+    "agent_profile",
 }
 
 
@@ -113,7 +114,7 @@ def test_job_worker_wired_with_real_executors_when_enabled(tmp_path, monkeypatch
     worker = app.state.job_worker
     assert worker is not None, "worker must be wired when the flag is enabled"
     # All resumable job types are registered (parse/build_kg/reindex/delete/
-    # replace/sync/clear_kb) — the durable-resume contract depends on it.
+    # replace/sync/clear_kb/agent_profile) — the durable-resume contract depends on it.
     assert worker.resumable_job_types == _EXPECTED_EXECUTORS
     # Each registered executor is a real callable (built from the KB services),
     # not a placeholder.

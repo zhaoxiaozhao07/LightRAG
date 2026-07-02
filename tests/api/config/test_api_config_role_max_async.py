@@ -14,6 +14,7 @@ ROLE_MAX_ASYNC_ENV_KEYS = (
     "KEYWORD_MAX_ASYNC_LLM",
     "QUERY_MAX_ASYNC_LLM",
     "AGENT_MAX_ASYNC_LLM",
+    "PROFILE_MAX_ASYNC_LLM",
     "VLM_MAX_ASYNC_LLM",
 )
 
@@ -62,6 +63,7 @@ def test_role_max_async_defaults_none_when_env_unset(monkeypatch):
     assert args.keyword_llm_max_async is None
     assert args.query_llm_max_async is None
     assert args.agent_llm_max_async is None
+    assert args.profile_llm_max_async is None
     assert args.vlm_llm_max_async is None
 
 
@@ -78,6 +80,7 @@ def test_role_max_async_env_override_keeps_other_roles_none(monkeypatch):
     assert args.keyword_llm_max_async is None
     assert args.query_llm_max_async is None
     assert args.agent_llm_max_async is None
+    assert args.profile_llm_max_async is None
     assert args.vlm_llm_max_async is None
 
 

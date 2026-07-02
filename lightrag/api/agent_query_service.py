@@ -10,6 +10,7 @@ from uuid import uuid4
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
+from lightrag.api.agent_profile_service import effective_agent_profile
 from lightrag.api.enterprise_auth import (
     agent_max_rounds,
     agent_query_enabled,
@@ -20,6 +21,7 @@ from lightrag.api.enterprise_auth import (
     get_request_principal,
 )
 from lightrag.api.kb_service import KnowledgeBaseRecord, KnowledgeBaseService
+from lightrag.api.llm_json_utils import LLMJsonError, call_llm_json
 from lightrag.api.query_tool_service import (
     KBQueryFilters,
     QueryMode,
@@ -28,9 +30,15 @@ from lightrag.api.query_tool_service import (
 )
 from lightrag.constants import DEFAULT_QUERY_PRIORITY
 from lightrag.prompt import PROMPTS
-from lightrag.utils import logger, process_chunks_unified
+from lightrag.utils import logger, truncate_list_by_token_size
 
 AGENT_ALLOWED_MODES: set[str] = {"local", "global", "hybrid", "naive", "mix"}
+
+# Bounded retries for the planning call: local models occasionally emit
+# invalid JSON; a failed plan is retried before the session fails.
+AGENT_PLAN_LLM_ATTEMPTS = 3
+_PRIORITY_RANK = {"P0": 0, "P1": 1, "P2": 2}
+_PLANNING_KB_WARN_THRESHOLD = 50
 
 DEFAULT_AGENT_WORKFLOW_PROMPT = """
 你是 LightRAG Agent 编排器。你只能在服务端提供的 allowed_kbs 中选择 kb_ids，
@@ -43,18 +51,34 @@ DEFAULT_AGENT_WORKFLOW_PROMPT = """
 
 class AgentPlanStep(BaseModel):
     step_index: int = Field(ge=1)
-    title: str = Field(default="", max_length=200)
-    query: str = Field(min_length=3, max_length=4096)
+    title: str = ""
+    query: str = Field(min_length=3)
     kb_ids: list[str] = Field(min_length=1)
     mode: Literal["local", "global", "hybrid", "naive", "mix"]
     priority: Literal["P0", "P1", "P2"] = "P1"
     hl_keywords: list[str] = Field(default_factory=list)
     ll_keywords: list[str] = Field(default_factory=list)
 
-    @field_validator("query", "title", mode="after")
+    @field_validator("title", mode="before")
     @classmethod
-    def _strip_text(cls, value: str) -> str:
-        return value.strip()
+    def _clip_title(cls, value: Any) -> str:
+        return str(value if value is not None else "").strip()[:200]
+
+    @field_validator("query", mode="before")
+    @classmethod
+    def _clip_query(cls, value: Any) -> str:
+        return str(value if value is not None else "").strip()[:4096]
+
+    @field_validator("kb_ids", "hl_keywords", "ll_keywords", mode="before")
+    @classmethod
+    def _coerce_str_list(cls, value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        if value is None:
+            return []
+        return [str(value)]
 
 
 class AgentPlan(BaseModel):
@@ -111,18 +135,6 @@ class AgentRunResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-def _strip_code_fence(text: str) -> str:
-    value = text.strip()
-    if value.startswith("```"):
-        lines = value.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        value = "\n".join(lines).strip()
-    return value
-
-
 def _json_event(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False) + "\n"
 
@@ -149,32 +161,39 @@ def _dedup_agent_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
-def _coerce_agent_tags(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    return []
+def _interleave_rounds(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Round-robin merge evidence across retrieval steps.
 
-
-def _coerce_agent_priority(value: Any) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
+    Each step's chunks are already relevance-ordered against that step's own
+    sub-query (per-step rerank happens inside retrieval). Interleaving keeps
+    every step represented near the front so the token-budget truncation trims
+    each step's tail instead of dropping whole (late or differently-phrased)
+    steps — deliberately NOT re-reranked against the umbrella question.
+    """
+    groups: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    order: list[tuple[int, int]] = []
+    for chunk in chunks:
+        key = (int(chunk.get("round_index") or 0), int(chunk.get("step_index") or 0))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(chunk)
+    result: list[dict[str, Any]] = []
+    index = 0
+    appended = True
+    while appended:
+        appended = False
+        for key in order:
+            bucket = groups[key]
+            if index < len(bucket):
+                result.append(bucket[index])
+                appended = True
+        index += 1
+    return result
 
 
 def agent_kb_profile(record: KnowledgeBaseRecord) -> dict[str, Any]:
-    metadata = record.metadata or {}
-    agent_description = str(metadata.get("agent_description") or "").strip()
-    return {
-        "kb_id": record.id,
-        "name": record.name,
-        "description": record.description or "",
-        "agent_description": agent_description,
-        "agent_tags": _coerce_agent_tags(metadata.get("agent_tags")),
-        "agent_priority": _coerce_agent_priority(metadata.get("agent_priority")),
-    }
+    return effective_agent_profile(record)
 
 
 class AgentQueryService:
@@ -194,6 +213,62 @@ class AgentQueryService:
         body: AgentQueryRequest,
         stream: bool = False,
     ) -> AgentRunResult:
+        result: AgentRunResult | None = None
+        async for event in self._run_events(
+            request=request, body=body, stream_synthesis=stream
+        ):
+            candidate = event.get("_result")
+            if isinstance(candidate, AgentRunResult):
+                result = candidate
+        if result is None:  # pragma: no cover — the generator always attaches one
+            raise HTTPException(status_code=500, detail="Agent query produced no result")
+        return result
+
+    async def stream_events(
+        self,
+        *,
+        request: Request,
+        body: AgentQueryRequest,
+    ) -> AsyncIterator[str]:
+        try:
+            async for event in self._run_events(
+                request=request, body=body, stream_synthesis=True
+            ):
+                payload = {
+                    key: value
+                    for key, value in event.items()
+                    if not key.startswith("_")
+                }
+                yield _json_event(payload)
+        except HTTPException as exc:
+            yield _json_event(
+                {
+                    "event": "error",
+                    "error_code": "agent_http_error",
+                    "status_code": exc.status_code,
+                    "message": exc.detail,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Agent stream failed: %s", exc, exc_info=True)
+            yield _json_event(
+                {"event": "error", "error_code": "agent_error", "message": str(exc)}
+            )
+
+    async def _run_events(
+        self,
+        *,
+        request: Request,
+        body: AgentQueryRequest,
+        stream_synthesis: bool,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Drive one Agent session, yielding progress events as they happen.
+
+        Events are emitted live (planning → per-round retrieval → references →
+        synthesis deltas) so the NDJSON stream shows progress during long
+        sessions; ``run()`` consumes the same generator and only keeps the
+        final result attached to the ``done`` event under ``_result``.
+        """
         session_id = f"agent_{uuid4().hex}"
         self._require_agent_access(request)
         max_rounds = min(body.max_rounds or agent_max_rounds(), agent_max_rounds())
@@ -210,174 +285,278 @@ class AgentQueryService:
                 "max_rounds": max_rounds,
             },
         )
-
-        plan = await self._plan(
-            request=request,
-            body=body,
-            effective_records=effective_records,
-            max_rounds=max_rounds,
-        )
-        if plan.clarification_required:
-            return AgentRunResult(
-                status="clarification_required",
-                session_id=session_id,
-                clarification_question=plan.clarification_question or "请补充关键约束。",
-                metadata={"effective_kb_ids": [record.id for record in effective_records]},
-            )
-
-        steps = self._validate_plan(plan, effective_records, max_rounds)
-        evidence_chunks: list[dict[str, Any]] = []
-        steps_summary: list[dict[str, Any]] = []
-        synth_result: QueryToolResult | None = None
-
-        for round_index, step in enumerate(steps, start=1):
-            tool_result = await self._query_tool_service.retrieve_serial(
-                http_request=request,
-                kb_ids=step.kb_ids,
-                query=step.query,
-                mode=cast(QueryMode, step.mode),
-                filters=body.filters,
-                top_k=body.top_k,
-                chunk_top_k=body.chunk_top_k,
-                max_entity_tokens=body.max_entity_tokens,
-                max_relation_tokens=body.max_relation_tokens,
-                max_total_tokens=body.max_total_tokens,
-                enable_rerank=body.enable_rerank,
-                hl_keywords=step.hl_keywords,
-                ll_keywords=step.ll_keywords,
-            )
-            if synth_result is None:
-                synth_result = tool_result
-            evidence_chunks.extend(
-                {**chunk, "round_index": round_index, "step_index": step.step_index, "mode": step.mode}
-                for chunk in tool_result.chunks
-            )
-            summary = {
-                "round": round_index,
-                "step_index": step.step_index,
-                "title": step.title or step.query[:80],
-                "query": step.query,
-                "kb_ids": tool_result.queried_kb_ids,
-                "mode": step.mode,
-                "priority": step.priority,
-                "chunk_count": len(tool_result.chunks),
-                "per_kb_chunk_counts": tool_result.per_kb_chunk_counts,
-                "skipped_kbs": tool_result.skipped_kbs,
+        try:
+            yield {
+                "event": "session_started",
+                "session_id": session_id,
+                "metadata": {
+                    "effective_kb_ids": [record.id for record in effective_records]
+                },
             }
-            steps_summary.append(summary)
+
+            plan = await self._plan(
+                request=request,
+                body=body,
+                effective_records=effective_records,
+                max_rounds=max_rounds,
+            )
+            if plan.clarification_required:
+                result = AgentRunResult(
+                    status="clarification_required",
+                    session_id=session_id,
+                    clarification_question=plan.clarification_question
+                    or "请补充关键约束。",
+                    metadata={
+                        "effective_kb_ids": [record.id for record in effective_records]
+                    },
+                )
+                yield {
+                    "event": "clarification_required",
+                    "session_id": session_id,
+                    "clarification_question": result.clarification_question,
+                }
+                yield {"event": "done", "session_id": session_id, "_result": result}
+                return
+
+            steps, plan_truncated = self._validate_plan(
+                plan, effective_records, max_rounds
+            )
+            yield {
+                "event": "plan_created",
+                "session_id": session_id,
+                "plan_truncated": plan_truncated,
+                "steps": [
+                    {
+                        "step_index": step.step_index,
+                        "title": step.title or step.query[:80],
+                        "query": step.query,
+                        "kb_ids": step.kb_ids,
+                        "mode": step.mode,
+                        "priority": step.priority,
+                    }
+                    for step in steps
+                ],
+            }
+
+            evidence_chunks: list[dict[str, Any]] = []
+            steps_summary: list[dict[str, Any]] = []
+            synth_result: QueryToolResult | None = None
+
+            for round_index, step in enumerate(steps, start=1):
+                yield {
+                    "event": "round_started",
+                    "session_id": session_id,
+                    "round": round_index,
+                    "step_index": step.step_index,
+                    "title": step.title or step.query[:80],
+                    "query": step.query,
+                    "kb_ids": step.kb_ids,
+                    "mode": step.mode,
+                    "priority": step.priority,
+                }
+                summary = {
+                    "round": round_index,
+                    "step_index": step.step_index,
+                    "title": step.title or step.query[:80],
+                    "query": step.query,
+                    "kb_ids": step.kb_ids,
+                    "mode": step.mode,
+                    "priority": step.priority,
+                    "status": "ok",
+                    "chunk_count": 0,
+                    "per_kb_chunk_counts": {},
+                    "skipped_kbs": [],
+                }
+                try:
+                    tool_result = await self._query_tool_service.retrieve_serial(
+                        http_request=request,
+                        kb_ids=step.kb_ids,
+                        query=step.query,
+                        mode=cast(QueryMode, step.mode),
+                        filters=body.filters,
+                        top_k=body.top_k,
+                        chunk_top_k=body.chunk_top_k,
+                        max_entity_tokens=body.max_entity_tokens,
+                        max_relation_tokens=body.max_relation_tokens,
+                        max_total_tokens=body.max_total_tokens,
+                        enable_rerank=body.enable_rerank,
+                        hl_keywords=step.hl_keywords,
+                        ll_keywords=step.ll_keywords,
+                    )
+                except Exception as exc:  # noqa: BLE001 — tolerate per-step failure
+                    # One failed step must not discard evidence accumulated in
+                    # earlier rounds; the gap is reported to the user instead.
+                    if isinstance(exc, HTTPException):
+                        detail = exc.detail
+                        error_code = (
+                            detail.get("error_code", "agent_step_failed")
+                            if isinstance(detail, dict)
+                            else "agent_step_failed"
+                        )
+                    else:
+                        error_code = "agent_step_failed"
+                        logger.error(
+                            "Agent step %d failed: %s", step.step_index, exc,
+                            exc_info=True,
+                        )
+                    summary["status"] = "failed"
+                    summary["error_code"] = error_code
+                    steps_summary.append(summary)
+                    await append_enterprise_audit_event(
+                        request,
+                        "agent_retrieve_round",
+                        target_type="agent_session",
+                        target_id=session_id,
+                        metadata={
+                            "round": round_index,
+                            "kb_ids": step.kb_ids,
+                            "mode": step.mode,
+                            "status": "failed",
+                            "error_code": error_code,
+                            "query_hash": hashlib.sha256(
+                                step.query.encode("utf-8")
+                            ).hexdigest(),
+                        },
+                    )
+                    yield {
+                        "event": "round_result",
+                        "session_id": session_id,
+                        **summary,
+                    }
+                    continue
+
+                if synth_result is None:
+                    synth_result = tool_result
+                evidence_chunks.extend(
+                    {
+                        **chunk,
+                        "round_index": round_index,
+                        "step_index": step.step_index,
+                        "mode": step.mode,
+                    }
+                    for chunk in tool_result.chunks
+                )
+                summary.update(
+                    {
+                        "kb_ids": tool_result.queried_kb_ids,
+                        "chunk_count": len(tool_result.chunks),
+                        "per_kb_chunk_counts": tool_result.per_kb_chunk_counts,
+                        "skipped_kbs": tool_result.skipped_kbs,
+                    }
+                )
+                steps_summary.append(summary)
+                await append_enterprise_audit_event(
+                    request,
+                    "agent_retrieve_round",
+                    target_type="agent_session",
+                    target_id=session_id,
+                    metadata={
+                        "round": round_index,
+                        "kb_ids": step.kb_ids,
+                        "mode": step.mode,
+                        "status": "ok",
+                        "query_hash": hashlib.sha256(
+                            step.query.encode("utf-8")
+                        ).hexdigest(),
+                        "chunk_count": len(tool_result.chunks),
+                        "skipped_kbs": tool_result.skipped_kbs,
+                    },
+                )
+                yield {"event": "round_result", "session_id": session_id, **summary}
+
+            failed_rounds = [s for s in steps_summary if s.get("status") == "failed"]
+            if synth_result is None:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error_code": "agent_all_steps_failed",
+                        "message": "All Agent retrieval steps failed",
+                        "steps_summary": steps_summary,
+                    },
+                )
+
+            processed = self._select_evidence(
+                body=body,
+                evidence_chunks=evidence_chunks,
+                synth_result=synth_result,
+            )
+            references, context_units = self._build_references(
+                processed, include_chunk_content=body.include_chunk_content
+            )
+            if references and body.include_references:
+                yield {
+                    "event": "references",
+                    "session_id": session_id,
+                    "references": references,
+                }
+
+            answer_parts: list[str] = []
+            if not context_units:
+                answer = "未检索到可用于回答的证据。"
+                yield {"event": "response", "session_id": session_id, "delta": answer}
+            else:
+                async for delta in self._synthesize_answer(
+                    body=body,
+                    synth_result=synth_result,
+                    references=references,
+                    context_units=context_units,
+                    steps_summary=steps_summary,
+                    stream=stream_synthesis,
+                ):
+                    if delta:
+                        answer_parts.append(delta)
+                        yield {
+                            "event": "response",
+                            "session_id": session_id,
+                            "delta": delta,
+                        }
+                answer = "".join(answer_parts)
+
             await append_enterprise_audit_event(
                 request,
-                "agent_retrieve_round",
+                "agent_query_completed",
                 target_type="agent_session",
                 target_id=session_id,
                 metadata={
-                    "round": round_index,
-                    "kb_ids": step.kb_ids,
-                    "mode": step.mode,
-                    "query_hash": hashlib.sha256(step.query.encode("utf-8")).hexdigest(),
-                    "chunk_count": len(tool_result.chunks),
-                    "skipped_kbs": tool_result.skipped_kbs,
+                    "round_count": len(steps_summary),
+                    "failed_round_count": len(failed_rounds),
+                    "reference_count": len(references),
+                    "effective_kb_ids": [record.id for record in effective_records],
                 },
             )
-
-        answer, references = await self._synthesize(
-            body=body,
-            evidence_chunks=evidence_chunks,
-            synth_result=synth_result,
-            stream=stream,
-        )
-        await append_enterprise_audit_event(
-            request,
-            "agent_query_completed",
-            target_type="agent_session",
-            target_id=session_id,
-            metadata={
-                "round_count": len(steps_summary),
-                "reference_count": len(references),
-                "effective_kb_ids": [record.id for record in effective_records],
-            },
-        )
-        return AgentRunResult(
-            status="success",
-            session_id=session_id,
-            answer=answer,
-            references=references if body.include_references else [],
-            steps_summary=steps_summary,
-            metadata={
-                "effective_kb_ids": [record.id for record in effective_records],
-                "round_count": len(steps_summary),
-            },
-        )
-
-    async def stream_events(
-        self,
-        *,
-        request: Request,
-        body: AgentQueryRequest,
-    ) -> AsyncIterator[str]:
-        # The first implementation preserves deterministic serial behavior and
-        # emits stable Agent envelopes while reusing the non-streaming synthesis
-        # path. Streaming token deltas can be added without changing event names.
-        try:
-            result = await self.run(request=request, body=body, stream=False)
-            yield _json_event(
-                {
-                    "event": "session_started",
-                    "session_id": result.session_id,
-                    "metadata": result.metadata,
-                }
+            result = AgentRunResult(
+                status="success",
+                session_id=session_id,
+                answer=answer,
+                references=references if body.include_references else [],
+                steps_summary=steps_summary,
+                metadata={
+                    "effective_kb_ids": [record.id for record in effective_records],
+                    "round_count": len(steps_summary),
+                    "failed_round_count": len(failed_rounds),
+                    "plan_truncated": plan_truncated,
+                },
             )
-            if result.status == "clarification_required":
-                yield _json_event(
-                    {
-                        "event": "clarification_required",
-                        "session_id": result.session_id,
-                        "clarification_question": result.clarification_question,
-                    }
+            yield {"event": "done", "session_id": session_id, "_result": result}
+        except Exception as exc:
+            try:
+                await append_enterprise_audit_event(
+                    request,
+                    "agent_session_failed",
+                    target_type="agent_session",
+                    target_id=session_id,
+                    metadata={
+                        "error": str(
+                            exc.detail if isinstance(exc, HTTPException) else exc
+                        )[:500],
+                        "status_code": exc.status_code
+                        if isinstance(exc, HTTPException)
+                        else None,
+                    },
                 )
-                yield _json_event({"event": "done", "session_id": result.session_id})
-                return
-            yield _json_event(
-                {
-                    "event": "plan_created",
-                    "session_id": result.session_id,
-                    "steps": result.steps_summary,
-                }
-            )
-            for step in result.steps_summary:
-                yield _json_event(
-                    {"event": "round_result", "session_id": result.session_id, **step}
-                )
-            if result.references:
-                yield _json_event(
-                    {
-                        "event": "references",
-                        "session_id": result.session_id,
-                        "references": result.references,
-                    }
-                )
-            yield _json_event(
-                {
-                    "event": "response",
-                    "session_id": result.session_id,
-                    "delta": result.answer,
-                }
-            )
-            yield _json_event({"event": "done", "session_id": result.session_id})
-        except HTTPException as exc:
-            yield _json_event(
-                {
-                    "event": "error",
-                    "error_code": "agent_http_error",
-                    "status_code": exc.status_code,
-                    "message": exc.detail,
-                }
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Agent stream failed: %s", exc, exc_info=True)
-            yield _json_event(
-                {"event": "error", "error_code": "agent_error", "message": str(exc)}
-            )
+            except Exception as audit_exc:  # noqa: BLE001
+                logger.warning("Agent session-failed audit failed: %s", audit_exc)
+            raise
 
     def _require_agent_access(self, request: Request):
         if not agent_query_enabled():
@@ -432,6 +611,12 @@ class AgentQueryService:
         agent_func = global_config["role_llm_funcs"].get("agent")
         if agent_func is None:
             raise HTTPException(status_code=500, detail="AGENT role LLM is unavailable")
+        if len(effective_records) > _PLANNING_KB_WARN_THRESHOLD:
+            logger.warning(
+                "Agent planning payload contains %d KB profiles; consider "
+                "candidate_kb_ids to narrow the planning context",
+                len(effective_records),
+            )
         user_prompt = ""
         principal = get_request_principal(request)
         if principal is not None and principal.auth_method == "jwt":
@@ -474,25 +659,24 @@ class AgentQueryService:
             },
         }
         prompt = json.dumps(payload, ensure_ascii=False)
+
+        def _parse_plan(data: Any) -> AgentPlan:
+            plan = AgentPlan.model_validate(data)
+            if not plan.clarification_required and not plan.steps:
+                raise ValueError("plan contains no steps and no clarification")
+            return plan
+
         try:
-            raw = await partial(agent_func, _priority=DEFAULT_QUERY_PRIORITY)(
+            return await call_llm_json(
+                agent_func,
                 prompt,
                 system_prompt=DEFAULT_AGENT_WORKFLOW_PROMPT,
-                stream=False,
-                enable_cot=False,
-                response_format={"type": "json_object"},
+                priority=DEFAULT_QUERY_PRIORITY,
+                parse=_parse_plan,
+                attempts=AGENT_PLAN_LLM_ATTEMPTS,
+                label="agent_plan",
             )
-        except TypeError:
-            raw = await partial(agent_func, _priority=DEFAULT_QUERY_PRIORITY)(
-                prompt,
-                system_prompt=DEFAULT_AGENT_WORKFLOW_PROMPT,
-                stream=False,
-                enable_cot=False,
-            )
-        try:
-            parsed = raw if isinstance(raw, dict) else json.loads(_strip_code_fence(str(raw)))
-            return AgentPlan.model_validate(parsed)
-        except Exception as exc:  # noqa: BLE001
+        except LLMJsonError as exc:
             raise HTTPException(
                 status_code=502,
                 detail={"error_code": "agent_plan_invalid", "message": str(exc)},
@@ -503,9 +687,23 @@ class AgentQueryService:
         plan: AgentPlan,
         effective_records: list[KnowledgeBaseRecord],
         max_rounds: int,
-    ) -> list[AgentPlanStep]:
+    ) -> tuple[list[AgentPlanStep], bool]:
         allowed_ids = {record.id for record in effective_records}
-        steps = sorted(plan.steps, key=lambda step: step.step_index)[:max_rounds]
+        # Stable order: P0 before P1/P2, plan order within the same priority.
+        # Sub-queries are self-contained by contract, so reordering is safe and
+        # guarantees P0 steps survive the max_rounds truncation below.
+        ordered = sorted(
+            plan.steps,
+            key=lambda step: (_PRIORITY_RANK.get(step.priority, 1), step.step_index),
+        )
+        truncated = len(ordered) > max_rounds
+        steps = ordered[:max_rounds]
+        if truncated:
+            logger.warning(
+                "Agent plan truncated from %d to %d steps (max_rounds)",
+                len(ordered),
+                max_rounds,
+            )
         if not steps:
             raise HTTPException(status_code=400, detail="Agent plan contains no executable steps")
         for step in steps:
@@ -513,32 +711,47 @@ class AgentQueryService:
                 raise HTTPException(status_code=400, detail="Agent plan contains unsupported mode")
             if any(kb_id not in allowed_ids for kb_id in step.kb_ids):
                 raise HTTPException(status_code=403, detail="Agent plan selected an inaccessible KB")
-        return steps
+        return steps, truncated
 
-    async def _synthesize(
+    def _select_evidence(
         self,
         *,
         body: AgentQueryRequest,
         evidence_chunks: list[dict[str, Any]],
-        synth_result: QueryToolResult | None,
-        stream: bool,
-    ) -> tuple[str, list[dict[str, Any]]]:
-        if synth_result is None or synth_result.rag is None or synth_result.param is None:
-            return "未检索到可用于回答的证据。", []
-        global_config = synth_result.rag._build_global_config()
+        synth_result: QueryToolResult,
+    ) -> list[dict[str, Any]]:
+        """Dedup, interleave across rounds, and token-truncate the evidence.
+
+        No second rerank happens here: chunks were already reranked against
+        their own sub-query during retrieval, and re-scoring them against the
+        umbrella question systematically drops evidence for sub-questions
+        phrased differently (e.g. P0 regulation lookups).
+        """
+        deduped = _dedup_agent_chunks(evidence_chunks)
+        interleaved = _interleave_rounds(deduped)
+        rag = synth_result.rag
         param = synth_result.param
-        if body.response_type:
-            param.response_type = body.response_type
-        if body.max_total_tokens:
-            param.max_total_tokens = body.max_total_tokens
-        processed = await process_chunks_unified(
-            query=body.query,
-            unique_chunks=_dedup_agent_chunks(evidence_chunks),
-            query_param=param,
-            global_config=global_config,
-            source_type="agent",
-            chunk_token_limit=None,
+        tokenizer = None
+        if rag is not None:
+            tokenizer = rag._build_global_config().get("tokenizer")
+        budget = body.max_total_tokens or (
+            getattr(param, "max_total_tokens", None) if param is not None else None
         )
+        if tokenizer is not None and budget:
+            interleaved = truncate_list_by_token_size(
+                interleaved,
+                key=lambda chunk: str(chunk.get("content", "")),
+                max_token_size=int(budget),
+                tokenizer=tokenizer,
+            )
+        return interleaved
+
+    def _build_references(
+        self,
+        processed: list[dict[str, Any]],
+        *,
+        include_chunk_content: bool,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
         references: list[dict[str, Any]] = []
         context_units: list[dict[str, str]] = []
         for index, chunk in enumerate(processed, start=1):
@@ -555,13 +768,28 @@ class AgentQueryService:
                 "chunk_id": chunk.get("chunk_id"),
                 "source_reference_id": chunk.get("reference_id"),
             }
-            if body.include_chunk_content:
+            if include_chunk_content:
                 ref["content"] = [content]
             references.append(ref)
             context_units.append({"reference_id": reference_id, "content": content})
+        return references, context_units
 
-        if not context_units:
-            return "未检索到可用于回答的证据。", []
+    async def _synthesize_answer(
+        self,
+        *,
+        body: AgentQueryRequest,
+        synth_result: QueryToolResult,
+        references: list[dict[str, Any]],
+        context_units: list[dict[str, str]],
+        steps_summary: list[dict[str, Any]],
+        stream: bool,
+    ) -> AsyncIterator[str]:
+        global_config = synth_result.rag._build_global_config()
+        param = synth_result.param
+        if body.response_type:
+            param.response_type = body.response_type
+        if body.max_total_tokens:
+            param.max_total_tokens = body.max_total_tokens
         reference_list_str = "\n".join(
             f"[{ref['reference_id']}] {ref['file_path']} (kb_id={ref['kb_id']}, round={ref['round']})"
             for ref in references
@@ -576,6 +804,11 @@ class AgentQueryService:
             "你只能基于给定证据回答。引用必须使用 [A1]、[A2] 这样的 Agent 级引用编号。"
             "如果证据不足或存在冲突，必须明确说明缺口或冲突；不要编造未在证据中的事实。"
         )
+        gap_notes = self._evidence_gap_notes(steps_summary)
+        if gap_notes:
+            agent_rules = (
+                f"{agent_rules}\n已知检索缺口（必须在回答中明确说明对应内容未覆盖）：{gap_notes}"
+            )
         sys_prompt = PROMPTS["naive_rag_response"].format(
             response_type=param.response_type or "Multiple Paragraphs",
             user_prompt=f"{agent_rules}\n\n{user_prompt}",
@@ -591,11 +824,24 @@ class AgentQueryService:
             enable_cot=True,
         )
         if hasattr(response, "__aiter__"):
-            parts: list[str] = []
             async for chunk in response:
                 if chunk:
-                    parts.append(str(chunk))
-            answer = "".join(parts)
+                    yield str(chunk)
         else:
-            answer = str(response)
-        return answer, references
+            yield str(response)
+
+    @staticmethod
+    def _evidence_gap_notes(steps_summary: list[dict[str, Any]]) -> str:
+        notes: list[str] = []
+        for summary in steps_summary:
+            if summary.get("status") == "failed":
+                notes.append(
+                    f"第{summary['round']}步“{summary['title']}”检索失败"
+                )
+                continue
+            for skipped in summary.get("skipped_kbs") or []:
+                notes.append(
+                    f"第{summary['round']}步知识库 {skipped.get('kb_id')} 不可用"
+                    f"（{skipped.get('reason')}）"
+                )
+        return "；".join(notes)

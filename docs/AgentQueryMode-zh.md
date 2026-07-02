@@ -175,7 +175,7 @@ KB 角色阶梯：`kb_viewer` < `kb_editor` < `kb_admin` < `kb_owner`。
 3. **effective_kb_ids**：  
    - 若 `candidate_kb_ids` 非空：`authorized_kb_ids ∩ candidate_kb_ids`；交集为空 → **400/403**，不调用 AGENT LLM。  
    - 若未传或为空：`effective_kb_ids = authorized_kb_ids`；规划时仅允许使用其中部分或全部，由模型在 JSON 计划中声明 `kb_ids`。  
-4. 注入编排上下文的 KB 列表：**仅 effective 集合** 的 id、名称、描述与 Agent Profile（不泄露未授权 KB）。Agent Profile 来自 KB `metadata` 中的可选字段：`agent_description`、`agent_tags`、`agent_priority`，用于帮助模型判断哪个 KB 更相关，不改变 RBAC。
+4. 注入编排上下文的 KB 列表：**仅 effective 集合** 的 id、名称、描述与 Agent Profile（不泄露未授权 KB）。Agent Profile 由人工覆盖字段 `agent_description` / `agent_tags` / `agent_priority` 与自动字段 `agent_auto_profile` 合并而来；自动字段由 `PROFILE` 角色 LLM 按“文档级 profile → KB 级 profile”后台生成。Profile 只帮助模型判断哪个 KB 更相关，不改变 RBAC。
 
 ### 6.3 审计与限流
 
@@ -195,19 +195,21 @@ KB 角色阶梯：`kb_viewer` < `kb_editor` < `kb_admin` < `kb_owner`。
 [0] 门禁：鉴权 → can_use_agent_query → effective_kb_ids
     ▼
 [1] 规划（AGENT LLM，JSON）：子问题、每步 kb_ids、底层 mode、优先级；或 clarification
+        （JSON 解析失败自动重试，最多 3 次；仍失败 → 502 + agent_session_failed 审计）
     ▼（若 clarification → 返回用户，结束本轮 HTTP）
-[2] 检索循环（串行，最多 max_rounds）：
+[2] 检索循环（串行，最多 max_rounds；步骤按 P0→P1→P2 稳定排序后截断，保证 P0 保留）：
         for step in plan.steps:
             校验 kb_ids ⊆ effective_kb_ids，mode ∈ {local,global,hybrid,naive,mix}
             执行单库或多库 retrieve（Query Tool Service）
+            失败 → 该步标记 status=failed，继续后续步骤（全部失败才 502）
             写入证据板
-            （可选）AGENT LLM 评估是否 CONTINUE / REFINE / FINISH（JSON）
+            （可选，后续版本）AGENT LLM 评估是否 CONTINUE / REFINE / FINISH（JSON）
     ▼
-[3] 证据整理：去重、分组、冲突标记、token 裁剪、Agent 引用编号 A1,A2,...
+[3] 证据整理：去重、按轮次轮转合并（不做二次 rerank）、token 裁剪、Agent 引用编号 A1,A2,...
     ▼
-[4] 终答合成（QUERY LLM + 证据包模板，include_references）
+[4] 终答合成（QUERY LLM + 证据包模板，include_references；失败步骤/跳过 KB 的缺口写入合成约束）
     ▼
-返回：answer、references、steps_summary、metadata
+返回：answer、references、steps_summary（含每步 status）、metadata（含 plan_truncated、failed_round_count）
 ```
 
 ### 7.2 底层 mode 选用（写入默认工作流提示词）
@@ -224,10 +226,12 @@ KB 角色阶梯：`kb_viewer` < `kb_editor` < `kb_admin` < `kb_owner`。
 - 评估 FINISH 且关键子问题（P0）在证据板有记录；或达到 `max_rounds`；或超时；或用户取消。  
 - 未满足 P0 且已达 `max_rounds`：终答 **声明证据缺口**，禁止编造。
 
-### 7.4 流式输出（建议）
+### 7.4 流式输出（已实现）
 
-NDJSON 事件，例如：`session_started`、`plan_created`、`round_started`、`round_result`、`references`、`response`（delta）、`done`、`error`。  
+NDJSON 事件按执行进度 **实时输出**：`session_started`、`plan_created`（规划完成即发）、`round_started`、`round_result`（每轮检索前后）、`references`、`response`（终答增量 delta，可多条）、`clarification_required`、`done`、`error`。
 与现有仅 `response` 的 query stream 区分，需 WebUI 独立 parser。
+
+**证据合成语义**：每步检索结果已在检索内按该步子问题 rerank；证据板合并时 **不做二次 rerank**（避免子问题证据被总问题相关性打分整体挤掉），而是按轮次轮转交错合并，再按 `max_total_tokens` 预算截断。失败步骤与跳过的 KB 作为"已知检索缺口"注入终答约束，要求模型明确声明未覆盖内容。
 
 ---
 
@@ -242,7 +246,7 @@ NDJSON 事件，例如：`session_started`、`plan_created`、`round_started`、
 **输入上下文（由服务端注入，勿虚构）**
 
 - `user_question`：用户原始问题  
-- `allowed_kbs`：`[{ "kb_id", "name", "description", "agent_description", "agent_tags", "agent_priority" }]`，仅限 effective 集合  
+- `allowed_kbs`：`[{ "kb_id", "name", "description", "agent_description", "agent_tags", "agent_priority", "agent_auto_profile_status", "agent_profile_domains", "agent_profile_sample_questions", "agent_profile_negative_scope" }]`，仅限 effective 集合  
 - `max_rounds`：最大检索轮次  
 - `default_retrieve_params`：如 `top_k`、`chunk_top_k` 上限（勿超出）  
 - `user_workflow_prompt`：用户自定义策略（可为空）
@@ -299,7 +303,7 @@ NDJSON 事件，例如：`session_started`、`plan_created`、`round_started`、
 
 ---
 
-## 9. 环境与 AGENT 角色配置
+## 9. 环境与 AGENT / PROFILE 角色配置
 
 ### 9.1 新增角色
 
@@ -307,22 +311,30 @@ NDJSON 事件，例如：`session_started`、`plan_created`、`round_started`、
 
 ```text
 RoleSpec("agent", "AGENT", "agent LLM func")
+RoleSpec("profile", "PROFILE", "profile LLM func")
 ```
 
 ### 9.2 `.env` 配置（参考 QUERY）
 
-与现有角色级变量一致，前缀为 **`AGENT_`**。单机场景可与 QUERY **共用同一本地 OpenAI 兼容服务**（同一 `host`、同一 `model`），仅角色队列与超时独立配置。
+与现有角色级变量一致，规划前缀为 **`AGENT_`**，Profile 生成前缀为 **`PROFILE_`**。单机场景可与 QUERY **共用同一本地 OpenAI 兼容服务**（同一 `host`、同一 `model`），仅角色队列与超时独立配置。
 
 示例（与 `env.enterprise-single-server.example` / `QUERY_LLM_*` 对齐）：
 
 ```bash
 ### Agent orchestration LLM (planning / JSON decisions)
-# Available roles: EXTRACT, KEYWORD, QUERY, VLM, AGENT
+# Available roles: EXTRACT, KEYWORD, QUERY, AGENT, PROFILE, VLM
 AGENT_LLM_BINDING=openai
 AGENT_LLM_BINDING_HOST=http://127.0.0.1:8000/v1
 AGENT_LLM_BINDING_API_KEY=not-needed-or-local-key
 AGENT_LLM_MODEL=qwen3.6-36b
 AGENT_LLM_TIMEOUT=300
+
+### Profile generation LLM (document profile -> KB profile)
+PROFILE_LLM_BINDING=openai
+PROFILE_LLM_BINDING_HOST=http://127.0.0.1:8000/v1
+PROFILE_LLM_BINDING_API_KEY=not-needed-or-local-key
+PROFILE_LLM_MODEL=qwen3.6-36b
+PROFILE_LLM_TIMEOUT=300
 
 # 可选：限制 AGENT 调用为 JSON 输出（实现层对 openai binding 设置 response_format）
 # AGENT_OPENAI_RESPONSE_FORMAT=json_object
@@ -333,26 +345,89 @@ AGENT_LLM_TIMEOUT=300
 - **绑定**：优先 `openai` 兼容本地 vLLM / SGLang / Ollama OpenAI 路由。  
 - **JSON**：规划与评估调用须 **强制结构化输出**（`response_format: json_object` 或项目内等价封装）；解析失败时重试有限次数，仍失败则 `agent_session_failed`。  
 - **与 QUERY 分工**：AGENT 负责 plan/evaluate（小步、短输出）；QUERY 负责终答合成（长文本、引用格式）。两角色可 **同一模型、同一 endpoint**，便于运维。  
+- **与 PROFILE 分工**：PROFILE 负责文档级/KB 级 profile JSON 生成，默认后台任务执行，不阻塞文档入库主流程。  
 - **Embedding / Rerank**：不新增角色；各 KB 共用部署级 embedding/rerank（本设计前提 §2.3）。
 
 ### 9.3 功能开关
 
 ```bash
 LIGHTRAG_AGENT_QUERY_ENABLED=false
+LIGHTRAG_AGENT_PROFILE_AUTO_REFRESH=true
+AGENT_PROFILE_REFRESH_DOC_DELTA=1
+AGENT_PROFILE_REFRESH_MIN_INTERVAL_SECONDS=0
 ```
 
-与企业模式、`can_use_agent_query` 共同生效。
+`LIGHTRAG_AGENT_QUERY_ENABLED` 与企业模式、`can_use_agent_query` 共同生效。Profile 自动刷新开关与节流参数只影响后台 `agent_profile` job；手动 `POST /kbs/{kb_id}/agent-profile:refresh` 不受节流限制。
 
 ---
 
-## 10. 用户自定义工作流提示词
+## 10. KB Agent Profile 自动生成
 
-### 10.1 需求
+### 10.1 数据结构
+
+采用“自动字段 + 人工覆盖字段”：
+
+| 层级 | 存储位置 | 说明 |
+|------|----------|------|
+| 文档级自动 profile | `documents.metadata.agent_doc_profile` | 由 `PROFILE` 角色根据解析后的 `full_docs` 内容抽样生成，包含 `summary`、`tags`、`domains`、`sample_questions`、`negative_scope`、`source_hash`、`index_hash` |
+| 组摘要缓存（大库） | `documents.metadata.agent_group_profile`（组首文档） | KB 超过 128 篇时的分层摘要中间结果：文档按创建顺序切成 128 篇/组，每组一份 LLM 组摘要，缓存键 `group_hash` 覆盖成员集合与各成员 profile 版本，成员或内容变化才重算 |
+| KB 级自动 profile | `knowledge_bases.metadata.agent_auto_profile` | 聚合文档级 profile（或组摘要）后生成，包含 `description`、`tags`、`domains`、`sample_questions`、`negative_scope`、`status`、`source_doc_count`、`profiled_doc_count`、`pending_document_profiles`、`aggregation_mode`、`group_count`、`updated_at`、`job_id` |
+| KB 级脏标记 | `knowledge_bases.metadata.agent_auto_profile_dirty` | 文档事件写入 `{dirty_at, reason, document_id}`；独立于 profile 键，刷新完成只清除早于本次刷新起点的标记，晚于起点的标记触发链式刷新 |
+| KB 级人工覆盖 | `knowledge_bases.metadata.agent_description` / `agent_tags` / `agent_priority` | 前端可编辑；人工字段优先于自动字段 |
+
+合并规则：
+
+- `agent_description` 非空时覆盖 `agent_auto_profile.description`。
+- `agent_tags` 非空时覆盖 `agent_auto_profile.tags`。
+- `agent_priority` 仅人工控制，默认 `0`。
+- 自动 profile 缺失、dirty、failed 时，Agent 查询不失败，回退到 KB `name` / `description` / 人工字段。
+
+### 10.2 后台生成流程
+
+```text
+文档解析 + 构建完成（status=ready）/ 启用停用 / 删除
+    ▼
+写入独立脏标记 knowledge_bases.metadata.agent_auto_profile_dirty
+（独立键：刷新完成写回 profile 不会覆盖并发到达的脏标记）
+    ▼
+入队 job_type=agent_profile（若该 KB 已有排队/运行中的 profile job 则合并，不重复建 job）
+    ▼
+PROFILE LLM：为缓存失效（source_hash/index_hash 变化）的文档生成 agent_doc_profile，
+每次刷新最多生成 24 篇；其余记入 pending_document_profiles
+    ▼
+KB 级聚合按已生成 profile 的文档数 N 自动选模式：
+  - direct（N ≤ 128）：全部文档 profile 逐条聚合
+  - sampled（N > 128 且回填未完成）：全库等距抽样 128 条 + tag/domain 频次统计（过渡模式）
+  - grouped（N > 128 且回填收敛）：分层摘要——按创建顺序 128 篇/组，
+    每组一份缓存的 LLM 组摘要（组首文档 agent_group_profile，group_hash 失效才重算），
+    最终聚合全部组摘要 + 频次统计；追加式入库稳态只重算尾部一组
+    ▼
+写回 KB metadata；刷新期间若有新脏标记或仍有 pending 文档 → 自动追加链式刷新（chained_refresh）
+失败只标记 failed，不影响文档 ready；LLM 超长输出截断而非拒绝，JSON 解析失败重试（最多 3 次）
+```
+
+第一期直接在 API Server 内后台执行；启用 `LIGHTRAG_KB_JOB_WORKER=true` 时，`agent_profile` job 也可被 durable worker 认领续跑。Profile 生成只读取当前 KB 的控制面文档与 `full_docs`，不会绕过用户查询时的 RBAC；`allowed_kbs` 注入仍只发生在授权 KB 子集内。
+
+### 10.3 API
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/kbs/{kb_id}/agent-profile` | 返回 `manual`、`auto`、`effective` 三段，供前端展示 |
+| PUT | `/kbs/{kb_id}/agent-profile` | 写入/清空人工覆盖字段 |
+| POST | `/kbs/{kb_id}/agent-profile:refresh` | 手动排队重新调用 `PROFILE` LLM 生成自动 profile |
+
+权限：GET 需 `kb_viewer`，PUT/POST 需 `kb_editor`；企业模式下写审计事件 `kb_agent_profile_manual_updated`、`kb_agent_profile_refresh_queued`。
+
+---
+
+## 11. 用户自定义工作流提示词
+
+### 11.1 需求
 
 - 不同用户可对 Agent **编排策略** 做个性化（如行业术语、输出结构、优先查某类库）。  
 - 须 **服务端持久化**，不依赖浏览器 localStorage 作为唯一来源。
 
-### 10.2 API 形态（建议，对齐 KB 级 `user_prompt`）
+### 11.2 API 形态（建议，对齐 KB 级 `user_prompt`）
 
 | 方法 | 路径（示意） | 说明 |
 |------|----------------|------|
@@ -370,7 +445,7 @@ LIGHTRAG_AGENT_QUERY_ENABLED=false
 - 服务端加载 **默认内置工作流提示词（§8）** + **当前用户 `workflow_prompt`**（非空则按产品规则追加或覆盖段落）。  
 - 审计仅记录 `has_custom_workflow_prompt: true/false`，不记录全文（或仅 hash）。
 
-### 10.3 与 KB 级 `user_prompt` 的关系
+### 11.3 与 KB 级 `user_prompt` 的关系
 
 - KB 级 `user_prompt` 仍作用于该 KB 的 **单次 query/retrieve** 默认参数。  
 - Agent **全局工作流提示词** 作用于 **编排与终答结构**；终答合成可将 KB 级提示词按主 KB 合并（实现细则在技术规格中定义）。  
@@ -378,7 +453,7 @@ LIGHTRAG_AGENT_QUERY_ENABLED=false
 
 ---
 
-## 11. 工具抽象（逻辑层）
+## 12. 工具抽象（逻辑层）
 
 | 逻辑工具 | 映射能力 | 备注 |
 |----------|----------|------|
@@ -393,7 +468,7 @@ LIGHTRAG_AGENT_QUERY_ENABLED=false
 
 ---
 
-## 12. 安全、审计与合规
+## 13. 安全、审计与合规
 
 - 会话证据缓存按 user/session 隔离，超时回收；敏感部署可仅内存、不落盘。  
 - 错误信息不泄露未授权 KB 是否存在。  
@@ -401,7 +476,7 @@ LIGHTRAG_AGENT_QUERY_ENABLED=false
 
 ---
 
-## 13. 与现有 API 对照
+## 14. 与现有 API 对照
 
 | 用户期望 | 现有 API | Agent 模式 |
 |----------|----------|------------|
@@ -415,39 +490,43 @@ LIGHTRAG_AGENT_QUERY_ENABLED=false
 
 ---
 
-## 14. 实施路线
+## 15. 实施路线
 
 | 阶段 | 内容 |
 |------|------|
 | A | 冻结：Agent API、NDJSON 事件、`can_use_agent_query`、AGENT 角色与 `.env`、用户工作流提示词 API |
 | B | Query Tool Service 抽取；门禁 + 串行单库多轮 retrieve + 证据合成终答 |
-| C | 多库 retrieve、引用重编号、流式事件、WebUI Agent 面板 |
-| D | 配额、审计、metrics、runbook |
-| E | 可选：独立 Agent worker 进程（loopback + 凭证透传） |
+| C | PROFILE 角色；文档级 profile → KB 级自动 profile；查看/人工覆盖/手动刷新 API |
+| D | 多库 retrieve、引用重编号、流式事件、WebUI Agent 面板 |
+| E | 配额、审计、metrics、runbook；可选独立 Agent worker 进程（loopback + 凭证透传） |
 
 ---
 
-## 15. 测试要点（摘要）
+## 16. 测试要点（摘要）
 
 - `candidate_kb_ids` 越权、交集为空、未指定时使用全部授权库。  
 - 规划含 `bypass` 或非法 `kb_id` 被拒绝。  
 - 串行顺序与 `max_rounds`。  
 - AGENT JSON 解析失败与重试。  
 - 用户工作流提示词读写与执行拼接。  
+- PROFILE 角色 JSON 生成、文档级缓存复用、KB 级自动 profile 写回、人工覆盖优先。  
 - 引用 A1/A2 跨轮不冲突。  
 - 企业限流按轮次计费。  
 
 ---
 
-## 16. 总结
+## 17. 总结
 
-**Agent 模式** 是面向用户的一种 **独立查询模式**：用 **AGENT 角色 LLM**（`.env` 中 `AGENT_LLM_*`，可与 QUERY 共用本地同一模型）输出 **JSON 规划**，在 **串行** 工作流中调用既有 **local/global/hybrid/naive/mix** 检索（**不用 bypass**），在 **用户指定或默认全部授权 KB** 范围内选库，结合 **内置工作流提示词** 与 **用户可配置工作流提示词**，以 **证据板 + QUERY 角色** 生成终答。推荐与 API Server **同进程** 部署，经 **Query Tool Service** 继承 KB RBAC 与审计，并在统一 embedding/rerank/LLM 前提下安全使用多库能力。
+**Agent 模式** 是面向用户的一种 **独立查询模式**：用 **AGENT 角色 LLM**（`.env` 中 `AGENT_LLM_*`，可与 QUERY 共用本地同一模型）输出 **JSON 规划**，在 **串行** 工作流中调用既有 **local/global/hybrid/naive/mix** 检索（**不用 bypass**），在 **用户指定或默认全部授权 KB** 范围内选库。KB 选择上下文由人工 Agent Profile 与 **PROFILE 角色**后台生成的自动 profile 合并而来；终答由 **证据板 + QUERY 角色** 生成。推荐与 API Server **同进程** 部署，经 **Query Tool Service** 继承 KB RBAC 与审计，并在统一 embedding/rerank/LLM 前提下安全使用多库能力。
 
 ---
 
-## 17. 修订记录
+## 18. 修订记录
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
 | 1.0 | 2026-07-01 | 初稿 |
 | 2.0 | 2026-07-01 | 明确 Agent 为产品模式；AGENT 角色与 `.env`；内置/用户工作流提示词；串行执行；`candidate_kb_ids` 语义；统一 embedding/rerank 前提；证据合成与 Query Tool Service |
+| 3.0 | 2026-07-01 | 增加 PROFILE 角色；文档级 profile → KB 级自动 profile；后台 `agent_profile` job；查看/人工覆盖/手动刷新 API |
+| 3.1 | 2026-07-02 | 实现修订：真流式事件；规划 JSON 重试与 `agent_session_failed` 审计；P0 优先截断；单步失败容忍；证据合成取消二次 rerank（轮次轮转合并）；profile 脏标记独立键 + job 去重 + 链式刷新；全量文档 profile 聚合（每次生成上限 24、聚合采样 128 + 频次统计）；LLM 输出截断代替拒绝 |
+| 3.2 | 2026-07-02 | 大库聚合分层摘要：KB 级聚合按规模自动切换 direct（≤128 全量）/ sampled（回填期全库等距抽样）/ grouped（128 篇/组缓存组摘要 map-reduce，追加式入库稳态 O(1) 组调用），消除 128 篇以上知识库的新旧偏差 |

@@ -36,7 +36,7 @@ MetadataStore = SQLiteMetadataStore | PostgresMetadataStore
 # extraction and VLM roles produce persisted KG/chunk content, so a change
 # there must trigger reindex; query/keyword roles only affect retrieval.
 _INDEX_AFFECTING_ROLES = frozenset({"extract", "vlm"})
-_QUERY_AFFECTING_ROLES = frozenset({"query", "keyword", "agent"})
+_QUERY_AFFECTING_ROLES = frozenset({"query", "keyword", "agent", "profile"})
 
 # Keys accepted inside an ``llm_role_config[<role>]`` mapping. ``model_kwargs``
 # and ``kwargs`` are aliases. Secret material (``api_key``) is accepted for

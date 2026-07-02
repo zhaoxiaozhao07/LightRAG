@@ -66,7 +66,7 @@ Content-Type: application/json
 - `GET /kbs?include_deleted=false`：默认排除软删除记录。
 - `GET /kbs/{kb_id}`：404 表示未找到或已软删除。
 - `PATCH /kbs/{kb_id}`：仅更新请求体显式给出的字段；`status` 不允许直接置为 `deleted`；`active_config_version_id` 不能通过 PATCH 修改，若请求体包含该字段返回 `400`，请改用 `POST /kbs/{kb_id}/configs/{version_id}:activate`。`metadata` 为**合并**语义：给出的 key 覆盖现值、value=null 删除该 key、未提及的 key 保留；顶层 `metadata: null` 返回 `400`；合并后序列化超 16KB 返回 `400`。
-- Agent 选库可使用 KB `metadata` 中的可选 profile 字段：`agent_description`（字符串，面向 Agent 的知识库说明）、`agent_tags`（字符串数组，或逗号分隔字符串）、`agent_priority`（整数，默认 0）。这些字段不会改变 RBAC，只会随 `allowed_kbs` 注入 `/agent/query` 的规划上下文，帮助 AGENT 角色判断哪个 KB 更相关。
+- Agent 选库可使用 KB `metadata` 中的 profile 字段。人工覆盖字段为 `agent_description`（字符串，面向 Agent 的知识库说明）、`agent_tags`（字符串数组，或逗号分隔字符串）、`agent_priority`（整数，默认 0）；自动字段为 `agent_auto_profile`，由 `PROFILE` 角色 LLM 基于文档级 `metadata.agent_doc_profile` 聚合生成。人工字段优先于自动字段；这些字段不会改变 RBAC，只会随授权 KB 的 `allowed_kbs` 注入 `/agent/query` 的规划上下文。
 - `DELETE /kbs/{kb_id}`：默认软删除，同步从 `LightRAGInstanceRegistry` 卸载实例。
 - `DELETE /kbs/{kb_id}?hard=true`：触发硬删除。若服务端启用 durable worker 且 `clear_kb` 在 `job_worker.resumable_job_types` 中，路由会先 soft-delete/tombstone KB，再调用 `KBDeletionService.enqueue_hard_delete()` 创建 queued `clear_kb` job，并返回 `KnowledgeBaseDeleteResponse` 中的 `hard_delete_queued=true`、`hard_delete_job_id`、`hard_delete_job_type="clear_kb"`、`hard_delete_job_status="queued"`；后续由 worker 通过 `resume_hard_delete` 幂等执行，且 job 查询/取消/重试端点对 soft-deleted KB 使用 `include_deleted=true`，因此硬删除 job 在 KB tombstone 后仍可观察和控制。若 durable worker 未启用，保持兼容的同步硬删除流程：`KBDeletionService` 在 destructive lock 下依次执行：
   1. `force_evict` 在内存中的 LightRAG 实例并调用 `finalize_storages`（关闭存储句柄，不删数据）；
@@ -1042,12 +1042,12 @@ Content-Type: application/json
 
 ### 9.3 Agent 查询模式（`/agent`）
 
-Agent 查询模式是服务端多轮编排入口，不是 `QueryParam.mode=agent`。它使用 `AGENT_LLM_*` 角色模型输出 JSON 规划，随后在当前用户可访问的 KB 范围内串行调用既有 `local` / `global` / `hybrid` / `naive` / `mix` 检索，**不支持 `bypass`**。完整能力要求企业模式、`LIGHTRAG_AGENT_QUERY_ENABLED=true`、当前 principal 具备 `can_use_agent_query`，且每个被选中的 KB 至少具备 `kb_viewer`。AGENT 规划时看到的 `allowed_kbs` 包含 KB `name`、`description` 以及 metadata 中的 `agent_description` / `agent_tags` / `agent_priority`。
+Agent 查询模式是服务端多轮编排入口，不是 `QueryParam.mode=agent`。它使用 `AGENT_LLM_*` 角色模型输出 JSON 规划，随后在当前用户可访问的 KB 范围内串行调用既有 `local` / `global` / `hybrid` / `naive` / `mix` 检索，**不支持 `bypass`**。完整能力要求企业模式、`LIGHTRAG_AGENT_QUERY_ENABLED=true`、当前 principal 具备 `can_use_agent_query`，且每个被选中的 KB 至少具备 `kb_viewer`。AGENT 规划时看到的 `allowed_kbs` 只包含已授权 KB 的 `name`、`description` 与合并后的 Agent Profile：人工 `agent_description` / `agent_tags` / `agent_priority` 优先，缺省时使用 `agent_auto_profile`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/agent/query` | 非流式 Agent 问答；返回终答、Agent 级引用、步骤摘要与 metadata |
-| `POST` | `/agent/query/stream` | Agent NDJSON 事件流；事件包括 `session_started`、`plan_created`、`round_result`、`references`、`response`、`done`、`error` |
+| `POST` | `/agent/query/stream` | Agent NDJSON 事件流；事件随执行进度**实时输出**（规划完成即发 `plan_created`，每轮检索前后发 `round_started` / `round_result`，终答按增量 `response` delta 流式输出）。事件包括 `session_started`、`plan_created`、`round_started`、`round_result`、`references`、`response`、`clarification_required`、`done`、`error` |
 
 请求体：
 
@@ -1070,7 +1070,11 @@ Agent 查询模式是服务端多轮编排入口，不是 `QueryParam.mode=agent
 字段说明：
 
 - `candidate_kb_ids` 可省略或为空：表示候选范围为当前 principal 的全部授权 KB，由 AGENT 模型在规划时自行选择；若提供，则必须全部在授权范围内，否则返回 `403`，且不会调用 AGENT LLM。
-- `max_rounds` 会被服务端全局 `AGENT_MAX_ROUNDS` clamp；所有轮次串行执行。
+- `max_rounds` 会被服务端全局 `AGENT_MAX_ROUNDS` clamp；所有轮次串行执行。规划步骤按 **P0 → P1 → P2 稳定排序** 后再截断到 `max_rounds`，保证 P0（法规/合规类）步骤不会被截断丢弃；发生截断时 `metadata.plan_truncated=true`。
+- 规划 JSON 解析失败会自动重试（最多 3 次 AGENT LLM 调用）；仍失败返回 `502`（`error_code=agent_plan_invalid`），并写审计事件 `agent_session_failed`。
+- **单步失败容忍**：某一步骤检索失败不会终止会话——该步在 `steps_summary` 中标记 `status="failed"`（附 `error_code`），其余步骤继续执行，终答会明确声明对应证据缺口；所有步骤都失败时返回 `502`（`error_code=agent_all_steps_failed`）。
+- 终答证据合成 **不做二次 rerank**：每步结果已按该步子问题排序（检索内启用 rerank 时），跨轮去重后按轮次轮转合并，再按 `max_total_tokens` 预算截断并编号为 A1、A2…，避免子问题证据被总问题的相关性打分整体挤掉。
+- KB 级用户查询设置中的 `user_prompt` 不参与 Agent 终答；需要定制终答风格请使用请求体 `user_prompt` 或用户工作流提示词（`/auth/me/agent-workflow-prompt`）。
 - `filters` 为用户请求级过滤，模型不能生成越权 filters；服务端沿用 KB query/retrieve 的文档生命周期、enabled/archived 与 doc-id scope 约束。
 - 底层检索 mode 由 AGENT 规划步骤决定，但只能是 `local` / `global` / `hybrid` / `naive` / `mix`。
 
@@ -1103,6 +1107,7 @@ Agent 查询模式是服务端多轮编排入口，不是 `QueryParam.mode=agent
       "kb_ids": ["kb_regulation"],
       "mode": "mix",
       "priority": "P0",
+      "status": "ok",
       "chunk_count": 5,
       "per_kb_chunk_counts": {"kb_regulation": 5},
       "skipped_kbs": []
@@ -1110,8 +1115,29 @@ Agent 查询模式是服务端多轮编排入口，不是 `QueryParam.mode=agent
   ],
   "metadata": {
     "effective_kb_ids": ["kb_regulation", "kb_formula"],
-    "round_count": 1
+    "round_count": 1,
+    "failed_round_count": 0,
+    "plan_truncated": false
   }
+}
+```
+
+失败步骤在 `steps_summary` 中的形态（会话不中断）：
+
+```json
+{
+  "round": 2,
+  "step_index": 2,
+  "title": "查配方",
+  "query": "检索配方建议...",
+  "kb_ids": ["kb_formula"],
+  "mode": "mix",
+  "priority": "P1",
+  "status": "failed",
+  "error_code": "kb_retrieve_failed",
+  "chunk_count": 0,
+  "per_kb_chunk_counts": {},
+  "skipped_kbs": []
 }
 ```
 
@@ -1129,18 +1155,115 @@ Agent 查询模式是服务端多轮编排入口，不是 `QueryParam.mode=agent
 }
 ```
 
-流式响应为 `application/x-ndjson`，示例：
+流式响应为 `application/x-ndjson`，事件随执行进度实时输出；`response` 事件为增量 delta，可出现多条。示例：
 
 ```json
 {"event":"session_started","session_id":"agent_...","metadata":{"effective_kb_ids":["kb1"]}}
-{"event":"plan_created","session_id":"agent_...","steps":[...]}
-{"event":"round_result","session_id":"agent_...","round":1,"kb_ids":["kb1"],"chunk_count":5}
+{"event":"plan_created","session_id":"agent_...","plan_truncated":false,"steps":[...]}
+{"event":"round_started","session_id":"agent_...","round":1,"step_index":1,"title":"查法规","kb_ids":["kb1"],"mode":"mix","priority":"P0"}
+{"event":"round_result","session_id":"agent_...","round":1,"status":"ok","kb_ids":["kb1"],"chunk_count":5}
 {"event":"references","session_id":"agent_...","references":[...]}
-{"event":"response","session_id":"agent_...","delta":"最终答案..."}
+{"event":"response","session_id":"agent_...","delta":"根据法规"}
+{"event":"response","session_id":"agent_...","delta":"要求... [A1]"}
 {"event":"done","session_id":"agent_..."}
 ```
 
-### 9.4 图谱（无前缀）
+### 9.4 KB Agent Profile（`/kbs/{kb_id}/agent-profile`）
+
+KB Agent Profile 用于帮助 `/agent/query` 在多 KB 候选集中选库，不改变 KB RBAC、文档 enabled/archived 生命周期、metadata filters 或 doc-id scope。系统在文档构建到 `ready`、启用/停用或删除后异步触发后台 `agent_profile` job：先用 `PROFILE` 角色 LLM 为文档生成 `documents.metadata.agent_doc_profile`，再聚合为 KB 级 `knowledge_bases.metadata.agent_auto_profile`。生成失败只把 profile 标为 `failed`，不会使文档入库失败；查询时 profile 缺失会回退到 KB `name` + `description` + 人工字段。
+
+后台生成的调度与规模行为：
+
+- **去重合并**：同一 KB 已有排队/运行中的 `agent_profile` job 时，新的自动触发不再重复建 job（批量导入 N 篇文档只产生一条刷新链，而不是 N 个全量刷新）。`force=true` 的手动刷新仅被"运行中的 force job"合并。
+- **脏标记与链式刷新**：文档事件写入独立的 `agent_auto_profile_dirty` 标记；刷新完成时若发现运行期间又有新事件（或仍有未生成 profile 的文档），会自动追加一次链式刷新（`reason=chained_refresh`），直到收敛。
+- **全库聚合（三种模式，按规模自动切换）**：单次刷新最多新生成 24 篇文档的 profile，超出部分记入 `pending_document_profiles` 并由链式刷新继续处理；文档级 profile 按 `source_hash` + `index_hash` 缓存复用。KB 级聚合按已生成 profile 的文档数 N 自动选择模式（`auto.aggregation_mode`）：
+  - `direct`（N ≤ 128）：全部文档 profile 逐条参与聚合；
+  - `sampled`（N > 128 且回填未完成）：过渡模式，对全库做**等距抽样**取 128 条逐条参与（覆盖新旧文档，而非只取最新），另附全库 tag/domain 频次统计；
+  - `grouped`（N > 128 且回填已收敛）：**分层摘要（map-reduce）**——文档按创建顺序切成 128 篇/组，每组由 PROFILE LLM 生成"组摘要"并缓存在组首文档的 `agent_group_profile` 元数据中（键含成员内容哈希，成员或其 profile 变化才重算），最终聚合全部组摘要 + 频次统计。追加式入库通常只需重算尾部一组，单篇变更的稳态成本为 O(1) 次组调用；组摘要覆盖**全部**已生成 profile 的文档，无新旧偏差。
+- **输出韧性**：PROFILE LLM 输出超长字段/超量条目会被**截断**而不是判为失败；JSON 解析失败自动重试（最多 3 次）。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/kbs/{kb_id}/agent-profile` | 查看人工字段、自动字段和最终 effective profile；需 `kb_viewer`+ |
+| `PUT` | `/kbs/{kb_id}/agent-profile` | 更新人工覆盖字段；需 `kb_editor`+ |
+| `POST` | `/kbs/{kb_id}/agent-profile:refresh` | 人工触发后台重新生成自动 profile；需 `kb_editor`+ |
+
+`GET /kbs/{kb_id}/agent-profile` 响应：
+
+```json
+{
+  "kb_id": "kb_regulation",
+  "manual": {
+    "agent_description": "优先用于法规、合规、禁忌和限量判断",
+    "agent_tags": ["法规", "合规"],
+    "agent_priority": 10
+  },
+  "auto": {
+    "schema_version": 1,
+    "type": "kb_agent_auto_profile",
+    "status": "ready",
+    "description": "适合回答食品法规、合规限制和原料限量问题。",
+    "tags": ["法规", "合规", "限量"],
+    "domains": ["食品合规"],
+    "sample_questions": ["某原料是否允许使用？"],
+    "negative_scope": ["配方工艺细节"],
+    "source_doc_count": 12,
+    "profiled_doc_count": 12,
+    "pending_document_profiles": 0,
+    "aggregation_mode": "direct",
+    "sampled_doc_count": 12,
+    "group_count": 0,
+    "updated_at": "2026-07-01T...",
+    "job_id": "job_agent_profile_..."
+  },
+  "dirty": null,
+  "effective": {
+    "kb_id": "kb_regulation",
+    "name": "法规库",
+    "description": "regulations",
+    "agent_description": "优先用于法规、合规、禁忌和限量判断",
+    "agent_tags": ["法规", "合规"],
+    "agent_priority": 10,
+    "agent_auto_profile_status": "ready"
+  }
+}
+```
+
+字段说明：`dirty` 非 null 时表示有文档事件尚未反映到自动 profile（`{"dirty_at", "reason", "document_id"}`），此时 `effective.agent_auto_profile_status` 为 `dirty`；`pending_document_profiles > 0` 表示仍有文档 profile 待链式刷新生成。`aggregation_mode` 为本次聚合模式（`direct` / `sampled` / `grouped`），`grouped` 模式下 `group_count` 为组摘要数量、`sampled_doc_count` 为组摘要覆盖的文档总数（等于全部已生成 profile 的文档数）。
+
+`PUT /kbs/{kb_id}/agent-profile` 请求体支持部分字段更新；显式 `null` 或空 tags 会清除对应人工覆盖，使 effective profile 回落到自动字段。
+
+```json
+{
+  "agent_description": "优先用于法规和合规判断",
+  "agent_tags": ["法规", "合规", "限量"],
+  "agent_priority": 10
+}
+```
+
+`POST /kbs/{kb_id}/agent-profile:refresh` 请求体：
+
+```json
+{
+  "force": true,
+  "idempotency_key": "manual-profile-refresh-20260701"
+}
+```
+
+返回：
+
+```json
+{
+  "job_id": "job_agent_profile_...",
+  "job_type": "agent_profile",
+  "status": "queued",
+  "created": true
+}
+```
+
+未携带 `idempotency_key` 的刷新请求，在该 KB 已有排队/运行中的 `agent_profile` job 时会合并到现有 job（返回 `created: false`）；`force: true` 仅与运行中的 force job 合并，否则会在当前 job 之后排队一次强制刷新。
+
+### 9.5 图谱（无前缀）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -1157,7 +1280,7 @@ Agent 查询模式是服务端多轮编排入口，不是 `QueryParam.mode=agent
 | `DELETE` | `/graph/entity/delete` | 删除实体及其关系 |
 | `DELETE` | `/graph/relation/delete` | 删除关系 |
 
-### 9.5 Ollama 兼容（`/api`）
+### 9.6 Ollama 兼容（`/api`）
 
 挂载 `OllamaAPI`，对外提供与 Ollama 接口兼容的端点：
 
@@ -1171,7 +1294,7 @@ Agent 查询模式是服务端多轮编排入口，不是 `QueryParam.mode=agent
 
 默认 `WHITELIST_PATHS` 仅放行 `/health`；如果要让 Ollama 兼容端点免 API Key，需要显式配置 `WHITELIST_PATHS=/health,/api/*`。企业模式下 `/api/*` 属于受保护前缀，不能被 whitelist 或全局 API key 默认绕过。
 
-### 9.6 状态与认证基础接口
+### 9.7 状态与认证基础接口
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -1238,6 +1361,9 @@ LIGHTRAG_ENTERPRISE_TENANT_MAX_CONCURRENT_JOBS=0
 LIGHTRAG_AGENT_QUERY_ENABLED=false
 AGENT_MAX_ROUNDS=5
 AGENT_WORKFLOW_PROMPT_MAX_LENGTH=16384
+LIGHTRAG_AGENT_PROFILE_AUTO_REFRESH=true
+AGENT_PROFILE_REFRESH_DOC_DELTA=1
+AGENT_PROFILE_REFRESH_MIN_INTERVAL_SECONDS=0
 
 # Agent 编排角色 LLM：通常与 QUERY 使用同一本地 OpenAI-compatible 模型
 AGENT_LLM_BINDING=openai
@@ -1246,6 +1372,14 @@ AGENT_LLM_BINDING_API_KEY=local-dummy-key
 AGENT_LLM_MODEL=qwen3.6-36b
 AGENT_MAX_ASYNC_LLM=1
 AGENT_LLM_TIMEOUT=300
+
+# Profile 生成角色 LLM：用于文档级 profile → KB 级自动 Agent Profile
+PROFILE_LLM_BINDING=openai
+PROFILE_LLM_BINDING_HOST=http://127.0.0.1:8000/v1
+PROFILE_LLM_BINDING_API_KEY=local-dummy-key
+PROFILE_LLM_MODEL=qwen3.6-36b
+PROFILE_MAX_ASYNC_LLM=1
+PROFILE_LLM_TIMEOUT=300
 ```
 
 ### 10.2 登录与当前用户
@@ -1405,7 +1539,7 @@ KB ACL 请求/响应约束：
 - KB 图谱编辑：`kb_graph_entity_edited`、`kb_graph_entity_created`、`kb_graph_entity_deleted`、`kb_graph_entities_merged`、`kb_graph_relation_edited`、`kb_graph_relation_created`、`kb_graph_relation_deleted`
 - artifact/job/document 类事件：`artifact_downloaded`、`artifact_previewed`、`artifact_download_url_created`、`kb_rebuild_queued`、`job_cancel_requested`、`job_retry_queued`、`document_batch_enabled`、`document_batch_disabled`，以及文档 upload/texts/urls/import/scan/sync/patch/enable/disable/replace/delete/batch-delete/parse/batch-parse/build/reindex/batch-build/batch-reindex/rebuild 相关事件。
 
-审计覆盖：企业模式下，KB 创建/删除、config 激活、query/query-stream/retrieve、artifact download/preview/download-url、文档 upload/texts/urls/import/scan/sync/patch/enable/disable/replace/delete/batch-delete/parse/batch-parse/build/reindex/batch-build/batch-reindex/rebuild，以及 job cancel/retry 均写入 audit event。审计 metadata 采用白名单字段：query 仅记录 `query_hash`、mode、过滤摘要；文档与 artifact 事件仅记录 job/batch/document/artifact id、count、flag、hash、size/type 等，不记录 raw query、上传正文、URL、local path、presigned URL、密码/token/API key 明文。
+审计覆盖：企业模式下，KB 创建/删除、KB Agent Profile 人工更新/刷新排队、config 激活、query/query-stream/retrieve、artifact download/preview/download-url、文档 upload/texts/urls/import/scan/sync/patch/enable/disable/replace/delete/batch-delete/parse/batch-parse/build/reindex/batch-build/batch-reindex/rebuild，以及 job cancel/retry 均写入 audit event。审计 metadata 采用白名单字段：query 仅记录 `query_hash`、mode、过滤摘要；文档与 artifact 事件仅记录 job/batch/document/artifact id、count、flag、hash、size/type 等，不记录 raw query、上传正文、URL、local path、presigned URL、密码/token/API key 明文。
 
 管理请求体示例：
 

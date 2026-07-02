@@ -6,7 +6,7 @@ import mimetypes
 import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Awaitable, Callable, Literal
 from uuid import uuid4
 
 from lightrag.api.config_version_service import active_parser_runtime_config_from_version
@@ -47,6 +47,7 @@ from lightrag.utils import compute_mdhash_id, generate_track_id, logger
 SourceType = Literal["upload", "text", "url", "import", "scan"]
 SOURCE_TYPES: tuple[SourceType, ...] = ("upload", "text", "url", "import", "scan")
 MetadataStore = SQLiteMetadataStore | PostgresMetadataStore
+AgentProfileDirtyCallback = Callable[[str, str, str], Awaitable[None]]
 
 # Sanitization rule: drop only path separators, control characters, and
 # characters that are unsafe inside a filename on common filesystems
@@ -187,11 +188,18 @@ class DocumentLifecycleService:
         metadata_store: MetadataStore,
         source_root: str | Path,
         object_storage: ObjectStorage | None = None,
+        agent_profile_dirty_callback: AgentProfileDirtyCallback | None = None,
     ):
         self._kb_service = kb_service
         self._metadata_store = metadata_store
         self._source_root = Path(source_root)
         self._object_storage = object_storage
+        self._agent_profile_dirty_callback = agent_profile_dirty_callback
+
+    def set_agent_profile_dirty_callback(
+        self, callback: AgentProfileDirtyCallback | None
+    ) -> None:
+        self._agent_profile_dirty_callback = callback
 
     @property
     def metadata_store(self) -> MetadataStore:
@@ -447,13 +455,18 @@ class DocumentLifecycleService:
         archived: bool | None = None,
     ) -> DocumentRecord:
         record = await self._kb_service.get(kb_id)
-        return await self._metadata_store.update_document(
+        document = await self._metadata_store.update_document(
             record.id,
             document_id,
             metadata_patch=metadata_patch,
             enabled=enabled,
             archived=archived,
         )
+        if enabled is not None or archived is not None:
+            await self._notify_agent_profile_dirty(
+                record.id, document_id, "document_lifecycle_changed"
+            )
+        return document
 
     async def claim_delete(
         self,
@@ -508,7 +521,7 @@ class DocumentLifecycleService:
         file_result: DocumentDeleteFileResult | None = None,
     ) -> DocumentRecord:
         record = await self._kb_service.get(kb_id)
-        return await self._metadata_store.complete_document_delete(
+        document = await self._metadata_store.complete_document_delete(
             record.id,
             document_id,
             metadata_patch={
@@ -520,6 +533,23 @@ class DocumentLifecycleService:
                 "file_delete_result": asdict(file_result) if file_result else None,
             },
         )
+        await self._notify_agent_profile_dirty(record.id, document_id, "document_deleted")
+        return document
+
+    async def _notify_agent_profile_dirty(
+        self, kb_id: str, document_id: str, reason: str
+    ) -> None:
+        if self._agent_profile_dirty_callback is None:
+            return
+        try:
+            await self._agent_profile_dirty_callback(kb_id, document_id, reason)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Agent profile dirty callback failed for KB '%s' doc '%s': %s",
+                kb_id,
+                document_id,
+                exc,
+            )
 
     async def fail_delete(
         self,

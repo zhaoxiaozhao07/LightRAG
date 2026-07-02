@@ -4,13 +4,15 @@ LightRAG supports configuring different LLMs or VLMs for different processing st
 
 ## Role Overview
 
-Four roles are currently supported:
+Six roles are currently supported:
 
 | Role | Purpose |
 | --- | --- |
 | `EXTRACT` | Entity/relation extraction and entity/relation description summarization. |
 | `KEYWORD` | Query keyword extraction for high-level / low-level keyword generation before retrieval. |
 | `QUERY` | Final QA, regular queries, bypass queries, and the query path of the Ollama-compatible API. |
+| `AGENT` | Server-side Agent query planning and JSON decisions. |
+| `PROFILE` | Background generation of document-level and KB-level Agent routing profiles. |
 | `VLM` | Multimodal analysis stage for VLM analysis of images, tables, formulas, and similar content. |
 
 If a role has no dedicated configuration, LightRAG uses the base `LLM_*` configuration.
@@ -60,7 +62,7 @@ Variable format:
 
 | Variable | Description |
 | --- | --- |
-| `{ROLE}_LLM_BINDING` | Overrides the role provider. `ROLE` can be `EXTRACT`, `KEYWORD`, `QUERY`, or `VLM`. |
+| `{ROLE}_LLM_BINDING` | Overrides the role provider. `ROLE` can be `EXTRACT`, `KEYWORD`, `QUERY`, `AGENT`, `PROFILE`, or `VLM`. |
 | `{ROLE}_LLM_MODEL` | Overrides the role model name. |
 | `{ROLE}_LLM_BINDING_HOST` | Overrides the role endpoint. |
 | `{ROLE}_LLM_BINDING_API_KEY` | Overrides the role API key. Bedrock does not support it. |

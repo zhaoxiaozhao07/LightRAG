@@ -2,6 +2,8 @@
 LightRAG FastAPI Server
 """
 
+import asyncio
+
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
@@ -79,6 +81,8 @@ from lightrag.api.metrics import build_prometheus_metrics, record_http_request
 from lightrag.api.object_storage import create_object_storage_from_env
 from lightrag.api.postgres_kb_service import PostgresKnowledgeBaseService
 from lightrag.api.postgres_metadata_store import PostgresMetadataStore
+from lightrag.api.agent_profile_service import AgentProfileService
+from lightrag.api.routers.agent_profile_routes import create_agent_profile_routes
 from lightrag.api.routers.agent_routes import create_agent_routes
 from lightrag.api.routers.kb_document_routes import create_kb_document_routes
 from lightrag.api.routers.kb_graph_routes import create_kb_graph_routes
@@ -2391,6 +2395,40 @@ def create_app(args):
         builder=build_kb_lightrag,
         finalizer=finalize_kb_lightrag,
     )
+    agent_profile_service = AgentProfileService(
+        kb_service=kb_service,
+        document_service=document_lifecycle_service,
+        registry=kb_registry,
+        job_service=job_service,
+        auto_refresh_enabled=get_env_value(
+            "LIGHTRAG_AGENT_PROFILE_AUTO_REFRESH", True, bool
+        ),
+        refresh_doc_delta=get_env_value("AGENT_PROFILE_REFRESH_DOC_DELTA", 1, int),
+        refresh_min_interval_seconds=get_env_value(
+            "AGENT_PROFILE_REFRESH_MIN_INTERVAL_SECONDS", 0.0, float
+        ),
+    )
+
+    async def _schedule_agent_profile_refresh(
+        kb_id: str,
+        document_id: str,
+        reason: str = "document_build_completed",
+    ) -> None:
+        # Enqueue dedup and in-process spawning both live inside the profile
+        # service (see AgentProfileService.enqueue_refresh / set_job_runner).
+        await agent_profile_service.mark_dirty(
+            kb_id,
+            reason=reason,
+            document_id=document_id,
+            enqueue=True,
+        )
+
+    index_build_service.set_agent_profile_dirty_callback(
+        _schedule_agent_profile_refresh
+    )
+    document_lifecycle_service.set_agent_profile_dirty_callback(
+        _schedule_agent_profile_refresh
+    )
     config_version_service = ConfigVersionService(
         kb_service, metadata_store, kb_registry
     )
@@ -2409,6 +2447,7 @@ def create_app(args):
     app.state.job_service = job_service
     app.state.config_version_service = config_version_service
     app.state.kb_deletion_service = kb_deletion_service
+    app.state.agent_profile_service = agent_profile_service
     app.state.object_storage = object_storage
 
     # Optional durable job worker: re-drives queued single-document
@@ -2419,6 +2458,7 @@ def create_app(args):
     if get_env_value("LIGHTRAG_KB_JOB_WORKER", False, bool):
         from lightrag.api.job_worker import (
             JobWorker,
+            build_agent_profile_executor,
             build_build_kg_executor,
             build_clear_kb_executor,
             build_delete_executor,
@@ -2460,6 +2500,9 @@ def create_app(args):
         clear_kb_executor = build_clear_kb_executor(
             deletion_service=kb_deletion_service,
         )
+        agent_profile_executor = build_agent_profile_executor(
+            profile_service=agent_profile_service,
+        )
         job_worker = JobWorker(
             job_service,
             executors={
@@ -2470,6 +2513,7 @@ def create_app(args):
                 "replace": replace_executor,
                 "sync": sync_executor,
                 "clear_kb": clear_kb_executor,
+                "agent_profile": agent_profile_executor,
             },
             poll_interval_seconds=get_env_value(
                 "LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS", 1.0, float
@@ -2479,6 +2523,12 @@ def create_app(args):
             ),
         )
     app.state.job_worker = job_worker
+    if job_worker is None:
+        # No durable worker: agent_profile jobs created by mark_dirty, the
+        # manual refresh route, or post-refresh chaining run in-process.
+        agent_profile_service.set_job_runner(
+            lambda job: asyncio.create_task(agent_profile_service.run_job(job))
+        )
 
     # Add routes
     # root_path is set on the app for reverse proxy support;
@@ -2521,6 +2571,12 @@ def create_app(args):
             kb_service=kb_service,
             document_service=document_lifecycle_service,
             registry=kb_registry,
+            api_key=api_key,
+        )
+    )
+    app.include_router(
+        create_agent_profile_routes(
+            profile_service=agent_profile_service,
             api_key=api_key,
         )
     )

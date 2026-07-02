@@ -45,12 +45,14 @@ _T = TypeVar("_T")
 #   source names, hashes, content types, and sync options in the job payload;
 # - ``clear_kb``: carries ``kb_id`` / ``workspace``; the destructive clear is
 #   idempotent so a queued job can be re-driven after restart.
+# - ``agent_profile``: carries ``kb_id`` plus force/reason flags; profile
+#   generation is idempotent and writes compact control-plane metadata.
 # Single-document ``replace`` matches the ``document_id IS NOT NULL`` arm and is
 # now worker-resumable: its uploaded bytes are staged to disk at claim time
 # (``stage_replacement_bytes``) and a ``replace`` executor is registered, so a
 # queued/retried replace job can be re-driven from disk.
 _AGGREGATE_RESUMABLE_JOB_TYPES: frozenset[str] = frozenset(
-    {"delete", "parse", "build_kg", "reindex", "sync", "clear_kb"}
+    {"delete", "parse", "build_kg", "reindex", "sync", "clear_kb", "agent_profile"}
 )
 
 

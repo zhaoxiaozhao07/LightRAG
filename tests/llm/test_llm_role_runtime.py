@@ -115,6 +115,7 @@ ROLE_MAX_ASYNC_ENV_KEYS = (
     "KEYWORD_MAX_ASYNC_LLM",
     "QUERY_MAX_ASYNC_LLM",
     "AGENT_MAX_ASYNC_LLM",
+    "PROFILE_MAX_ASYNC_LLM",
     "VLM_MAX_ASYNC_LLM",
 )
 
@@ -219,11 +220,13 @@ def test_role_max_async_defaults_inherit_base(tmp_path, monkeypatch):
     assert rag._role_llm_states["keyword"].max_async is None
     assert rag._role_llm_states["query"].max_async is None
     assert rag._role_llm_states["agent"].max_async is None
+    assert rag._role_llm_states["profile"].max_async is None
     assert rag._role_llm_states["vlm"].max_async is None
     assert rag._get_effective_role_llm_max_async("extract") == 10
     assert rag._get_effective_role_llm_max_async("keyword") == 10
     assert rag._get_effective_role_llm_max_async("query") == 10
     assert rag._get_effective_role_llm_max_async("agent") == 10
+    assert rag._get_effective_role_llm_max_async("profile") == 10
     assert rag._get_effective_role_llm_max_async("vlm") == 10
 
 
@@ -241,11 +244,13 @@ def test_role_max_async_env_override_keeps_other_roles_inherited(tmp_path, monke
     assert rag._role_llm_states["keyword"].max_async is None
     assert rag._role_llm_states["query"].max_async is None
     assert rag._role_llm_states["agent"].max_async is None
+    assert rag._role_llm_states["profile"].max_async is None
     assert rag._role_llm_states["vlm"].max_async is None
     assert rag._get_effective_role_llm_max_async("extract") == 7
     assert rag._get_effective_role_llm_max_async("keyword") == 10
     assert rag._get_effective_role_llm_max_async("query") == 10
     assert rag._get_effective_role_llm_max_async("agent") == 10
+    assert rag._get_effective_role_llm_max_async("profile") == 10
     assert rag._get_effective_role_llm_max_async("vlm") == 10
 
 
@@ -258,6 +263,8 @@ async def test_role_functions_are_isolated_and_vlm_present(tmp_path):
         rag.role_llm_funcs["extract"],
         rag.role_llm_funcs["keyword"],
         rag.role_llm_funcs["query"],
+        rag.role_llm_funcs["agent"],
+        rag.role_llm_funcs["profile"],
         rag.role_llm_funcs["vlm"],
     ]
     assert all(callable(func) for func in funcs)
@@ -855,7 +862,7 @@ async def test_llm_role_config_and_queue_status_are_observable(tmp_path):
     )
 
     all_configs = rag.get_llm_role_config()
-    assert set(all_configs) == {"extract", "keyword", "query", "vlm"}
+    assert set(all_configs) == {"extract", "keyword", "query", "agent", "profile", "vlm"}
     assert all_configs["query"]["binding"] == "openai"
     assert all_configs["query"]["model"] == "gpt-test"
     # Auth-bearing fields are dropped from the observability snapshot,
@@ -869,7 +876,7 @@ async def test_llm_role_config_and_queue_status_are_observable(tmp_path):
     assert rag._role_llm_states["query"].metadata["api_key"] == "secret-key"
 
     queue_status = await rag.get_llm_queue_status()
-    assert set(queue_status) == {"extract", "keyword", "query", "vlm"}
+    assert set(queue_status) == {"extract", "keyword", "query", "agent", "profile", "vlm"}
     assert queue_status["query"]["available"] is True
     assert queue_status["query"]["queue_name"] == "query LLM func"
 
