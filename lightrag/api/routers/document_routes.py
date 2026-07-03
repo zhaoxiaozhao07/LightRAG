@@ -94,8 +94,11 @@ SUPPORTED_DOCUMENT_EXTENSIONS = (
     ".md",
     ".mdx",  # MDX (Markdown + JSX)
     ".pdf",
+    ".doc",
     ".docx",
+    ".ppt",
     ".pptx",
+    ".xls",
     ".xlsx",
     ".rtf",  # Rich Text Format
     ".odt",  # OpenDocument Text
@@ -131,6 +134,7 @@ SUPPORTED_DOCUMENT_EXTENSIONS = (
     ".scss",  # Sassy CSS
     ".less",  # LESS CSS
 )
+LEGACY_OFFICE_DOCUMENT_EXTENSIONS = {".doc", ".ppt", ".xls"}
 
 
 def normalize_file_path(file_path: str | None) -> str:
@@ -1427,6 +1431,7 @@ def _file_path_for_parsed_artifact_dir(dir_name: str) -> str | None:
     - ``<basename>.parsed[_NNN]/``        — sidecar output (every engine)
     - ``<basename>.mineru_raw[_NNN]/``    — MinerU preserved raw bundle
     - ``<basename>.docling_raw[_NNN]/``   — Docling preserved raw bundle
+    - ``<basename>.libreoffice_raw[_NNN]/`` — cached Office conversion output
 
     Raw bundles are preserved across re-parses for cache reuse and on-demand
     diagnostics; they are cleaned only when the user deletes the document
@@ -1890,6 +1895,24 @@ async def pipeline_enqueue_file(
                     f"[File Extraction]Error enqueuing {file_path.name} for {extraction_engine}: {str(e)}"
                 )
                 return False, track_id
+
+        if ext in LEGACY_OFFICE_DOCUMENT_EXTENSIONS:
+            guidance = (
+                f"Legacy Office file {ext} requires Docling with LibreOffice "
+                "conversion. Configure LIGHTRAG_PARSER to route doc/ppt/xls "
+                "to docling and set ENABLE_LIBREOFFICE_CONVERSION=true."
+            )
+            error_files = [
+                {
+                    "file_path": str(file_path.name),
+                    "error_description": "[File Extraction]Legacy Office conversion not configured",
+                    "original_error": guidance,
+                    "file_size": file_size,
+                }
+            ]
+            await rag.apipeline_enqueue_error_documents(error_files, track_id)
+            logger.error("[File Extraction]%s", guidance)
+            return False, track_id
 
         file = None
         try:

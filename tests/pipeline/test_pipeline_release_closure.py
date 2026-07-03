@@ -226,6 +226,20 @@ def test_filename_hint_missing_required_endpoint_rejects(monkeypatch):
 
 
 @pytest.mark.offline
+def test_filename_hint_legacy_office_docling_requires_libreoffice(monkeypatch):
+    from lightrag.parser.routing import resolve_file_parser_directives
+
+    monkeypatch.setenv("DOCLING_ENDPOINT", "http://fake-docling")
+    monkeypatch.delenv("ENABLE_LIBREOFFICE_CONVERSION", raising=False)
+
+    with pytest.raises(FilenameParserHintError, match="ENABLE_LIBREOFFICE_CONVERSION"):
+        resolve_file_parser_directives("foo.[docling].doc")
+
+    monkeypatch.setenv("ENABLE_LIBREOFFICE_CONVERSION", "true")
+    assert resolve_file_parser_directives("foo.[docling].doc") == ("docling", "")
+
+
+@pytest.mark.offline
 def test_parse_process_options_decodes_flags():
     from lightrag.parser.routing import parse_process_options
 
@@ -2205,6 +2219,31 @@ def test_parser_routing_accepts_semicolon_rules(monkeypatch):
     assert resolve_file_parser_engine("paper.pdf", parser_rules=rules) == "mineru"
     assert resolve_file_parser_engine("index.html", parser_rules=rules) == "docling"
     assert resolve_file_parser_engine("notes.txt", parser_rules=rules) == "legacy"
+
+
+@pytest.mark.offline
+def test_parser_routing_accepts_legacy_office_docling_rules(monkeypatch):
+    monkeypatch.setenv("DOCLING_ENDPOINT", "http://fake-docling")
+    monkeypatch.setenv("ENABLE_LIBREOFFICE_CONVERSION", "true")
+
+    rules = "doc:docling,ppt:docling,xls:docling"
+    validate_parser_routing_config(rules)
+    assert resolve_file_parser_engine("legacy.doc", parser_rules=rules) == "docling"
+    assert resolve_file_parser_engine("slides.ppt", parser_rules=rules) == "docling"
+    assert resolve_file_parser_engine("book.xls", parser_rules=rules) == "docling"
+
+
+@pytest.mark.offline
+def test_parser_routing_requires_libreoffice_for_legacy_office_docling_rules(
+    monkeypatch,
+):
+    monkeypatch.setenv("DOCLING_ENDPOINT", "http://fake-docling")
+    monkeypatch.delenv("ENABLE_LIBREOFFICE_CONVERSION", raising=False)
+
+    with pytest.raises(
+        ParserRoutingConfigError, match="ENABLE_LIBREOFFICE_CONVERSION=true"
+    ):
+        validate_parser_routing_config("doc:docling,ppt:docling,xls:docling")
 
 
 @pytest.mark.offline

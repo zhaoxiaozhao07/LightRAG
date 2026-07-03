@@ -408,6 +408,172 @@ def test_parse_docling_cache_hit_skips_download(
 
 
 @pytest.mark.offline
+def test_parse_docling_legacy_doc_converts_before_docling_and_keeps_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _run() -> None:
+        monkeypatch.setenv("DOCLING_ENDPOINT", "http://docling.test")
+        monkeypatch.setenv("ENABLE_LIBREOFFICE_CONVERSION", "true")
+
+        from lightrag.parser.external.libreoffice import (
+            LibreOfficeConversionResult,
+            LibreOfficeConverter,
+        )
+
+        conversion_calls: list[dict[str, Any]] = []
+
+        async def _fake_convert(
+            self,
+            raw_dir: Path,
+            source_file_path: Path,
+            *,
+            document_name: str,
+        ) -> LibreOfficeConversionResult:
+            conversion_calls.append(
+                {
+                    "raw_dir": raw_dir,
+                    "source": source_file_path,
+                    "document_name": document_name,
+                }
+            )
+            converted = raw_dir / "output" / "demo.docx"
+            converted.parent.mkdir(parents=True, exist_ok=True)
+            if not converted.exists():
+                converted.write_bytes(b"converted docx payload")
+            return LibreOfficeConversionResult(
+                converted_path=converted,
+                upload_filename="demo.docx",
+                cache_hit=len(conversion_calls) > 1,
+            )
+
+        monkeypatch.setattr(
+            LibreOfficeConverter,
+            "convert_for_docling",
+            _fake_convert,
+        )
+
+        import lightrag.parser.external.docling.client as client_mod
+
+        download_calls: list[dict[str, Any]] = []
+
+        async def _fake_download(
+            self,
+            raw_dir: Path,
+            source_file_path: Path,
+            *,
+            upload_filename: str | None = None,
+        ):
+            download_calls.append(
+                {
+                    "raw_dir": raw_dir,
+                    "source": source_file_path,
+                    "upload_filename": upload_filename,
+                }
+            )
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            main_json = raw_dir / "demo.json"
+            main_json.write_text(json.dumps(_FAKE_DOCLING_JSON), encoding="utf-8")
+            (raw_dir / "demo.md").write_text("# fake md", encoding="utf-8")
+
+            src_size, src_hash = compute_size_and_hash(source_file_path)
+            crit_size, crit_hash = compute_size_and_hash(main_json)
+            options_signature = compute_options_signature(
+                tunable_env=snapshot_tunable_env(),
+                fixed_constants=FIXED_CONSTANTS,
+            )
+            manifest = Manifest(
+                engine="docling",
+                source_content_hash=src_hash,
+                source_size_bytes=src_size,
+                source_filename_at_parse=upload_filename or source_file_path.name,
+                critical_file=ManifestFile(
+                    path="demo.json", size=crit_size, sha256=crit_hash
+                ),
+                files=[
+                    ManifestFile(
+                        path="demo.md", size=(raw_dir / "demo.md").stat().st_size
+                    )
+                ],
+                total_size_bytes=crit_size + (raw_dir / "demo.md").stat().st_size,
+                task_id="fake-legacy-doc",
+                endpoint_signature="http://docling.test",
+                options_signature=options_signature,
+                extras={"fixed_constants": dict(FIXED_CONSTANTS)},
+                downloaded_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            )
+            write_manifest(raw_dir, manifest)
+            return manifest
+
+        monkeypatch.setattr(
+            client_mod.DoclingRawClient,
+            "download_into",
+            _fake_download,
+        )
+
+        input_dir = tmp_path / "inputs" / "ws"
+        input_dir.mkdir(parents=True)
+        src = input_dir / "demo.doc"
+        src.write_bytes(b"legacy doc payload")
+
+        archived_sources: list[str] = []
+
+        async def _record_archive(path: str) -> None:
+            archived_sources.append(path)
+            return None
+
+        import lightrag.pipeline as pipeline_module
+
+        monkeypatch.setattr(
+            pipeline_module,
+            "archive_docx_source_after_full_docs_sync",
+            _record_archive,
+        )
+
+        rag = _new_rag(tmp_path)
+        await rag.initialize_storages()
+        try:
+            monkeypatch.setattr(rag, "_resolve_source_file_for_parser", lambda _p: str(src))
+            doc_id = "doc-abcdef0123456789abcdef0123456789"
+            await _seed_doc_status(rag, doc_id)
+
+            parsed = await rag.parse_docling(
+                doc_id=doc_id,
+                file_path="demo.doc",
+                content_data={},
+            )
+
+            parsed_dir = Path(parsed["blocks_path"]).parent
+            assert parsed_dir.name == "demo.doc.parsed"
+            assert conversion_calls[0]["raw_dir"].name == "demo.doc.libreoffice_raw"
+            assert conversion_calls[0]["source"] == src
+            assert conversion_calls[0]["document_name"] == "demo.doc"
+            converted = conversion_calls[0]["raw_dir"] / "output" / "demo.docx"
+            assert download_calls == [
+                {
+                    "raw_dir": parsed_dir.parent / "demo.doc.docling_raw",
+                    "source": converted,
+                    "upload_filename": "demo.docx",
+                }
+            ]
+
+            meta = json.loads((parsed_dir / "demo.blocks.jsonl").read_text().splitlines()[0])
+            assert meta["document_name"] == "demo.doc"
+            assert meta["document_format"] == "doc"
+            assert archived_sources == [str(src)]
+
+            await rag.parse_docling(
+                doc_id=doc_id,
+                file_path="demo.doc",
+                content_data={},
+            )
+            assert len(download_calls) == 1, "converted-path Docling cache must hit"
+        finally:
+            await rag.finalize_storages()
+
+    asyncio.new_event_loop().run_until_complete(_run())
+
+
+@pytest.mark.offline
 def test_parse_docling_cache_invalidates_on_source_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

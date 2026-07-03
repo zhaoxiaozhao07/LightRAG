@@ -26,6 +26,7 @@ from lightrag.constants import (
     DOCLING_RAW_DIR_SUFFIX,
     FULL_DOCS_FORMAT_LIGHTRAG,
     FULL_DOCS_FORMAT_PENDING_PARSE,
+    LIBREOFFICE_RAW_DIR_SUFFIX,
     MINERU_RAW_DIR_SUFFIX,
     PARSED_DIR_SUFFIX,
     PARSER_ENGINE_DOCLING,
@@ -1861,8 +1862,9 @@ def _build_parse_artifacts(
         )
 
     if sidecar_dir is not None:
-        raw_dir = _raw_artifact_dir(sidecar_dir, plan.parser_engine)
-        if raw_dir is not None and raw_dir.exists():
+        for raw_dir in _raw_artifact_dirs(sidecar_dir, plan.parser_engine):
+            if not raw_dir.exists():
+                continue
             artifacts.append(
                 _artifact_record(
                     plan,
@@ -1990,15 +1992,18 @@ def _artifact_record(
     )
 
 
-def _raw_artifact_dir(sidecar_dir: Path, engine: str) -> Path | None:
+def _raw_artifact_dirs(sidecar_dir: Path, engine: str) -> list[Path]:
     if not sidecar_dir.name.endswith(PARSED_DIR_SUFFIX):
-        return None
+        return []
     base = sidecar_dir.name[: -len(PARSED_DIR_SUFFIX)]
     if engine == PARSER_ENGINE_MINERU:
-        return sidecar_dir.parent / f"{base}{MINERU_RAW_DIR_SUFFIX}"
+        return [sidecar_dir.parent / f"{base}{MINERU_RAW_DIR_SUFFIX}"]
     if engine == PARSER_ENGINE_DOCLING:
-        return sidecar_dir.parent / f"{base}{DOCLING_RAW_DIR_SUFFIX}"
-    return None
+        return [
+            sidecar_dir.parent / f"{base}{DOCLING_RAW_DIR_SUFFIX}",
+            sidecar_dir.parent / f"{base}{LIBREOFFICE_RAW_DIR_SUFFIX}",
+        ]
+    return []
 
 
 def _file_checksum(path: Path) -> str:

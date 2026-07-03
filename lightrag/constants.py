@@ -208,8 +208,11 @@ PARSER_ENGINE_SUFFIX_CAPABILITIES = {
     PARSER_ENGINE_DOCLING: frozenset(
         {
             "pdf",
+            "doc",
             "docx",
+            "ppt",
             "pptx",
+            "xls",
             "xlsx",
             "md",
             "html",
@@ -233,10 +236,12 @@ PARSED_DIR_NAME = "__parsed__"  # Dir for parsed files (renamed from __enqueued_
 PARSED_DIR_SUFFIX = ".parsed"  # spec sidecar layout (every engine)
 MINERU_RAW_DIR_SUFFIX = ".mineru_raw"  # preserved MinerU raw bundle
 DOCLING_RAW_DIR_SUFFIX = ".docling_raw"  # preserved Docling raw bundle
+LIBREOFFICE_RAW_DIR_SUFFIX = ".libreoffice_raw"  # cached Office conversions
 PARSED_ARTIFACT_DIR_SUFFIXES: tuple[str, ...] = (
     PARSED_DIR_SUFFIX,
     MINERU_RAW_DIR_SUFFIX,
     DOCLING_RAW_DIR_SUFFIX,
+    LIBREOFFICE_RAW_DIR_SUFFIX,
 )
 
 # Per-file processing options carried by filename hints / LIGHTRAG_PARSER rules.

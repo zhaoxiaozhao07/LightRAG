@@ -43,6 +43,7 @@ _PARSER_ENGINE_ENDPOINT_ENV = {
     PARSER_ENGINE_DOCLING: "DOCLING_ENDPOINT",
 }
 _VALID_MINERU_API_MODES = {"official", "local"}
+_LEGACY_OFFICE_SUFFIXES_REQUIRING_LIBREOFFICE = frozenset({"doc", "ppt", "xls"})
 
 # Trailing parser-hint pattern: matches ``.[engine].ext`` at end of basename.
 # Group 1 captures the raw engine token (still needs normalize_parser_engine
@@ -505,6 +506,26 @@ def parser_engine_endpoint_requirement(engine: str) -> str | None:
     return _PARSER_ENGINE_ENDPOINT_ENV.get(engine)
 
 
+def libreoffice_conversion_enabled() -> bool:
+    return os.getenv("ENABLE_LIBREOFFICE_CONVERSION", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _docling_rule_requires_libreoffice(pattern: str) -> bool:
+    return any(
+        fnmatch.fnmatch(suffix, pattern)
+        for suffix in _LEGACY_OFFICE_SUFFIXES_REQUIRING_LIBREOFFICE
+    )
+
+
+def _docling_suffix_requires_libreoffice(suffix: str) -> bool:
+    return suffix.lower().lstrip(".") in _LEGACY_OFFICE_SUFFIXES_REQUIRING_LIBREOFFICE
+
+
 def _engine_is_usable(
     engine: str,
     suffix: str,
@@ -514,6 +535,12 @@ def _engine_is_usable(
     if engine not in SUPPORTED_PARSER_ENGINES:
         return False
     if not parser_engine_supports_suffix(engine, suffix):
+        return False
+    if (
+        engine == PARSER_ENGINE_DOCLING
+        and _docling_suffix_requires_libreoffice(suffix)
+        and not libreoffice_conversion_enabled()
+    ):
         return False
     if require_external_endpoint and not parser_engine_endpoint_configured(engine):
         return False
@@ -649,6 +676,16 @@ def _validate_filename_hint_for_resolution(
                 f"filename hint {m.group(0)!r} requires {endpoint_req} "
                 "to be configured"
             )
+        if (
+            engine == PARSER_ENGINE_DOCLING
+            and _docling_suffix_requires_libreoffice(suffix)
+            and not libreoffice_conversion_enabled()
+        ):
+            errors.append(
+                f"filename hint {m.group(0)!r} routes legacy Office suffix "
+                f"{suffix!r} through Docling and requires "
+                "ENABLE_LIBREOFFICE_CONVERSION=true"
+            )
 
     if errors:
         raise FilenameParserHintError(
@@ -774,6 +811,15 @@ def validate_parser_routing_config(parser_rules: str | None = None) -> None:
         endpoint_req = parser_engine_endpoint_requirement(engine)
         if endpoint_req and not parser_engine_endpoint_configured(engine):
             errors.append(f"{label} requires {endpoint_req} to be configured")
+        if (
+            engine == PARSER_ENGINE_DOCLING
+            and _docling_rule_requires_libreoffice(pattern)
+            and not libreoffice_conversion_enabled()
+        ):
+            errors.append(
+                f"{label} routes legacy Office suffixes (doc/ppt/xls) through "
+                "Docling and requires ENABLE_LIBREOFFICE_CONVERSION=true"
+            )
         if options_str:
             errors.extend(
                 f"{label}: {msg}"

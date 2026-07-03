@@ -3259,6 +3259,11 @@ class _PipelineMixin:
             is_bundle_valid,
             raw_dir_for_parsed_dir,
         )
+        from lightrag.parser.external.libreoffice import (
+            LibreOfficeConverter,
+            is_legacy_office_file,
+            raw_dir_for_parsed_dir as libreoffice_raw_dir_for_parsed_dir,
+        )
         from lightrag.sidecar import write_sidecar
 
         source_file_path = Path(
@@ -3282,6 +3287,17 @@ class _PipelineMixin:
         )
         raw_dir = raw_dir_for_parsed_dir(parsed_dir)
 
+        docling_source_path = source_file_path
+        docling_upload_filename = document_name
+        if is_legacy_office_file(document_name):
+            conversion = await LibreOfficeConverter().convert_for_docling(
+                libreoffice_raw_dir_for_parsed_dir(parsed_dir),
+                source_file_path,
+                document_name=document_name,
+            )
+            docling_source_path = conversion.converted_path
+            docling_upload_filename = conversion.upload_filename
+
         env_force_reparse = os.getenv("LIGHTRAG_FORCE_REPARSE_DOCLING", "").lower() in {
             "1",
             "true",
@@ -3291,7 +3307,7 @@ class _PipelineMixin:
         force_reparse = bool(content_data.get("force_reparse")) or env_force_reparse
 
         parse_stage_skipped = False
-        if not force_reparse and is_bundle_valid(raw_dir, source_file_path):
+        if not force_reparse and is_bundle_valid(raw_dir, docling_source_path):
             # Cache hit: keep purely local so re-parses still work when the
             # docling-serve endpoint is temporarily unavailable.
             parse_stage_skipped = True
@@ -3309,7 +3325,7 @@ class _PipelineMixin:
             logger.info(
                 "[Docling] Parsing %s %s (may take a few minutes)",
                 doc_id,
-                source_file_path.name,
+                docling_source_path.name,
             )
             # Pass the canonical (hint-stripped) name so docling-serve names
             # the bundle's main JSON ``<canonical_stem>.json`` instead of
@@ -3317,11 +3333,21 @@ class _PipelineMixin:
             # the canonical ``document_name`` — cannot locate the bundle JSON
             # via the preferred-path lookup.
             await client.download_into(
-                raw_dir, source_file_path, upload_filename=document_name
+                raw_dir,
+                docling_source_path,
+                upload_filename=docling_upload_filename,
             )
 
         ir_builder = DoclingIRBuilder()
-        ir = ir_builder.normalize_from_workdir(raw_dir, document_name=document_name)
+        ir = ir_builder.normalize_from_workdir(
+            raw_dir, document_name=docling_upload_filename
+        )
+        if docling_upload_filename != document_name:
+            # The Docling raw bundle is named after the converted OOXML upload
+            # (e.g. demo.docx → demo.json), but the public sidecar/full_docs
+            # identity must remain the original user document (demo.doc).
+            ir.document_name = document_name
+            ir.document_format = Path(document_name).suffix.lower().lstrip(".")
         if not ir.blocks:
             raise ValueError(
                 f"Docling IR builder produced zero blocks for {file_path} "
