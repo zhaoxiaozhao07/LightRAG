@@ -3,7 +3,7 @@
 > 文档版本：2026-07-01（v2）  
 > 适用范围：在现有 LightRAG API Server、知识库（KB）多模式检索、企业认证与 KB 级 RBAC/ACL 之上，新增面向生产环境的 **Agent 多轮查询编排** 能力（产品面称 **「Agent 模式」**）。  
 > 目标读者：架构师、后端与前端集成者、安全审计、单机/私有化部署运维。  
-> 关联文档：`docs/archive/企业级多用户权限管理改造设计方案.md`、`docs/LightRAG-API-Server-zh.md`、`docs/RoleSpecificLLMConfiguration-zh.md`、`docs/API接口.md`。
+> 关联文档：`docs/archive/企业级多用户权限管理改造设计方案.md`、`docs/LightRAG-API-Server-zh.md`、`docs/RoleSpecificLLMConfiguration-zh.md`、`docs/API接口.md`、`docs/AgentStagedRecommendation-zh.md`（阶段化配比推荐工作流）。
 
 ---
 
@@ -373,14 +373,16 @@ AGENT_PROFILE_REFRESH_MIN_INTERVAL_SECONDS=0
 | 组摘要缓存（大库） | `documents.metadata.agent_group_profile`（组首文档） | KB 超过 128 篇时的分层摘要中间结果：文档按创建顺序切成 128 篇/组，每组一份 LLM 组摘要，缓存键 `group_hash` 覆盖成员集合与各成员 profile 版本，成员或内容变化才重算 |
 | KB 级自动 profile | `knowledge_bases.metadata.agent_auto_profile` | 聚合文档级 profile（或组摘要）后生成，包含 `description`、`tags`、`domains`、`sample_questions`、`negative_scope`、`status`、`source_doc_count`、`profiled_doc_count`、`pending_document_profiles`、`aggregation_mode`、`group_count`、`updated_at`、`job_id` |
 | KB 级脏标记 | `knowledge_bases.metadata.agent_auto_profile_dirty` | 文档事件写入 `{dirty_at, reason, document_id}`；独立于 profile 键，刷新完成只清除早于本次刷新起点的标记，晚于起点的标记触发链式刷新 |
-| KB 级人工覆盖 | `knowledge_bases.metadata.agent_description` / `agent_tags` / `agent_priority` | 前端可编辑；人工字段优先于自动字段 |
+| KB 级人工覆盖 | `knowledge_bases.metadata.agent_description` / `agent_tags` / `agent_priority` / `agent_domains` / `agent_sample_questions` / `agent_negative_scope` | 前端可编辑；人工字段优先于自动字段 |
 
 合并规则：
 
 - `agent_description` 非空时覆盖 `agent_auto_profile.description`。
 - `agent_tags` 非空时覆盖 `agent_auto_profile.tags`。
+- `agent_domains` / `agent_sample_questions` / `agent_negative_scope` 非空时覆盖自动 profile 的同名字段（纠正自动生成的选库偏差，尤其是错误的 `negative_scope`）。
 - `agent_priority` 仅人工控制，默认 `0`。
 - 自动 profile 缺失、dirty、failed 时，Agent 查询不失败，回退到 KB `name` / `description` / 人工字段。
+- 单篇文档 profile 生成失败不阻塞 KB 级聚合：失败计入 `document_profiles_failed`（明细 `failed_documents`），其余文档照常聚合；全部失败且无缓存时才判刷新失败。
 
 ### 10.2 后台生成流程
 
@@ -530,3 +532,5 @@ KB 级聚合按已生成 profile 的文档数 N 自动选模式：
 | 3.0 | 2026-07-01 | 增加 PROFILE 角色；文档级 profile → KB 级自动 profile；后台 `agent_profile` job；查看/人工覆盖/手动刷新 API |
 | 3.1 | 2026-07-02 | 实现修订：真流式事件；规划 JSON 重试与 `agent_session_failed` 审计；P0 优先截断；单步失败容忍；证据合成取消二次 rerank（轮次轮转合并）；profile 脏标记独立键 + job 去重 + 链式刷新；全量文档 profile 聚合（每次生成上限 24、聚合采样 128 + 频次统计）；LLM 输出截断代替拒绝 |
 | 3.2 | 2026-07-02 | 大库聚合分层摘要：KB 级聚合按规模自动切换 direct（≤128 全量）/ sampled（回填期全库等距抽样）/ grouped（128 篇/组缓存组摘要 map-reduce，追加式入库稳态 O(1) 组调用），消除 128 篇以上知识库的新旧偏差 |
+| 3.3 | 2026-07-02 | 新增 `workflow` 请求参数：`plan`（既有一次性规划，默认）/ `staged`（阶段化配比推荐工作流，设计与实现见 `AgentStagedRecommendation-zh.md`）；两种工作流共用检索空结果自动换 mode 重试（`retried_mode` 上报） |
+| 3.4 | 2026-07-03 | Profile 健壮性与可纠偏：单篇文档 profile 失败容忍（`document_profiles_failed` / `failed_documents` 上报，全部失败且无缓存才判失败）；`agent_domains` / `agent_sample_questions` / `agent_negative_scope` 支持人工覆盖 |

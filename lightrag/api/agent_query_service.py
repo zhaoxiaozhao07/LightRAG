@@ -40,6 +40,17 @@ AGENT_PLAN_LLM_ATTEMPTS = 3
 _PRIORITY_RANK = {"P0": 0, "P1": 1, "P2": 2}
 _PLANNING_KB_WARN_THRESHOLD = 50
 
+# One-shot fallback mode per retrieval mode, used when a step succeeds but
+# returns zero chunks. The fallback trades the planner's mode choice for any
+# evidence at all, so each entry switches retrieval family (graph <-> vector).
+EMPTY_RETRY_MODE_FALLBACK: dict[str, str] = {
+    "mix": "naive",
+    "naive": "hybrid",
+    "hybrid": "mix",
+    "local": "hybrid",
+    "global": "hybrid",
+}
+
 DEFAULT_AGENT_WORKFLOW_PROMPT = """
 你是 LightRAG Agent 编排器。你只能在服务端提供的 allowed_kbs 中选择 kb_ids，
 并为每个检索步骤指定底层检索模式 local/global/hybrid/naive/mix 之一。禁止使用 bypass。
@@ -91,6 +102,7 @@ class AgentPlan(BaseModel):
 
 class AgentQueryRequest(BaseModel):
     query: str = Field(min_length=3)
+    workflow: Literal["plan", "staged"] = "plan"
     candidate_kb_ids: list[str] | None = None
     max_rounds: int | None = Field(default=None, ge=1, le=20)
     response_type: str | None = None
@@ -280,6 +292,7 @@ class AgentQueryService:
             target_type="agent_session",
             target_id=session_id,
             metadata={
+                "workflow": body.workflow,
                 "effective_kb_count": len(effective_records),
                 "query_hash": hashlib.sha256(body.query.encode("utf-8")).hexdigest(),
                 "max_rounds": max_rounds,
@@ -290,9 +303,26 @@ class AgentQueryService:
                 "event": "session_started",
                 "session_id": session_id,
                 "metadata": {
-                    "effective_kb_ids": [record.id for record in effective_records]
+                    "workflow": body.workflow,
+                    "effective_kb_ids": [record.id for record in effective_records],
                 },
             }
+
+            if body.workflow == "staged":
+                # Local import: the staged module imports plan-mode helpers from
+                # this module, so the dependency must stay one-directional at
+                # import time.
+                from lightrag.api.agent_staged_service import AgentStagedRunner
+
+                async for event in AgentStagedRunner(self).run_events(
+                    request=request,
+                    body=body,
+                    session_id=session_id,
+                    effective_records=effective_records,
+                    stream_synthesis=stream_synthesis,
+                ):
+                    yield event
+                return
 
             plan = await self._plan(
                 request=request,
@@ -307,7 +337,8 @@ class AgentQueryService:
                     clarification_question=plan.clarification_question
                     or "请补充关键约束。",
                     metadata={
-                        "effective_kb_ids": [record.id for record in effective_records]
+                        "workflow": body.workflow,
+                        "effective_kb_ids": [record.id for record in effective_records],
                     },
                 )
                 yield {
@@ -368,20 +399,8 @@ class AgentQueryService:
                     "skipped_kbs": [],
                 }
                 try:
-                    tool_result = await self._query_tool_service.retrieve_serial(
-                        http_request=request,
-                        kb_ids=step.kb_ids,
-                        query=step.query,
-                        mode=cast(QueryMode, step.mode),
-                        filters=body.filters,
-                        top_k=body.top_k,
-                        chunk_top_k=body.chunk_top_k,
-                        max_entity_tokens=body.max_entity_tokens,
-                        max_relation_tokens=body.max_relation_tokens,
-                        max_total_tokens=body.max_total_tokens,
-                        enable_rerank=body.enable_rerank,
-                        hl_keywords=step.hl_keywords,
-                        ll_keywords=step.ll_keywords,
+                    tool_result, retried_mode = await self._retrieve_with_empty_retry(
+                        http_request=request, body=body, step=step
                     )
                 except Exception as exc:  # noqa: BLE001 — tolerate per-step failure
                     # One failed step must not discard evidence accumulated in
@@ -427,12 +446,15 @@ class AgentQueryService:
 
                 if synth_result is None:
                     synth_result = tool_result
+                used_mode = retried_mode or step.mode
+                if retried_mode:
+                    summary["retried_mode"] = retried_mode
                 evidence_chunks.extend(
                     {
                         **chunk,
                         "round_index": round_index,
                         "step_index": step.step_index,
-                        "mode": step.mode,
+                        "mode": used_mode,
                     }
                     for chunk in tool_result.chunks
                 )
@@ -445,22 +467,25 @@ class AgentQueryService:
                     }
                 )
                 steps_summary.append(summary)
+                audit_metadata = {
+                    "round": round_index,
+                    "kb_ids": step.kb_ids,
+                    "mode": step.mode,
+                    "status": "ok",
+                    "query_hash": hashlib.sha256(
+                        step.query.encode("utf-8")
+                    ).hexdigest(),
+                    "chunk_count": len(tool_result.chunks),
+                    "skipped_kbs": tool_result.skipped_kbs,
+                }
+                if retried_mode:
+                    audit_metadata["retried_mode"] = retried_mode
                 await append_enterprise_audit_event(
                     request,
                     "agent_retrieve_round",
                     target_type="agent_session",
                     target_id=session_id,
-                    metadata={
-                        "round": round_index,
-                        "kb_ids": step.kb_ids,
-                        "mode": step.mode,
-                        "status": "ok",
-                        "query_hash": hashlib.sha256(
-                            step.query.encode("utf-8")
-                        ).hexdigest(),
-                        "chunk_count": len(tool_result.chunks),
-                        "skipped_kbs": tool_result.skipped_kbs,
-                    },
+                    metadata=audit_metadata,
                 )
                 yield {"event": "round_result", "session_id": session_id, **summary}
 
@@ -531,6 +556,7 @@ class AgentQueryService:
                 references=references if body.include_references else [],
                 steps_summary=steps_summary,
                 metadata={
+                    "workflow": body.workflow,
                     "effective_kb_ids": [record.id for record in effective_records],
                     "round_count": len(steps_summary),
                     "failed_round_count": len(failed_rounds),
@@ -598,14 +624,17 @@ class AgentQueryService:
             raise HTTPException(status_code=403, detail="No accessible knowledge bases for Agent query")
         return records
 
-    async def _plan(
+    async def _agent_llm_context(
         self,
-        *,
         request: Request,
         body: AgentQueryRequest,
         effective_records: list[KnowledgeBaseRecord],
-        max_rounds: int,
-    ) -> AgentPlan:
+    ) -> tuple[Any, str]:
+        """Resolve the AGENT role LLM plus the merged user workflow prompt.
+
+        Shared by the plan-mode planner and the staged workflow so both use
+        identical role resolution and prompt-merging semantics.
+        """
         rag = await self._query_tool_service.get_rag(effective_records[0].id)
         global_config = rag._build_global_config()
         agent_func = global_config["role_llm_funcs"].get("agent")
@@ -624,7 +653,80 @@ class AgentQueryService:
                 request
             ).get_prompt(principal.user_id)
         if body.user_prompt:
-            user_prompt = "\n\n".join(part for part in [user_prompt, body.user_prompt] if part)
+            user_prompt = "\n\n".join(
+                part for part in [user_prompt, body.user_prompt] if part
+            )
+        return agent_func, user_prompt
+
+    async def _retrieve_with_empty_retry(
+        self,
+        *,
+        http_request: Request,
+        body: AgentQueryRequest,
+        step: AgentPlanStep,
+    ) -> tuple[QueryToolResult, str | None]:
+        """Execute one retrieval step, retrying once on an empty result.
+
+        The retry is best-effort: a fallback-mode failure keeps the original
+        empty result instead of failing the step. Returns the result plus the
+        fallback mode when the retry produced the returned chunks.
+        """
+        tool_result = await self._retrieve_for_step(
+            http_request=http_request, body=body, step=step, mode=step.mode
+        )
+        if tool_result.chunks:
+            return tool_result, None
+        fallback = EMPTY_RETRY_MODE_FALLBACK.get(step.mode)
+        if not fallback:
+            return tool_result, None
+        try:
+            retry_result = await self._retrieve_for_step(
+                http_request=http_request, body=body, step=step, mode=fallback
+            )
+        except Exception as exc:  # noqa: BLE001 — retry must not fail the step
+            logger.warning(
+                "Agent empty-result retry (mode=%s) failed: %s", fallback, exc
+            )
+            return tool_result, None
+        if retry_result.chunks:
+            return retry_result, fallback
+        return tool_result, None
+
+    async def _retrieve_for_step(
+        self,
+        *,
+        http_request: Request,
+        body: AgentQueryRequest,
+        step: AgentPlanStep,
+        mode: str,
+    ) -> QueryToolResult:
+        return await self._query_tool_service.retrieve_serial(
+            http_request=http_request,
+            kb_ids=step.kb_ids,
+            query=step.query,
+            mode=cast(QueryMode, mode),
+            filters=body.filters,
+            top_k=body.top_k,
+            chunk_top_k=body.chunk_top_k,
+            max_entity_tokens=body.max_entity_tokens,
+            max_relation_tokens=body.max_relation_tokens,
+            max_total_tokens=body.max_total_tokens,
+            enable_rerank=body.enable_rerank,
+            hl_keywords=step.hl_keywords,
+            ll_keywords=step.ll_keywords,
+        )
+
+    async def _plan(
+        self,
+        *,
+        request: Request,
+        body: AgentQueryRequest,
+        effective_records: list[KnowledgeBaseRecord],
+        max_rounds: int,
+    ) -> AgentPlan:
+        agent_func, user_prompt = await self._agent_llm_context(
+            request, body, effective_records
+        )
 
         payload = {
             "user_question": body.query,
@@ -706,12 +808,20 @@ class AgentQueryService:
             )
         if not steps:
             raise HTTPException(status_code=400, detail="Agent plan contains no executable steps")
+        self._ensure_steps_allowed(steps, allowed_ids)
+        return steps, truncated
+
+    @staticmethod
+    def _ensure_steps_allowed(
+        steps: list[AgentPlanStep], allowed_ids: set[str]
+    ) -> None:
+        """Fail closed on any step using an unsupported mode or an
+        inaccessible KB; shared by plan-mode and staged validation."""
         for step in steps:
             if step.mode not in AGENT_ALLOWED_MODES:
                 raise HTTPException(status_code=400, detail="Agent plan contains unsupported mode")
             if any(kb_id not in allowed_ids for kb_id in step.kb_ids):
                 raise HTTPException(status_code=403, detail="Agent plan selected an inaccessible KB")
-        return steps, truncated
 
     def _select_evidence(
         self,
@@ -783,6 +893,7 @@ class AgentQueryService:
         context_units: list[dict[str, str]],
         steps_summary: list[dict[str, Any]],
         stream: bool,
+        extra_rules: str = "",
     ) -> AsyncIterator[str]:
         global_config = synth_result.rag._build_global_config()
         param = synth_result.param
@@ -804,6 +915,8 @@ class AgentQueryService:
             "你只能基于给定证据回答。引用必须使用 [A1]、[A2] 这样的 Agent 级引用编号。"
             "如果证据不足或存在冲突，必须明确说明缺口或冲突；不要编造未在证据中的事实。"
         )
+        if extra_rules:
+            agent_rules = f"{agent_rules}\n{extra_rules}"
         gap_notes = self._evidence_gap_notes(steps_summary)
         if gap_notes:
             agent_rules = (

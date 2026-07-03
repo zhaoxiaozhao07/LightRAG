@@ -1044,16 +1044,22 @@ Content-Type: application/json
 
 Agent 查询模式是服务端多轮编排入口，不是 `QueryParam.mode=agent`。它使用 `AGENT_LLM_*` 角色模型输出 JSON 规划，随后在当前用户可访问的 KB 范围内串行调用既有 `local` / `global` / `hybrid` / `naive` / `mix` 检索，**不支持 `bypass`**。完整能力要求企业模式、`LIGHTRAG_AGENT_QUERY_ENABLED=true`、当前 principal 具备 `can_use_agent_query`，且每个被选中的 KB 至少具备 `kb_viewer`。AGENT 规划时看到的 `allowed_kbs` 只包含已授权 KB 的 `name`、`description` 与合并后的 Agent Profile：人工 `agent_description` / `agent_tags` / `agent_priority` 优先，缺省时使用 `agent_auto_profile`。
 
+Agent 支持两种工作流（请求体 `workflow` 字段选择）：
+
+- `workflow="plan"`（默认）：**一次性规划** —— AGENT LLM 先输出完整步骤计划，服务端按 P0→P1→P2 排序截断后串行执行，证据合并后一次合成终答。
+- `workflow="staged"`：**阶段化配比/配方推荐工作流** —— 面向"推荐一种在某环境下的配比"类问题的证据链流水线（需求解析 → 骨架召回 → 要素证据 → 指标验证 → 缺口补查 → 合成），详见 §9.3.1 与 `docs/AgentStagedRecommendation-zh.md`。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/agent/query` | 非流式 Agent 问答；返回终答、Agent 级引用、步骤摘要与 metadata |
-| `POST` | `/agent/query/stream` | Agent NDJSON 事件流；事件随执行进度**实时输出**（规划完成即发 `plan_created`，每轮检索前后发 `round_started` / `round_result`，终答按增量 `response` delta 流式输出）。事件包括 `session_started`、`plan_created`、`round_started`、`round_result`、`references`、`response`、`clarification_required`、`done`、`error` |
+| `POST` | `/agent/query/stream` | Agent NDJSON 事件流；事件随执行进度**实时输出**（规划完成即发 `plan_created`，每轮检索前后发 `round_started` / `round_result`，终答按增量 `response` delta 流式输出）。`plan` 工作流事件：`session_started`、`plan_created`、`round_started`、`round_result`、`references`、`response`、`clarification_required`、`done`、`error`；`staged` 工作流额外事件见 §9.3.1 |
 
 请求体：
 
 ```json
 {
   "query": "请结合法规和配方库推荐一个合规方案",
+  "workflow": "plan",
   "candidate_kb_ids": ["kb_regulation", "kb_formula"],
   "max_rounds": 5,
   "top_k": 40,
@@ -1069,10 +1075,12 @@ Agent 查询模式是服务端多轮编排入口，不是 `QueryParam.mode=agent
 
 字段说明：
 
+- `workflow` 可省略，默认 `"plan"`；`"staged"` 启用阶段化配比推荐工作流（此时 `max_rounds` 不生效，检索预算由 `AGENT_STAGED_MAX_RETRIEVALS` 与阶段上限控制，见 §9.3.1）。
 - `candidate_kb_ids` 可省略或为空：表示候选范围为当前 principal 的全部授权 KB，由 AGENT 模型在规划时自行选择；若提供，则必须全部在授权范围内，否则返回 `403`，且不会调用 AGENT LLM。
 - `max_rounds` 会被服务端全局 `AGENT_MAX_ROUNDS` clamp；所有轮次串行执行。规划步骤按 **P0 → P1 → P2 稳定排序** 后再截断到 `max_rounds`，保证 P0（法规/合规类）步骤不会被截断丢弃；发生截断时 `metadata.plan_truncated=true`。
 - 规划 JSON 解析失败会自动重试（最多 3 次 AGENT LLM 调用）；仍失败返回 `502`（`error_code=agent_plan_invalid`），并写审计事件 `agent_session_failed`。
 - **单步失败容忍**：某一步骤检索失败不会终止会话——该步在 `steps_summary` 中标记 `status="failed"`（附 `error_code`），其余步骤继续执行，终答会明确声明对应证据缺口；所有步骤都失败时返回 `502`（`error_code=agent_all_steps_failed`）。
+- **空结果自动重试**：某步检索成功但返回 0 条证据时，服务端自动用一个替代 mode 重试一次（`mix→naive`、`naive→hybrid`、`hybrid→mix`、`local/global→hybrid`）；重试成功时该步 `steps_summary` 与 `round_result` 事件携带 `retried_mode` 字段，审计 metadata 同步记录；重试自身失败不影响该步（保留原空结果）。两种工作流均生效。
 - 终答证据合成 **不做二次 rerank**：每步结果已按该步子问题排序（检索内启用 rerank 时），跨轮去重后按轮次轮转合并，再按 `max_total_tokens` 预算截断并编号为 A1、A2…，避免子问题证据被总问题的相关性打分整体挤掉。
 - KB 级用户查询设置中的 `user_prompt` 不参与 Agent 终答；需要定制终答风格请使用请求体 `user_prompt` 或用户工作流提示词（`/auth/me/agent-workflow-prompt`）。
 - `filters` 为用户请求级过滤，模型不能生成越权 filters；服务端沿用 KB query/retrieve 的文档生命周期、enabled/archived 与 doc-id scope 约束。
@@ -1114,6 +1122,7 @@ Agent 查询模式是服务端多轮编排入口，不是 `QueryParam.mode=agent
     }
   ],
   "metadata": {
+    "workflow": "plan",
     "effective_kb_ids": ["kb_regulation", "kb_formula"],
     "round_count": 1,
     "failed_round_count": 0,
@@ -1158,7 +1167,7 @@ Agent 查询模式是服务端多轮编排入口，不是 `QueryParam.mode=agent
 流式响应为 `application/x-ndjson`，事件随执行进度实时输出；`response` 事件为增量 delta，可出现多条。示例：
 
 ```json
-{"event":"session_started","session_id":"agent_...","metadata":{"effective_kb_ids":["kb1"]}}
+{"event":"session_started","session_id":"agent_...","metadata":{"workflow":"plan","effective_kb_ids":["kb1"]}}
 {"event":"plan_created","session_id":"agent_...","plan_truncated":false,"steps":[...]}
 {"event":"round_started","session_id":"agent_...","round":1,"step_index":1,"title":"查法规","kb_ids":["kb1"],"mode":"mix","priority":"P0"}
 {"event":"round_result","session_id":"agent_...","round":1,"status":"ok","kb_ids":["kb1"],"chunk_count":5}
@@ -1166,6 +1175,75 @@ Agent 查询模式是服务端多轮编排入口，不是 `QueryParam.mode=agent
 {"event":"response","session_id":"agent_...","delta":"根据法规"}
 {"event":"response","session_id":"agent_...","delta":"要求... [A1]"}
 {"event":"done","session_id":"agent_..."}
+```
+
+#### 9.3.1 阶段化配比推荐工作流（`workflow="staged"`）
+
+面向 **按证据来源分库**（如配方库、实验数据库、论文库、应用专项库）的配比/配方推荐问题，服务端按固定阶段流水线执行，证据链锚定在知识库而非模型记忆（设计详见 `docs/AgentStagedRecommendation-zh.md`）：
+
+```text
+S0 需求解析（结构化目标性能指标清单，缺关键信息 → clarification）
+S1 骨架召回（模型标注各 KB 证据角色 kb_roles → 检索参考配方 ≤3 步 → 提取骨架组分，引用必须可校验）
+S2 要素证据（open_questions + 组分补充查询，服务端模板实例化，≤8 步且为 S3 预留预算）
+S3 指标验证（逐指标检索实验数据 → 裁决 supported/partial/unsupported/no_data，无有效引用的结论降级 no_data）
+S4 缺口补查（存在 no_data/unsupported 或空结果步骤时补查一轮 ≤4 步，仅对缺口指标重新裁决）
+S5 终答合成（推荐配比表 + 指标核对 + 未覆盖点，配比数值只能来自证据）
+```
+
+行为要点：
+
+- **检索预算**：单会话检索步数硬上限 `AGENT_STAGED_MAX_RETRIEVALS`（默认 24）；被预算跳过的工作记入 `metadata.clipped` 并进入终答"未覆盖点"，不静默截断。
+- **每步 KB 数上限**：`AGENT_STAGED_MAX_KBS_PER_STEP`（默认 4）。知识库数量不定：模型选库超限或角色回退到"全部授权库"时，按各库人工 `agent_priority` 降序择优（同分保持原顺序），裁剪记入 `metadata.clipped`。
+- **引用编号**：证据在检回时即分配稳定 `A{n}` 编号（提取/裁决先于终答引用），最终 `references` 编号可能不连续（编号是 ID 不是序号）；每条引用携带 `stage` 与 `evidence_role`（reference_formula/mechanism/validation/repair）。
+- **fail-closed**：骨架组分引用无效 → 丢弃并计入 `dropped_components`；裁决缺失/无效引用 → `no_data`；骨架规划选择越权 KB → `403` 会话失败；补查规划越权 → 仅丢弃该步并记录。骨架提取与指标裁决 LLM 失败不终止会话（按缺口处理），仅 S0/S1 规划失败返回 `502`（`agent_requirement_invalid` / `agent_skeleton_plan_invalid`）。
+- `max_rounds` 不适用于 staged；其余请求字段（`candidate_kb_ids`、`top_k`、`filters`、`user_prompt`、用户工作流提示词等）语义与 `plan` 一致。
+
+新增 NDJSON 事件（其余复用 `plan` 工作流）：
+
+```json
+{"event":"session_started","session_id":"agent_...","metadata":{"workflow":"staged","effective_kb_ids":["kb_formula","kb_exp","kb_paper","kb_side"]}}
+{"event":"stage_started","session_id":"agent_...","stage":"requirement"}
+{"event":"requirement_parsed","session_id":"agent_...","requirement":{"application":"胎侧胶料","conditions":["高寒环境"],"target_properties":[{"name":"低温屈挠性","why":"低温开裂","priority":"P0"}],"constraints":[]}}
+{"event":"stage_started","session_id":"agent_...","stage":"skeleton"}
+{"event":"kb_roles_assigned","session_id":"agent_...","kb_roles":{"kb_formula":"reference_formula","kb_exp":"experimental","kb_paper":"literature","kb_side":"application_spec"}}
+{"event":"round_started","session_id":"agent_...","round":1,"stage":"skeleton","title":"查参考配方","kb_ids":["kb_formula","kb_side"],"mode":"mix","priority":"P0"}
+{"event":"round_result","session_id":"agent_...","round":1,"stage":"skeleton","status":"ok","chunk_count":5,"new_chunk_count":5}
+{"event":"skeleton_extracted","session_id":"agent_...","components":[{"material":"NR/BR 并用","ratio":"50/50 phr","function":"低温屈挠性能","source_refs":["A1"]}],"open_questions":["..."],"dropped_components":0}
+{"event":"stage_started","session_id":"agent_...","stage":"factor_evidence"}
+{"event":"stage_started","session_id":"agent_...","stage":"validation"}
+{"event":"validation_verdicts","session_id":"agent_...","verdicts":[{"property":"低温屈挠性","priority":"P0","verdict":"supported","evidence_refs":["A4"],"note":"有实测数据"}],"after_repair":false}
+{"event":"stage_started","session_id":"agent_...","stage":"gap_repair"}
+{"event":"validation_verdicts","session_id":"agent_...","verdicts":[...],"after_repair":true}
+{"event":"references","session_id":"agent_...","references":[{"reference_id":"A1","kb_id":"kb_formula","stage":"skeleton","evidence_role":"reference_formula","round":1,"step_index":1,"mode":"mix","file_path":"formula.md","chunk_id":"chunk-...","source_reference_id":"1"}]}
+{"event":"response","session_id":"agent_...","delta":"推荐配比表..."}
+{"event":"done","session_id":"agent_..."}
+```
+
+非流式响应结构与 `plan` 一致，`metadata` 扩展为：
+
+```json
+{
+  "workflow": "staged",
+  "effective_kb_ids": ["kb_formula", "kb_exp", "kb_paper", "kb_side"],
+  "kb_roles": {"kb_formula": "reference_formula", "kb_exp": "experimental"},
+  "requirement": {"application": "胎侧胶料", "conditions": ["高寒环境"], "target_properties": [...], "constraints": []},
+  "skeleton_component_count": 6,
+  "dropped_component_count": 0,
+  "property_verdicts": [{"property": "低温屈挠性", "priority": "P0", "verdict": "supported", "evidence_refs": ["A4"], "note": "..."}],
+  "round_count": 8,
+  "failed_round_count": 0,
+  "retrieval_budget": {"max": 24, "used": 8},
+  "clipped": []
+}
+```
+
+配置（`.env`）：
+
+```bash
+# staged 工作流单会话检索步数硬上限（阶段内上限：骨架≤3 / 要素≤8 / 验证≤8 / 补查≤4）
+AGENT_STAGED_MAX_RETRIEVALS=24
+# staged 工作流每个检索步最多同时查询的 KB 数（超限按 agent_priority 择优并上报）
+AGENT_STAGED_MAX_KBS_PER_STEP=4
 ```
 
 ### 9.4 KB Agent Profile（`/kbs/{kb_id}/agent-profile`）
@@ -1181,6 +1259,7 @@ KB Agent Profile 用于帮助 `/agent/query` 在多 KB 候选集中选库，不�
   - `sampled`（N > 128 且回填未完成）：过渡模式，对全库做**等距抽样**取 128 条逐条参与（覆盖新旧文档，而非只取最新），另附全库 tag/domain 频次统计；
   - `grouped`（N > 128 且回填已收敛）：**分层摘要（map-reduce）**——文档按创建顺序切成 128 篇/组，每组由 PROFILE LLM 生成"组摘要"并缓存在组首文档的 `agent_group_profile` 元数据中（键含成员内容哈希，成员或其 profile 变化才重算），最终聚合全部组摘要 + 频次统计。追加式入库通常只需重算尾部一组，单篇变更的稳态成本为 O(1) 次组调用；组摘要覆盖**全部**已生成 profile 的文档，无新旧偏差。
 - **输出韧性**：PROFILE LLM 输出超长字段/超量条目会被**截断**而不是判为失败；JSON 解析失败自动重试（最多 3 次）。
+- **单篇失败容忍**：某一篇文档的 profile 生成失败（重试耗尽）不会使整个刷新失败——该篇计入 `auto.document_profiles_failed`（明细在 `auto.failed_documents`，最多 5 条），KB 级 profile 用其余文档照常聚合写回；失败文档在下一次文档事件或手动刷新时重试（**不会**自动链式重试，避免对固定失败的文档形成重试风暴）。仅当**没有任何**可用文档 profile（全部失败且无缓存）时才判定刷新失败（`error_code=agent_profile_documents_failed`），保留醒目的失败信号。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -1210,6 +1289,8 @@ KB Agent Profile 用于帮助 `/agent/query` 在多 KB 候选集中选库，不�
     "source_doc_count": 12,
     "profiled_doc_count": 12,
     "pending_document_profiles": 0,
+    "document_profiles_failed": 0,
+    "failed_documents": [],
     "aggregation_mode": "direct",
     "sampled_doc_count": 12,
     "group_count": 0,
@@ -1231,13 +1312,16 @@ KB Agent Profile 用于帮助 `/agent/query` 在多 KB 候选集中选库，不�
 
 字段说明：`dirty` 非 null 时表示有文档事件尚未反映到自动 profile（`{"dirty_at", "reason", "document_id"}`），此时 `effective.agent_auto_profile_status` 为 `dirty`；`pending_document_profiles > 0` 表示仍有文档 profile 待链式刷新生成。`aggregation_mode` 为本次聚合模式（`direct` / `sampled` / `grouped`），`grouped` 模式下 `group_count` 为组摘要数量、`sampled_doc_count` 为组摘要覆盖的文档总数（等于全部已生成 profile 的文档数）。
 
-`PUT /kbs/{kb_id}/agent-profile` 请求体支持部分字段更新；显式 `null` 或空 tags 会清除对应人工覆盖，使 effective profile 回落到自动字段。
+`PUT /kbs/{kb_id}/agent-profile` 请求体支持部分字段更新；显式 `null` 或空列表会清除对应人工覆盖，使 effective profile 回落到自动字段。除 `agent_description` / `agent_tags` / `agent_priority` 外，三个选库关键的自动字段也支持人工覆盖（人工非空则覆盖自动值）：`agent_domains`、`agent_sample_questions`、`agent_negative_scope`——典型用途是纠正自动生成的 `negative_scope` 错误地把本库排除出某类问题。
 
 ```json
 {
   "agent_description": "优先用于法规和合规判断",
   "agent_tags": ["法规", "合规", "限量"],
-  "agent_priority": 10
+  "agent_priority": 10,
+  "agent_domains": ["食品合规"],
+  "agent_sample_questions": ["某原料在化妆品中的限量是多少？"],
+  "agent_negative_scope": ["生产排产", "设备维护"]
 }
 ```
 
@@ -1360,6 +1444,10 @@ LIGHTRAG_ENTERPRISE_TENANT_MAX_CONCURRENT_JOBS=0
 # Agent 查询模式：默认关闭；开启后仍需用户/服务密钥具备 can_use_agent_query
 LIGHTRAG_AGENT_QUERY_ENABLED=false
 AGENT_MAX_ROUNDS=5
+# staged 工作流（workflow="staged"）单会话检索步数硬上限
+AGENT_STAGED_MAX_RETRIEVALS=24
+# staged 工作流每个检索步最多同时查询的 KB 数
+AGENT_STAGED_MAX_KBS_PER_STEP=4
 AGENT_WORKFLOW_PROMPT_MAX_LENGTH=16384
 LIGHTRAG_AGENT_PROFILE_AUTO_REFRESH=true
 AGENT_PROFILE_REFRESH_DOC_DELTA=1

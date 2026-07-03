@@ -836,6 +836,12 @@ def parse_args() -> argparse.Namespace:
         "LIGHTRAG_AGENT_QUERY_ENABLED", False, bool
     )
     args.agent_max_rounds = get_env_value("AGENT_MAX_ROUNDS", 5, int)
+    args.agent_staged_max_retrievals = get_env_value(
+        "AGENT_STAGED_MAX_RETRIEVALS", 24, int
+    )
+    args.agent_staged_max_kbs_per_step = get_env_value(
+        "AGENT_STAGED_MAX_KBS_PER_STEP", 4, int
+    )
     args.agent_workflow_prompt_max_length = get_env_value(
         "AGENT_WORKFLOW_PROMPT_MAX_LENGTH", 16384, int
     )

@@ -326,6 +326,18 @@ def agent_max_rounds() -> int:
     return max(1, int(getattr(_global_args(), "agent_max_rounds", 5) or 5))
 
 
+def agent_staged_max_retrievals() -> int:
+    return max(
+        1, int(getattr(_global_args(), "agent_staged_max_retrievals", 24) or 24)
+    )
+
+
+def agent_staged_max_kbs_per_step() -> int:
+    return max(
+        1, int(getattr(_global_args(), "agent_staged_max_kbs_per_step", 4) or 4)
+    )
+
+
 def agent_workflow_prompt_max_length() -> int:
     return max(
         0,
@@ -2669,6 +2681,8 @@ def _global_args() -> Any:
         ),
         agent_query_enabled=_env_bool("LIGHTRAG_AGENT_QUERY_ENABLED", False),
         agent_max_rounds=_env_int("AGENT_MAX_ROUNDS", 5),
+        agent_staged_max_retrievals=_env_int("AGENT_STAGED_MAX_RETRIEVALS", 24),
+        agent_staged_max_kbs_per_step=_env_int("AGENT_STAGED_MAX_KBS_PER_STEP", 4),
         agent_workflow_prompt_max_length=_env_int(
             "AGENT_WORKFLOW_PROMPT_MAX_LENGTH", 16384
         ),

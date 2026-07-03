@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import pytest
+from fastapi import HTTPException
 
 from lightrag.api.agent_profile_service import (
     DOC_PROFILE_METADATA_KEY,
@@ -360,6 +361,79 @@ async def test_manual_profile_overrides_auto_profile():
     assert effective["agent_description"] == "人工说明"
     assert effective["agent_tags"] == ["人工", "覆盖"]
     assert effective["agent_priority"] == 9
+
+
+@pytest.mark.asyncio
+async def test_manual_scope_fields_override_auto_and_clear():
+    kb_service = _KBService()
+    kb_service.record.metadata["agent_auto_profile"] = {
+        "status": "ready",
+        "description": "自动说明",
+        "domains": ["自动领域"],
+        "sample_questions": ["自动示例问题？"],
+        "negative_scope": ["自动排除项"],
+    }
+    service, _, _, _ = _service(kb_service=kb_service)
+
+    await service.update_manual_profile(
+        "kb1",
+        AgentProfileUpdateRequest(
+            agent_domains=["橡胶配方"],
+            agent_negative_scope=["生产排产"],
+        ),
+    )
+
+    effective = effective_agent_profile(kb_service.record)
+    # Manual values win where set; untouched fields keep the auto values.
+    assert effective["agent_profile_domains"] == ["橡胶配方"]
+    assert effective["agent_profile_negative_scope"] == ["生产排产"]
+    assert effective["agent_profile_sample_questions"] == ["自动示例问题？"]
+
+    # Clearing with an empty list falls back to the auto value.
+    await service.update_manual_profile(
+        "kb1", AgentProfileUpdateRequest(agent_domains=[])
+    )
+    effective = effective_agent_profile(kb_service.record)
+    assert effective["agent_profile_domains"] == ["自动领域"]
+    assert effective["agent_profile_negative_scope"] == ["生产排产"]
+
+
+@pytest.mark.asyncio
+async def test_document_profile_failure_is_tolerated():
+    kb_service = _KBService()
+    documents = [_make_document(1), _make_document(2)]
+    document_service = _DocumentService(documents)
+    # doc1 fails all 3 JSON attempts; doc2 falls back to the default response.
+    rag = _FakeRAG(doc_responses=["坏输出 1", "坏输出 2", "坏输出 3"])
+    service, _, _, _ = _service(
+        kb_service=kb_service, document_service=document_service, rag=rag
+    )
+
+    result = await service.refresh_kb_profile("kb1", force=True, job_id="job1")
+
+    assert result.status == "ready"
+    assert result.document_profiles_generated == 1
+    assert result.document_profiles_failed == 1
+    auto = kb_service.record.metadata[KB_AUTO_PROFILE_METADATA_KEY]
+    assert auto["status"] == "ready"
+    assert auto["document_profiles_failed"] == 1
+    assert auto["failed_documents"][0]["document_id"] == "doc1"
+    assert auto["profiled_doc_count"] == 1
+    assert DOC_PROFILE_METADATA_KEY not in documents[0].metadata
+    assert DOC_PROFILE_METADATA_KEY in documents[1].metadata
+
+
+@pytest.mark.asyncio
+async def test_all_document_profiles_failed_without_cache_fails_loudly():
+    rag = _FakeRAG(doc_responses=["坏输出 1", "坏输出 2", "坏输出 3"])
+    service, kb_service, _, _ = _service(rag=rag)
+
+    with pytest.raises(HTTPException) as exc:
+        await service.refresh_kb_profile("kb1", force=True)
+
+    assert exc.value.status_code == 502
+    assert exc.value.detail["error_code"] == "agent_profile_documents_failed"
+    assert KB_AUTO_PROFILE_METADATA_KEY not in kb_service.record.metadata
 
 
 @pytest.mark.asyncio

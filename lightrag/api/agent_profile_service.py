@@ -33,6 +33,12 @@ GROUP_PROFILE_METADATA_KEY = "agent_group_profile"
 MANUAL_DESCRIPTION_KEY = "agent_description"
 MANUAL_TAGS_KEY = "agent_tags"
 MANUAL_PRIORITY_KEY = "agent_priority"
+# Manual overrides for the routing-critical auto fields: a wrong generated
+# negative_scope can systematically steer the Agent away from the right KB,
+# so operators need a direct correction path (non-empty manual wins).
+MANUAL_DOMAINS_KEY = "agent_domains"
+MANUAL_SAMPLE_QUESTIONS_KEY = "agent_sample_questions"
+MANUAL_NEGATIVE_SCOPE_KEY = "agent_negative_scope"
 # Per-refresh cap on PROFILE LLM document calls; remaining stale documents are
 # reported as pending and picked up by a chained refresh job.
 MAX_PROFILE_DOCUMENTS = 24
@@ -182,6 +188,9 @@ class AgentProfileUpdateRequest(BaseModel):
     agent_description: str | None = Field(default=None, max_length=2000)
     agent_tags: list[str] | str | None = None
     agent_priority: int | None = None
+    agent_domains: list[str] | str | None = None
+    agent_sample_questions: list[str] | str | None = None
+    agent_negative_scope: list[str] | str | None = None
 
     @field_validator("agent_description", mode="after")
     @classmethod
@@ -200,6 +209,7 @@ class AgentProfileRefreshResult:
     document_profiles_generated: int
     document_profiles_reused: int
     pending_document_profiles: int = 0
+    document_profiles_failed: int = 0
     refresh_started_at: str = ""
     aggregation_mode: str = "direct"
     group_profiles_generated: int = 0
@@ -232,6 +242,13 @@ def _manual_profile_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "agent_description": str(metadata.get(MANUAL_DESCRIPTION_KEY) or "").strip(),
         "agent_tags": _coerce_tags(metadata.get(MANUAL_TAGS_KEY)),
         "agent_priority": _coerce_priority(metadata.get(MANUAL_PRIORITY_KEY)),
+        "agent_domains": _coerce_tags(metadata.get(MANUAL_DOMAINS_KEY)),
+        "agent_sample_questions": _coerce_tags(
+            metadata.get(MANUAL_SAMPLE_QUESTIONS_KEY)
+        ),
+        "agent_negative_scope": _coerce_tags(
+            metadata.get(MANUAL_NEGATIVE_SCOPE_KEY)
+        ),
     }
 
 
@@ -252,9 +269,12 @@ def effective_agent_profile(record: KnowledgeBaseRecord) -> dict[str, Any]:
         "agent_priority": manual["agent_priority"],
         "agent_auto_profile_status": status,
         "agent_profile_updated_at": auto.get("updated_at"),
-        "agent_profile_domains": _coerce_tags(auto.get("domains")),
-        "agent_profile_sample_questions": _coerce_tags(auto.get("sample_questions")),
-        "agent_profile_negative_scope": _coerce_tags(auto.get("negative_scope")),
+        "agent_profile_domains": manual["agent_domains"]
+        or _coerce_tags(auto.get("domains")),
+        "agent_profile_sample_questions": manual["agent_sample_questions"]
+        or _coerce_tags(auto.get("sample_questions")),
+        "agent_profile_negative_scope": manual["agent_negative_scope"]
+        or _coerce_tags(auto.get("negative_scope")),
     }
 
 
@@ -393,7 +413,9 @@ def _compact_kb_profile_for_metadata(
     group_count: int = 0,
     group_profiles_generated: int = 0,
     group_profiles_reused: int = 0,
+    failed_profiles: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
+    failed_profiles = failed_profiles or []
     source_documents = []
     for document in aggregated_documents[:MAX_DOCUMENT_PROFILES_IN_KB_METADATA]:
         doc_profile = profiles_by_doc.get(document.id) or {}
@@ -425,6 +447,8 @@ def _compact_kb_profile_for_metadata(
         "group_profiles_reused": group_profiles_reused,
         "document_profiles_generated": generated,
         "document_profiles_reused": reused,
+        "document_profiles_failed": len(failed_profiles),
+        "failed_documents": list(failed_profiles[:5]),
         "source_documents": source_documents,
         "updated_at": utc_now_iso(),
         "profile_version": f"agent-profile-v{PROFILE_SCHEMA_VERSION}",
@@ -438,11 +462,14 @@ def _compact_kb_profile_for_metadata(
             > _KB_PROFILE_METADATA_BUDGET_BYTES
         )
 
-    # Shrink progressively: sampled source docs first, then list fields, then
-    # the description itself. The KB metadata store enforces a hard 16KB total
-    # budget shared with manual fields, so this must always converge.
+    # Shrink progressively: sampled source docs first, then failed-document
+    # details, then list fields, then the description itself. The KB metadata
+    # store enforces a hard 16KB total budget shared with manual fields, so
+    # this must always converge.
     while _over_budget() and result["source_documents"]:
         result["source_documents"].pop()
+    while _over_budget() and result["failed_documents"]:
+        result["failed_documents"].pop()
     for key in ("sample_questions", "negative_scope", "domains", "tags"):
         while _over_budget() and result[key]:
             result[key].pop()
@@ -515,6 +542,19 @@ class AgentProfileService:
             patch[MANUAL_TAGS_KEY] = tags or None
         if "agent_priority" in fields:
             patch[MANUAL_PRIORITY_KEY] = body.agent_priority
+        if "agent_domains" in fields:
+            domains = _clip_text_list(body.agent_domains, max_items=40, max_chars=120)
+            patch[MANUAL_DOMAINS_KEY] = domains or None
+        if "agent_sample_questions" in fields:
+            questions = _clip_text_list(
+                body.agent_sample_questions, max_items=20, max_chars=160
+            )
+            patch[MANUAL_SAMPLE_QUESTIONS_KEY] = questions or None
+        if "agent_negative_scope" in fields:
+            scope = _clip_text_list(
+                body.agent_negative_scope, max_items=20, max_chars=160
+            )
+            patch[MANUAL_NEGATIVE_SCOPE_KEY] = scope or None
         record = await self._kb_service.update(kb_id, metadata=patch)
         return agent_profile_response(record)
 
@@ -686,6 +726,7 @@ class AgentProfileService:
                     "auto_profile": result.auto_profile,
                     "document_profiles_generated": result.document_profiles_generated,
                     "document_profiles_reused": result.document_profiles_reused,
+                    "document_profiles_failed": result.document_profiles_failed,
                     "pending_document_profiles": result.pending_document_profiles,
                 },
             )
@@ -783,19 +824,50 @@ class AgentProfileService:
         )
 
         generated = 0
+        failed_profiles: list[dict[str, str]] = []
         for document in to_generate:
-            doc_profile = await self._generate_document_profile(
-                profile_func=profile_func,
-                rag=rag,
-                record=record,
-                document=document,
-            )
+            try:
+                doc_profile = await self._generate_document_profile(
+                    profile_func=profile_func,
+                    rag=rag,
+                    record=record,
+                    document=document,
+                )
+            except Exception as exc:  # noqa: BLE001 — one bad document must not
+                # block the KB-level profile. The document keeps its invalid
+                # cache entry and is retried on the next refresh trigger
+                # (document event or manual refresh); failures deliberately do
+                # NOT chain an automatic refresh to avoid a retry storm on a
+                # permanently-failing document.
+                logger.warning(
+                    "Agent document profile failed for KB '%s' doc '%s': %s",
+                    record.id,
+                    document.id,
+                    exc,
+                )
+                failed_profiles.append(
+                    {"document_id": document.id, "error": str(exc)[:160]}
+                )
+                continue
             profiles_by_doc[document.id] = doc_profile
             generated += 1
             await self._document_service.update_document(
                 record.id,
                 document.id,
                 metadata_patch={DOC_PROFILE_METADATA_KEY: doc_profile},
+            )
+        if failed_profiles and not profiles_by_doc:
+            # Nothing cached and nothing generated: keep the loud failure
+            # signal instead of writing a contentless "ready" stub profile.
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error_code": "agent_profile_documents_failed",
+                    "message": (
+                        f"All {len(failed_profiles)} document profile "
+                        "generations failed"
+                    ),
+                },
             )
         reused = len(profiles_by_doc) - generated
 
@@ -872,6 +944,7 @@ class AgentProfileService:
             group_count=len(group_entries),
             group_profiles_generated=groups_generated,
             group_profiles_reused=groups_reused,
+            failed_profiles=failed_profiles,
         )
         await self._kb_service.update(
             record.id, metadata={KB_AUTO_PROFILE_METADATA_KEY: auto_profile}
@@ -883,6 +956,7 @@ class AgentProfileService:
             document_profiles_generated=generated,
             document_profiles_reused=reused,
             pending_document_profiles=pending,
+            document_profiles_failed=len(failed_profiles),
             refresh_started_at=refresh_started_at,
             aggregation_mode=aggregation_mode,
             group_profiles_generated=groups_generated,
