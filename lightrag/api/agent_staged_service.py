@@ -33,10 +33,13 @@ from pydantic import BaseModel, Field, field_validator
 
 from lightrag.api.agent_query_service import (
     AGENT_ALLOWED_MODES,
+    BILINGUAL_PLAN_PROMPT_SUFFIX,
     AgentPlanStep,
     AgentRunResult,
+    agent_bilingual_enabled,
     agent_kb_profile,
 )
+from lightrag.api.bilingual_query_service import contains_cjk
 from lightrag.api.enterprise_auth import (
     agent_staged_max_kbs_per_step,
     agent_staged_max_retrievals,
@@ -141,6 +144,18 @@ SYNTHESIS_EXTRA_RULES = """
 3) 未覆盖点与风险：明确列出无数据或证据不利的指标、未完成的检索，以及采纳建议前需补充的验证实验。
 """.strip()
 
+BILINGUAL_REQUIREMENT_PROMPT_SUFFIX = """
+本次启用双语检索（payload 中 bilingual_retrieval=true）：为 target_properties 中每一项额外给出
+name_alt（该指标名的另一语言版本：中文指标给英文，英文指标给中文；使用领域通用译法，
+型号/代号/标准号原样保留）。
+""".strip()
+
+BILINGUAL_SKELETON_EXTRACT_PROMPT_SUFFIX = """
+本次启用双语检索（payload 中 bilingual_retrieval=true）：额外输出 open_questions_alt 数组，
+与 open_questions 按顺序一一对应，给出每条补充检索问题的另一语言完整版本
+（中文问题给英文，英文问题给中文）；无法翻译的条目用空字符串占位。
+""".strip()
+
 
 def _clip_str(value: Any, limit: int) -> str:
     return str(value if value is not None else "").strip()[:limit]
@@ -169,8 +184,11 @@ class TargetProperty(BaseModel):
     name: str = Field(min_length=1)
     why: str = ""
     priority: Literal["P0", "P1", "P2"] = "P1"
+    # Alternate-language property name, filled only when bilingual retrieval
+    # is on; drives the validation step's secondary retrieval path.
+    name_alt: str = ""
 
-    @field_validator("name", mode="before")
+    @field_validator("name", "name_alt", mode="before")
     @classmethod
     def _clip_name(cls, value: Any) -> str:
         return _clip_str(value, 120)
@@ -272,12 +290,30 @@ class SkeletonExtract(BaseModel):
     type: Literal["skeleton"] = "skeleton"
     components: list[SkeletonComponent] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
+    # Positionally paired alternate-language variants of open_questions
+    # (bilingual retrieval only); shorter lists simply leave the tail unpaired.
+    open_questions_alt: list[str] = Field(default_factory=list)
     rationale: str = ""
 
     @field_validator("open_questions", mode="before")
     @classmethod
     def _clip_questions(cls, value: Any) -> list[str]:
         return _clip_str_list(value, max_items=MAX_OPEN_QUESTIONS, max_chars=500)
+
+    @field_validator("open_questions_alt", mode="before")
+    @classmethod
+    def _clip_questions_alt(cls, value: Any) -> list[str]:
+        # Positional pairing forbids the dedup/drop-empty normalization used
+        # for open_questions; only clip length and item count here.
+        if isinstance(value, str):
+            raw: list[Any] = [value]
+        elif isinstance(value, list):
+            raw = value
+        elif value is None:
+            raw = []
+        else:
+            raw = [value]
+        return [str(entry).strip()[:500] for entry in raw[:MAX_OPEN_QUESTIONS]]
 
     @field_validator("rationale", mode="before")
     @classmethod
@@ -409,6 +445,7 @@ class AgentStagedRunner:
         agent_func, user_prompt = await self._service._agent_llm_context(
             request, body, effective_records
         )
+        bilingual = agent_bilingual_enabled(body)
         kb_profiles = [agent_kb_profile(record) for record in effective_records]
         board = _EvidenceBoard()
         steps_summary: list[dict[str, Any]] = []
@@ -434,6 +471,7 @@ class AgentStagedRunner:
             body=body,
             kb_profiles=kb_profiles,
             user_prompt=user_prompt,
+            bilingual=bilingual,
         )
         if requirement.clarification_required:
             result = AgentRunResult(
@@ -473,6 +511,7 @@ class AgentStagedRunner:
             kb_profiles=kb_profiles,
             user_prompt=user_prompt,
             max_kbs_per_step=max_kbs_per_step,
+            bilingual=bilingual,
         )
         kb_roles = {
             kb_id: (role if role in KB_EVIDENCE_ROLES else "other")
@@ -524,6 +563,9 @@ class AgentStagedRunner:
                 mode=step.mode,
                 hl_keywords=step.hl_keywords,
                 ll_keywords=step.ll_keywords,
+                query_alt=step.query_alt if bilingual else "",
+                hl_keywords_alt=step.hl_keywords_alt,
+                ll_keywords_alt=step.ll_keywords_alt,
                 priority=step.priority,
             ):
                 yield event
@@ -532,6 +574,7 @@ class AgentStagedRunner:
             agent_func=agent_func,
             requirement_payload=requirement_payload,
             board=board,
+            bilingual=bilingual,
         )
         if skeleton is None or not skeleton.components:
             clipped_notes.append("未能从知识库证据中提取骨架配方")
@@ -552,7 +595,10 @@ class AgentStagedRunner:
             max(0, max_retrievals - state["round"] - validation_reserve),
         )
         factor_queries = self._factor_queries(
-            requirement=requirement, skeleton=skeleton, allowance=factor_allowance
+            requirement=requirement,
+            skeleton=skeleton,
+            allowance=factor_allowance,
+            bilingual=bilingual,
         )
         factor_kbs = self._kbs_with_roles(
             effective_records,
@@ -570,7 +616,7 @@ class AgentStagedRunner:
                 "session_id": session_id,
                 "stage": STAGE_FACTOR,
             }
-            for query in factor_queries:
+            for factor_query, factor_query_alt in factor_queries:
                 async for event in self._run_step(
                     request=request,
                     body=body,
@@ -582,10 +628,11 @@ class AgentStagedRunner:
                     max_retrievals=max_retrievals,
                     stage=STAGE_FACTOR,
                     evidence_role="mechanism",
-                    title=f"要素证据：{query[:60]}",
-                    query=query,
+                    title=f"要素证据：{factor_query[:60]}",
+                    query=factor_query,
                     kb_ids=factor_kbs,
                     mode="mix",
+                    query_alt=factor_query_alt,
                     priority="P1",
                 ):
                     yield event
@@ -616,6 +663,19 @@ class AgentStagedRunner:
                 f"{requirement.application}在{conditions_text}条件下的"
                 f"{prop.name}实验数据与测试结果"
             )
+            prop_query_alt = ""
+            prop_hl_alt: list[str] = []
+            if bilingual and prop.name_alt:
+                prop_hl_alt = [prop.name_alt]
+                if contains_cjk(prop.name):
+                    prop_query_alt = (
+                        f"{prop.name_alt} experimental data and test results "
+                        f"for {requirement.application}"
+                    )
+                else:
+                    prop_query_alt = (
+                        f"{requirement.application}的{prop.name_alt}实验数据与测试结果"
+                    )
             next_round = state["round"] + 1
             async for event in self._run_step(
                 request=request,
@@ -633,6 +693,8 @@ class AgentStagedRunner:
                 kb_ids=validation_kbs,
                 mode="mix",
                 hl_keywords=[prop.name],
+                query_alt=prop_query_alt,
+                hl_keywords_alt=prop_hl_alt,
                 priority=prop.priority,
             ):
                 yield event
@@ -683,6 +745,7 @@ class AgentStagedRunner:
                 clipped_notes=clipped_notes,
                 priority_by_id=priority_by_id,
                 max_kbs_per_step=max_kbs_per_step,
+                bilingual=bilingual,
             )
             rounds_before_repair = state["round"]
             for step in repair_steps:
@@ -703,6 +766,9 @@ class AgentStagedRunner:
                     mode=step.mode,
                     hl_keywords=step.hl_keywords,
                     ll_keywords=step.ll_keywords,
+                    query_alt=step.query_alt if bilingual else "",
+                    hl_keywords_alt=step.hl_keywords_alt,
+                    ll_keywords_alt=step.ll_keywords_alt,
                     priority=step.priority,
                 ):
                     yield event
@@ -827,6 +893,7 @@ class AgentStagedRunner:
                 "failed_round_count": len(failed_rounds),
                 "retrieval_budget": {"max": max_retrievals, "used": state["round"]},
                 "clipped": clipped_notes,
+                "bilingual_retrieval": bilingual,
             },
         )
         yield {"event": "done", "session_id": session_id, "_result": result}
@@ -854,6 +921,9 @@ class AgentStagedRunner:
         mode: str,
         hl_keywords: list[str] | None = None,
         ll_keywords: list[str] | None = None,
+        query_alt: str = "",
+        hl_keywords_alt: list[str] | None = None,
+        ll_keywords_alt: list[str] | None = None,
         priority: str = "P1",
     ) -> AsyncIterator[dict[str, Any]]:
         if state["round"] >= max_retrievals:
@@ -898,6 +968,9 @@ class AgentStagedRunner:
             priority=priority,  # type: ignore[arg-type]
             hl_keywords=hl_keywords or [],
             ll_keywords=ll_keywords or [],
+            query_alt=query_alt or "",
+            hl_keywords_alt=hl_keywords_alt or [],
+            ll_keywords_alt=ll_keywords_alt or [],
         )
         try:
             tool_result, retried_mode = await self._service._retrieve_with_empty_retry(
@@ -943,6 +1016,11 @@ class AgentStagedRunner:
         used_mode = retried_mode or mode
         if retried_mode:
             summary["retried_mode"] = retried_mode
+        if tool_result.alt_chunk_counts or tool_result.alt_failed_kbs:
+            summary["bilingual"] = True
+            summary["alt_chunk_counts"] = tool_result.alt_chunk_counts
+            if tool_result.alt_failed_kbs:
+                summary["alt_failed_kbs"] = tool_result.alt_failed_kbs
         new_chunks = 0
         for chunk in tool_result.chunks:
             if board.add(
@@ -996,10 +1074,19 @@ class AgentStagedRunner:
         body: "AgentQueryRequest",
         kb_profiles: list[dict[str, Any]],
         user_prompt: str,
+        bilingual: bool = False,
     ) -> StagedRequirement:
+        property_schema: dict[str, Any] = {
+            "name": "性能指标",
+            "why": "为何重要",
+            "priority": "P0",
+        }
+        if bilingual:
+            property_schema["name_alt"] = "指标名的另一语言版本"
         payload = {
             "user_question": body.query,
             "allowed_kbs": kb_profiles,
+            "bilingual_retrieval": bilingual,
             "user_workflow_prompt": user_prompt,
             "output_schema": {
                 "type": "requirement",
@@ -1007,12 +1094,13 @@ class AgentStagedRunner:
                 "clarification_question": None,
                 "application": "应用对象",
                 "conditions": ["环境/工况条件"],
-                "target_properties": [
-                    {"name": "性能指标", "why": "为何重要", "priority": "P0"}
-                ],
+                "target_properties": [property_schema],
                 "constraints": ["其他约束"],
             },
         }
+        system_prompt = REQUIREMENT_SYSTEM_PROMPT
+        if bilingual:
+            system_prompt = f"{system_prompt}\n{BILINGUAL_REQUIREMENT_PROMPT_SUFFIX}"
 
         def _parse(data: Any) -> StagedRequirement:
             requirement = StagedRequirement.model_validate(data)
@@ -1029,7 +1117,7 @@ class AgentStagedRunner:
             return await call_llm_json(
                 agent_func,
                 json.dumps(payload, ensure_ascii=False),
-                system_prompt=REQUIREMENT_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 priority=DEFAULT_QUERY_PRIORITY,
                 parse=_parse,
                 attempts=STAGED_LLM_ATTEMPTS,
@@ -1049,31 +1137,43 @@ class AgentStagedRunner:
         kb_profiles: list[dict[str, Any]],
         user_prompt: str,
         max_kbs_per_step: int,
+        bilingual: bool = False,
     ) -> SkeletonPlan:
+        step_schema: dict[str, Any] = {
+            "step_index": 1,
+            "title": "短标题",
+            "query": "完整自洽的检索子问题",
+            "kb_ids": ["kb_xxx"],
+            "mode": "mix",
+            "priority": "P0",
+            "hl_keywords": [],
+            "ll_keywords": [],
+        }
+        if bilingual:
+            step_schema.update(
+                {
+                    "query_alt": "该步子问题的另一语言完整版本",
+                    "hl_keywords_alt": [],
+                    "ll_keywords_alt": [],
+                }
+            )
         payload = {
             "requirement": requirement_payload,
             "allowed_kbs": kb_profiles,
             "max_steps": SKELETON_MAX_STEPS,
             "max_kbs_per_step": max_kbs_per_step,
             "kb_role_values": list(KB_EVIDENCE_ROLES),
+            "bilingual_retrieval": bilingual,
             "user_workflow_prompt": user_prompt,
             "output_schema": {
                 "type": "skeleton_plan",
                 "kb_roles": {"kb_xxx": "reference_formula"},
-                "steps": [
-                    {
-                        "step_index": 1,
-                        "title": "短标题",
-                        "query": "完整自洽的检索子问题",
-                        "kb_ids": ["kb_xxx"],
-                        "mode": "mix",
-                        "priority": "P0",
-                        "hl_keywords": [],
-                        "ll_keywords": [],
-                    }
-                ],
+                "steps": [step_schema],
             },
         }
+        system_prompt = SKELETON_PLAN_SYSTEM_PROMPT
+        if bilingual:
+            system_prompt = f"{system_prompt}\n{BILINGUAL_PLAN_PROMPT_SUFFIX}"
 
         def _parse(data: Any) -> SkeletonPlan:
             plan = SkeletonPlan.model_validate(data)
@@ -1085,7 +1185,7 @@ class AgentStagedRunner:
             return await call_llm_json(
                 agent_func,
                 json.dumps(payload, ensure_ascii=False),
-                system_prompt=SKELETON_PLAN_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 priority=DEFAULT_QUERY_PRIORITY,
                 parse=_parse,
                 attempts=STAGED_LLM_ATTEMPTS,
@@ -1106,12 +1206,31 @@ class AgentStagedRunner:
         agent_func: Any,
         requirement_payload: dict[str, Any],
         board: _EvidenceBoard,
+        bilingual: bool = False,
     ) -> tuple[SkeletonExtract | None, int]:
         chunks = board.for_stage(STAGE_SKELETON)[:_EXTRACT_MAX_CHUNKS]
         if not chunks:
             return None, 0
+        output_schema: dict[str, Any] = {
+            "type": "skeleton",
+            "components": [
+                {
+                    "material": "组分/原料名",
+                    "ratio": "证据中的用量（含单位）",
+                    "function": "作用",
+                    "source_refs": ["A1"],
+                }
+            ],
+            "open_questions": ["完整自洽的补充检索问题"],
+            "rationale": "一句话选择依据",
+        }
+        if bilingual:
+            output_schema["open_questions_alt"] = [
+                "与 open_questions 按序对应的另一语言版本"
+            ]
         payload = {
             "requirement": requirement_payload,
+            "bilingual_retrieval": bilingual,
             "evidence": [
                 {
                     "reference_id": chunk["reference_id"],
@@ -1120,25 +1239,18 @@ class AgentStagedRunner:
                 }
                 for chunk in chunks
             ],
-            "output_schema": {
-                "type": "skeleton",
-                "components": [
-                    {
-                        "material": "组分/原料名",
-                        "ratio": "证据中的用量（含单位）",
-                        "function": "作用",
-                        "source_refs": ["A1"],
-                    }
-                ],
-                "open_questions": ["完整自洽的补充检索问题"],
-                "rationale": "一句话选择依据",
-            },
+            "output_schema": output_schema,
         }
+        system_prompt = SKELETON_EXTRACT_SYSTEM_PROMPT
+        if bilingual:
+            system_prompt = (
+                f"{system_prompt}\n{BILINGUAL_SKELETON_EXTRACT_PROMPT_SUFFIX}"
+            )
         try:
             extract = await call_llm_json(
                 agent_func,
                 json.dumps(payload, ensure_ascii=False),
-                system_prompt=SKELETON_EXTRACT_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 priority=DEFAULT_QUERY_PRIORITY,
                 parse=SkeletonExtract.model_validate,
                 attempts=STAGED_LLM_ATTEMPTS,
@@ -1298,7 +1410,26 @@ class AgentStagedRunner:
         clipped_notes: list[str],
         priority_by_id: dict[str, Any],
         max_kbs_per_step: int,
+        bilingual: bool = False,
     ) -> list[AgentPlanStep]:
+        step_schema: dict[str, Any] = {
+            "step_index": 1,
+            "title": "短标题",
+            "query": "完整自洽的补查子问题",
+            "kb_ids": ["kb_xxx"],
+            "mode": "naive",
+            "priority": "P0",
+            "hl_keywords": [],
+            "ll_keywords": [],
+        }
+        if bilingual:
+            step_schema.update(
+                {
+                    "query_alt": "该步子问题的另一语言完整版本",
+                    "hl_keywords_alt": [],
+                    "ll_keywords_alt": [],
+                }
+            )
         payload = {
             "requirement": requirement_payload,
             "gaps": [
@@ -1321,27 +1452,20 @@ class AgentStagedRunner:
             "allowed_kbs": kb_profiles,
             "max_steps": REPAIR_MAX_STEPS,
             "max_kbs_per_step": max_kbs_per_step,
+            "bilingual_retrieval": bilingual,
             "output_schema": {
                 "type": "repair_plan",
-                "steps": [
-                    {
-                        "step_index": 1,
-                        "title": "短标题",
-                        "query": "完整自洽的补查子问题",
-                        "kb_ids": ["kb_xxx"],
-                        "mode": "naive",
-                        "priority": "P0",
-                        "hl_keywords": [],
-                        "ll_keywords": [],
-                    }
-                ],
+                "steps": [step_schema],
             },
         }
+        system_prompt = REPAIR_PLAN_SYSTEM_PROMPT
+        if bilingual:
+            system_prompt = f"{system_prompt}\n{BILINGUAL_PLAN_PROMPT_SUFFIX}"
         try:
             repair = await call_llm_json(
                 agent_func,
                 json.dumps(payload, ensure_ascii=False),
-                system_prompt=REPAIR_PLAN_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 priority=DEFAULT_QUERY_PRIORITY,
                 parse=RepairPlan.model_validate,
                 attempts=STAGED_LLM_ATTEMPTS,
@@ -1381,13 +1505,16 @@ class AgentStagedRunner:
     def _requirement_payload(
         requirement: StagedRequirement, properties: list[TargetProperty]
     ) -> dict[str, Any]:
+        def _prop_payload(prop: TargetProperty) -> dict[str, Any]:
+            payload = {"name": prop.name, "why": prop.why, "priority": prop.priority}
+            if prop.name_alt:
+                payload["name_alt"] = prop.name_alt
+            return payload
+
         return {
             "application": requirement.application,
             "conditions": requirement.conditions,
-            "target_properties": [
-                {"name": prop.name, "why": prop.why, "priority": prop.priority}
-                for prop in properties
-            ],
+            "target_properties": [_prop_payload(prop) for prop in properties],
             "constraints": requirement.constraints,
         }
 
@@ -1411,14 +1538,28 @@ class AgentStagedRunner:
         requirement: StagedRequirement,
         skeleton: SkeletonExtract | None,
         allowance: int,
-    ) -> list[str]:
+        bilingual: bool = False,
+    ) -> list[tuple[str, str]]:
+        """Return ``(query, query_alt)`` pairs; ``query_alt`` is empty when
+        bilingual is off or no reliable pairing exists."""
         if skeleton is None or allowance <= 0:
             return []
-        queries: list[str] = []
-        for question in skeleton.open_questions:
+        # Positional pairing is only trusted when the alt list survived
+        # validation with the same length (open_questions is deduplicated,
+        # which would silently shift indexes otherwise).
+        alts: list[str] = []
+        if bilingual and len(skeleton.open_questions_alt) == len(
+            skeleton.open_questions
+        ):
+            alts = skeleton.open_questions_alt
+        queries: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for index, question in enumerate(skeleton.open_questions):
             text = question.strip()
-            if len(text) >= 3 and text not in queries:
-                queries.append(text)
+            alt = alts[index].strip() if index < len(alts) else ""
+            if len(text) >= 3 and text not in seen:
+                seen.add(text)
+                queries.append((text, alt))
             if len(queries) >= allowance:
                 return queries
         conditions_text = "、".join(requirement.conditions) or "目标环境"
@@ -1427,8 +1568,9 @@ class AgentStagedRunner:
                 f"{requirement.application}在{conditions_text}条件下，"
                 f"{component.material}的用量与影响机理"
             )
-            if text not in queries:
-                queries.append(text)
+            if text not in seen:
+                seen.add(text)
+                queries.append((text, ""))
             if len(queries) >= allowance:
                 break
         return queries

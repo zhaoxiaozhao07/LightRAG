@@ -5,6 +5,14 @@ This module contains all query-related routes for the LightRAG API.
 import json
 from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
+from lightrag.api.bilingual_query_service import (
+    apply_plan_keywords_to_param,
+    bilingual_applies,
+    bilingual_query_data,
+    bilingual_query_llm,
+    prepare_bilingual_queries,
+    resolve_bilingual_mode,
+)
 from lightrag.base import QueryParam
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.utils import logger
@@ -108,6 +116,15 @@ class QueryRequest(BaseModel):
         description="If True, enables streaming output for real-time responses. Only affects /query/stream endpoint.",
     )
 
+    bilingual: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Explicit dual-path bilingual retrieval override. True forces it on, "
+            "False forces it off; omit to follow the deployment default "
+            "(BILINGUAL_QUERY_DEFAULT_MODE). Requires BILINGUAL_QUERY_ENABLED."
+        ),
+    )
+
     @field_validator("query", mode="after")
     @classmethod
     def query_strip_after(cls, query: str) -> str:
@@ -132,13 +149,24 @@ class QueryRequest(BaseModel):
         # Use Pydantic's `.model_dump(exclude_none=True)` to remove None values automatically
         # Exclude API-level parameters that don't belong in QueryParam
         request_data = self.model_dump(
-            exclude_none=True, exclude={"query", "include_chunk_content"}
+            exclude_none=True, exclude={"query", "include_chunk_content", "bilingual"}
         )
 
         # Ensure `mode` and `stream` are set explicitly
         param = QueryParam(**request_data)
         param.stream = is_stream
         return param
+
+
+async def _legacy_bilingual_plan(rag, request: "QueryRequest", param: "QueryParam"):
+    """Global routes have no per-KB config: request flag > deployment default."""
+    mode = resolve_bilingual_mode(request.bilingual, None)
+    if not bilingual_applies(mode, request.query, param):
+        return None
+    plan = await prepare_bilingual_queries(rag, request.query)
+    if plan is not None:
+        apply_plan_keywords_to_param(param, plan)
+    return plan
 
 
 class ReferenceItem(BaseModel):
@@ -413,7 +441,13 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             param.stream = False
 
             # Unified approach: always use aquery_llm for both cases
-            result = await rag.aquery_llm(request.query, param=param)
+            plan = await _legacy_bilingual_plan(rag, request, param)
+            if plan is not None:
+                result, _bilingual_info = await bilingual_query_llm(
+                    rag, request.query, param, plan, stream=False
+                )
+            else:
+                result = await rag.aquery_llm(request.query, param=param)
 
             # Extract LLM response and references from unified result
             llm_response = result.get("llm_response", {})
@@ -671,7 +705,13 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             from fastapi.responses import StreamingResponse
 
             # Unified approach: always use aquery_llm for all cases
-            result = await rag.aquery_llm(request.query, param=param)
+            plan = await _legacy_bilingual_plan(rag, request, param)
+            if plan is not None:
+                result, _bilingual_info = await bilingual_query_llm(
+                    rag, request.query, param, plan, stream=stream_mode
+                )
+            else:
+                result = await rag.aquery_llm(request.query, param=param)
 
             async def stream_generator():
                 # Extract references and LLM response from unified result
@@ -1144,7 +1184,11 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         """
         try:
             param = request.to_query_params(False)  # No streaming for data endpoint
-            response = await rag.aquery_data(request.query, param=param)
+            plan = await _legacy_bilingual_plan(rag, request, param)
+            if plan is not None:
+                response = await bilingual_query_data(rag, request.query, param, plan)
+            else:
+                response = await rag.aquery_data(request.query, param=param)
 
             # aquery_data returns the new format with status, message, data, and metadata
             if isinstance(response, dict):

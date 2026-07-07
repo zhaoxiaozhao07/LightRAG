@@ -771,9 +771,9 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 > - `parser_config`：`engine`/`parser_engine`、`process_options`/`options`。`engine` 支持 `legacy` / `native` / `mineru` / `docling`，会在创建配置时校验并规范化，作为解析默认值参与 `parser_hash`，并按“请求 > 文档 metadata > active config > 文件路由”的优先级生效。
 > - `chunk_config`：`chunk_size`/`chunk_token_size`、`chunk_overlap_size`/`chunk_overlap_token_size`、`tiktoken_model_name`。
 > - `embedding_config`：`model`、`dim`/`embedding_dim`、`token_limit`/`max_token_size`（`model` 会触发重建 embedding provider 闭包）。
-> - `query_config`：`top_k`/`chunk_top_k`/`max_entity_tokens`/`max_relation_tokens`/`max_total_tokens`/`related_chunk_number`/`cosine_threshold` 等 QueryParam 字段。
+> - `query_config`：`top_k`/`chunk_top_k`/`max_entity_tokens`/`max_relation_tokens`/`max_total_tokens`/`related_chunk_number`/`cosine_threshold` 等 QueryParam 字段；另支持 `bilingual_query`（`off`/`auto`/`on`，非法值创建时 `400`），控制该 KB 的双语双路检索模式（见 [8.2 双语查询](#82-双语双路检索bilingual)与 `docs/BilingualQuery-zh.md`）。`bilingual_query` 参与 `query_hash`（仅影响查询，不触发重建），且不会作为 QueryParam 默认值下发。
 > - `extraction_config`：`language`（摘要/抽取语言）、`entity_types`（列表，自动渲染成 `entity_types_guidance` 并去重保序）或显式 `entity_types_guidance`（优先于 `entity_types`）、`entity_type_prompt_file`、`max_gleaning`/`max_extraction_records`/`max_extraction_entities`/`force_llm_summary_on_merge`。这些会 overlay 到 `addon_params` 与 LightRAG 抽取构造参数，并纳入 `index_hash`，因此变更会被 `:diff` 标为 `requires_reindex`。
-> - `llm_role_config`：按角色（`extract`/`keyword`/`query`/`vlm`）覆盖运行时 LLM。每个角色可为字符串（等价 `{"model": <str>}`）或对象（`model`/`binding`/`host`/`api_key`/`provider_options`/`model_kwargs`(别名 `kwargs`)/`max_async`/`timeout`）。配置创建时校验角色名与字段名（未知项报错）。实例构建后通过已注册的 role builder 调用 `aupdate_llm_role_config` 应用覆盖，因此 `binding`/`model`/`host`/`api_key` 变更会重建该角色的 LLM func。哈希影响：`extract`/`vlm` 角色的“输出身份”（`binding`/`model`/`host`/`provider_options`/`model_kwargs`，不含 `api_key` 与 `max_async`/`timeout`）纳入 `index_hash`（变更触发 `requires_reindex`）；`query`/`keyword` 角色身份纳入 `query_hash`（仅影响查询，不重建）。轮换 `api_key` 或调 `max_async`/`timeout` 不改变任何哈希、不触发重建。
+> - `llm_role_config`：按角色（`extract`/`keyword`/`query`/`vlm`/`agent`/`profile`/`bilingual`）覆盖运行时 LLM。每个角色可为字符串（等价 `{"model": <str>}`）或对象（`model`/`binding`/`host`/`api_key`/`provider_options`/`model_kwargs`(别名 `kwargs`)/`max_async`/`timeout`）。配置创建时校验角色名与字段名（未知项报错）。实例构建后通过已注册的 role builder 调用 `aupdate_llm_role_config` 应用覆盖，因此 `binding`/`model`/`host`/`api_key` 变更会重建该角色的 LLM func。哈希影响：`extract`/`vlm` 角色的“输出身份”（`binding`/`model`/`host`/`provider_options`/`model_kwargs`，不含 `api_key` 与 `max_async`/`timeout`）纳入 `index_hash`（变更触发 `requires_reindex`）；`query`/`keyword`/`agent`/`profile`/`bilingual` 角色身份纳入 `query_hash`（仅影响查询，不重建）。轮换 `api_key` 或调 `max_async`/`timeout` 不改变任何哈希、不触发重建。
 > - 部署级配置不允许写入 KB config：`storage_config`，以及 `parser_config` 中的 parser 服务实例字段（如 endpoint/base_url/api_key/api_mode/token/timeout/workers/max_concurrency 等）。这些字段必须通过 `.env` / 部署编排统一管理；请求中携带会返回 `400`。
 
 | 方法 | 路径 | 说明 |
@@ -912,6 +912,7 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
   "include_references": true,
   "include_chunk_content": false,
   "stream": false,
+  "bilingual": null,
   "filters": {
     "doc_ids": ["doc_xxx"],
     "metadata": {"tenant": "demo", "tag": ["legal", "finance"]}
@@ -951,6 +952,7 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 - `filters.doc_ids` 会先校验 ID 必须属于本 KB（不在则 400 + `error_code=doc_ids_not_in_kb`），随后在检索层精确生效：服务端把 `filters.doc_ids` 与"可检索集合"（`enabled=true` 且 `archived=false` 且已建索引、有 `lightrag_doc_id`）取交集，映射成 `QueryParam.ids`（即 `full_doc_id` 白名单）传入 LightRAG。被禁用/归档的文档即使显式出现在 `filters.doc_ids` 里也会被静默剔除，不会进入答案。KB 边界仍由 workspace 双重保证。
 - `filters.metadata` 支持非空 key，value 为标量或标量列表（列表为 OR 语义），总 JSON 大小上限 64 KB；它会先在 KB documents metadata 上做精确匹配，再与 `filters.doc_ids`、`enabled/archived/lightrag_doc_id` 可检索集合取交集。无匹配时传入空 `QueryParam.ids=[]`，返回空检索范围而不是退回 KB-wide。
 - `include_chunk_content=true` 时 `references[].content` 返回该 reference 命中的 chunk 文本数组，便于评估与排查。
+- `bilingual`（可选，`true`/`false`/缺省）：双语双路检索显式覆盖；缺省时跟随 KB `query_config.bilingual_query` 与部署默认值，详见 [8.2 双语双路检索](#82-双语双路检索bilingual)。双路生效时响应 `metadata.bilingual` 返回 `{enabled, source_language, translated_query, primary_chunks, secondary_chunks, merged_chunks, final_chunks, ...}`。
 - 非流式、结构化检索和流式首行都会在 `metadata` 中返回 active config 信息（存在时包含 `config_version_id`、`parser_hash`、`index_hash`、`query_hash`）。
 - 流式响应 `Content-Type: application/x-ndjson`：第一行是 `{kb_id, metadata}`，若 `include_references=true` 则同一行还包含 `references`；后续每行 `{response: "..."}`，错误时 `{error: "..."}`。当请求体 `stream=false` 或底层返回非流式结果时，`/query/stream` 会返回单行完整 NDJSON，而不是多段 chunk。
 - 短查询（< 3 字符）返回 422；KB 不存在 404。
@@ -1010,7 +1012,35 @@ Content-Type: application/json
 - **`/kbs:retrieve`**：同样的扇出+合并+重排，但不调用 LLM，返回 `data.chunks`（带 `kb_id`）+ `data.references`。
 - **`/kbs:query/stream`**：与 `/kbs:query` 同入参，流式返回 `application/x-ndjson`：首行 `{kb_ids, metadata, references}`，随后每行 `{response: "..."}`，出错 `{error}`。合成阶段单次 LLM，故先完成检索/合并再流式输出答案。
 - **`filters`（可选，per-KB）**：`metadata` 过滤统一作用于每个 KB；`doc_ids` 按所属 KB 拆分（每个 KB 只应用属于它的 id），且每个 `doc_id` 必须至少属于一个目标 KB，否则 `400`（`detail.missing` 列出越界 id）。语义与单库 `filters` 一致，仅 doc_ids 改为跨库软交集。
+- **`bilingual`（可选）**：对每个目标 KB 启用双语双路检索（见 8.2）；多库查询不读取 per-KB `query_config`，由请求体标志 + 部署默认值决定，预处理只调用一次并被所有 KB 共享。双路生效时 `metadata.bilingual` 额外含 `per_kb_secondary_chunks` 与（失败时）`secondary_failed_kbs`。
 - 查询缓存为后续项。
+
+### 8.2 双语双路检索（bilingual）
+
+> 完整设计、降级链与灰度建议见 `docs/BilingualQuery-zh.md`。前提：多语言 embedding（如 bge-m3 / Qwen-Embedding）+ 多语言 reranker（如 bge-reranker-v2-m3）。
+
+面向中英混合语料的跨语言召回：一次预处理 LLM 调用产出译句 + 双语 hl/ll 关键词（**替代**核心层关键词提取调用，kg 模式 LLM 调用数不变），随后"原句+同语关键词"与"译句+另一语关键词"两路并行检索，chunk 池按 `chunk_id` 去重合并、以原句统一 rerank 截断、引用重编号，最后单次合成并强制以原句语言回答（引用他语证据时关键术语括注原文）。
+
+**三层开关（优先级从高到低）：**
+
+| 层级 | 配置 | 取值 |
+|---|---|---|
+| 请求体 | `bilingual` | `true`（强制开）/ `false`（强制关）/ 缺省（跟随下层） |
+| KB config | `query_config.bilingual_query`（仅单库端点读取） | `off` / `auto` / `on` |
+| 部署环境 | `BILINGUAL_QUERY_DEFAULT_MODE`（默认 `auto`） | `off` / `auto` / `on` |
+
+全部受总开关 `BILINGUAL_QUERY_ENABLED`（默认 `false`）约束；`auto` 表示仅含 CJK 字符的查询走双路。预处理超时由 `BILINGUAL_QUERY_TIMEOUT`（默认 12s）控制。
+
+**翻译模型（`bilingual` LLM 角色）**：预处理调用走独立的 `bilingual` 角色，任何未设置的 `BILINGUAL_LLM_*` 字段（model/binding/host/api_key/max_async/timeout）**逐项继承 `QUERY_LLM_*`**，因此默认零配置即用 query 同款模型；后续切专用翻译模型只需设 `BILINGUAL_LLM_MODEL` 等。该调用固定 `enable_cot=false`（不思考）；Qwen3 类模型可再加 `BILINGUAL_OPENAI_LLM_EXTRA_BODY='{"chat_template_kwargs": {"enable_thinking": false}}'` 硬关思考模式。KB 级可用 `llm_role_config.bilingual` 覆盖（身份参与 `query_hash`）。
+
+**行为与约束：**
+
+- 覆盖端点：单库 `/kbs/{kb_id}/query`、`/query/stream`、`/query/data`、`/retrieve`；跨库 `/kbs:query`、`:query/stream`、`:retrieve`；legacy 全局 `/query` 系列（无 KB config 层）；Agent 两种工作流（见 §9.3）。所有底层 mode（`local/global/hybrid/naive/mix`）均支持。
+- 自动跳过双路：`mode=bypass`、`only_need_context/only_need_prompt=true`、请求体显式提供 `hl_keywords/ll_keywords`。
+- **fail-open 降级链**：预处理失败/超时/译句不可用 → 单路（现状行为），`metadata.bilingual={enabled:false, reason:"preprocess_unavailable"}`；副路检索失败 → 只用主路并标记 `secondary_failed`；主路失败 → 与现状同样报错。
+- 预处理结果缓存在 KB 的 LLM cache（`bilingual:query_preprocess:*`），换查询角色模型自动失效。
+- `/query/data` 的合并结果中，实体按 `entity_name`、关系按 `(src_id, tgt_id)` 去重；两路各自的 `reference_id` 编号体系无法跨路复用，合并后置空（chunks 与 references 保持一致编号）。
+- 审计 metadata 记录 `bilingual_enabled` 与 `bilingual_translated_query_hash`（只记 hash 不记原文，与 `query_hash` 口径一致）。
 
 ---
 
@@ -1045,7 +1075,7 @@ Content-Type: application/json
 | `POST` | `/query/stream` | 流式问答（NDJSON，`Content-Type: application/x-ndjson`） |
 | `POST` | `/query/data` | 仅返回结构化检索数据，不调用 LLM 生成 |
 
-支持的 `mode`：`local` / `global` / `hybrid` / `naive` / `mix` / `bypass`。`/query/stream` 与 KB scoped stream 一样返回 NDJSON；当请求体 `stream=false` 或底层返回非流式结果时，会返回单行完整 NDJSON。
+支持的 `mode`：`local` / `global` / `hybrid` / `naive` / `mix` / `bypass`。`/query/stream` 与 KB scoped stream 一样返回 NDJSON；当请求体 `stream=false` 或底层返回非流式结果时，会返回单行完整 NDJSON。请求体支持 `bilingual` 字段启用双语双路检索（无 KB config 层，按"请求体 > 部署默认值"解析，行为同 §8.2）。
 
 ### 9.3 Agent 查询模式（`/agent`）
 
@@ -1074,6 +1104,7 @@ Agent 支持两种工作流（请求体 `workflow` 字段选择）：
   "enable_rerank": true,
   "include_references": true,
   "include_chunk_content": false,
+  "bilingual": null,
   "filters": {
     "metadata": {"category": "food"}
   }
@@ -1092,6 +1123,7 @@ Agent 支持两种工作流（请求体 `workflow` 字段选择）：
 - KB 级用户查询设置中的 `user_prompt` 不参与 Agent 终答；需要定制终答风格请使用请求体 `user_prompt` 或用户工作流提示词（`/auth/me/agent-workflow-prompt`）。
 - `filters` 为用户请求级过滤，模型不能生成越权 filters；服务端沿用 KB query/retrieve 的文档生命周期、enabled/archived 与 doc-id scope 约束。
 - 底层检索 mode 由 AGENT 规划步骤决定，但只能是 `local` / `global` / `hybrid` / `naive` / `mix`。
+- **双语双路检索**（`bilingual` 字段，行为基线见 §8.2；Agent 按"请求体 > 部署默认值"解析，不读 per-KB config）：启用时规划 LLM 为每步额外生成 `query_alt` / `hl_keywords_alt` / `ll_keywords_alt`（该步子问题的另一语言版本，一次规划调用顺带完成，零额外 LLM 成本），步骤执行器对每个 KB 双路检索合并（副路失败仅告警不失败）。`staged` 工作流同步生效：需求解析额外产出 `target_properties[].name_alt`（驱动指标验证步骤副路）、骨架提取额外产出 `open_questions_alt`（与 `open_questions` 等长按序配对，驱动要素证据步骤副路）、骨架/补查规划步骤同 plan 工作流。双路生效的轮次在 `steps_summary` 与 `round_result` 事件携带 `bilingual=true` 与 `alt_chunk_counts`；终答 `metadata.bilingual_retrieval` 标识本次会话是否启用。空结果换 mode 重试、检索预算等既有机制不变。
 
 非流式成功响应：
 

@@ -56,6 +56,10 @@ ROLES: tuple[RoleSpec, ...] = (
     RoleSpec("agent", "AGENT", "agent LLM func"),
     RoleSpec("profile", "PROFILE", "profile LLM func"),
     RoleSpec("vlm", "VLM", "vlm LLM func"),
+    # Bilingual dual-path query preprocessing (translation + bilingual
+    # keywords). The API env layer backfills unset BILINGUAL_LLM_* fields
+    # from the QUERY role so it defaults to the query model, not the base.
+    RoleSpec("bilingual", "BILINGUAL", "bilingual LLM func"),
 )
 ROLE_NAMES: frozenset[str] = frozenset(spec.name for spec in ROLES)
 ROLES_BY_NAME: dict[str, RoleSpec] = {spec.name: spec for spec in ROLES}

@@ -11,6 +11,10 @@ from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
 from lightrag.api.agent_profile_service import effective_agent_profile
+from lightrag.api.bilingual_query_service import (
+    bilingual_applies,
+    resolve_bilingual_mode,
+)
 from lightrag.api.enterprise_auth import (
     agent_max_rounds,
     agent_query_enabled,
@@ -59,6 +63,23 @@ DEFAULT_AGENT_WORKFLOW_PROMPT = """
 不要输出 markdown，不要输出 chain-of-thought。
 """.strip()
 
+# Appended to planner system prompts when bilingual retrieval is on: the
+# planner then emits an alternate-language query + keywords per step so the
+# executor can retrieve both language halves of a mixed zh/en corpus.
+BILINGUAL_PLAN_PROMPT_SUFFIX = """
+本次启用双语检索（payload 中 bilingual_retrieval=true）：知识库同时包含中文与英文文档。
+为每个检索步骤额外生成 query_alt（该步子问题的另一语言完整版本：中文步骤给英文，英文步骤给中文）、
+hl_keywords_alt 与 ll_keywords_alt（与 query_alt 同语言、语义对应的关键词）。
+术语使用领域通用译法；型号、代号、化学式、标准号等记号原样保留，不要翻译。
+""".strip()
+
+
+def agent_bilingual_enabled(body: "AgentQueryRequest") -> bool:
+    """Agent flows resolve bilingual mode from the request flag plus the
+    deployment default only (steps span KBs, so per-KB config is not read)."""
+    mode = resolve_bilingual_mode(body.bilingual, None)
+    return bilingual_applies(mode, body.query, None)
+
 
 class AgentPlanStep(BaseModel):
     step_index: int = Field(ge=1)
@@ -69,18 +90,30 @@ class AgentPlanStep(BaseModel):
     priority: Literal["P0", "P1", "P2"] = "P1"
     hl_keywords: list[str] = Field(default_factory=list)
     ll_keywords: list[str] = Field(default_factory=list)
+    # Bilingual retrieval (optional): alternate-language variant of this
+    # step's sub-query plus matching keywords; empty when bilingual is off.
+    query_alt: str = ""
+    hl_keywords_alt: list[str] = Field(default_factory=list)
+    ll_keywords_alt: list[str] = Field(default_factory=list)
 
     @field_validator("title", mode="before")
     @classmethod
     def _clip_title(cls, value: Any) -> str:
         return str(value if value is not None else "").strip()[:200]
 
-    @field_validator("query", mode="before")
+    @field_validator("query", "query_alt", mode="before")
     @classmethod
     def _clip_query(cls, value: Any) -> str:
         return str(value if value is not None else "").strip()[:4096]
 
-    @field_validator("kb_ids", "hl_keywords", "ll_keywords", mode="before")
+    @field_validator(
+        "kb_ids",
+        "hl_keywords",
+        "ll_keywords",
+        "hl_keywords_alt",
+        "ll_keywords_alt",
+        mode="before",
+    )
     @classmethod
     def _coerce_str_list(cls, value: Any) -> list[str]:
         if isinstance(value, str):
@@ -116,6 +149,14 @@ class AgentQueryRequest(BaseModel):
     include_chunk_content: bool = False
     filters: KBQueryFilters | None = None
     user_prompt: str | None = None
+    bilingual: bool | None = Field(
+        default=None,
+        description=(
+            "Explicit dual-path bilingual retrieval override for every "
+            "planned step. Omit to follow the deployment default "
+            "(BILINGUAL_QUERY_DEFAULT_MODE); requires BILINGUAL_QUERY_ENABLED."
+        ),
+    )
 
     @field_validator("query", mode="after")
     @classmethod
@@ -449,6 +490,11 @@ class AgentQueryService:
                 used_mode = retried_mode or step.mode
                 if retried_mode:
                     summary["retried_mode"] = retried_mode
+                if tool_result.alt_chunk_counts or tool_result.alt_failed_kbs:
+                    summary["bilingual"] = True
+                    summary["alt_chunk_counts"] = tool_result.alt_chunk_counts
+                    if tool_result.alt_failed_kbs:
+                        summary["alt_failed_kbs"] = tool_result.alt_failed_kbs
                 evidence_chunks.extend(
                     {
                         **chunk,
@@ -561,6 +607,7 @@ class AgentQueryService:
                     "round_count": len(steps_summary),
                     "failed_round_count": len(failed_rounds),
                     "plan_truncated": plan_truncated,
+                    "bilingual_retrieval": agent_bilingual_enabled(body),
                 },
             )
             yield {"event": "done", "session_id": session_id, "_result": result}
@@ -700,6 +747,7 @@ class AgentQueryService:
         step: AgentPlanStep,
         mode: str,
     ) -> QueryToolResult:
+        bilingual = agent_bilingual_enabled(body)
         return await self._query_tool_service.retrieve_serial(
             http_request=http_request,
             kb_ids=step.kb_ids,
@@ -714,6 +762,9 @@ class AgentQueryService:
             enable_rerank=body.enable_rerank,
             hl_keywords=step.hl_keywords,
             ll_keywords=step.ll_keywords,
+            query_alt=step.query_alt if bilingual else None,
+            hl_keywords_alt=step.hl_keywords_alt,
+            ll_keywords_alt=step.ll_keywords_alt,
         )
 
     async def _plan(
@@ -727,6 +778,26 @@ class AgentQueryService:
         agent_func, user_prompt = await self._agent_llm_context(
             request, body, effective_records
         )
+        bilingual = agent_bilingual_enabled(body)
+
+        step_schema: dict[str, Any] = {
+            "step_index": 1,
+            "title": "短标题",
+            "query": "完整自洽的检索子问题",
+            "kb_ids": [effective_records[0].id],
+            "mode": "mix",
+            "priority": "P0",
+            "hl_keywords": [],
+            "ll_keywords": [],
+        }
+        if bilingual:
+            step_schema.update(
+                {
+                    "query_alt": "该步子问题的另一语言完整版本",
+                    "hl_keywords_alt": [],
+                    "ll_keywords_alt": [],
+                }
+            )
 
         payload = {
             "user_question": body.query,
@@ -735,6 +806,7 @@ class AgentQueryService:
                 for record in effective_records
             ],
             "max_rounds": max_rounds,
+            "bilingual_retrieval": bilingual,
             "default_retrieve_params": {
                 "top_k": body.top_k,
                 "chunk_top_k": body.chunk_top_k,
@@ -745,22 +817,14 @@ class AgentQueryService:
                 "type": "plan",
                 "clarification_required": False,
                 "clarification_question": None,
-                "steps": [
-                    {
-                        "step_index": 1,
-                        "title": "短标题",
-                        "query": "完整自洽的检索子问题",
-                        "kb_ids": [effective_records[0].id],
-                        "mode": "mix",
-                        "priority": "P0",
-                        "hl_keywords": [],
-                        "ll_keywords": [],
-                    }
-                ],
+                "steps": [step_schema],
                 "notes_for_user": "可选一句话",
             },
         }
         prompt = json.dumps(payload, ensure_ascii=False)
+        system_prompt = DEFAULT_AGENT_WORKFLOW_PROMPT
+        if bilingual:
+            system_prompt = f"{system_prompt}\n{BILINGUAL_PLAN_PROMPT_SUFFIX}"
 
         def _parse_plan(data: Any) -> AgentPlan:
             plan = AgentPlan.model_validate(data)
@@ -772,7 +836,7 @@ class AgentQueryService:
             return await call_llm_json(
                 agent_func,
                 prompt,
-                system_prompt=DEFAULT_AGENT_WORKFLOW_PROMPT,
+                system_prompt=system_prompt,
                 priority=DEFAULT_QUERY_PRIORITY,
                 parse=_parse_plan,
                 attempts=AGENT_PLAN_LLM_ATTEMPTS,

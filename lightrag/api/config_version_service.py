@@ -33,7 +33,7 @@ MetadataStore = SQLiteMetadataStore | PostgresMetadataStore
 # extraction and VLM roles produce persisted KG/chunk content, so a change
 # there must trigger reindex; query/keyword roles only affect retrieval.
 _INDEX_AFFECTING_ROLES = frozenset({"extract", "vlm"})
-_QUERY_AFFECTING_ROLES = frozenset({"query", "keyword", "agent", "profile"})
+_QUERY_AFFECTING_ROLES = frozenset({"query", "keyword", "agent", "profile", "bilingual"})
 
 # Keys accepted inside an ``llm_role_config[<role>]`` mapping. ``model_kwargs``
 # and ``kwargs`` are aliases. Secret material (``api_key``) is accepted for
@@ -112,10 +112,14 @@ _EXTRACTION_CONFIG_KEYS = frozenset(
         "force_llm_summary_on_merge",
     }
 )
-# ``query_config`` accepts every QueryParam field plus two non-QueryParam
-# retrieval knobs applied at construction time (``cosine_threshold`` →
-# vector store; ``related_chunk_number`` → retrieval default).
-_QUERY_CONFIG_EXTRA_KEYS = frozenset({"cosine_threshold", "related_chunk_number"})
+# ``query_config`` accepts every QueryParam field plus non-QueryParam
+# retrieval knobs: ``cosine_threshold`` / ``related_chunk_number`` are applied
+# at construction time; ``bilingual_query`` (off/auto/on) is read per request
+# by the bilingual dual-path query service.
+_QUERY_CONFIG_EXTRA_KEYS = frozenset(
+    {"cosine_threshold", "related_chunk_number", "bilingual_query"}
+)
+_BILINGUAL_QUERY_MODES = frozenset({"off", "auto", "on"})
 # Fields that change LLM *output* (and therefore built content / answers).
 # Excludes ``api_key`` (secret, not output-affecting) and perf-only knobs
 # (``max_async`` / ``timeout``).
@@ -268,6 +272,13 @@ def _active_query_runtime_config(config: dict[str, Any] | None) -> dict[str, Any
         runtime["related_chunk_number"] = _positive_int(
             query_config["related_chunk_number"]
         )
+    if query_config.get("bilingual_query") is not None:
+        bilingual_mode = str(query_config["bilingual_query"]).strip().lower()
+        if bilingual_mode not in _BILINGUAL_QUERY_MODES:
+            raise ValueError(
+                "query_config.bilingual_query must be one of: off, auto, on"
+            )
+        runtime["bilingual_query"] = bilingual_mode
     return runtime
 
 

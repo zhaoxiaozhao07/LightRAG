@@ -25,6 +25,18 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
+from lightrag.api.bilingual_query_service import (
+    answer_language_rules,
+    apply_plan_keywords_to_param,
+    bilingual_applies,
+    bilingual_audit_fields,
+    bilingual_mode_from_rag,
+    bilingual_query_data,
+    bilingual_query_llm,
+    dual_aquery_data,
+    prepare_bilingual_queries,
+    resolve_bilingual_mode,
+)
 from lightrag.api.config_version_service import (
     active_query_defaults_from_rag,
     active_query_metadata_from_rag,
@@ -111,6 +123,7 @@ def _query_audit_metadata(
     *,
     route: str,
     stream: bool,
+    bilingual_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "route": route,
@@ -132,7 +145,37 @@ def _query_audit_metadata(
     for key in ("config_version_id", "parser_hash", "index_hash", "query_hash"):
         if key in active_metadata:
             metadata[f"active_{key}"] = active_metadata[key]
+    if bilingual_info is not None:
+        metadata.update(bilingual_audit_fields(bilingual_info))
     return metadata
+
+
+async def _maybe_bilingual_plan(
+    rag: Any, request: "KBQueryRequest", param: QueryParam
+):
+    """Resolve the bilingual mode for one KB query and preprocess if it applies.
+
+    Returns ``(plan, info)``:
+
+    - ``(plan, None)`` — dual-path should run; keywords already seeded on
+      ``param``; the caller builds the final info block from the dual result.
+    - ``(None, info)`` — dual-path was requested but preprocessing was
+      unavailable; ``info`` explains the single-path fallback.
+    - ``(None, None)`` — bilingual is off / not applicable; responses stay
+      byte-identical to deployments that never enable the feature.
+    """
+    mode = resolve_bilingual_mode(request.bilingual, bilingual_mode_from_rag(rag))
+    if not bilingual_applies(mode, request.query, param):
+        return None, None
+    plan = await prepare_bilingual_queries(rag, request.query)
+    if plan is None:
+        return None, {
+            "enabled": False,
+            "mode": mode,
+            "reason": "preprocess_unavailable",
+        }
+    apply_plan_keywords_to_param(param, plan)
+    return plan, None
 
 
 class KBQueryFilters(BaseModel):
@@ -205,6 +248,15 @@ class KBQueryRequest(BaseModel):
     include_chunk_content: Optional[bool] = False
     stream: Optional[bool] = True
     filters: Optional[KBQueryFilters] = None
+    bilingual: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Explicit dual-path bilingual retrieval override. True forces it "
+            "on, False forces it off; omit to follow the KB's "
+            "query_config.bilingual_query and the deployment default. The "
+            "BILINGUAL_QUERY_ENABLED master switch must be on either way."
+        ),
+    )
 
     @field_validator("query", mode="after")
     @classmethod
@@ -231,7 +283,7 @@ class KBQueryRequest(BaseModel):
         is_stream: bool,
         active_defaults: dict[str, Any] | None = None,
     ) -> QueryParam:
-        route_only_fields = {"query", "include_chunk_content", "filters"}
+        route_only_fields = {"query", "include_chunk_content", "filters", "bilingual"}
         request_data = self.model_dump(
             exclude_none=True,
             exclude=route_only_fields,
@@ -536,6 +588,14 @@ class MultiKBQueryRequest(BaseModel):
     include_references: Optional[bool] = True
     include_chunk_content: Optional[bool] = False
     filters: Optional[KBQueryFilters] = None
+    bilingual: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Explicit dual-path bilingual retrieval override for every target "
+            "KB. Multi-KB queries do not consult per-KB query_config; omit to "
+            "follow the deployment default mode."
+        ),
+    )
 
     @field_validator("query", mode="after")
     @classmethod
@@ -581,6 +641,7 @@ class MultiKBQueryRequest(BaseModel):
             "include_chunk_content",
             "include_references",
             "filters",
+            "bilingual",
         }
         request_data = self.model_dump(exclude_none=True, exclude=route_only_fields)
         explicit_fields = self.model_fields_set - route_only_fields
@@ -641,8 +702,9 @@ def _multi_kb_query_audit_metadata(
     skipped: List[Dict[str, Any]],
     reranked: bool,
     final_count: int,
+    bilingual_info: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    return {
+    metadata = {
         "route": "multi_query",
         "mode": param.mode if param is not None else request.mode,
         "kb_ids": kb_ids,
@@ -656,6 +718,9 @@ def _multi_kb_query_audit_metadata(
         "reranked": reranked,
         "final_chunk_count": final_count,
     }
+    if bilingual_info is not None:
+        metadata.update(bilingual_audit_fields(bilingual_info))
+    return metadata
 
 
 async def _resolve_multi_kb_doc_id_filters(
@@ -700,6 +765,8 @@ async def _prepare_multi_kb_synthesis(
     merged: List[Dict[str, Any]],
     synth_rag: Any,
     synth_param: QueryParam | None,
+    *,
+    bilingual_info: Dict[str, Any] | None = None,
 ):
     """Process merged chunks and build the single-synthesis system prompt.
 
@@ -714,9 +781,17 @@ async def _prepare_multi_kb_synthesis(
     global_config = synth_rag._build_global_config()
     tokenizer = global_config.get("tokenizer")
     response_type = synth_param.response_type or "Multiple Paragraphs"
-    user_prompt = (
-        f"\n\n{synth_param.user_prompt}" if synth_param.user_prompt else "n/a"
-    )
+    user_prompt_parts: List[str] = []
+    if bilingual_info and bilingual_info.get("enabled"):
+        user_prompt_parts.append(
+            answer_language_rules(
+                str(bilingual_info.get("source_language") or "zh")
+            )
+        )
+    if synth_param.user_prompt:
+        user_prompt_parts.append(synth_param.user_prompt)
+    joined_user_prompt = "\n\n".join(user_prompt_parts)
+    user_prompt = f"\n\n{joined_user_prompt}" if joined_user_prompt else "n/a"
     max_total_tokens = (
         getattr(synth_param, "max_total_tokens", None)
         or global_config.get("max_total_tokens")
@@ -802,12 +877,14 @@ async def _multi_kb_retrieve(
     List[str],
     List[Dict[str, Any]],
     Dict[str, int],
+    Dict[str, Any] | None,
 ]:
     """Fan out retrieval across ``request.kb_ids`` and merge the chunks.
 
     Returns ``(merged_chunks, synth_rag, synth_param, queried_kb_ids,
-    skipped_kbs, per_kb_chunk_counts)``. ``synth_rag``/``synth_param`` come from
-    the first KB that retrieved successfully (drive synthesis).
+    skipped_kbs, per_kb_chunk_counts, bilingual_info)``. ``synth_rag``/
+    ``synth_param`` come from the first KB that retrieved successfully
+    (drive synthesis).
 
     SECURITY: the central middleware ``enforce_enterprise_request_access`` does
     NOT cover the collection-level ``/kbs:query`` / ``/kbs:retrieve`` paths
@@ -827,11 +904,35 @@ async def _multi_kb_retrieve(
         for kb_id in kb_ids:
             await authz.require_kb_role(principal, kb_id, KB_ROLE_VIEWER)
 
+    # Multi-KB queries deliberately use request-level params only (see the
+    # comment in _retrieve_one), so bilingual mode also resolves from the
+    # request flag plus the deployment default — per-KB query_config is not
+    # consulted. Preprocessing runs once and is shared by every KB.
+    plan = None
+    bilingual_info: Dict[str, Any] | None = None
+    bilingual_mode = resolve_bilingual_mode(request.bilingual, None)
+    if bilingual_applies(bilingual_mode, request.query, None):
+        try:
+            preprocess_rag = cast(Any, await registry.get(kb_ids[0]))
+        except Exception:  # noqa: BLE001 — KB errors surface in the fan-out
+            preprocess_rag = None
+        if preprocess_rag is not None:
+            plan = await prepare_bilingual_queries(preprocess_rag, request.query)
+        if plan is None:
+            bilingual_info = {
+                "enabled": False,
+                "mode": bilingual_mode,
+                "reason": "preprocess_unavailable",
+            }
+
     # Per-KB filters: metadata applies uniformly; doc_ids are split to the KB
     # they belong to (with union validation). None when no filters supplied.
     per_kb_filters = await _resolve_multi_kb_doc_id_filters(
         document_service, kb_ids, request.filters
     )
+
+    secondary_counts: Dict[str, int] = {}
+    secondary_failed_kbs: List[str] = []
 
     async def _retrieve_one(kb_id: str):
         kb_filters = per_kb_filters.get(kb_id)
@@ -845,6 +946,14 @@ async def _multi_kb_retrieve(
         param = request.to_query_params()
         param.stream = False
         param.ids = await _resolve_doc_id_scope(document_service, kb_id, kb_filters)
+        if plan is not None:
+            apply_plan_keywords_to_param(param, plan)
+            dual = await dual_aquery_data(rag, request.query, param, plan)
+            secondary_counts[kb_id] = len(dual.secondary_chunks)
+            if dual.secondary_failed:
+                secondary_failed_kbs.append(kb_id)
+            data = {"data": {"chunks": dual.merged_chunks()}}
+            return rag, param, data
         data = await rag.aquery_data(request.query, param=param)
         return rag, param, data
 
@@ -889,7 +998,27 @@ async def _multi_kb_retrieve(
             status_code=502,
             detail="All target knowledge bases failed to retrieve",
         )
-    return _dedup_chunks(merged), synth_rag, synth_param, queried, skipped, per_kb_counts
+    if plan is not None:
+        bilingual_info = {
+            "enabled": True,
+            "mode": bilingual_mode,
+            "source_language": plan.source_language,
+            "translated_query": plan.secondary_query,
+            "translation_cached": plan.from_cache,
+            "per_kb_secondary_chunks": secondary_counts,
+            "secondary_chunks": sum(secondary_counts.values()),
+        }
+        if secondary_failed_kbs:
+            bilingual_info["secondary_failed_kbs"] = secondary_failed_kbs
+    return (
+        _dedup_chunks(merged),
+        synth_rag,
+        synth_param,
+        queried,
+        skipped,
+        per_kb_counts,
+        bilingual_info,
+    )
 
 
 def create_kb_query_routes(
@@ -935,7 +1064,13 @@ def create_kb_query_routes(
                 kb_id,
                 request.filters,
             )
-            result = await rag.aquery_llm(request.query, param=param)
+            plan, bilingual_info = await _maybe_bilingual_plan(rag, request, param)
+            if plan is not None:
+                result, bilingual_info = await bilingual_query_llm(
+                    rag, request.query, param, plan, stream=False
+                )
+            else:
+                result = await rag.aquery_llm(request.query, param=param)
             llm_response = result.get("llm_response", {})
             data = result.get("data", {})
             references = data.get("references", [])
@@ -945,6 +1080,9 @@ def create_kb_query_routes(
                 references = _enrich_with_chunk_content(
                     references, data.get("chunks", [])
                 )
+            response_metadata = dict(active_metadata)
+            if bilingual_info is not None:
+                response_metadata["bilingual"] = bilingual_info
             await append_enterprise_audit_event(
                 http_request,
                 "query_executed",
@@ -956,6 +1094,7 @@ def create_kb_query_routes(
                     active_metadata,
                     route="query",
                     stream=False,
+                    bilingual_info=bilingual_info,
                 ),
             )
             return KBQueryResponse(
@@ -967,7 +1106,7 @@ def create_kb_query_routes(
                 ]
                 if include_references
                 else None,
-                metadata=active_metadata,
+                metadata=response_metadata,
             )
         except HTTPException:
             raise
@@ -1011,7 +1150,16 @@ def create_kb_query_routes(
                 kb_id,
                 request.filters,
             )
-            result = await rag.aquery_llm(request.query, param=param)
+            plan, bilingual_info = await _maybe_bilingual_plan(rag, request, param)
+            if plan is not None:
+                result, bilingual_info = await bilingual_query_llm(
+                    rag, request.query, param, plan, stream=stream_mode
+                )
+            else:
+                result = await rag.aquery_llm(request.query, param=param)
+            response_metadata = dict(active_metadata)
+            if bilingual_info is not None:
+                response_metadata["bilingual"] = bilingual_info
             await append_enterprise_audit_event(
                 http_request,
                 "query_stream_started",
@@ -1023,6 +1171,7 @@ def create_kb_query_routes(
                     active_metadata,
                     route="query_stream",
                     stream=True,
+                    bilingual_info=bilingual_info,
                 ),
             )
 
@@ -1037,7 +1186,7 @@ def create_kb_query_routes(
                 if llm_response.get("is_streaming"):
                     payload = {
                         "kb_id": kb_id,
-                        "metadata": active_metadata,
+                        "metadata": response_metadata,
                     }
                     if include_references:
                         payload["references"] = references
@@ -1055,7 +1204,7 @@ def create_kb_query_routes(
                     body = {
                         "kb_id": kb_id,
                         "response": llm_response.get("content", ""),
-                        "metadata": active_metadata,
+                        "metadata": response_metadata,
                     }
                     if include_references:
                         body["references"] = references
@@ -1114,7 +1263,14 @@ def create_kb_query_routes(
                 kb_id,
                 request.filters,
             )
-            result = await rag.aquery_data(request.query, param=param)
+            plan, bilingual_info = await _maybe_bilingual_plan(rag, request, param)
+            if plan is not None:
+                result = await bilingual_query_data(rag, request.query, param, plan)
+                bilingual_info = (result.get("metadata") or {}).get("bilingual")
+            else:
+                result = await rag.aquery_data(request.query, param=param)
+                if bilingual_info is not None:
+                    result.setdefault("metadata", {})["bilingual"] = bilingual_info
             await append_enterprise_audit_event(
                 http_request,
                 "retrieve_executed",
@@ -1128,6 +1284,7 @@ def create_kb_query_routes(
                     if http_request.url.path.endswith("/retrieve")
                     else "query_data",
                     stream=False,
+                    bilingual_info=bilingual_info,
                 ),
             )
             return KBQueryDataResponse(
@@ -1173,6 +1330,7 @@ def create_kb_query_routes(
                 queried,
                 skipped,
                 per_kb_counts,
+                bilingual_info,
             ) = await _multi_kb_retrieve(
                 document_service, registry, request, http_request
             )
@@ -1185,7 +1343,7 @@ def create_kb_query_routes(
                 reranked,
                 final_count,
             ) = await _prepare_multi_kb_synthesis(
-                request, merged, synth_rag, synth_param
+                request, merged, synth_rag, synth_param, bilingual_info=bilingual_info
             )
             if sys_prompt is not None and use_model_func is not None:
                 llm_out = await use_model_func(
@@ -1207,6 +1365,8 @@ def create_kb_query_routes(
                 "skipped_kbs": skipped,
                 "synthesis_kb_id": queried[0] if queried else None,
             }
+            if bilingual_info is not None:
+                metadata["bilingual"] = bilingual_info
 
             await append_enterprise_audit_event(
                 http_request,
@@ -1220,6 +1380,7 @@ def create_kb_query_routes(
                     skipped=skipped,
                     reranked=reranked,
                     final_count=final_count,
+                    bilingual_info=bilingual_info,
                 ),
             )
             return MultiKBQueryResponse(
@@ -1255,6 +1416,7 @@ def create_kb_query_routes(
                 queried,
                 skipped,
                 per_kb_counts,
+                bilingual_info,
             ) = await _multi_kb_retrieve(
                 document_service, registry, request, http_request
             )
@@ -1265,7 +1427,7 @@ def create_kb_query_routes(
                 reranked,
                 final_count,
             ) = await _prepare_multi_kb_synthesis(
-                request, merged, synth_rag, synth_param
+                request, merged, synth_rag, synth_param, bilingual_info=bilingual_info
             )
             metadata = {
                 "requested_kb_count": len(request.kb_ids),
@@ -1276,6 +1438,8 @@ def create_kb_query_routes(
                 "skipped_kbs": skipped,
                 "synthesis_kb_id": queried[0] if queried else None,
             }
+            if bilingual_info is not None:
+                metadata["bilingual"] = bilingual_info
             await append_enterprise_audit_event(
                 http_request,
                 "multi_kb_query_stream_started",
@@ -1288,6 +1452,7 @@ def create_kb_query_routes(
                     skipped=skipped,
                     reranked=reranked,
                     final_count=final_count,
+                    bilingual_info=bilingual_info,
                 ),
             )
 
@@ -1355,6 +1520,7 @@ def create_kb_query_routes(
                 queried,
                 skipped,
                 per_kb_counts,
+                bilingual_info,
             ) = await _multi_kb_retrieve(
                 document_service, registry, request, http_request
             )
@@ -1402,6 +1568,8 @@ def create_kb_query_routes(
                 "reranked": reranked,
                 "skipped_kbs": skipped,
             }
+            if bilingual_info is not None:
+                metadata["bilingual"] = bilingual_info
             await append_enterprise_audit_event(
                 http_request,
                 "multi_kb_retrieve_executed",
@@ -1414,6 +1582,7 @@ def create_kb_query_routes(
                     skipped=skipped,
                     reranked=reranked,
                     final_count=len(processed_with_ids),
+                    bilingual_info=bilingual_info,
                 ),
             )
             return MultiKBQueryDataResponse(

@@ -71,6 +71,40 @@ class DefaultRAGStorageConfig:
     DOC_STATUS_STORAGE = "JsonDocStatusStorage"
 
 
+# Bilingual role env-fallback fields: any BILINGUAL_LLM_* field left unset
+# inherits the QUERY role's value for that field (before the standard
+# role -> base LLM fallback), so the translation call defaults to the exact
+# model the query role uses. See docs/BilingualQuery-zh.md.
+_BILINGUAL_ROLE_FALLBACK_FIELDS = (
+    "llm_binding",
+    "llm_model",
+    "llm_binding_host",
+    "llm_binding_api_key",
+    "llm_max_async",
+    "llm_timeout",
+    "aws_region",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "aws_session_token",
+)
+
+
+def _backfill_bilingual_role_args(args) -> None:
+    """Backfill unset ``bilingual_*`` role args from the ``query_*`` role.
+
+    Runs after the per-role env loop so explicit BILINGUAL_LLM_* values win;
+    fields that remain ``None`` after this keep the normal base-LLM fallback
+    applied by ``resolve_role_llm_settings``.
+    """
+    for field_name in _BILINGUAL_ROLE_FALLBACK_FIELDS:
+        if getattr(args, f"bilingual_{field_name}", None) is None:
+            setattr(
+                args,
+                f"bilingual_{field_name}",
+                getattr(args, f"query_{field_name}", None),
+            )
+
+
 def get_default_host(binding_type: str) -> str:
     default_hosts = {
         "ollama": os.getenv("LLM_BINDING_HOST", "http://localhost:11434"),
@@ -719,6 +753,8 @@ def parse_args() -> argparse.Namespace:
                     f"but required env vars are missing: {', '.join(missing)}"
                 )
 
+    _backfill_bilingual_role_args(args)
+
     # VLM multimodal master switch — when off, the pipeline emits a warning
     # and skips every i/t/e item without touching the VLM. When on, the
     # effective VLM binding must support image inputs.
@@ -845,6 +881,13 @@ def parse_args() -> argparse.Namespace:
     args.agent_workflow_prompt_max_length = get_env_value(
         "AGENT_WORKFLOW_PROMPT_MAX_LENGTH", 16384, int
     )
+
+    # Bilingual (zh<->en) dual-path query (docs/BilingualQuery-zh.md)
+    args.bilingual_query_enabled = get_env_value("BILINGUAL_QUERY_ENABLED", False, bool)
+    args.bilingual_query_default_mode = get_env_value(
+        "BILINGUAL_QUERY_DEFAULT_MODE", "auto"
+    )
+    args.bilingual_query_timeout = get_env_value("BILINGUAL_QUERY_TIMEOUT", 12, int)
 
     # Token auto-renewal configuration (sliding window expiration)
     args.token_auto_renew = get_env_value("TOKEN_AUTO_RENEW", True, bool)

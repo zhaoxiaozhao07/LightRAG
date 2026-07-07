@@ -7,6 +7,10 @@ from typing import Any, Dict, List, Literal, Optional, cast
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
+from lightrag.api.bilingual_query_service import (
+    alt_retrieval_param,
+    usable_alt_query,
+)
 from lightrag.api.config_version_service import (
     active_query_defaults_from_rag,
     active_query_metadata_from_rag,
@@ -314,6 +318,8 @@ class QueryToolResult:
     skipped_kbs: list[dict[str, Any]] = field(default_factory=list)
     per_kb_chunk_counts: dict[str, int] = field(default_factory=dict)
     active_metadata: dict[str, Any] = field(default_factory=dict)
+    alt_chunk_counts: dict[str, int] = field(default_factory=dict)
+    alt_failed_kbs: list[str] = field(default_factory=list)
 
 
 class QueryToolService:
@@ -351,11 +357,19 @@ class QueryToolService:
         enable_rerank: bool | None = None,
         hl_keywords: list[str] | None = None,
         ll_keywords: list[str] | None = None,
+        query_alt: str | None = None,
+        hl_keywords_alt: list[str] | None = None,
+        ll_keywords_alt: list[str] | None = None,
     ) -> QueryToolResult:
         if not kb_ids:
             raise HTTPException(status_code=400, detail="At least one KB is required")
         if mode == "bypass":
             raise HTTPException(status_code=400, detail="bypass mode is not supported for Agent query")
+
+        # Bilingual dual-path: a usable alternate-language query triggers a
+        # second retrieval per KB whose chunks join the merged pool. The alt
+        # path is best-effort — its failure never fails the step.
+        alt_query = usable_alt_query(query, query_alt)
 
         if enterprise_auth_enabled():
             principal = get_request_principal(http_request)
@@ -371,6 +385,8 @@ class QueryToolService:
         skipped: list[dict[str, Any]] = []
         queried: list[str] = []
         per_kb_counts: dict[str, int] = {}
+        alt_counts: dict[str, int] = {}
+        alt_failed: list[str] = []
         synth_rag: Any | None = None
         synth_param: QueryParam | None = None
         active_metadata: dict[str, Any] = {}
@@ -434,6 +450,23 @@ class QueryToolService:
                 skipped.append({"kb_id": kb_id, "reason": "error"})
                 continue
 
+            alt_chunks: list[dict[str, Any]] = []
+            if alt_query is not None:
+                try:
+                    alt_param = alt_retrieval_param(
+                        param, alt_query, hl_keywords_alt, ll_keywords_alt
+                    )
+                    alt_data = await rag.aquery_data(alt_query, param=alt_param)
+                    alt_chunks = (
+                        ((alt_data or {}).get("data", {}) or {}).get("chunks", []) or []
+                    )
+                    alt_counts[kb_id] = len(alt_chunks)
+                except Exception as exc:  # noqa: BLE001 — alt path is best-effort
+                    logger.warning(
+                        "Agent bilingual alt retrieval failed for '%s': %s", kb_id, exc
+                    )
+                    alt_failed.append(kb_id)
+
             if synth_rag is None:
                 synth_rag = rag
                 synth_param = param
@@ -444,6 +477,11 @@ class QueryToolService:
             for chunk in chunks:
                 tagged = dict(chunk)
                 tagged["kb_id"] = kb_id
+                merged.append(tagged)
+            for chunk in alt_chunks:
+                tagged = dict(chunk)
+                tagged["kb_id"] = kb_id
+                tagged.setdefault("retrieval_path", "secondary")
                 merged.append(tagged)
 
         if not queried:
@@ -457,4 +495,6 @@ class QueryToolService:
             skipped_kbs=skipped,
             per_kb_chunk_counts=per_kb_counts,
             active_metadata=active_metadata,
+            alt_chunk_counts=alt_counts,
+            alt_failed_kbs=alt_failed,
         )

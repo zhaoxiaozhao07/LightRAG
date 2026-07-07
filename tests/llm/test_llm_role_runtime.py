@@ -862,7 +862,7 @@ async def test_llm_role_config_and_queue_status_are_observable(tmp_path):
     )
 
     all_configs = rag.get_llm_role_config()
-    assert set(all_configs) == {"extract", "keyword", "query", "agent", "profile", "vlm"}
+    assert set(all_configs) == {"extract", "keyword", "query", "agent", "profile", "vlm", "bilingual"}
     assert all_configs["query"]["binding"] == "openai"
     assert all_configs["query"]["model"] == "gpt-test"
     # Auth-bearing fields are dropped from the observability snapshot,
@@ -876,7 +876,7 @@ async def test_llm_role_config_and_queue_status_are_observable(tmp_path):
     assert rag._role_llm_states["query"].metadata["api_key"] == "secret-key"
 
     queue_status = await rag.get_llm_queue_status()
-    assert set(queue_status) == {"extract", "keyword", "query", "agent", "profile", "vlm"}
+    assert set(queue_status) == {"extract", "keyword", "query", "agent", "profile", "vlm", "bilingual"}
     assert queue_status["query"]["available"] is True
     assert queue_status["query"]["queue_name"] == "query LLM func"
 
