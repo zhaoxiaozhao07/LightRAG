@@ -432,6 +432,14 @@ def test_active_parser_runtime_helper_normalizes_supported_fields():
     }
 
 
+def test_active_parser_runtime_helper_allows_legacy_engine():
+    active = _config_version({"parser_config": {"engine": "legacy"}})
+
+    assert active_parser_runtime_config_from_version(active) == {
+        "parser_engine": "legacy"
+    }
+
+
 def test_active_config_applies_extraction_runtime_fields():
     active = _config_version(
         {

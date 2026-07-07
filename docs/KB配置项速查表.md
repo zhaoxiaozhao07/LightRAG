@@ -48,8 +48,10 @@ GET    /kbs/{kb_id}/configs/{version_id}           # 详情
 
 | 字段（别名） | 含义 | 取值 |
 |---|---|---|
-| `engine` / `parser_engine` | 解析引擎 | `mineru` / `docling` / `native`（拒绝 `legacy`） |
+| `engine` / `parser_engine` | 解析引擎 | `legacy` / `mineru` / `docling` / `native` |
 | `process_options` / `options` | 文件级处理选项 | 选项串，创建时校验+规范化 |
+
+> `legacy` 是本地轻量抽取路径，适合文本/数据/代码类文件（如 `txt/md/json/xml/yaml/log/sql/py/js/ts/css/...`）以及轻量 `pdf/docx/pptx/xlsx` 抽取；CSV 可显式指定 legacy 本地抽取，但生产 `.env` 路由已将 `csv:docling-iteP` 放在 `*:legacy-R` 前，默认建议走 Docling 以保留表格结构。legacy 不依赖 MinerU/Docling 服务，但仍会生成 KB sidecar/blocks artifact，后续可正常 `:build-kg` 进入 chunk、抽取、embedding、图谱和向量管理。传统 Office `doc/ppt/xls` 仍建议走 LibreOffice 预转换后的 Docling/MinerU 路径。
 
 > ⛔ parser **服务实例级**字段（endpoint/api_key/api_mode/timeout/workers 等）属部署级，**不能**写进 KB config，必须走 `.env`。详见 §4。
 

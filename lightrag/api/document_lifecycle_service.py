@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import mimetypes
@@ -28,6 +29,7 @@ from lightrag.constants import (
     FULL_DOCS_FORMAT_PENDING_PARSE,
     LIBREOFFICE_RAW_DIR_SUFFIX,
     MINERU_RAW_DIR_SUFFIX,
+    PARSED_DIR_NAME,
     PARSED_DIR_SUFFIX,
     PARSER_ENGINE_DOCLING,
     PARSER_ENGINE_LEGACY,
@@ -48,6 +50,47 @@ from lightrag.utils import compute_mdhash_id, generate_track_id, logger
 SourceType = Literal["upload", "text", "url", "import", "scan"]
 SOURCE_TYPES: tuple[SourceType, ...] = ("upload", "text", "url", "import", "scan")
 MetadataStore = SQLiteMetadataStore | PostgresMetadataStore
+
+_PREVIEW_SCHEMA_VERSION = 1
+_PREVIEW_TEXT_MAX_BYTES = 256 * 1024
+_PREVIEW_TABLE_MAX_ROWS = 50
+_PREVIEW_TABLE_MAX_COLS = 50
+_PREVIEW_TEXT_SUFFIXES = {
+    ".txt",
+    ".md",
+    ".mdx",
+    ".rtf",
+    ".tex",
+    ".html",
+    ".htm",
+    ".csv",
+    ".json",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".log",
+    ".conf",
+    ".ini",
+    ".properties",
+    ".sql",
+    ".bat",
+    ".sh",
+    ".c",
+    ".h",
+    ".cpp",
+    ".hpp",
+    ".py",
+    ".java",
+    ".js",
+    ".ts",
+    ".swift",
+    ".go",
+    ".rb",
+    ".php",
+    ".css",
+    ".scss",
+    ".less",
+}
 AgentProfileDirtyCallback = Callable[[str, str, str], Awaitable[None]]
 
 # Sanitization rule: drop only path separators, control characters, and
@@ -71,6 +114,7 @@ def _sanitize_filename_char(char: str) -> str:
 
 
 _PARSEABLE_ENGINES = {
+    PARSER_ENGINE_LEGACY,
     PARSER_ENGINE_NATIVE,
     PARSER_ENGINE_MINERU,
     PARSER_ENGINE_DOCLING,
@@ -1176,6 +1220,10 @@ class DocumentLifecycleService:
             "archive_source_after_parse": False,
         }
         source_path = str(plan.source_path)
+        if plan.parser_engine == PARSER_ENGINE_LEGACY:
+            return await rag.parse_legacy(
+                plan.lightrag_doc_id, source_path, content_data
+            )
         if plan.parser_engine == PARSER_ENGINE_NATIVE:
             return await rag.parse_native(
                 plan.lightrag_doc_id, source_path, content_data
@@ -1202,6 +1250,7 @@ class DocumentLifecycleService:
         parsed_data: dict[str, Any],
     ) -> DocumentParseResult:
         artifacts = _build_parse_artifacts(plan, parsed_data)
+        artifacts.extend(_build_preview_artifacts(plan, parsed_data))
         artifacts = await self._persist_parse_artifacts(plan, artifacts)
         (
             document,
@@ -1266,6 +1315,112 @@ class DocumentLifecycleService:
             limit=limit,
             offset=offset,
         )
+
+    async def get_document_preview_manifest(
+        self, kb_id: str, document_id: str
+    ) -> dict[str, Any]:
+        record = await self._kb_service.get(kb_id)
+        document = await self._metadata_store.get_document(record.id, document_id)
+        artifacts, _total = await self._metadata_store.list_document_artifacts(
+            record.id,
+            document_id,
+            limit=500,
+            offset=0,
+        )
+        preview_priority = {
+            "preview_table_json": 0,
+            "preview_text": 1,
+            "preview_html": 2,
+        }
+        preview_artifacts = sorted(
+            (
+                artifact
+                for artifact in artifacts
+                if artifact.artifact_type in preview_priority
+                and artifact.metadata.get("preview") is True
+            ),
+            key=lambda artifact: preview_priority.get(artifact.artifact_type, 99),
+        )
+
+        variants: list[dict[str, Any]] = []
+        for artifact in preview_artifacts:
+            try:
+                artifact_path, is_directory = _resolve_artifact_path(
+                    self._source_root, document, artifact
+                )
+            except (FileNotFoundError, ValueError):
+                continue
+            media_type = _artifact_media_type(
+                document, artifact, artifact_path, is_directory
+            )
+            variants.append(
+                {
+                    "kind": _preview_kind_for_artifact_type(artifact.artifact_type),
+                    "artifact_id": artifact.id,
+                    "artifact_type": artifact.artifact_type,
+                    "media_type": media_type,
+                    "size_bytes": _artifact_size_bytes(artifact, artifact_path),
+                    "preview_url": _artifact_route_url(
+                        record.id, document_id, artifact.id, suffix=":preview"
+                    ),
+                }
+            )
+
+        original = next(
+            (artifact for artifact in artifacts if artifact.artifact_type == "original"),
+            None,
+        )
+        fallback: dict[str, Any] | None = None
+        if original is not None:
+            try:
+                original_path, original_is_dir = _resolve_artifact_path(
+                    self._source_root, document, original
+                )
+                original_media_type = _artifact_media_type(
+                    document, original, original_path, original_is_dir
+                )
+                original_preview_kind = _inline_preview_kind_for_media_type(
+                    original_media_type
+                )
+                if original_preview_kind is not None:
+                    variants.append(
+                        {
+                            "kind": original_preview_kind,
+                            "artifact_id": original.id,
+                            "artifact_type": original.artifact_type,
+                            "media_type": original_media_type,
+                            "size_bytes": _artifact_size_bytes(
+                                original, original_path
+                            ),
+                            "preview_url": _artifact_route_url(
+                                record.id,
+                                document_id,
+                                original.id,
+                                suffix=":preview",
+                            ),
+                        }
+                    )
+                fallback = {
+                    "artifact_id": original.id,
+                    "artifact_type": original.artifact_type,
+                    "media_type": original_media_type,
+                    "size_bytes": _artifact_size_bytes(original, original_path),
+                    "download_url": _artifact_route_url(
+                        record.id, document_id, original.id, suffix=":download"
+                    ),
+                }
+            except (FileNotFoundError, ValueError):
+                fallback = None
+
+        return {
+            "document_id": document.id,
+            "source_name": document.source_name,
+            "source_content_type": document.content_type,
+            "status": document.status,
+            "preferred": variants[0] if variants else None,
+            "variants": variants,
+            "fallback": fallback,
+        }
 
     async def get_document_artifact(
         self, kb_id: str, document_id: str, artifact_id: str
@@ -1704,6 +1859,219 @@ def _artifact_media_type(
     return guessed_type or "application/octet-stream"
 
 
+def _artifact_route_url(
+    kb_id: str, document_id: str, artifact_id: str, *, suffix: str
+) -> str:
+    return f"/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}{suffix}"
+
+
+def _artifact_size_bytes(artifact: ArtifactRecord, path: Path) -> int | None:
+    if artifact.size_bytes is not None:
+        return artifact.size_bytes
+    try:
+        return path.stat().st_size if path.is_file() else None
+    except OSError:
+        return None
+
+
+def _preview_kind_for_artifact_type(artifact_type: str) -> str:
+    return {
+        "preview_text": "text",
+        "preview_table_json": "table",
+        "preview_html": "html",
+    }.get(artifact_type, artifact_type)
+
+
+def _inline_preview_kind_for_media_type(media_type: str) -> str | None:
+    normalized = media_type.split(";", 1)[0].lower()
+    if normalized == "application/pdf":
+        return "pdf"
+    if normalized.startswith("image/") and normalized != "image/svg+xml":
+        return "image"
+    if normalized.startswith("text/"):
+        return "text"
+    if normalized in {
+        "application/json",
+        "application/ld+json",
+        "application/markdown",
+        "application/x-ndjson",
+    }:
+        return "text"
+    return None
+
+
+def _build_preview_artifacts(
+    plan: DocumentParsePlan, parsed_data: dict[str, Any]
+) -> list[ArtifactRecord]:
+    preview_dir = (
+        plan.source_path.parent / PARSED_DIR_NAME / f"{plan.source_path.name}.preview"
+    )
+    if preview_dir.exists():
+        shutil.rmtree(preview_dir, ignore_errors=True)
+    preview_dir.mkdir(parents=True, exist_ok=True)
+
+    now = utc_now_iso()
+    artifacts: list[ArtifactRecord] = []
+
+    table_artifact = _build_table_preview_artifact(
+        plan, preview_dir=preview_dir, created_at=now
+    )
+    if table_artifact is not None:
+        artifacts.append(table_artifact)
+
+    text = parsed_data.get("content")
+    if not isinstance(text, str) or not text.strip():
+        text = _read_text_preview_source(plan.source_path)
+    if isinstance(text, str) and text.strip():
+        preview_text, truncated = _truncate_utf8_text(text, _PREVIEW_TEXT_MAX_BYTES)
+        text_path = preview_dir / f"{plan.source_path.stem or 'document'}.preview.txt"
+        text_path.write_text(preview_text, encoding="utf-8")
+        artifacts.append(
+            _artifact_record(
+                plan,
+                artifact_type="preview_text",
+                uri=str(text_path),
+                path=text_path,
+                created_at=now,
+                metadata={
+                    **_preview_metadata(plan, truncated=truncated),
+                    "media_type": "text/plain; charset=utf-8",
+                },
+            )
+        )
+
+    if not artifacts:
+        shutil.rmtree(preview_dir, ignore_errors=True)
+    return artifacts
+
+
+def _preview_metadata(plan: DocumentParsePlan, *, truncated: bool) -> dict[str, Any]:
+    return {
+        "preview": True,
+        "source_hash": plan.document.source_hash,
+        "parser_hash": plan.parser_hash,
+        "parse_engine": plan.parser_engine,
+        "truncated": truncated,
+        "preview_schema_version": _PREVIEW_SCHEMA_VERSION,
+    }
+
+
+def _truncate_utf8_text(text: str, max_bytes: int) -> tuple[str, bool]:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text, False
+    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
+def _read_text_preview_source(source_path: Path) -> str | None:
+    if source_path.suffix.lower() not in _PREVIEW_TEXT_SUFFIXES:
+        return None
+    try:
+        return source_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _build_table_preview_artifact(
+    plan: DocumentParsePlan, *, preview_dir: Path, created_at: str
+) -> ArtifactRecord | None:
+    suffix = plan.source_path.suffix.lower()
+    payload: dict[str, Any] | None = None
+    if suffix == ".csv":
+        payload = _csv_preview_payload(plan.source_path)
+    elif suffix == ".xlsx":
+        payload = _xlsx_preview_payload(plan.source_path)
+    if payload is None:
+        return None
+
+    table_path = (
+        preview_dir / f"{plan.source_path.stem or 'document'}.preview.table.json"
+    )
+    table_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return _artifact_record(
+        plan,
+        artifact_type="preview_table_json",
+        uri=str(table_path),
+        path=table_path,
+        created_at=created_at,
+        metadata={
+            **_preview_metadata(plan, truncated=bool(payload.get("truncated"))),
+            "media_type": "application/json",
+        },
+    )
+
+
+def _csv_preview_payload(source_path: Path) -> dict[str, Any] | None:
+    try:
+        with source_path.open("r", encoding="utf-8", newline="") as file:
+            reader = csv.reader(file)
+            rows: list[list[str]] = []
+            truncated = False
+            for row_index, row in enumerate(reader):
+                if row_index >= _PREVIEW_TABLE_MAX_ROWS:
+                    truncated = True
+                    break
+                if len(row) > _PREVIEW_TABLE_MAX_COLS:
+                    truncated = True
+                rows.append([str(value) for value in row[:_PREVIEW_TABLE_MAX_COLS]])
+    except (OSError, UnicodeDecodeError, csv.Error):
+        return None
+    return _table_preview_payload(
+        source_path.name,
+        sheets=[{"name": source_path.stem or "Sheet1", "rows": rows}],
+        truncated=truncated,
+    )
+
+
+def _xlsx_preview_payload(source_path: Path) -> dict[str, Any] | None:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+
+        workbook = load_workbook(source_path, read_only=True, data_only=True)
+    except Exception:  # noqa: BLE001 - preview should not fail parse completion
+        return None
+
+    try:
+        sheets: list[dict[str, Any]] = []
+        truncated = False
+        for sheet_index, sheet in enumerate(workbook.worksheets):
+            if sheet_index >= 3:
+                truncated = True
+                break
+            rows: list[list[str]] = []
+            for row_index, row in enumerate(sheet.iter_rows(values_only=True)):
+                if row_index >= _PREVIEW_TABLE_MAX_ROWS:
+                    truncated = True
+                    break
+                values = ["" if value is None else str(value) for value in row]
+                if len(values) > _PREVIEW_TABLE_MAX_COLS:
+                    truncated = True
+                rows.append(values[:_PREVIEW_TABLE_MAX_COLS])
+            sheets.append({"name": str(sheet.title), "rows": rows})
+        return _table_preview_payload(
+            source_path.name, sheets=sheets, truncated=truncated
+        )
+    finally:
+        close = getattr(workbook, "close", None)
+        if callable(close):
+            close()
+
+
+def _table_preview_payload(
+    source_name: str, *, sheets: list[dict[str, Any]], truncated: bool
+) -> dict[str, Any]:
+    return {
+        "preview_schema_version": _PREVIEW_SCHEMA_VERSION,
+        "kind": "table",
+        "source_name": source_name,
+        "truncated": truncated,
+        "sheets": sheets,
+    }
+
+
 def _apply_parse_defaults(
     parser_engine: str | None,
     process_options: str | None,
@@ -1746,8 +2114,6 @@ def _resolve_parse_directives(
                 source_path, require_external_endpoint=False
             )
 
-    if engine == PARSER_ENGINE_LEGACY:
-        raise ValueError("KB parse endpoint does not support legacy parser engine")
     if engine not in _PARSEABLE_ENGINES or engine not in SUPPORTED_PARSER_ENGINES:
         raise ValueError(f"Unsupported parser engine: {engine}")
     suffix = parser_suffix(source_path)
@@ -1773,8 +2139,6 @@ def _validate_parse_request_directives(
 ) -> None:
     if parser_engine is not None:
         engine = normalize_parser_engine(parser_engine)
-        if engine == PARSER_ENGINE_LEGACY:
-            raise ValueError("KB parse endpoint does not support legacy parser engine")
         if engine not in _PARSEABLE_ENGINES or engine not in SUPPORTED_PARSER_ENGINES:
             raise ValueError(f"Unsupported parser engine: {parser_engine}")
     raw_options_text = "" if process_options is None else str(process_options)

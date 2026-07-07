@@ -37,6 +37,7 @@ from lightrag.constants import (
     FULL_DOCS_FORMAT_RAW,
     PARSED_DIR_NAME,
     PARSER_ENGINE_DOCLING,
+    PARSER_ENGINE_LEGACY,
     PARSER_ENGINE_MINERU,
     PARSER_ENGINE_NATIVE,
 )
@@ -1672,7 +1673,11 @@ class _PipelineMixin:
                     logger.info(log_message)
                     ctx.pipeline_status["latest_message"] = log_message
                     ctx.pipeline_status["history_messages"].append(log_message)
-                if engine == "mineru":
+                if engine == PARSER_ENGINE_LEGACY:
+                    parsed_data_w = await self.parse_legacy(
+                        doc_id_w, file_path_w, content_data_w
+                    )
+                elif engine == "mineru":
                     parsed_data_w = await self.parse_mineru(
                         doc_id_w, file_path_w, content_data_w
                     )
@@ -2919,6 +2924,90 @@ class _PipelineMixin:
     # ============================================================
     # Parser engines (also called by tests directly)
     # ============================================================
+
+    async def parse_legacy(
+        self, doc_id: str, file_path: str, content_data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Phase 1 parse for the local legacy/direct-text parser."""
+        doc_format = content_data.get("parse_format", FULL_DOCS_FORMAT_RAW)
+        if doc_format == FULL_DOCS_FORMAT_LIGHTRAG:
+            merged_text = strip_lightrag_doc_prefix(
+                content_data.get("content"), doc_format
+            )
+            blocks_path = (
+                sidecar_blocks_path(content_data.get("sidecar_location")) or ""
+            )
+            return {
+                "doc_id": doc_id,
+                "file_path": file_path,
+                "parse_format": doc_format,
+                "parse_engine": PARSER_ENGINE_LEGACY,
+                "content": merged_text,
+                "blocks_path": blocks_path,
+                "parse_stage_skipped": True,
+            }
+
+        if doc_format == FULL_DOCS_FORMAT_PENDING_PARSE:
+            source_path = _call_source_file_resolver(
+                self,
+                file_path,
+                source_file=_read_source_file(content_data),
+                parser_engine=PARSER_ENGINE_LEGACY,
+            )
+            p = Path(source_path)
+            if not (p.exists() and p.is_file()):
+                raise ValueError(f"Legacy parser pending file does not exist: {file_path}")
+
+            from lightrag.parser.legacy import parse_legacy_source_file
+
+            document_name = normalize_document_file_path(file_path)
+            if document_name == "unknown_source":
+                document_name = p.name or f"{doc_id}.txt"
+            parsed_data = await asyncio.to_thread(
+                parse_legacy_source_file,
+                doc_id=doc_id,
+                file_path=p,
+                document_name=document_name,
+            )
+            blocks_path = str(parsed_data.get("blocks_path") or "")
+            sidecar_dir = Path(blocks_path).parent if blocks_path else None
+            await self._persist_parsed_full_docs(
+                doc_id,
+                {
+                    "content": make_lightrag_doc_content(parsed_data["content"]),
+                    "file_path": file_path,
+                    "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
+                    "sidecar_location": sidecar_uri_for(sidecar_dir)
+                    if sidecar_dir is not None
+                    else "unknown_source",
+                    "parse_engine": PARSER_ENGINE_LEGACY,
+                    "update_time": int(time.time()),
+                },
+            )
+            if content_data.get("archive_source_after_parse", True):
+                await archive_source_after_full_docs_sync(str(p))
+            logger.info(
+                f"[parse_legacy] pending_parse completed for {file_path} via local extractor"
+            )
+            return {
+                "doc_id": doc_id,
+                "file_path": file_path,
+                "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
+                "parse_engine": PARSER_ENGINE_LEGACY,
+                "content": parsed_data["content"],
+                "blocks_path": blocks_path,
+                "parse_stage_skipped": False,
+            }
+
+        return {
+            "doc_id": doc_id,
+            "file_path": file_path,
+            "parse_format": FULL_DOCS_FORMAT_RAW,
+            "parse_engine": PARSER_ENGINE_LEGACY,
+            "content": content_data.get("content", ""),
+            "blocks_path": "",
+            "parse_stage_skipped": True,
+        }
 
     async def parse_native(
         self, doc_id: str, file_path: str, content_data: dict[str, Any]

@@ -448,9 +448,10 @@ Content-Type: application/json
 
 行为：
 - 解析指令优先级为：请求体 `engine/process_options` > 文档 metadata 中已 snapshot 的 `parser_engine/process_options` > active config 的 `parser_config.engine/process_options` > 文件名/环境变量路由默认值。active `parser_config` 只提供默认值；请求体显式传值始终优先。
-- 解析缓存命中时直接复用 artifacts：缓存有效性由 MinerU/Docling 的 `*.mineru_raw` raw bundle manifest 校验（源文件大小 + 内容 sha256 + options 签名），而非 KB 控制面的 `source_hash`/`parser_hash`（后者用于增量决策与 diff，不作为 raw bundle cache key）。`force_reparse=true` 绕过该 raw bundle cache。
+- `engine="legacy"` 现已接入 KB 生命周期：文本/数据/代码类文件（如 `txt/md/json/xml/yaml/log/sql/py/js/ts/css/...`）直接按 UTF-8 本地抽取，轻量 Office/PDF 路径支持 `pdf/docx/pptx/xlsx` 本地抽取，不依赖 MinerU/Docling；CSV 仍可显式指定 legacy 本地抽取，但生产默认 `.env` 路由将 `csv:docling-iteP` 放在 `*:legacy-R` 前，表格结构更适合 Docling；传统 Office `doc/ppt/xls` 仍建议按 LibreOffice → Docling/MinerU 预转换链路处理。legacy 解析同样写入 LightRAG sidecar/blocks artifact，可继续走 `:build-kg` 纳入 chunk、实体关系抽取、embedding、图谱和向量管理。
+- 解析缓存命中时直接复用 artifacts：缓存有效性由 MinerU/Docling 的 `*.mineru_raw` raw bundle manifest 校验（源文件大小 + 内容 sha256 + options 签名），而非 KB 控制面的 `source_hash`/`parser_hash`（后者用于增量决策与 diff，不作为 raw bundle cache key）。`force_reparse=true` 绕过该 raw bundle cache；legacy 本地解析不依赖外部 raw bundle，会按当前 source 重新生成 sidecar/blocks。
 - 同一文档已有 `parse_queued` / `parsing` / `build_queued` / `building` / `deleting` / `replacing` 时返回 `409`，原 active job 保持不变，新建的 job 同步标记 `failed`。
-- 成功后写入 `original` / `sidecar` / `blocks` artifact，MinerU/Docling 还会写 `raw_dir`，并从 raw bundle 中记录细粒度文件 artifact：`markdown`、`content_list`、`middle_json`、`model_json`、`image`、`layout_pdf`。细粒度 artifact metadata 包含 `parse_engine`、`parser_hash`、`source`、`relative_path`。启用对象存储时，文件 artifact 额外写入 `metadata.object_uri`，目录 artifact 写入 `metadata.object_prefix_uri`；`original` artifact 复用 document 的 `metadata.source_object_uri`。
+- 成功后写入 `original` / `sidecar` / `blocks` artifact，MinerU/Docling 还会写 `raw_dir`，并从 raw bundle 中记录细粒度文件 artifact：`markdown`、`content_list`、`middle_json`、`model_json`、`image`、`layout_pdf`。解析完成还会生成可缓存的安全预览 artifact（如 `preview_text`、`preview_table_json`；CSV 会生成 `preview_table_json`），metadata 标记 `preview=true`、`source_hash`、`parser_hash`、`truncated`、`preview_schema_version`，供文档级 preview manifest 选择。细粒度 artifact metadata 包含 `parse_engine`、`parser_hash`、`source`、`relative_path`。启用对象存储时，文件 artifact 额外写入 `metadata.object_uri`，目录 artifact 写入 `metadata.object_prefix_uri`；`original` artifact 复用 document 的 `metadata.source_object_uri`。
 - **`auto_index` 是 parse-only 预留 no-op**：`:parse` 始终只解析、不构建，持久化 job payload 固定 `auto_index=false`，因此 durable worker 续跑与 in-process 路径行为一致（都不构建）。要在解析后构建知识图谱请调用 `:build-kg`。
 
 ### 3.2 批量解析
@@ -731,11 +732,12 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 
 ## 六、知识库产物 Artifacts
 
-> 产物记录解析阶段产生的文件 / 目录。当前支持 `original` / `sidecar` / `blocks` / `raw_dir`，以及 MinerU/Docling raw bundle 中的 `markdown` / `content_list` / `middle_json` / `model_json` / `image` / `layout_pdf` 等细粒度类型。`uri` 是本地 cache path；启用对象存储后，metadata 会额外包含 `object_uri` 或 `object_prefix_uri`。
+> 产物记录解析阶段产生的文件 / 目录。当前支持 `original` / `sidecar` / `blocks` / `raw_dir`，以及 MinerU/Docling raw bundle 中的 `markdown` / `content_list` / `middle_json` / `model_json` / `image` / `layout_pdf` 等细粒度类型；同时支持预览缓存产物 `preview_text` / `preview_table_json`。`uri` 是本地 cache path；启用对象存储后，metadata 会额外包含 `object_uri` 或 `object_prefix_uri`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts` | 产物列表 |
+| `GET` | `/kbs/{kb_id}/documents/{document_id}/preview` | 文档级预览 manifest：返回后端已生成的安全预览 variant 与原件下载 fallback |
 | `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}` | 产物元数据 |
 | `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:download` | 下载文件型产物；目录型产物以 zip 代理下载 |
 | `GET` | `/kbs/{kb_id}/documents/{document_id}/artifacts/{artifact_id}:preview` | 内联预览受支持的小型文件型产物 |
@@ -743,13 +745,18 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 
 列表示例：`GET /kbs/{kb_id}/documents/{document_id}/artifacts?artifact_type=markdown&limit=50&offset=0`。
 
+文档级 preview manifest：
+- `GET /kbs/{kb_id}/documents/{document_id}/preview` 面向新前端统一 viewer。返回结构包含 `document_id`、`source_name`、`source_content_type`、`status`、`preferred`、`variants[]`、`fallback`。
+- `variants[]` 中每项包含 `kind`（`text` / `table` / `html` 等）、`artifact_id`、`artifact_type`、`media_type`、`size_bytes`、`preview_url`。前端按 `kind` 选择 viewer：文本/代码 viewer、表格 viewer、HTML sandbox viewer、PDF/image 原件 viewer；如果 `variants` 为空则展示 `fallback.download_url` 下载。
+- `preferred` 是服务端按安全性和可用性排序的首选 variant；`fallback` 指向 `original` artifact 的 `:download` URL（若原件 artifact 尚不存在或无法恢复则为 `null`）。因此不要让前端直接尝试 inline Excel/Office 原件；Excel 优先消费 `preview_table_json`，否则回退下载。
+
 下载约束：
 - 企业模式权限：artifact list/detail 按 `kb_viewer` 或更高角色读取。`:download` 与 `:download-url` 的默认最低角色由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 控制，默认 `kb_viewer` 保持旧行为，可提升为 `kb_editor`、`kb_admin` 或 `kb_owner`；`LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY` 可用 JSON object 按 artifact type 覆盖（如 `{"original":"kb_editor","*":"kb_viewer"}`），并同时作用于显式匹配类型的 `:preview`。更细粒度时可使用 `LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY`，按 action 分别设置 artifact type policy，例如 `{"preview":{"*":"kb_editor"},"download":{"original":"kb_editor"},"download-url":{"original":"kb_admin"}}`。action policy 优先于 download policy；低于要求的角色返回 `403`。
-- 文件型产物（`original` / `blocks` / `markdown` / `content_list` / `middle_json` / `model_json` / `image` / `layout_pdf`）以 `FileResponse` 直接返回。
+- 文件型产物（`original` / `blocks` / `markdown` / `content_list` / `middle_json` / `model_json` / `image` / `layout_pdf` / `preview_text` / `preview_table_json`）以 `FileResponse` 直接返回。
 - 目录型产物（`sidecar` / `raw_dir`）以流式 zip 返回（`Content-Type: application/zip`），单次下载 zip 内未压缩字节上限 512 MB，超限返回 `413`。
 - 路径必须位于 `inputs/<workspace>/<document_id>` 内；跨 KB、缺失文件、路径逃逸均返回 `404` / `400`。
 - 启用对象存储时，如果本地 cache path 缺失，`:download` 接口会先从 `metadata.object_uri` / `metadata.object_prefix_uri` restore 到原 cache path，再返回文件或 zip，保持旧客户端兼容。
-- `:preview` 仅支持文件型 artifact，目录返回 `400`；支持 `text/*`、`application/json`、`application/ld+json`、`application/markdown`、`application/x-ndjson`、普通图片（不含 `image/svg+xml`）和 `application/pdf`，以 `inline` content-disposition 返回；单次 preview 上限 10 MB，超出返回 `413`，不支持的 media type 返回 `415`。本地 cache 缺失时同样按对象存储 metadata restore。
+- `:preview` 仅支持文件型 artifact，目录返回 `400`；支持 `text/*`、`application/json`、`application/ld+json`、`application/markdown`、`application/x-ndjson`、普通图片（不含 `image/svg+xml`）和 `application/pdf`，以 `inline` content-disposition 返回；单次 preview 上限 10 MB，超出返回 `413`，不支持的 media type 返回 `415`。响应带 `X-Content-Type-Options: nosniff`；HTML 类预览带保守 CSP。不要把 Excel/Word/PPT MIME 直接加入 inline 白名单，需通过后端生成的 `preview_text` / `preview_table_json` / 未来 `preview_html` 等安全产物预览。本地 cache 缺失时同样按对象存储 metadata restore。
 - `:download-url` 仅对 metadata 中存在 `object_uri` 的**文件型** artifact 生效，返回 `{artifact_id,url,object_uri,expires_in_seconds,filename,media_type}`；服务端使用对象存储后端生成 `GET Object` 预签名 URL，不会触发本地 cache restore。`expires_in_seconds` 默认 3600 秒，服务端限制在 `[1, 604800]`。目录型 artifact（`sidecar` / `raw_dir`，metadata 中为 `object_prefix_uri`）仍需走 `:download` 的 zip 代理下载。企业模式且 `LIGHTRAG_ENTERPRISE_MASK_STORAGE_URIS=true`（默认）时，文档 `source_uri`、artifact `uri`、响应中的 storage metadata、job payload/result 中的路径字段与 `download-url.object_uri` 会返回 `"<masked>"` 或被递归移除，不泄露本地路径或对象存储 URI；下载/预览/预签名内部仍使用真实 metadata。
 
 ---
@@ -761,7 +768,7 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 > 不可变的 KB 级配置快照。新建配置不会自动生效，需要显式 `:activate` 才会写入 `KnowledgeBase.active_config_version_id` 并 discard 缓存的 LightRAG 实例。当前实现会让后续实例重建或 parse planning 时读取已支持的 active config 字段；部署级字段会在创建配置版本时直接拒绝，避免单个 KB 修改已经部署好的服务基础设施。创建时会严格校验：各 section（`parser_config`/`chunk_config`/`embedding_config`/`query_config`/`extraction_config`）出现**未知键**（无运行时效果）会直接返回 `400`，避免"存了不生效"。
 >
 > 已接入运行时的 active config 字段：
-> - `parser_config`：`engine`/`parser_engine`、`process_options`/`options`。这些字段会在创建配置时校验并规范化，作为解析默认值参与 `parser_hash`，并按“请求 > 文档 metadata > active config > 文件路由”的优先级生效。
+> - `parser_config`：`engine`/`parser_engine`、`process_options`/`options`。`engine` 支持 `legacy` / `native` / `mineru` / `docling`，会在创建配置时校验并规范化，作为解析默认值参与 `parser_hash`，并按“请求 > 文档 metadata > active config > 文件路由”的优先级生效。
 > - `chunk_config`：`chunk_size`/`chunk_token_size`、`chunk_overlap_size`/`chunk_overlap_token_size`、`tiktoken_model_name`。
 > - `embedding_config`：`model`、`dim`/`embedding_dim`、`token_limit`/`max_token_size`（`model` 会触发重建 embedding provider 闭包）。
 > - `query_config`：`top_k`/`chunk_top_k`/`max_entity_tokens`/`max_relation_tokens`/`max_total_tokens`/`related_chunk_number`/`cosine_threshold` 等 QueryParam 字段。

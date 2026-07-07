@@ -66,6 +66,9 @@ class FakeRAG:
     async def parse_docling(self, doc_id: str, file_path: str, content_data):
         return await self._parse(doc_id, file_path, content_data)
 
+    async def parse_legacy(self, doc_id: str, file_path: str, content_data):
+        return await self._parse(doc_id, file_path, content_data)
+
     async def _parse(self, doc_id: str, file_path: str, content_data):
         source_path = Path(file_path)
         parsed_dir = source_path.parent / "__parsed__" / f"{source_path.name}.parsed"

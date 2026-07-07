@@ -312,6 +312,33 @@ export type PaginatedDocsResponse = {
   status_counts: Record<string, number>
 }
 
+export type KBDocumentPreviewVariant = {
+  kind: 'text' | 'table' | 'html' | string
+  artifact_id: string
+  artifact_type: string
+  media_type: string
+  size_bytes?: number | null
+  preview_url: string
+}
+
+export type KBDocumentPreviewFallback = {
+  artifact_id: string
+  artifact_type: string
+  media_type: string
+  size_bytes?: number | null
+  download_url: string
+}
+
+export type KBDocumentPreviewManifest = {
+  document_id: string
+  source_name: string
+  source_content_type?: string | null
+  status: string
+  preferred?: KBDocumentPreviewVariant | null
+  variants: KBDocumentPreviewVariant[]
+  fallback?: KBDocumentPreviewFallback | null
+}
+
 export type StatusCountsResponse = {
   status_counts: Record<string, number>
 }
@@ -887,6 +914,43 @@ export const uploadDocument = async (
           onUploadProgress(percentCompleted)
         }
         : undefined
+  })
+  return response.data
+}
+
+export const getKBDocumentPreviewManifest = async (
+  kbId: string,
+  documentId: string
+): Promise<KBDocumentPreviewManifest> => {
+  const response = await axiosInstance.get(
+    `/kbs/${encodeURIComponent(kbId)}/documents/${encodeURIComponent(documentId)}/preview`
+  )
+  return response.data
+}
+
+export const getKBDocumentPreviewVariantText = async (
+  variant: KBDocumentPreviewVariant
+): Promise<string> => {
+  const response = await axiosInstance.get(variant.preview_url, {
+    responseType: 'text'
+  })
+  return response.data
+}
+
+export const getKBDocumentPreviewVariantBlob = async (
+  variant: KBDocumentPreviewVariant
+): Promise<Blob> => {
+  const response = await axiosInstance.get(variant.preview_url, {
+    responseType: 'blob'
+  })
+  return response.data
+}
+
+export const downloadKBDocumentPreviewFallback = async (
+  fallback: KBDocumentPreviewFallback
+): Promise<Blob> => {
+  const response = await axiosInstance.get(fallback.download_url, {
+    responseType: 'blob'
   })
   return response.data
 }

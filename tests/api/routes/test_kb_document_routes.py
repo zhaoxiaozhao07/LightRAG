@@ -59,15 +59,20 @@ class FakeRAG:
         *,
         should_fail: bool = False,
         fail_source_names: set[str] | None = None,
+        parse_content: str = "parsed",
     ):
         self.workspace = workspace
         self.should_fail = should_fail
         self.fail_source_names = fail_source_names or set()
+        self.parse_content = parse_content
         self.parse_calls = []
         self.delete_calls = []
 
     async def finalize_storages(self) -> None:
         return None
+
+    async def adrop_all_storages(self) -> dict:
+        return {"dropped": 0, "failed": 0, "errors": []}
 
     async def parse_native(self, doc_id: str, file_path: str, content_data):
         return await self._parse("native", doc_id, file_path, content_data)
@@ -77,6 +82,9 @@ class FakeRAG:
 
     async def parse_docling(self, doc_id: str, file_path: str, content_data):
         return await self._parse("docling", doc_id, file_path, content_data)
+
+    async def parse_legacy(self, doc_id: str, file_path: str, content_data):
+        return await self._parse("legacy", doc_id, file_path, content_data)
 
     async def apipeline_enqueue_documents(self, *args, **kwargs):
         raise AssertionError("KB parse endpoint must not enqueue indexing pipeline")
@@ -99,10 +107,24 @@ class FakeRAG:
         source_path = Path(file_path)
         if self.should_fail or source_path.name in self.fail_source_names:
             raise RuntimeError("parser exploded")
+        if engine == "legacy":
+            from lightrag.parser.legacy import parse_legacy_source_file
+
+            result = parse_legacy_source_file(doc_id=doc_id, file_path=source_path)
+            if content_data.get("archive_source_after_parse", True):
+                source_path.unlink()
+            return result
         parsed_dir = source_path.parent / "__parsed__" / f"{source_path.name}.parsed"
         parsed_dir.mkdir(parents=True, exist_ok=True)
         blocks_path = parsed_dir / f"{source_path.stem}.blocks.jsonl"
-        blocks_path.write_text('{"type":"content","text":"parsed"}\n', encoding="utf-8")
+        blocks_path.write_text(
+            json.dumps(
+                {"type": "content", "text": self.parse_content},
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         if engine == "mineru":
             raw_dir = parsed_dir.parent / f"{source_path.name}.mineru_raw"
             raw_dir.mkdir(parents=True, exist_ok=True)
@@ -122,7 +144,7 @@ class FakeRAG:
             "doc_id": doc_id,
             "file_path": file_path,
             "parse_format": "lightrag",
-            "content": "parsed",
+            "content": self.parse_content,
             "blocks_path": str(blocks_path),
             "parse_stage_skipped": False,
         }
@@ -234,9 +256,11 @@ class BuilderProbe:
         *,
         should_fail: bool = False,
         fail_source_names: set[str] | None = None,
+        parse_content: str = "parsed",
     ):
         self.should_fail = should_fail
         self.fail_source_names = fail_source_names or set()
+        self.parse_content = parse_content
         self.instances: list[FakeRAG] = []
 
     async def build(self, record) -> FakeRAG:
@@ -244,6 +268,7 @@ class BuilderProbe:
             record.workspace,
             should_fail=self.should_fail,
             fail_source_names=self.fail_source_names,
+            parse_content=self.parse_content,
         )
         self.instances.append(rag)
         return rag
@@ -1610,6 +1635,258 @@ def test_parse_document_succeeds_and_persists_artifacts(tmp_path):
     assert detail.json()["id"] == artifact_id
 
 
+@pytest.mark.parametrize(
+    ("filename", "content", "content_type", "expected_snippet"),
+    [
+        ("notes.txt", b"plain legacy text", "text/plain", "plain legacy text"),
+        ("data.json", b'{"answer": 42}', "application/json", "answer"),
+        ("legacy.csv", b"name,value\nlegacy,1\n", "text/csv", "legacy,1"),
+        ("script.py", b"print('legacy code')\n", "text/x-python", "legacy code"),
+    ],
+)
+def test_parse_legacy_text_data_code_succeeds_and_persists_artifacts(
+    tmp_path, filename, content, content_type, expected_snippet
+):
+    probe = BuilderProbe()
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path, probe=probe
+    )
+    _create_kb(client, "kb_parse_legacy")
+    upload = client.post(
+        "/kbs/kb_parse_legacy/documents:upload",
+        files=[("files", (filename, content, content_type))],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200, upload.text
+    document_id = upload.json()["documents"][0]["id"]
+
+    response = client.post(
+        f"/kbs/kb_parse_legacy/documents/{document_id}:parse",
+        json={"engine": "legacy", "force_reparse": True},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    job = client.get(
+        f"/kbs/kb_parse_legacy/jobs/{response.json()['id']}", headers=_HEADERS
+    )
+    assert job.status_code == 200
+    assert job.json()["status"] == "succeeded"
+    assert probe.instances[0].parse_calls[0][0] == "legacy"
+
+    document = client.get(
+        f"/kbs/kb_parse_legacy/documents/{document_id}", headers=_HEADERS
+    )
+    assert document.status_code == 200
+    document_payload = document.json()
+    assert document_payload["status"] == "parsed"
+    assert document_payload["metadata"]["parse_engine"] == "legacy"
+
+    artifacts = client.get(
+        f"/kbs/kb_parse_legacy/documents/{document_id}/artifacts", headers=_HEADERS
+    )
+    assert artifacts.status_code == 200
+    artifacts_by_type = {
+        item["artifact_type"]: item for item in artifacts.json()["artifacts"]
+    }
+    assert {"original", "sidecar", "blocks"}.issubset(artifacts_by_type)
+    source_path = Path(document_payload["source_uri"])
+    sidecar_path = Path(artifacts_by_type["sidecar"]["uri"])
+    blocks_path = Path(artifacts_by_type["blocks"]["uri"])
+    assert sidecar_path.is_relative_to(source_path.parent / "__parsed__")
+    assert blocks_path.parent == sidecar_path
+    assert expected_snippet in blocks_path.read_text(encoding="utf-8")
+
+
+def test_parse_csv_with_docling_persists_artifacts_and_table_preview(tmp_path):
+    probe = BuilderProbe()
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path, probe=probe
+    )
+    _create_kb(client, "kb_parse_csv_docling")
+    upload = client.post(
+        "/kbs/kb_parse_csv_docling/documents:upload",
+        files=[("files", ("data.csv", b"name,value\nalpha,1\n", "text/csv"))],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200, upload.text
+    document_id = upload.json()["documents"][0]["id"]
+
+    response = client.post(
+        f"/kbs/kb_parse_csv_docling/documents/{document_id}:parse",
+        json={"engine": "docling"},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    job = client.get(
+        f"/kbs/kb_parse_csv_docling/jobs/{response.json()['id']}",
+        headers=_HEADERS,
+    )
+    assert job.status_code == 200
+    assert job.json()["status"] == "succeeded"
+    assert probe.instances[0].parse_calls[0][0] == "docling"
+
+    document = client.get(
+        f"/kbs/kb_parse_csv_docling/documents/{document_id}", headers=_HEADERS
+    )
+    assert document.status_code == 200
+    document_payload = document.json()
+    assert document_payload["status"] == "parsed"
+    assert document_payload["metadata"]["parse_engine"] == "docling"
+
+    artifacts = client.get(
+        f"/kbs/kb_parse_csv_docling/documents/{document_id}/artifacts",
+        headers=_HEADERS,
+    )
+    assert artifacts.status_code == 200
+    artifact_types = {item["artifact_type"] for item in artifacts.json()["artifacts"]}
+    assert {"original", "sidecar", "blocks", "preview_table_json"}.issubset(
+        artifact_types
+    )
+
+    manifest = client.get(
+        f"/kbs/kb_parse_csv_docling/documents/{document_id}/preview",
+        headers=_HEADERS,
+    )
+    assert manifest.status_code == 200, manifest.text
+    payload = manifest.json()
+    assert payload["preferred"]["kind"] == "table"
+    assert any(
+        variant["artifact_type"] == "preview_table_json"
+        for variant in payload["variants"]
+    )
+
+
+def test_preview_manifest_returns_text_variant_and_original_fallback(tmp_path):
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_preview_text")
+    upload = client.post(
+        "/kbs/kb_preview_text/documents:upload",
+        files=[("files", ("notes.txt", b"preview me", "text/plain"))],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200, upload.text
+    document_id = upload.json()["documents"][0]["id"]
+    parse = client.post(
+        f"/kbs/kb_preview_text/documents/{document_id}:parse",
+        json={"engine": "legacy"},
+        headers=_HEADERS,
+    )
+    assert parse.status_code == 200, parse.text
+
+    manifest = client.get(
+        f"/kbs/kb_preview_text/documents/{document_id}/preview", headers=_HEADERS
+    )
+
+    assert manifest.status_code == 200, manifest.text
+    payload = manifest.json()
+    assert payload["document_id"] == document_id
+    assert payload["source_name"] == "notes.txt"
+    assert payload["status"] == "parsed"
+    assert payload["preferred"]["kind"] == "text"
+    assert payload["preferred"]["artifact_type"] == "preview_text"
+    assert payload["preferred"]["preview_url"].startswith(
+        f"/kbs/kb_preview_text/documents/{document_id}/artifacts/"
+    )
+    assert "source_uri" not in json.dumps(payload)
+    assert payload["fallback"]["artifact_type"] == "original"
+    assert payload["fallback"]["download_url"].endswith(":download")
+
+    artifacts = client.get(
+        f"/kbs/kb_preview_text/documents/{document_id}/artifacts",
+        headers=_HEADERS,
+    ).json()["artifacts"]
+    document = client.get(
+        f"/kbs/kb_preview_text/documents/{document_id}", headers=_HEADERS
+    ).json()
+    preview_artifact = next(
+        item for item in artifacts if item["artifact_type"] == "preview_text"
+    )
+    assert preview_artifact["metadata"]["preview"] is True
+    assert preview_artifact["metadata"]["source_hash"] == document["source_hash"]
+    assert preview_artifact["metadata"]["parser_hash"] == document["parser_hash"]
+    assert preview_artifact["metadata"]["preview_schema_version"] == 1
+
+
+def test_preview_manifest_binary_document_falls_back_to_original(tmp_path):
+    probe = BuilderProbe(parse_content="")
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path, probe=probe
+    )
+    _create_kb(client, "kb_preview_binary")
+    upload = client.post(
+        "/kbs/kb_preview_binary/documents:upload",
+        files=[("files", ("paper.pdf", b"%PDF-binary", "application/pdf"))],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200, upload.text
+    document_id = upload.json()["documents"][0]["id"]
+    parse = client.post(
+        f"/kbs/kb_preview_binary/documents/{document_id}:parse",
+        json={"engine": "mineru"},
+        headers=_HEADERS,
+    )
+    assert parse.status_code == 200, parse.text
+
+    manifest = client.get(
+        f"/kbs/kb_preview_binary/documents/{document_id}/preview", headers=_HEADERS
+    )
+
+    assert manifest.status_code == 200, manifest.text
+    payload = manifest.json()
+    assert payload["preferred"]["kind"] == "pdf"
+    assert payload["preferred"]["artifact_type"] == "original"
+    assert payload["preferred"]["preview_url"].endswith(":preview")
+    assert payload["fallback"]["artifact_type"] == "original"
+    assert payload["fallback"]["media_type"] == "application/pdf"
+
+
+def test_object_storage_preview_artifact_restores_before_inline_preview(tmp_path):
+    object_storage = FakeObjectStorage()
+    client, _kb_service, _store, _document_service, _job_service = _build_client(
+        tmp_path, object_storage=object_storage
+    )
+    _create_kb(client, "kb_preview_object")
+    upload = client.post(
+        "/kbs/kb_preview_object/documents:upload",
+        files=[("files", ("notes.txt", b"restore preview", "text/plain"))],
+        headers=_HEADERS,
+    )
+    assert upload.status_code == 200, upload.text
+    document_id = upload.json()["documents"][0]["id"]
+    parse = client.post(
+        f"/kbs/kb_preview_object/documents/{document_id}:parse",
+        json={"engine": "legacy"},
+        headers=_HEADERS,
+    )
+    assert parse.status_code == 200, parse.text
+    artifacts = client.get(
+        f"/kbs/kb_preview_object/documents/{document_id}/artifacts",
+        headers=_HEADERS,
+    ).json()["artifacts"]
+    preview_artifact = next(
+        item for item in artifacts if item["artifact_type"] == "preview_text"
+    )
+    preview_path = Path(preview_artifact["uri"])
+    object_uri = preview_artifact["metadata"]["object_uri"]
+    assert object_uri in object_storage.files
+    preview_path.unlink()
+
+    response = client.get(
+        f"/kbs/kb_preview_object/documents/{document_id}/artifacts/"
+        f"{preview_artifact['id']}:preview",
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.text == "restore preview"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert (object_uri, preview_path) in object_storage.downloads
+
+
 def test_parse_document_uses_active_parser_config_defaults(tmp_path):
     probe = BuilderProbe()
     client, _kb_service, _store, _document_service, _job_service = _build_client(
@@ -2015,14 +2292,34 @@ def test_batch_parse_treats_active_parse_as_per_item_failure(tmp_path):
     )
     _create_kb(client, "kb_batch_active")
     active_upload = client.post(
-        "/kbs/kb_batch_active/documents:upload?auto_parse=true",
+        "/kbs/kb_batch_active/documents:upload",
         files=[("files", ("active.pdf", b"active", "application/pdf"))],
         headers=_HEADERS,
     )
     assert active_upload.status_code == 200
     active_payload = active_upload.json()
-    active_job_id = active_payload["job_id"]
     active_document_id = active_payload["documents"][0]["id"]
+
+    async def _seed_active_parse() -> str:
+        plan = await _document_service.create_parse_plan(
+            "kb_batch_active", active_document_id, parser_engine="mineru"
+        )
+        job, _created = await _job_service.create_parse_job_once(
+            "kb_batch_active",
+            document_id=active_document_id,
+            parser_hash=plan.parser_hash,
+            lightrag_doc_id=plan.lightrag_doc_id,
+            parser_engine=plan.parser_engine,
+            process_options=plan.process_options,
+            source_uri=str(plan.source_path),
+            source_hash=plan.document.source_hash,
+        )
+        await _document_service.mark_parse_queued(
+            "kb_batch_active", active_document_id, job=job, plan=plan
+        )
+        return job.id
+
+    active_job_id = asyncio.run(_seed_active_parse())
     valid_upload = client.post(
         "/kbs/kb_batch_active/documents:upload",
         files=[("files", ("valid.pdf", b"valid", "application/pdf"))],

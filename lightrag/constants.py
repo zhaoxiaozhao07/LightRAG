@@ -214,6 +214,7 @@ PARSER_ENGINE_SUFFIX_CAPABILITIES = {
             "pptx",
             "xls",
             "xlsx",
+            "csv",
             "md",
             "html",
             "xhtml",

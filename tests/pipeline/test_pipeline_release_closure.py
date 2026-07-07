@@ -2234,6 +2234,16 @@ def test_parser_routing_accepts_legacy_office_docling_rules(monkeypatch):
 
 
 @pytest.mark.offline
+def test_parser_routing_accepts_csv_docling_rules(monkeypatch):
+    monkeypatch.setenv("DOCLING_ENDPOINT", "http://fake-docling")
+
+    rules = "csv:docling-iteP,*:legacy-R"
+    validate_parser_routing_config(rules)
+    assert resolve_file_parser_engine("data.csv", parser_rules=rules) == "docling"
+    assert resolve_file_parser_engine("data.[legacy].csv", parser_rules=rules) == "legacy"
+
+
+@pytest.mark.offline
 def test_parser_routing_requires_libreoffice_for_legacy_office_docling_rules(
     monkeypatch,
 ):

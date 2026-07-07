@@ -85,6 +85,7 @@ _PREVIEW_TEXT_MEDIA_TYPES = {
     "application/ld+json",
     "application/markdown",
     "application/x-ndjson",
+    "text/html",
     "text/markdown",
     "text/plain",
 }
@@ -266,11 +267,17 @@ def _artifact_preview_response(artifact_file: Any) -> FileResponse:
                 f"{_MAX_ARTIFACT_PREVIEW_BYTES // (1024 * 1024)}MB"
             ),
         )
+    headers = {"X-Content-Type-Options": "nosniff"}
+    if media_type.split(";", 1)[0].lower() == "text/html":
+        headers["Content-Security-Policy"] = (
+            "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'"
+        )
     return FileResponse(
         artifact_file.path,
         media_type=media_type,
         filename=artifact_file.filename,
         content_disposition_type="inline",
+        headers=headers,
     )
 
 
@@ -400,6 +407,33 @@ class ArtifactDownloadUrlResponse(BaseModel):
     expires_in_seconds: int
     filename: str
     media_type: str
+
+
+class DocumentPreviewVariantResponse(BaseModel):
+    kind: str
+    artifact_id: str
+    artifact_type: str
+    media_type: str
+    size_bytes: Optional[int]
+    preview_url: str
+
+
+class DocumentPreviewFallbackResponse(BaseModel):
+    artifact_id: str
+    artifact_type: str
+    media_type: str
+    size_bytes: Optional[int]
+    download_url: str
+
+
+class DocumentPreviewManifestResponse(BaseModel):
+    document_id: str
+    source_name: str
+    source_content_type: Optional[str]
+    status: str
+    preferred: Optional[DocumentPreviewVariantResponse]
+    variants: list[DocumentPreviewVariantResponse]
+    fallback: Optional[DocumentPreviewFallbackResponse]
 
 
 class ParseDocumentRequest(BaseModel):
@@ -6462,6 +6496,22 @@ def create_kb_document_routes(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except InvalidJobTransitionError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.get(
+        "/{kb_id}/documents/{document_id}/preview",
+        response_model=DocumentPreviewManifestResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Get a manifest of preview variants for a knowledge base document",
+    )
+    async def get_document_preview_manifest(kb_id: str, document_id: str):
+        try:
+            return await document_service.get_document_preview_manifest(
+                kb_id, document_id
+            )
+        except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

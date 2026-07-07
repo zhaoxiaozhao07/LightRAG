@@ -16,10 +16,7 @@ from lightrag.api.metadata_store import (
 )
 from lightrag.api.postgres_metadata_store import PostgresMetadataStore
 from lightrag.base import QueryParam
-from lightrag.constants import (
-    PARSER_ENGINE_LEGACY,
-    SUPPORTED_PARSER_ENGINES,
-)
+from lightrag.constants import SUPPORTED_PARSER_ENGINES
 from lightrag.llm_roles import ROLE_NAMES
 from lightrag.parser.routing import (
     normalize_parser_engine,
@@ -221,8 +218,6 @@ def _active_parser_runtime_config(config: dict[str, Any] | None) -> dict[str, st
     engine_value = _first_present(parser_config, "engine", "parser_engine")
     if engine_value is not None:
         engine = normalize_parser_engine(str(engine_value))
-        if engine == PARSER_ENGINE_LEGACY:
-            raise ValueError("parser_config.engine does not support legacy")
         if engine not in SUPPORTED_PARSER_ENGINES:
             raise ValueError(f"Unsupported parser_config.engine: {engine_value}")
         runtime["parser_engine"] = engine

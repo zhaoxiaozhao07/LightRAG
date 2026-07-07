@@ -69,7 +69,7 @@ def build_debug_rag():
         - ``self.doc_status.get_by_id(...)`` / ``.upsert(...)`` —
           :class:`DebugDocStatus` covers both.
 
-    When any of the three ``LightRAG.parse_*`` methods grows a new
+    When any of the ``LightRAG.parse_*`` methods grows a new
     dependency on ``self``, extend this stand-in (and update the list
     above) rather than copy-pasting a parallel stub into the call sites.
     """
@@ -77,6 +77,7 @@ def build_debug_rag():
 
     class _DebugRag:
         _persist_parsed_full_docs = LightRAG._persist_parsed_full_docs
+        parse_legacy = LightRAG.parse_legacy
         parse_native = LightRAG.parse_native
         parse_mineru = LightRAG.parse_mineru
         parse_docling = LightRAG.parse_docling
