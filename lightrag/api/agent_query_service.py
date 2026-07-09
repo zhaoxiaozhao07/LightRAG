@@ -42,6 +42,35 @@ AGENT_ALLOWED_MODES: set[str] = {"local", "global", "hybrid", "naive", "mix"}
 # invalid JSON; a failed plan is retried before the session fails.
 AGENT_PLAN_LLM_ATTEMPTS = 3
 _PRIORITY_RANK = {"P0": 0, "P1": 1, "P2": 2}
+_PRIORITY_ALIASES = {
+    "0": "P0",
+    "critical": "P0",
+    "high": "P0",
+    "highest": "P0",
+    "important": "P0",
+    "must": "P0",
+    "required": "P0",
+    "urgent": "P0",
+    "关键": "P0",
+    "高": "P0",
+    "高优先级": "P0",
+    "重要": "P0",
+    "必要": "P0",
+    "1": "P1",
+    "default": "P1",
+    "medium": "P1",
+    "normal": "P1",
+    "standard": "P1",
+    "一般": "P1",
+    "中": "P1",
+    "普通": "P1",
+    "2": "P2",
+    "low": "P2",
+    "optional": "P2",
+    "低": "P2",
+    "低优先级": "P2",
+    "可选": "P2",
+}
 _PLANNING_KB_WARN_THRESHOLD = 50
 
 # One-shot fallback mode per retrieval mode, used when a step succeeds but
@@ -105,6 +134,18 @@ class AgentPlanStep(BaseModel):
     @classmethod
     def _clip_query(cls, value: Any) -> str:
         return str(value if value is not None else "").strip()[:4096]
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def _normalize_priority(cls, value: Any) -> str:
+        text = str(value if value is not None else "").strip()
+        if not text:
+            return "P1"
+        upper = text.upper()
+        if upper in _PRIORITY_RANK:
+            return upper
+        normalized = text.lower().replace("_", "-").strip()
+        return _PRIORITY_ALIASES.get(normalized, "P1")
 
     @field_validator(
         "kb_ids",
@@ -247,6 +288,66 @@ def _interleave_rounds(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def agent_kb_profile(record: KnowledgeBaseRecord) -> dict[str, Any]:
     return effective_agent_profile(record)
+
+
+def _agent_plan_response_format(
+    effective_records: list[KnowledgeBaseRecord], *, bilingual: bool
+) -> dict[str, Any]:
+    allowed_kb_ids = [record.id for record in effective_records]
+    step_properties: dict[str, Any] = {
+        "step_index": {"type": "integer", "minimum": 1},
+        "title": {"type": "string"},
+        "query": {"type": "string", "minLength": 3},
+        "kb_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "enum": allowed_kb_ids},
+        },
+        "mode": {"type": "string", "enum": sorted(AGENT_ALLOWED_MODES)},
+        "priority": {"type": "string", "enum": list(_PRIORITY_RANK)},
+        "hl_keywords": {"type": "array", "items": {"type": "string"}},
+        "ll_keywords": {"type": "array", "items": {"type": "string"}},
+    }
+    if bilingual:
+        step_properties.update(
+            {
+                "query_alt": {"type": "string"},
+                "hl_keywords_alt": {"type": "array", "items": {"type": "string"}},
+                "ll_keywords_alt": {"type": "array", "items": {"type": "string"}},
+            }
+        )
+    schema = {
+        "type": "object",
+        "properties": {
+            "type": {"type": "string", "enum": ["plan"]},
+            "clarification_required": {"type": "boolean"},
+            "clarification_question": {"type": ["string", "null"]},
+            "steps": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": step_properties,
+                    "required": [
+                        "step_index",
+                        "query",
+                        "kb_ids",
+                        "mode",
+                        "priority",
+                    ],
+                },
+            },
+            "notes_for_user": {"type": ["string", "null"]},
+        },
+        "required": ["type", "clarification_required", "steps"],
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "agent_plan",
+            "schema": schema,
+        },
+    }
 
 
 class AgentQueryService:
@@ -397,6 +498,7 @@ class AgentQueryService:
                 "event": "plan_created",
                 "session_id": session_id,
                 "plan_truncated": plan_truncated,
+                "notes_for_user": plan.notes_for_user,
                 "steps": [
                     {
                         "step_index": step.step_index,
@@ -608,6 +710,7 @@ class AgentQueryService:
                     "failed_round_count": len(failed_rounds),
                     "plan_truncated": plan_truncated,
                     "bilingual_retrieval": agent_bilingual_enabled(body),
+                    "notes_for_user": plan.notes_for_user,
                 },
             )
             yield {"event": "done", "session_id": session_id, "_result": result}
@@ -826,9 +929,13 @@ class AgentQueryService:
         if bilingual:
             system_prompt = f"{system_prompt}\n{BILINGUAL_PLAN_PROMPT_SUFFIX}"
 
+        saw_empty_plan = False
+
         def _parse_plan(data: Any) -> AgentPlan:
+            nonlocal saw_empty_plan
             plan = AgentPlan.model_validate(data)
             if not plan.clarification_required and not plan.steps:
+                saw_empty_plan = True
                 raise ValueError("plan contains no steps and no clarification")
             return plan
 
@@ -841,8 +948,40 @@ class AgentQueryService:
                 parse=_parse_plan,
                 attempts=AGENT_PLAN_LLM_ATTEMPTS,
                 label="agent_plan",
+                response_format=_agent_plan_response_format(
+                    effective_records, bilingual=bilingual
+                ),
             )
         except LLMJsonError as exc:
+            if saw_empty_plan:
+                # All attempts failed and at least one returned a syntactically
+                # valid plan with no steps — a degenerate-but-legal output some
+                # JSON-constrained models produce. Degrade to one mix-mode
+                # retrieval over the candidate KBs instead of failing the
+                # session with 502.
+                logger.warning(
+                    "Agent planner produced no usable plan after %d attempts; "
+                    "using single-step fallback retrieval: %s",
+                    AGENT_PLAN_LLM_ATTEMPTS,
+                    exc,
+                )
+                return AgentPlan(
+                    type="plan",
+                    clarification_required=False,
+                    steps=[
+                        AgentPlanStep(
+                            step_index=1,
+                            title="直接检索",
+                            query=body.query,
+                            kb_ids=[record.id for record in effective_records],
+                            mode="mix",
+                            priority="P1",
+                        )
+                    ],
+                    notes_for_user=(
+                        "规划器未能生成有效检索计划，已改为对候选知识库直接执行单步混合检索。"
+                    ),
+                )
             raise HTTPException(
                 status_code=502,
                 detail={"error_code": "agent_plan_invalid", "message": str(exc)},

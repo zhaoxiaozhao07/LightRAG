@@ -81,12 +81,14 @@ class _FakeRAG:
         self.raw_plan_responses = list(raw_plan_responses or [])
         self.answer_deltas = answer_deltas
         self.seen_plan_payload = None
+        self.seen_plan_kwargs = None
         self.plan_calls = 0
 
     def _build_global_config(self):
         async def agent_func(prompt, **_kwargs):
             self.plan_calls += 1
             self.seen_plan_payload = json.loads(prompt)
+            self.seen_plan_kwargs = _kwargs
             if self.raw_plan_responses:
                 return self.raw_plan_responses.pop(0)
             return json.dumps(self.agent_plan, ensure_ascii=False)
@@ -259,6 +261,95 @@ async def test_plan_retry_recovers_from_invalid_json(monkeypatch):
 
     assert result.status == "success"
     assert rag.plan_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_plan_priority_alias_is_normalized(monkeypatch):
+    _audit_recorder(monkeypatch)
+    plan = _single_step_plan()
+    plan["steps"][0]["priority"] = "normal"
+    rag = _FakeRAG(plan)
+    service = AgentQueryService(kb_service=_KBService(), query_tool_service=_QueryTool(rag))
+
+    result = await service.run(
+        request=_request(monkeypatch),
+        body=AgentQueryRequest(query="如何合规推荐配方？", candidate_kb_ids=["kb1"]),
+    )
+
+    assert result.status == "success"
+    assert result.steps_summary[0]["priority"] == "P1"
+
+
+@pytest.mark.asyncio
+async def test_empty_plan_falls_back_to_single_step_retrieval(monkeypatch):
+    _audit_recorder(monkeypatch)
+    rag = _FakeRAG(
+        {"type": "plan", "clarification_required": False, "steps": []}
+    )
+    query_tool = _QueryTool(rag)
+    service = AgentQueryService(kb_service=_KBService(), query_tool_service=query_tool)
+
+    result = await service.run(
+        request=_request(monkeypatch),
+        body=AgentQueryRequest(query="如何合规推荐配方？", candidate_kb_ids=["kb1"]),
+    )
+
+    assert result.status == "success"
+    # Empty plans are retried like any other invalid payload; the fallback
+    # only engages once every attempt is exhausted.
+    assert rag.plan_calls == 3
+    assert query_tool.calls[0]["query"] == "如何合规推荐配方？"
+    assert query_tool.calls[0]["kb_ids"] == ["kb1"]
+    assert query_tool.calls[0]["mode"] == "mix"
+    assert result.steps_summary[0]["title"] == "直接检索"
+    assert "单步混合检索" in result.metadata["notes_for_user"]
+
+
+@pytest.mark.asyncio
+async def test_empty_plan_retry_recovers_without_fallback(monkeypatch):
+    _audit_recorder(monkeypatch)
+    rag = _FakeRAG(
+        _single_step_plan(),
+        raw_plan_responses=[
+            json.dumps(
+                {"type": "plan", "clarification_required": False, "steps": []}
+            )
+        ],
+    )
+    service = AgentQueryService(kb_service=_KBService(), query_tool_service=_QueryTool(rag))
+
+    result = await service.run(
+        request=_request(monkeypatch),
+        body=AgentQueryRequest(query="如何合规推荐配方？", candidate_kb_ids=["kb1"]),
+    )
+
+    assert result.status == "success"
+    assert rag.plan_calls == 2
+    assert result.steps_summary[0]["title"] != "直接检索"
+
+
+@pytest.mark.asyncio
+async def test_agent_plan_requests_schema_constrained_json(monkeypatch):
+    _audit_recorder(monkeypatch)
+    rag = _FakeRAG(_single_step_plan())
+    service = AgentQueryService(kb_service=_KBService(), query_tool_service=_QueryTool(rag))
+
+    await service.run(
+        request=_request(monkeypatch),
+        body=AgentQueryRequest(query="如何合规推荐配方？", candidate_kb_ids=["kb1"]),
+    )
+
+    response_format = rag.seen_plan_kwargs["response_format"]
+    assert response_format["type"] == "json_schema"
+    schema = response_format["json_schema"]["schema"]
+    step_schema = schema["properties"]["steps"]
+    assert step_schema["minItems"] == 1
+    assert step_schema["items"]["properties"]["priority"]["enum"] == [
+        "P0",
+        "P1",
+        "P2",
+    ]
+    assert step_schema["items"]["properties"]["kb_ids"]["items"]["enum"] == ["kb1"]
 
 
 @pytest.mark.asyncio

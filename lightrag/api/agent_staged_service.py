@@ -69,6 +69,35 @@ KB_EVIDENCE_ROLES = (
 )
 
 PRIORITY_RANK = {"P0": 0, "P1": 1, "P2": 2}
+PRIORITY_ALIASES = {
+    "0": "P0",
+    "critical": "P0",
+    "high": "P0",
+    "highest": "P0",
+    "important": "P0",
+    "must": "P0",
+    "required": "P0",
+    "urgent": "P0",
+    "关键": "P0",
+    "高": "P0",
+    "高优先级": "P0",
+    "重要": "P0",
+    "必要": "P0",
+    "1": "P1",
+    "default": "P1",
+    "medium": "P1",
+    "normal": "P1",
+    "standard": "P1",
+    "一般": "P1",
+    "中": "P1",
+    "普通": "P1",
+    "2": "P2",
+    "low": "P2",
+    "optional": "P2",
+    "低": "P2",
+    "低优先级": "P2",
+    "可选": "P2",
+}
 
 STAGED_LLM_ATTEMPTS = 3
 SKELETON_MAX_STEPS = 3
@@ -180,6 +209,219 @@ def _clip_str_list(value: Any, *, max_items: int, max_chars: int) -> list[str]:
     return items
 
 
+def _json_schema_response_format(name: str, schema: dict[str, Any]) -> dict[str, Any]:
+    return {"type": "json_schema", "json_schema": {"name": name, "schema": schema}}
+
+
+def _string_array_schema(
+    *,
+    min_items: int = 0,
+    max_items: int | None = None,
+    enum: list[str] | None = None,
+) -> dict[str, Any]:
+    item_schema: dict[str, Any] = {"type": "string"}
+    if enum is not None:
+        item_schema["enum"] = enum
+    schema: dict[str, Any] = {
+        "type": "array",
+        "minItems": min_items,
+        "items": item_schema,
+    }
+    if max_items is not None:
+        schema["maxItems"] = max_items
+    return schema
+
+
+def _staged_step_schema(
+    *, allowed_kb_ids: list[str], max_kbs_per_step: int, bilingual: bool
+) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "step_index": {"type": "integer", "minimum": 1},
+        "title": {"type": "string"},
+        "query": {"type": "string", "minLength": 3},
+        "kb_ids": _string_array_schema(
+            min_items=1, max_items=max_kbs_per_step, enum=allowed_kb_ids
+        ),
+        "mode": {"type": "string", "enum": sorted(AGENT_ALLOWED_MODES)},
+        "priority": {"type": "string", "enum": list(PRIORITY_RANK)},
+        "hl_keywords": _string_array_schema(max_items=20),
+        "ll_keywords": _string_array_schema(max_items=20),
+    }
+    if bilingual:
+        properties.update(
+            {
+                "query_alt": {"type": "string"},
+                "hl_keywords_alt": _string_array_schema(max_items=20),
+                "ll_keywords_alt": _string_array_schema(max_items=20),
+            }
+        )
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": ["step_index", "query", "kb_ids", "mode", "priority"],
+    }
+
+
+def _requirement_response_format(*, bilingual: bool) -> dict[str, Any]:
+    property_fields: dict[str, Any] = {
+        "name": {"type": "string", "minLength": 1},
+        "why": {"type": "string"},
+        "priority": {"type": "string", "enum": list(PRIORITY_RANK)},
+    }
+    if bilingual:
+        property_fields["name_alt"] = {"type": "string"}
+    schema = {
+        "type": "object",
+        "properties": {
+            "type": {"type": "string", "enum": ["requirement"]},
+            "clarification_required": {"type": "boolean"},
+            "clarification_question": {"type": ["string", "null"]},
+            "application": {"type": "string"},
+            "conditions": _string_array_schema(max_items=10),
+            "target_properties": {
+                "type": "array",
+                "maxItems": MAX_TARGET_PROPERTIES,
+                "items": {
+                    "type": "object",
+                    "properties": property_fields,
+                    "required": ["name", "priority"],
+                },
+            },
+            "constraints": _string_array_schema(max_items=10),
+        },
+        "required": ["type", "clarification_required", "target_properties"],
+    }
+    return _json_schema_response_format("agent_staged_requirement", schema)
+
+
+def _skeleton_plan_response_format(
+    *, allowed_kb_ids: list[str], max_kbs_per_step: int, bilingual: bool
+) -> dict[str, Any]:
+    schema = {
+        "type": "object",
+        "properties": {
+            "type": {"type": "string", "enum": ["skeleton_plan"]},
+            "kb_roles": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "string",
+                    "enum": list(KB_EVIDENCE_ROLES),
+                },
+            },
+            "steps": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": SKELETON_MAX_STEPS,
+                "items": _staged_step_schema(
+                    allowed_kb_ids=allowed_kb_ids,
+                    max_kbs_per_step=max_kbs_per_step,
+                    bilingual=bilingual,
+                ),
+            },
+        },
+        "required": ["type", "steps"],
+    }
+    return _json_schema_response_format("agent_staged_skeleton_plan", schema)
+
+
+def _skeleton_extract_response_format(
+    *, reference_ids: list[str], bilingual: bool
+) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "type": {"type": "string", "enum": ["skeleton"]},
+        "components": {
+            "type": "array",
+            "maxItems": MAX_SKELETON_COMPONENTS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "material": {"type": "string", "minLength": 1},
+                    "ratio": {"type": "string"},
+                    "function": {"type": "string"},
+                    "source_refs": _string_array_schema(
+                        min_items=1, max_items=6, enum=reference_ids
+                    ),
+                },
+                "required": ["material", "source_refs"],
+            },
+        },
+        "open_questions": _string_array_schema(max_items=MAX_OPEN_QUESTIONS),
+        "rationale": {"type": "string"},
+    }
+    if bilingual:
+        properties["open_questions_alt"] = _string_array_schema(
+            max_items=MAX_OPEN_QUESTIONS
+        )
+    schema = {
+        "type": "object",
+        "properties": properties,
+        "required": ["type", "components", "open_questions"],
+    }
+    return _json_schema_response_format("agent_staged_skeleton_extract", schema)
+
+
+def _verdicts_response_format(
+    *, properties: list[TargetProperty], reference_ids: list[str]
+) -> dict[str, Any]:
+    schema = {
+        "type": "object",
+        "properties": {
+            "type": {"type": "string", "enum": ["verdicts"]},
+            "verdicts": {
+                "type": "array",
+                "maxItems": len(properties),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "property": {
+                            "type": "string",
+                            "enum": [prop.name for prop in properties],
+                        },
+                        "verdict": {
+                            "type": "string",
+                            "enum": [
+                                "supported",
+                                "partial",
+                                "unsupported",
+                                "no_data",
+                            ],
+                        },
+                        "evidence_refs": _string_array_schema(
+                            max_items=6, enum=reference_ids
+                        ),
+                        "note": {"type": "string"},
+                    },
+                    "required": ["property", "verdict", "evidence_refs"],
+                },
+            },
+        },
+        "required": ["type", "verdicts"],
+    }
+    return _json_schema_response_format("agent_staged_verdicts", schema)
+
+
+def _repair_plan_response_format(
+    *, allowed_kb_ids: list[str], max_kbs_per_step: int, bilingual: bool
+) -> dict[str, Any]:
+    schema = {
+        "type": "object",
+        "properties": {
+            "type": {"type": "string", "enum": ["repair_plan"]},
+            "steps": {
+                "type": "array",
+                "maxItems": REPAIR_MAX_STEPS,
+                "items": _staged_step_schema(
+                    allowed_kb_ids=allowed_kb_ids,
+                    max_kbs_per_step=max_kbs_per_step,
+                    bilingual=bilingual,
+                ),
+            },
+        },
+        "required": ["type", "steps"],
+    }
+    return _json_schema_response_format("agent_staged_repair_plan", schema)
+
+
 class TargetProperty(BaseModel):
     name: str = Field(min_length=1)
     why: str = ""
@@ -201,8 +443,14 @@ class TargetProperty(BaseModel):
     @field_validator("priority", mode="before")
     @classmethod
     def _coerce_priority(cls, value: Any) -> str:
-        text = str(value or "").strip().upper()
-        return text if text in PRIORITY_RANK else "P1"
+        text = str(value or "").strip()
+        if not text:
+            return "P1"
+        upper = text.upper()
+        if upper in PRIORITY_RANK:
+            return upper
+        normalized = text.lower().replace("_", "-").strip()
+        return PRIORITY_ALIASES.get(normalized, "P1")
 
 
 class StagedRequirement(BaseModel):
@@ -1122,6 +1370,7 @@ class AgentStagedRunner:
                 parse=_parse,
                 attempts=STAGED_LLM_ATTEMPTS,
                 label="agent_staged_requirement",
+                response_format=_requirement_response_format(bilingual=bilingual),
             )
         except LLMJsonError as exc:
             raise HTTPException(
@@ -1190,6 +1439,11 @@ class AgentStagedRunner:
                 parse=_parse,
                 attempts=STAGED_LLM_ATTEMPTS,
                 label="agent_staged_skeleton_plan",
+                response_format=_skeleton_plan_response_format(
+                    allowed_kb_ids=[str(profile["kb_id"]) for profile in kb_profiles],
+                    max_kbs_per_step=max_kbs_per_step,
+                    bilingual=bilingual,
+                ),
             )
         except LLMJsonError as exc:
             raise HTTPException(
@@ -1255,6 +1509,9 @@ class AgentStagedRunner:
                 parse=SkeletonExtract.model_validate,
                 attempts=STAGED_LLM_ATTEMPTS,
                 label="agent_staged_skeleton_extract",
+                response_format=_skeleton_extract_response_format(
+                    reference_ids=sorted(board.ids()), bilingual=bilingual
+                ),
             )
         except LLMJsonError as exc:
             # Extraction is best-effort: later stages can still ground an
@@ -1366,6 +1623,9 @@ class AgentStagedRunner:
                 parse=ValidationVerdicts.model_validate,
                 attempts=STAGED_LLM_ATTEMPTS,
                 label="agent_staged_verdicts",
+                response_format=_verdicts_response_format(
+                    properties=properties, reference_ids=sorted(board.ids())
+                ),
             )
         except LLMJsonError as exc:
             logger.warning("Agent staged verdict extraction failed: %s", exc)
@@ -1470,6 +1730,11 @@ class AgentStagedRunner:
                 parse=RepairPlan.model_validate,
                 attempts=STAGED_LLM_ATTEMPTS,
                 label="agent_staged_repair_plan",
+                response_format=_repair_plan_response_format(
+                    allowed_kb_ids=[str(profile["kb_id"]) for profile in kb_profiles],
+                    max_kbs_per_step=max_kbs_per_step,
+                    bilingual=bilingual,
+                ),
             )
         except LLMJsonError as exc:
             logger.warning("Agent staged repair planning failed: %s", exc)

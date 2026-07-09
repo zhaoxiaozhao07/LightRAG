@@ -107,7 +107,7 @@ LightRAG 已提供：
    `conversation_history` 不参与检索；多轮信息需求须体现为 **显式子 query** 与过滤条件（写入工作流提示词）。
 
 7. **结构化规划，非 Provider 原生 Tool Call**  
-   AGENT 角色通过 **OpenAI 兼容 `response_format` / JSON 模式**（或等价约束）输出规划与轮次决策；由服务端 **校验 schema 后** 调用内部工具，不依赖各厂商不一致的 tools API。
+   AGENT 角色通过 **OpenAI 兼容 `response_format: json_schema`**（`kb_ids`/`mode`/`priority` 等字段为受限枚举）输出规划与轮次决策，不支持 `json_schema` 的后端自动降级 `json_object`，再降级为仅提示词约束；由服务端 **校验 schema 后** 调用内部工具，不依赖各厂商不一致的 tools API。
 
 8. **串行与成本**  
    串行执行降低峰值 GPU/并发压力；配合 `max_rounds`、超时与配额控制总成本。
@@ -336,14 +336,14 @@ PROFILE_LLM_BINDING_API_KEY=not-needed-or-local-key
 PROFILE_LLM_MODEL=qwen3.6-36b
 PROFILE_LLM_TIMEOUT=300
 
-# 可选：限制 AGENT 调用为 JSON 输出（实现层对 openai binding 设置 response_format）
-# AGENT_OPENAI_RESPONSE_FORMAT=json_object
+# 说明：AGENT 调用的 response_format 由服务端自动设置（json_schema，
+# 不支持时自动降级 json_object / 无 response_format），无需配置。
 ```
 
 说明：
 
 - **绑定**：优先 `openai` 兼容本地 vLLM / SGLang / Ollama OpenAI 路由。  
-- **JSON**：规划与评估调用须 **强制结构化输出**（`response_format: json_object` 或项目内等价封装）；解析失败时重试有限次数，仍失败则 `agent_session_failed`。  
+- **JSON**：规划与评估调用强制 **schema 约束的结构化输出**（`response_format: json_schema`，字段受限枚举；后端不支持时自动降级 `json_object` → 无 `response_format`）；解析失败时重试有限次数。plan 工作流在重试耗尽且模型仅产出"合法但零步骤"计划时，降级为对候选 KB 的单步 `mix` 兜底检索而非失败；其余情况仍 `agent_session_failed`。  
 - **与 QUERY 分工**：AGENT 负责 plan/evaluate（小步、短输出）；QUERY 负责终答合成（长文本、引用格式）。两角色可 **同一模型、同一 endpoint**，便于运维。  
 - **与 PROFILE 分工**：PROFILE 负责文档级/KB 级 profile JSON 生成，默认后台任务执行，不阻塞文档入库主流程。  
 - **Embedding / Rerank**：不新增角色；各 KB 共用部署级 embedding/rerank（本设计前提 §2.3）。

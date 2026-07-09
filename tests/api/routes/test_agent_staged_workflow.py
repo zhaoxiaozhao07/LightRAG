@@ -58,12 +58,14 @@ class _FakeRAG:
     def __init__(self, agent_responses: list[str], *, answer_deltas=None):
         self.agent_responses = list(agent_responses)
         self.agent_payloads: list[dict] = []
+        self.agent_kwargs: list[dict] = []
         self.answer_deltas = answer_deltas
         self.query_prompts: list[str] = []
 
     def _build_global_config(self):
         async def agent_func(prompt, **_kwargs):
             self.agent_payloads.append(json.loads(prompt))
+            self.agent_kwargs.append(_kwargs)
             if not self.agent_responses:
                 raise AssertionError("unexpected AGENT LLM call")
             return self.agent_responses.pop(0)
@@ -375,6 +377,49 @@ async def test_staged_happy_path_result_metadata_and_verdict_payload(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_staged_agent_calls_request_schema_constrained_json(monkeypatch):
+    _audit_recorder(monkeypatch)
+    rag = _FakeRAG(_happy_path_responses())
+    service = AgentQueryService(kb_service=_KBService(), query_tool_service=_QueryTool(rag))
+
+    result = await service.run(request=_request(monkeypatch), body=_staged_body())
+
+    assert result.status == "success"
+    schema_names = [
+        kwargs["response_format"]["json_schema"]["name"] for kwargs in rag.agent_kwargs
+    ]
+    assert schema_names == [
+        "agent_staged_requirement",
+        "agent_staged_skeleton_plan",
+        "agent_staged_skeleton_extract",
+        "agent_staged_verdicts",
+    ]
+    requirement_schema = rag.agent_kwargs[0]["response_format"]["json_schema"]["schema"]
+    property_schema = requirement_schema["properties"]["target_properties"]["items"]
+    assert property_schema["properties"]["priority"]["enum"] == ["P0", "P1", "P2"]
+    plan_schema = rag.agent_kwargs[1]["response_format"]["json_schema"]["schema"]
+    step_schema = plan_schema["properties"]["steps"]
+    assert step_schema["minItems"] == 1
+    assert step_schema["maxItems"] == 3
+    step_item = step_schema["items"]
+    assert step_item["properties"]["kb_ids"]["items"]["enum"] == [
+        "kb_formula",
+        "kb_exp",
+        "kb_paper",
+        "kb_side",
+    ]
+    extract_schema = rag.agent_kwargs[2]["response_format"]["json_schema"]["schema"]
+    component_schema = extract_schema["properties"]["components"]["items"]
+    assert component_schema["properties"]["source_refs"]["items"]["enum"] == ["A1"]
+    verdict_schema = rag.agent_kwargs[3]["response_format"]["json_schema"]["schema"]
+    verdict_item = verdict_schema["properties"]["verdicts"]["items"]
+    assert verdict_item["properties"]["property"]["enum"] == [
+        "低温屈挠性",
+        "耐臭氧老化",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_staged_clarification_short_circuits(monkeypatch):
     _audit_recorder(monkeypatch)
     rag = _FakeRAG(
@@ -550,6 +595,26 @@ async def test_staged_gap_repair_updates_verdicts(monkeypatch):
     ]
     assert len(repair_rounds) == 1
     assert repair_rounds[0]["mode"] == "naive"
+    schema_names = [
+        kwargs["response_format"]["json_schema"]["name"] for kwargs in rag.agent_kwargs
+    ]
+    assert schema_names == [
+        "agent_staged_requirement",
+        "agent_staged_skeleton_plan",
+        "agent_staged_skeleton_extract",
+        "agent_staged_verdicts",
+        "agent_staged_repair_plan",
+        "agent_staged_verdicts",
+    ]
+    repair_schema = rag.agent_kwargs[4]["response_format"]["json_schema"]["schema"]
+    repair_steps = repair_schema["properties"]["steps"]
+    assert repair_steps["maxItems"] == 4
+    assert repair_steps["items"]["properties"]["kb_ids"]["items"]["enum"] == [
+        "kb_formula",
+        "kb_exp",
+        "kb_paper",
+        "kb_side",
+    ]
 
 
 @pytest.mark.asyncio

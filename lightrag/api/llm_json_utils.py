@@ -39,6 +39,22 @@ def strip_code_fence(text: str) -> str:
     return value
 
 
+def _looks_like_response_format_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    # "schema" covers OpenAI/vLLM json_schema rejections; "grammar" covers
+    # llama.cpp servers that fail to convert a schema into a GBNF grammar.
+    return any(
+        marker in text
+        for marker in (
+            "response_format",
+            "structured output",
+            "guided json",
+            "schema",
+            "grammar",
+        )
+    )
+
+
 async def call_llm_json(
     llm_func: Callable[..., Any],
     prompt: str,
@@ -48,6 +64,7 @@ async def call_llm_json(
     parse: Callable[[Any], T],
     attempts: int = DEFAULT_LLM_JSON_ATTEMPTS,
     label: str = "llm_json",
+    response_format: dict[str, Any] | None = None,
 ) -> T:
     """Call a role LLM function and parse its JSON output with bounded retries.
 
@@ -61,6 +78,8 @@ async def call_llm_json(
     attempts = max(1, int(attempts))
     bound = partial(llm_func, _priority=priority)
     supports_response_format = True
+    response_format_payload = response_format or {"type": "json_object"}
+    schema_response_format = response_format is not None
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         if supports_response_format:
@@ -70,7 +89,7 @@ async def call_llm_json(
                     system_prompt=system_prompt,
                     stream=False,
                     enable_cot=False,
-                    response_format={"type": "json_object"},
+                    response_format=response_format_payload,
                 )
             except TypeError:
                 supports_response_format = False
@@ -80,6 +99,33 @@ async def call_llm_json(
                     stream=False,
                     enable_cot=False,
                 )
+            except Exception as exc:
+                if schema_response_format and _looks_like_response_format_error(exc):
+                    logger.warning(
+                        "%s: schema response_format failed; retrying with json_object: %s",
+                        label,
+                        exc,
+                    )
+                    schema_response_format = False
+                    response_format_payload = {"type": "json_object"}
+                    try:
+                        raw = await bound(
+                            prompt,
+                            system_prompt=system_prompt,
+                            stream=False,
+                            enable_cot=False,
+                            response_format=response_format_payload,
+                        )
+                    except TypeError:
+                        supports_response_format = False
+                        raw = await bound(
+                            prompt,
+                            system_prompt=system_prompt,
+                            stream=False,
+                            enable_cot=False,
+                        )
+                else:
+                    raise
         else:
             raw = await bound(
                 prompt,

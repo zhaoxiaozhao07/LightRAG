@@ -1118,7 +1118,9 @@ Agent 支持两种工作流（请求体 `workflow` 字段选择）：
 - `workflow` 可省略，默认 `"plan"`；`"staged"` 启用阶段化配比推荐工作流（此时 `max_rounds` 不生效，检索预算由 `AGENT_STAGED_MAX_RETRIEVALS` 与阶段上限控制，见 §9.3.1）。
 - `candidate_kb_ids` 可省略或为空：表示候选范围为当前 principal 的全部授权 KB，由 AGENT 模型在规划时自行选择；若提供，则必须全部在授权范围内，否则返回 `403`，且不会调用 AGENT LLM。
 - `max_rounds` 会被服务端全局 `AGENT_MAX_ROUNDS` clamp；所有轮次串行执行。规划步骤按 **P0 → P1 → P2 稳定排序** 后再截断到 `max_rounds`，保证 P0（法规/合规类）步骤不会被截断丢弃；发生截断时 `metadata.plan_truncated=true`。
-- 规划 JSON 解析失败会自动重试（最多 3 次 AGENT LLM 调用）；仍失败返回 `502`（`error_code=agent_plan_invalid`），并写审计事件 `agent_session_failed`。
+- 规划/阶段化的所有 AGENT LLM 调用均请求 **schema 约束的结构化输出**（OpenAI 兼容 `response_format: json_schema`，其中 `kb_ids`、`mode`、`priority` 等字段为受限枚举，`steps` 要求至少 1 步）；后端不支持 `json_schema` 时自动降级为 `json_object`，再不支持时不传 `response_format`（仅提示词约束）。
+- 规划 JSON 解析失败会自动重试（最多 3 次 AGENT LLM 调用）。重试耗尽时：若模型曾返回"合法 JSON 但零步骤"的退化计划，服务端**降级为单步兜底检索**（对全部候选 KB 执行一次 `mix` 检索，`steps_summary` 单步标题为 `直接检索`，`metadata.notes_for_user` 说明降级原因），不再返回 502；其余失败仍返回 `502`（`error_code=agent_plan_invalid`），并写审计事件 `agent_session_failed`。
+- 步骤 `priority` 具备别名容错：`high`/`normal`/`low`、`高`/`中`/`低` 等常见别名归一化为 `P0`/`P1`/`P2`，无法识别时默认 `P1`（`staged` 工作流的 `target_properties[].priority` 同样适用）。
 - **单步失败容忍**：某一步骤检索失败不会终止会话——该步在 `steps_summary` 中标记 `status="failed"`（附 `error_code`），其余步骤继续执行，终答会明确声明对应证据缺口；所有步骤都失败时返回 `502`（`error_code=agent_all_steps_failed`）。
 - **空结果自动重试**：某步检索成功但返回 0 条证据时，服务端自动用一个替代 mode 重试一次（`mix→naive`、`naive→hybrid`、`hybrid→mix`、`local/global→hybrid`）；重试成功时该步 `steps_summary` 与 `round_result` 事件携带 `retried_mode` 字段，审计 metadata 同步记录；重试自身失败不影响该步（保留原空结果）。两种工作流均生效。
 - 终答证据合成 **不做二次 rerank**：每步结果已按该步子问题排序（检索内启用 rerank 时），跨轮去重后按轮次轮转合并，再按 `max_total_tokens` 预算截断并编号为 A1、A2…，避免子问题证据被总问题的相关性打分整体挤掉。
@@ -1167,7 +1169,9 @@ Agent 支持两种工作流（请求体 `workflow` 字段选择）：
     "effective_kb_ids": ["kb_regulation", "kb_formula"],
     "round_count": 1,
     "failed_round_count": 0,
-    "plan_truncated": false
+    "plan_truncated": false,
+    "bilingual_retrieval": false,
+    "notes_for_user": null
   }
 }
 ```
@@ -1209,7 +1213,7 @@ Agent 支持两种工作流（请求体 `workflow` 字段选择）：
 
 ```json
 {"event":"session_started","session_id":"agent_...","metadata":{"workflow":"plan","effective_kb_ids":["kb1"]}}
-{"event":"plan_created","session_id":"agent_...","plan_truncated":false,"steps":[...]}
+{"event":"plan_created","session_id":"agent_...","plan_truncated":false,"notes_for_user":null,"steps":[...]}
 {"event":"round_started","session_id":"agent_...","round":1,"step_index":1,"title":"查法规","kb_ids":["kb1"],"mode":"mix","priority":"P0"}
 {"event":"round_result","session_id":"agent_...","round":1,"status":"ok","kb_ids":["kb1"],"chunk_count":5}
 {"event":"references","session_id":"agent_...","references":[...]}
