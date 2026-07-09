@@ -358,6 +358,7 @@ async def _edit_entity_impl(
             keywords = edge_data.get("keywords", "")
             source_id = edge_data.get("source_id", "")
             weight = float(edge_data.get("weight", 1.0))
+            file_path = edge_data.get("file_path", "unknown_source")
 
             content = f"{normalized_src}\t{normalized_tgt}\n{keywords}\n{description}"
 
@@ -374,6 +375,7 @@ async def _edit_entity_impl(
                     "description": description,
                     "keywords": keywords,
                     "weight": weight,
+                    "file_path": file_path,
                 }
             }
 
@@ -386,6 +388,9 @@ async def _edit_entity_impl(
     description = new_node_data.get("description", "")
     source_id = new_node_data.get("source_id", "")
     entity_type = new_node_data.get("entity_type", "")
+    # Milvus collections declare file_path in the schema; legacy collections
+    # created before nullable=True reject any insert that omits the field.
+    file_path = new_node_data.get("file_path", "unknown_source")
     content = entity_name + "\n" + description
 
     entity_id = compute_mdhash_id(entity_name, prefix="ent-")
@@ -397,6 +402,7 @@ async def _edit_entity_impl(
             "source_id": source_id,
             "description": description,
             "entity_type": entity_type,
+            "file_path": file_path,
         }
     }
 
@@ -810,6 +816,7 @@ async def aedit_relation(
             keywords = new_edge_data.get("keywords", "")
             source_id = new_edge_data.get("source_id", "")
             weight = float(new_edge_data.get("weight", 1.0))
+            file_path = new_edge_data.get("file_path", "unknown_source")
 
             # Create content for embedding
             content = f"{source_entity}\t{target_entity}\n{keywords}\n{description}"
@@ -829,6 +836,7 @@ async def aedit_relation(
                     "description": description,
                     "keywords": keywords,
                     "weight": weight,
+                    "file_path": file_path,
                 }
             }
 
