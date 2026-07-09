@@ -11,6 +11,12 @@ Read endpoints (``kb_viewer``+ in enterprise mode):
 - ``GET /kbs/{kb_id}/graph/relations`` — relation (edge) listing
 - ``GET /kbs/{kb_id}/graph``           — connected subgraph for a label
 
+Subgraph/relations responses are normalized so ``nodes[].id`` and
+``edges[].source``/``target`` are always entity names (some backends,
+e.g. Neo4j, natively return internal storage ids there); the values can
+be fed directly into the curation endpoints below as ``entity_name`` /
+``source_entity`` / ``target_entity``.
+
 Write endpoints (``kb_admin``+ in enterprise mode; the enterprise middleware
 escalates non-GET ``/graph`` paths). These wrap the engine's curation methods
 with the KB workspace boundary — with global ``/graph/*`` routes disabled in
@@ -32,18 +38,53 @@ from __future__ import annotations
 from typing import Any, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from lightrag.api.enterprise_auth import append_enterprise_audit_event
 from lightrag.api.kb_service import KnowledgeBaseNotFoundError
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.base import DeletionResult
+from lightrag.types import KnowledgeGraph, KnowledgeGraphNode
 from lightrag.utils import logger
 
 from .document_routes import check_pipeline_busy_or_raise
 
 _MAX_GRAPH_STATUS_NODES = 100_000
+
+
+def _node_entity_name(node: KnowledgeGraphNode) -> str | None:
+    name = (node.properties or {}).get("entity_id")
+    if isinstance(name, str) and name:
+        return name
+    if node.labels:
+        label = node.labels[0]
+        if isinstance(label, str) and label:
+            return label
+    return None
+
+
+def _normalize_graph_ids(graph: KnowledgeGraph) -> KnowledgeGraph:
+    """Rewrite storage-internal node ids to entity names, in place.
+
+    NetworkX already uses the entity name as ``node.id``, but the Neo4j
+    APOC path returns internal numeric ids in ``node.id`` and
+    ``edge.source``/``edge.target``, keeping the entity name only in
+    ``labels[0]``/``properties.entity_id``. The curation endpoints
+    (``entity:delete`` etc.) match on entity name, so clients that feed a
+    read-model id back into them would get a 404 on Neo4j. Normalizing
+    here gives every backend the same contract: ids ARE entity names.
+    """
+    id_to_name: dict[str, str] = {}
+    for node in graph.nodes:
+        name = _node_entity_name(node)
+        if name:
+            id_to_name[node.id] = name
+            node.id = name
+    for edge in graph.edges:
+        edge.source = id_to_name.get(edge.source, edge.source)
+        edge.target = id_to_name.get(edge.target, edge.target)
+    return graph
 
 
 class KBEntityEditRequest(BaseModel):
@@ -60,6 +101,14 @@ class KBEntityCreateRequest(BaseModel):
 
 class KBEntityDeleteRequest(BaseModel):
     entity_name: str = Field(min_length=1)
+
+    @field_validator("entity_name", mode="after")
+    @classmethod
+    def _strip_entity_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Entity name cannot be empty")
+        return value
 
 
 class KBEntitiesMergeRequest(BaseModel):
@@ -82,6 +131,14 @@ class KBRelationCreateRequest(BaseModel):
 class KBRelationDeleteRequest(BaseModel):
     source_entity: str = Field(min_length=1)
     target_entity: str = Field(min_length=1)
+
+    @field_validator("source_entity", "target_entity", mode="after")
+    @classmethod
+    def _strip_entity_names(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Entity name cannot be empty")
+        return value
 
 
 def create_kb_graph_routes(
@@ -196,6 +253,7 @@ def create_kb_graph_routes(
                 max_depth=1,
                 max_nodes=_MAX_GRAPH_STATUS_NODES,
             )
+            _normalize_graph_ids(graph)
             edges = graph.edges
             total = len(edges)
             page = edges[offset : offset + limit]
@@ -235,10 +293,12 @@ def create_kb_graph_routes(
     ):
         try:
             rag = cast(Any, await registry.get(kb_id))
-            return await rag.get_knowledge_graph(
-                node_label=label,
-                max_depth=max_depth,
-                max_nodes=max_nodes,
+            return _normalize_graph_ids(
+                await rag.get_knowledge_graph(
+                    node_label=label,
+                    max_depth=max_depth,
+                    max_nodes=max_nodes,
+                )
             )
         except KnowledgeBaseNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

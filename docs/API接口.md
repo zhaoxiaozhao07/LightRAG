@@ -580,8 +580,8 @@ Content-Type: application/json
 |---|---|---|
 | `GET` | `/kbs/{kb_id}/graph/status` | 图谱统计：`label_count` / `node_count` / `edge_count` / `is_truncated`（受 `max_nodes_scanned` 上限保护） |
 | `GET` | `/kbs/{kb_id}/graph/entities` | 实体标签分页列表，支持 `limit` / `offset` 与可选模糊搜索 `q`（大小写不敏感） |
-| `GET` | `/kbs/{kb_id}/graph/relations` | 关系（edge）分页列表，返回 `id/type/source/target/properties` |
-| `GET` | `/kbs/{kb_id}/graph` | 指定 `label` 的连通子图（`*` 表示整图），支持 `max_depth` / `max_nodes` |
+| `GET` | `/kbs/{kb_id}/graph/relations` | 关系（edge）分页列表，返回 `id/type/source/target/properties`；`source`/`target` 为实体名 |
+| `GET` | `/kbs/{kb_id}/graph` | 指定 `label` 的连通子图（`*` 表示整图），支持 `max_depth` / `max_nodes`；`nodes[].id` 与 `edges[].source/target` 为实体名 |
 
 编辑端点（企业模式 `kb_admin`+，包装引擎 curation 方法）：
 
@@ -597,6 +597,8 @@ Content-Type: application/json
 
 约束：
 - 只读端点复用全局 `/graph/*` 同款 LightRAG 方法，但带 KB workspace 边界。
+- **子图与关系列表的 id 已归一化为实体名**：部分图存储后端（如 Neo4j）原生返回内部存储 id，KB 路由统一改写为实体名后返回，因此 `nodes[].id`、`edges[].source/target`、`relations[].source/target` 可直接作为编辑端点的 `entity_name` / `source_entity` / `target_entity` 回传（此前直接回传 Neo4j 内部 id 会导致 `entity:delete` 等报 404）。`edges[].id` / `relations[].id` 仍为后端内部边 id，仅作展示用途。
+- `entity:delete` / `relation:delete` 的实体名首尾空白会被自动剔除后再匹配。
 - `graph/status` 与 `graph/relations` 使用 `"*"` 通配做有界全图扫描（默认上限 100,000 节点）；超限时 `is_truncated=true`。
 - 编辑端点在文档 pipeline 忙碌（构建/删除进行中）时返回 `409`，等任务完成后重试；引擎参数校验失败（实体不存在/已存在等）返回 `400`。
 - **手工编辑结果存放在引擎存储中，会被该文档的 force `:reindex` / `:rebuild` 重新抽取覆盖**——图谱纠错建议在文档集稳定后进行，或纠错后避免对相关文档强制重建。
@@ -1599,8 +1601,8 @@ username=admin&password=change-me
 | `PATCH` | `/admin/tenants/{tenant_id}` | 更新租户 `name`/`description`/`status`（`active`/`disabled`） |
 | `DELETE` | `/admin/tenants/{tenant_id}` | 删除租户实体；仅当无任何引用（成员/租户内 KB/归属用户/tenant-KB ACL）时允许，否则 `409`（不级联） |
 | `GET` | `/admin/tenants/{tenant_id}/kbs` | 列出该租户下的 KB（`id`/`name`/`status`/`visibility`/`owner_id`） |
-| `GET` | `/admin/tenants/{tenant_id}/members` | 列出 tenant 成员与 tenant role |
-| `PUT` | `/admin/tenants/{tenant_id}/members/{user_id}` | 写入/更新 tenant membership，body：`{"role":"tenant_member"}` |
+| `GET` | `/admin/tenants/{tenant_id}/members` | 列出 tenant 成员与 tenant role；每条 membership 附带解析后的 `username` / `display_name` / `user_status` |
+| `PUT` | `/admin/tenants/{tenant_id}/members/{user_id}` | 写入/更新 tenant membership，body：`{"role":"tenant_member"}`；响应同样附带 `username` / `display_name` / `user_status` |
 | `DELETE` | `/admin/tenants/{tenant_id}/members/{user_id}` | 删除 tenant membership |
 | `GET` | `/admin/kbs/{kb_id}/acl` | 查看 KB ACL，返回 user 与 tenant 两类 principal；KB 不存在时返回 404 |
 | `PUT` | `/admin/kbs/{kb_id}/acl` | 授权 KB 角色，body：`{"user_id":"usr_...","role":"kb_viewer"}` 或 `{"tenant_id":"tenant-a","role":"kb_viewer"}`；KB 不存在时返回 404 |
@@ -1620,9 +1622,11 @@ username=admin&password=change-me
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/tenants/{tenant_id}/members` | tenant admin 查看本 tenant 成员 |
+| `GET` | `/tenants/{tenant_id}/members` | tenant admin 查看本 tenant 成员；每条 membership 附带 `username` / `display_name` / `user_status`（tenant admin 无法访问超管专属的 `/admin/users`，用户名信息直接随成员列表返回） |
 | `PUT` | `/tenants/{tenant_id}/members/{user_id}` | tenant admin 仅可授予/更新普通 `tenant_member`；不能提升为 admin/owner，也不能修改已有 admin/owner |
 | `DELETE` | `/tenants/{tenant_id}/members/{user_id}` | tenant admin 仅可撤销普通 `tenant_member`；不能撤销 tenant admin/owner |
+
+Tenant membership 响应对象字段：`tenant_id`、`user_id`、`role`、`granted_by`、`created_at`、`updated_at`，以及读取时从用户记录解析出的 `username`（用户名）、`display_name`（用户自助资料中的显示名，未设置时为 `null`）、`user_status`（`active` / `disabled` / `pending`）；对应用户记录已被删除时这三个解析字段为 `null`。适用于 `/admin/tenants/{tenant_id}/members` 与 `/tenants/{tenant_id}/members` 的 GET 列表响应及 PUT 授予响应。
 
 KB ACL 角色使用规范名称：`kb_viewer`、`kb_editor`、`kb_admin`、`kb_owner`。用户 effective KB role 取 direct user ACL 与其 tenant memberships 命中的 tenant-scoped KB ACL 的最高角色；没有 direct/tenant ACL 时跨 tenant 默认拒绝。Service/scoped API key 默认只按自身 `kb_roles` scope 授权；若创建时同时设置 `tenant_id` 与 `inherit_tenant_kb_acl=true`，则显式继承该 tenant 命中的 tenant-scoped KB ACL，并与 `kb_roles` 取最高角色。第一期中 KB ACL 仍由 super admin 统一执行；tenant admin 只具备本 tenant 成员自助管理权限，不具备 KB ACL 管理或删除 KB 的平台权限。
 

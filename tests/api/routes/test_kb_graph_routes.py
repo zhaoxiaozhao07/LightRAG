@@ -350,6 +350,88 @@ def test_kb_graph_entities_relations_subgraph_404_for_unknown_kb(tmp_path):
     )
 
 
+def test_kb_graph_ids_normalized_to_entity_names(tmp_path):
+    """Backends like Neo4j return internal storage ids in nodes[].id and
+    edges[].source/target, keeping the entity name only in labels[0] /
+    properties.entity_id. The KB read endpoints must normalize ids to entity
+    names so a client can feed nodes[].id straight back into entity:delete
+    (which matches on entity name) without a 404."""
+    initialize_share_data()
+    try:
+        _run_kb_graph_ids_normalized(tmp_path)
+    finally:
+        finalize_share_data()
+
+
+def _run_kb_graph_ids_normalized(tmp_path):
+    client, probe = _build_client(tmp_path)
+    _create_kb(client, "kb_neo")
+    # Trigger the lazy build, then emulate a Neo4j-style read model on the
+    # registry-held instance.
+    client.get("/kbs/kb_neo/graph/status", headers=_HEADERS)
+    rag = probe.instances["kb_neo"]
+
+    async def neo4j_style_graph(
+        node_label: str, max_depth: int = 3, max_nodes: int | None = None
+    ) -> KnowledgeGraph:
+        return KnowledgeGraph(
+            nodes=[
+                KnowledgeGraphNode(
+                    id="101", labels=["Alice"], properties={"entity_id": "Alice"}
+                ),
+                KnowledgeGraphNode(
+                    id="102", labels=["Bob"], properties={"entity_id": "Bob"}
+                ),
+                # No resolvable entity name: the raw id must survive untouched.
+                KnowledgeGraphNode(id="103", labels=[], properties={}),
+            ],
+            edges=[
+                KnowledgeGraphEdge(
+                    id="900", type="KNOWS", source="101", target="102", properties={}
+                ),
+                KnowledgeGraphEdge(
+                    id="901", type="LINKS", source="102", target="103", properties={}
+                ),
+            ],
+        )
+
+    rag.get_knowledge_graph = neo4j_style_graph
+
+    subgraph = client.get("/kbs/kb_neo/graph?label=*", headers=_HEADERS)
+    assert subgraph.status_code == 200, subgraph.text
+    body = subgraph.json()
+    assert {node["id"] for node in body["nodes"]} == {"Alice", "Bob", "103"}
+    assert {(edge["source"], edge["target"]) for edge in body["edges"]} == {
+        ("Alice", "Bob"),
+        ("Bob", "103"),
+    }
+
+    relations = client.get("/kbs/kb_neo/graph/relations", headers=_HEADERS)
+    assert relations.status_code == 200, relations.text
+    assert {
+        (rel["source"], rel["target"]) for rel in relations.json()["relations"]
+    } == {("Alice", "Bob"), ("Bob", "103")}
+
+    # Round-trip: the id exposed by the read model is accepted by the
+    # curation endpoint (FakeGraphRAG deletes by entity name).
+    alice_id = next(node["id"] for node in body["nodes"] if node["id"] == "Alice")
+    deleted = client.post(
+        "/kbs/kb_neo/graph/entity:delete",
+        json={"entity_name": alice_id},
+        headers=_HEADERS,
+    )
+    assert deleted.status_code == 200, deleted.text
+
+    # Copy-pasted names with stray whitespace are stripped before matching.
+    padded = client.post(
+        "/kbs/kb_neo/graph/entity:delete",
+        json={"entity_name": "  Bob "},
+        headers=_HEADERS,
+    )
+    assert padded.status_code == 200, padded.text
+    assert padded.json()["doc_id"] == ""
+
+
 def test_kb_graph_write_endpoints_roundtrip(tmp_path):
     # The busy-guard reads shared pipeline state; bootstrap it like the real
     # server lifespan does so the guard takes its silent no-op path.

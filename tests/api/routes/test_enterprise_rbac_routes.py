@@ -589,6 +589,11 @@ def test_enterprise_tenant_kb_acl_authorizes_members_only(monkeypatch, tmp_path)
     members = client.get("/admin/tenants/tenant-a/members", headers=admin_headers)
     assert members.status_code == 200, members.text
     assert {item["user_id"] for item in members.json()} == {bob.id, dave.id}
+    # Membership listings resolve user names so a client never has to join
+    # against the (super-admin-only) /admin/users endpoints.
+    admin_members_by_user = {item["user_id"]: item for item in members.json()}
+    assert admin_members_by_user[bob.id]["username"] == "bob"
+    assert admin_members_by_user[dave.id]["username"] == "dave"
 
     tenant_grant = client.put(
         "/admin/kbs/kb_tenant_acl/acl",
@@ -624,12 +629,31 @@ def test_enterprise_tenant_kb_acl_authorizes_members_only(monkeypatch, tmp_path)
     )
     assert tenant_admin_members.status_code == 200, tenant_admin_members.text
     assert {item["user_id"] for item in tenant_admin_members.json()} == {bob.id, dave.id}
+    # Tenant admins cannot call /admin/users, so the self-service listing
+    # itself must carry usernames (and display_name once the user sets one).
+    self_service_by_user = {
+        item["user_id"]: item for item in tenant_admin_members.json()
+    }
+    assert self_service_by_user[bob.id]["username"] == "bob"
+    assert self_service_by_user[bob.id]["display_name"] is None
+    profile_update = client.patch(
+        "/auth/me",
+        json={"display_name": "Bob B."},
+        headers=bob_headers,
+    )
+    assert profile_update.status_code == 200, profile_update.text
+    refreshed_members = client.get("/tenants/tenant-a/members", headers=dave_headers)
+    assert refreshed_members.status_code == 200, refreshed_members.text
+    refreshed_by_user = {item["user_id"]: item for item in refreshed_members.json()}
+    assert refreshed_by_user[bob.id]["username"] == "bob"
+    assert refreshed_by_user[bob.id]["display_name"] == "Bob B."
     tenant_admin_add_member = client.put(
         f"/tenants/tenant-a/members/{carol.id}",
         json={"role": "tenant_member"},
         headers=dave_headers,
     )
     assert tenant_admin_add_member.status_code == 200, tenant_admin_add_member.text
+    assert tenant_admin_add_member.json()["username"] == "carol"
     tenant_admin_promote_denied = client.put(
         f"/tenants/tenant-a/members/{carol.id}",
         json={"role": "tenant_admin"},

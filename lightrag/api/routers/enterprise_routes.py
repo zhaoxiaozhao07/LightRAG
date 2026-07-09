@@ -194,12 +194,25 @@ class EnterpriseTenantMembershipResponse(BaseModel):
     granted_by: str | None
     created_at: str
     updated_at: str
+    # Resolved from the user record so tenant admins (who cannot call the
+    # super-admin-only /admin/users endpoints) can see who each member is.
+    username: str | None = None
+    display_name: str | None = None
+    user_status: str | None = None
 
     @classmethod
     def from_record(
-        cls, record: EnterpriseTenantMembershipRecord
+        cls,
+        record: EnterpriseTenantMembershipRecord,
+        *,
+        user: EnterpriseUserRecord | None = None,
     ) -> "EnterpriseTenantMembershipResponse":
-        return cls(**record.to_dict())
+        data = record.to_dict()
+        if user is not None:
+            data["username"] = user.username
+            data["display_name"] = (user.metadata or {}).get("display_name")
+            data["user_status"] = user.status
+        return cls(**data)
 
 
 class EnterpriseTenantCreateRequest(BaseModel):
@@ -441,6 +454,31 @@ def create_enterprise_routes(
             tenant_id,
             TENANT_ROLE_ADMIN,
         )
+
+    async def memberships_with_user_info(
+        request: Request,
+        records: list[EnterpriseTenantMembershipRecord],
+    ) -> list[EnterpriseTenantMembershipResponse]:
+        """Attach username/display_name to membership records.
+
+        Batch-resolves the page's user ids in one ``list_users`` pass; a
+        membership whose user record has vanished keeps null user fields.
+        """
+        user_ids = {record.user_id for record in records}
+        users: dict[str, EnterpriseUserRecord] = {}
+        if user_ids:
+            user_service = get_enterprise_user_service(request)
+            users = {
+                user.id: user
+                for user in await user_service.list_users()
+                if user.id in user_ids
+            }
+        return [
+            EnterpriseTenantMembershipResponse.from_record(
+                record, user=users.get(record.user_id)
+            )
+            for record in records
+        ]
 
     def login_response(user_service, user: EnterpriseUserRecord) -> dict[str, Any]:
         token = auth_handler.create_token(
@@ -1196,10 +1234,9 @@ def create_enterprise_routes(
     )
     async def list_tenant_members(tenant_id: str, request: Request):
         authz_service = get_enterprise_authorization_service(request)
-        return [
-            EnterpriseTenantMembershipResponse.from_record(item)
-            for item in await authz_service.list_tenant_memberships(tenant_id)
-        ]
+        return await memberships_with_user_info(
+            request, await authz_service.list_tenant_memberships(tenant_id)
+        )
 
     @router.put(
         "/admin/tenants/{tenant_id}/members/{user_id}",
@@ -1220,7 +1257,7 @@ def create_enterprise_routes(
             body.role,
             granted_by=principal.user_id,
         )
-        return EnterpriseTenantMembershipResponse.from_record(record)
+        return (await memberships_with_user_info(request, [record]))[0]
 
     @router.delete(
         "/admin/tenants/{tenant_id}/members/{user_id}",
@@ -1244,10 +1281,9 @@ def create_enterprise_routes(
     async def self_service_list_tenant_members(tenant_id: str, request: Request):
         await require_tenant_admin(request, tenant_id)
         authz_service = get_enterprise_authorization_service(request)
-        return [
-            EnterpriseTenantMembershipResponse.from_record(item)
-            for item in await authz_service.list_tenant_memberships(tenant_id)
-        ]
+        return await memberships_with_user_info(
+            request, await authz_service.list_tenant_memberships(tenant_id)
+        )
 
     @router.put(
         "/tenants/{tenant_id}/members/{user_id}",
@@ -1286,7 +1322,7 @@ def create_enterprise_routes(
             body.role,
             granted_by=principal.user_id,
         )
-        return EnterpriseTenantMembershipResponse.from_record(record)
+        return (await memberships_with_user_info(request, [record]))[0]
 
     @router.delete(
         "/tenants/{tenant_id}/members/{user_id}",
