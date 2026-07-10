@@ -1436,7 +1436,7 @@ KB Agent Profile 用于帮助 `/agent/query` 在多 KB 候选集中选库，不�
 
 ## 十、企业模式 Auth / Admin
 
-本节接口仅在 `LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true` 时挂载或启用。企业模式默认禁用 guest 对受保护 API 的访问；`LIGHTRAG_API_KEY` 默认不能绕过 RBAC；`WHITELIST_PATHS` 不能放行 `/kbs`、`/documents`、`/query`、`/agent`、`/graph`、`/api` 等受保护前缀。企业 service API key 使用同一 `X-API-Key` 请求头，但与全局 `LIGHTRAG_API_KEY` 分离：只按持久化 hash 查找，默认只拥有创建时授予的 `kb_roles` scope；设置 `tenant_id + inherit_tenant_kb_acl=true` 时可显式继承 tenant-scoped KB ACL。service key 不能成为 super admin，撤销后立即失效。
+本节接口仅在 `LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true` 时挂载或启用。企业模式默认禁用 guest 对受保护 API 的访问；`LIGHTRAG_API_KEY` 默认不能绕过 RBAC；`WHITELIST_PATHS` 不能放行 `/kbs`、`/documents`、`/query`、`/agent`、`/graph`、`/api`、`/chat` 等受保护前缀。企业 service API key 使用同一 `X-API-Key` 请求头，但与全局 `LIGHTRAG_API_KEY` 分离：只按持久化 hash 查找，默认只拥有创建时授予的 `kb_roles` scope；设置 `tenant_id + inherit_tenant_kb_acl=true` 时可显式继承 tenant-scoped KB ACL。service key 不能成为 super admin，撤销后立即失效。
 
 ### 10.1 配置项
 
@@ -1672,6 +1672,7 @@ KB ACL 请求/响应约束：
 - 权限/限流/配额：`permission_denied`、`rate_limited`、`quota_exceeded`
 - KB/config/query/Agent：`kb_created`、`kb_deleted`、`kb_hard_deleted`、`kb_restored`、`kb_config_activated`、`query_executed`、`query_stream_started`、`retrieve_executed`、`agent_session_started`、`agent_retrieve_round`、`agent_query_completed`、`agent_session_failed`
 - KB 图谱编辑：`kb_graph_entity_edited`、`kb_graph_entity_created`、`kb_graph_entity_deleted`、`kb_graph_entities_merged`、`kb_graph_relation_edited`、`kb_graph_relation_created`、`kb_graph_relation_deleted`
+- 用户对话管理：`chat_project_created`、`chat_project_renamed`、`chat_project_deleted`、`chat_session_created`、`chat_session_updated`、`chat_session_deleted`、`chat_messages_appended`、`chat_message_deleted`（metadata 仅记录 id/计数/标志，不记录项目、会话名称或消息正文）
 - artifact/job/document 类事件：`artifact_downloaded`、`artifact_previewed`、`artifact_download_url_created`、`kb_rebuild_queued`、`job_cancel_requested`、`job_retry_queued`、`document_batch_enabled`、`document_batch_disabled`，以及文档 upload/texts/urls/import/scan/sync/patch/enable/disable/replace/delete/batch-delete/parse/batch-parse/build/reindex/batch-build/batch-reindex/rebuild 相关事件。
 
 审计覆盖：企业模式下，KB 创建/删除、KB Agent Profile 人工更新/刷新排队、config 激活、query/query-stream/retrieve、artifact download/preview/download-url、文档 upload/texts/urls/import/scan/sync/patch/enable/disable/replace/delete/batch-delete/parse/batch-parse/build/reindex/batch-build/batch-reindex/rebuild，以及 job cancel/retry 均写入 audit event。审计 metadata 采用白名单字段：query 仅记录 `query_hash`、mode、过滤摘要；文档与 artifact 事件仅记录 job/batch/document/artifact id、count、flag、hash、size/type 等，不记录 raw query、上传正文、URL、local path、presigned URL、密码/token/API key 明文。
@@ -1817,6 +1818,125 @@ KB 路由角色矩阵：
 | 文档删除（`DELETE …/documents/{id}`、`:batch-delete`） | `kb_editor` 仅删本人上传(`metadata.created_by`)的文档；删他人需 `can_delete_documents` 能力或 `kb_admin`+/`super_admin` |
 | KB 配置创建/激活/diff、`PATCH /kbs/{kb_id}`、图谱编辑（`/graph` 下全部非 GET 端点） | `kb_admin` 或更高 |
 | `DELETE /kbs/{kb_id}`、`?hard=true`、`POST /kbs/{kb_id}:restore`、`/admin/...` | super admin |
+
+### 10.5 用户对话管理（/chat）
+
+> 面向新前端的个人问答历史组织能力，层级严格为 **用户个人对话记录 > 项目 > 会话 > 消息**：一个用户可创建多个项目，一个项目下可创建多个会话（用于细分问答），会话内的问答消息**落库持久化**，用户换浏览器/设备登录后可从服务端拉取同一份历史（跨端同步）。项目/会话/消息是纯控制面记录，不触碰 LightRAG 引擎存储，也不改变 KB RBAC；持久化在 KB 控制面 metadata store（`LIGHTRAG_KB_METADATA_BACKEND=postgres` 时为 PostgreSQL 表 `enterprise_chat_projects` / `enterprise_chat_sessions` / `enterprise_chat_messages`，local 模式为 `metadata.sqlite3` 同名表，两后端行为由契约测试保证一致）。
+>
+> 仅企业模式挂载该路由；仅**交互式 JWT 用户**可用——service/scoped API key 与 legacy enterprise API key principal 一律 `403`。所有读写都按当前用户隔离：访问不存在或属于他人的项目/会话/消息统一返回 `404`（不泄露存在性）。`/chat` 属于企业 anti-bypass 受保护前缀，不能通过 `WHITELIST_PATHS` 放行。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/chat/projects` | 创建项目；body `{"name": "..."}`（1..256 字符，去首尾空白后非空，空白串 `400`） |
+| `GET` | `/chat/projects?limit=50&offset=0` | 当前用户项目列表，按 `updated_at` 倒序；`limit` 1..200，返回 `total` 供分页 |
+| `GET` | `/chat/projects/{project_id}` | 项目详情 |
+| `PATCH` | `/chat/projects/{project_id}` | 项目改名；body `{"name": "..."}` |
+| `DELETE` | `/chat/projects/{project_id}` | 删除项目并**级联删除其全部会话与消息**，响应含 `deleted_sessions` / `deleted_messages` 计数 |
+| `POST` | `/chat/projects/{project_id}/sessions` | 在项目下创建会话；body 可整体省略，`name` 缺省/空白时默认以**服务器当前时间命名**（`YYYY-MM-DD HH:MM:SS`）；`context_rounds` 缺省取部署默认值 `CHAT_SESSION_DEFAULT_CONTEXT_ROUNDS` |
+| `GET` | `/chat/projects/{project_id}/sessions?limit=50&offset=0` | 项目下会话列表，按 `updated_at` 倒序；项目不存在返回 `404` |
+| `GET` | `/chat/projects/{project_id}/sessions/{session_id}` | 会话详情 |
+| `PATCH` | `/chat/projects/{project_id}/sessions/{session_id}` | 更新会话；body 为 `name` / `context_rounds` 的任意组合，至少给一个字段（空 body `400`） |
+| `DELETE` | `/chat/projects/{project_id}/sessions/{session_id}` | 删除会话并**级联删除其全部消息**，响应含 `deleted_messages` 计数 |
+| `POST` | `/chat/projects/{project_id}/sessions/{session_id}/messages` | 批量追加消息（1..20 条，单事务原子写入并分配连续 `seq`）；同一事务内刷新会话 `updated_at` |
+| `GET` | `/chat/projects/{project_id}/sessions/{session_id}/messages?limit=100&offset=0` | 会话消息列表，按 `seq` 升序（`limit` 1..500，返回 `total`）；会话不存在返回 `404` |
+| `DELETE` | `/chat/projects/{project_id}/sessions/{session_id}/messages/{message_id}` | 删除单条消息 |
+
+请求/响应示例：
+
+```http
+POST /chat/projects
+Content-Type: application/json
+
+{"name": "胎侧配方调研"}
+```
+
+```json
+{
+  "id": "proj_1a2b3c4d5e6f",
+  "user_id": "usr_...",
+  "name": "胎侧配方调研",
+  "created_at": "2026-07-10T08:00:00.000000+00:00",
+  "updated_at": "2026-07-10T08:00:00.000000+00:00"
+}
+```
+
+```http
+POST /chat/projects/proj_1a2b3c4d5e6f/sessions
+Content-Type: application/json
+
+{}
+```
+
+```json
+{
+  "id": "sess_9f8e7d6c5b4a",
+  "project_id": "proj_1a2b3c4d5e6f",
+  "user_id": "usr_...",
+  "name": "2026-07-10 16:00:05",
+  "context_rounds": 1,
+  "created_at": "2026-07-10T08:00:05.000000+00:00",
+  "updated_at": "2026-07-10T08:00:05.000000+00:00"
+}
+```
+
+```http
+PATCH /chat/projects/proj_1a2b3c4d5e6f/sessions/sess_9f8e7d6c5b4a
+Content-Type: application/json
+
+{"name": "低温屈挠专题", "context_rounds": -1}
+```
+
+追加消息（前端在拿到问答结果后写入一问一答，也可只写单条）：
+
+```http
+POST /chat/projects/proj_1a2b3c4d5e6f/sessions/sess_9f8e7d6c5b4a/messages
+Content-Type: application/json
+
+{
+  "messages": [
+    {"role": "user", "content": "低温屈挠性怎么提升？"},
+    {
+      "role": "assistant",
+      "content": "建议 NR/BR 并用… [A1]",
+      "metadata": {
+        "mode": "mix",
+        "kb_ids": ["kb_formula"],
+        "references": [{"reference_id": "A1", "kb_id": "kb_formula", "file_path": "formula.md"}]
+      }
+    }
+  ]
+}
+```
+
+```json
+{
+  "session_id": "sess_9f8e7d6c5b4a",
+  "project_id": "proj_1a2b3c4d5e6f",
+  "messages": [
+    {"id": "msg_...", "session_id": "sess_9f8e7d6c5b4a", "project_id": "proj_...", "user_id": "usr_...", "role": "user", "content": "低温屈挠性怎么提升？", "metadata": {}, "seq": 1, "created_at": "..."},
+    {"id": "msg_...", "role": "assistant", "content": "建议 NR/BR 并用… [A1]", "metadata": {"mode": "mix", "kb_ids": ["kb_formula"], "references": [...]}, "seq": 2, "created_at": "...", "session_id": "...", "project_id": "...", "user_id": "..."}
+  ]
+}
+```
+
+列表响应形态：`GET /chat/projects` 返回 `{"total", "limit", "offset", "projects": [...]}`；`GET .../sessions` 返回 `{"total", "limit", "offset", "sessions": [...]}`；`GET .../messages` 返回 `{"total", "limit", "offset", "messages": [...]}`。删除响应：项目 `{"id", "deleted": true, "deleted_sessions": N, "deleted_messages": M}`，会话 `{"id", "project_id", "deleted": true, "deleted_messages": M}`，消息 `{"id", "session_id", "project_id", "deleted": true}`。
+
+行为约束：
+
+- 项目、会话均可改名（`PATCH`）；改名会刷新 `updated_at`，因此最近操作的记录排在列表前面；`created_at` 保持不变。**追加消息也会刷新所属会话的 `updated_at`**（同一事务内），会话列表天然按"最近活跃"排序。
+- 会话创建默认名为服务器本地时间（如 `2026-07-10 16:00:05`），显式传非空白 `name` 则使用该名称；名称不要求唯一。
+- **`context_rounds`（上下文轮次）**：会话级参数，表示每次问答发送给大模型的最近对话轮数——对话轮数超过 `n` 时只发送最近 `n` 轮，`-1` 表示全部发送。创建时缺省取部署默认值 `CHAT_SESSION_DEFAULT_CONTEXT_ROUNDS`（出厂 `1`），之后可随时 `PATCH` 修改；合法取值为 `-1` 或正整数，`0`、`-2` 等返回 `400`。前端从服务端拉取消息后，按该值取最近 `n` 轮组装 `conversation_history` 再调用 query/agent 端点。
+- **消息（跨端同步）**：`role` 仅允许 `user` / `assistant`；`content` 非空且单条 ≤ 1 MB；`metadata` 为自由 dict（推荐存放该条回答的 `references`、`mode`、`kb_ids`、agent `session_id` 等，前端换设备后可原样还原引用面板），序列化 ≤ 64 KB，超限 `400`；单次批量 1..20 条，`422` 校验。消息按会话内 `seq`（服务端在写入事务中分配的连续序号）升序返回，分页用 `total/limit/offset`。消息不可编辑，只能追加或删除单条。
+- 删除会话在同一事务内级联删除其全部消息；删除项目级联删除其下全部会话与消息；删除用户（`DELETE /admin/users/{user_id}`）级联清理该用户全部项目、会话与消息。
+- 问答本身仍走 `/kbs/{kb_id}/query`、`/kbs:query`、`/agent/query` 等既有端点：前端发起提问 → 拿到回答后把一问一答（含引用 metadata）`POST` 到 `.../messages` 落库；换浏览器登录后 `GET .../messages` 即可还原完整历史。
+- 审计：`chat_project_created/renamed/deleted`、`chat_session_created/updated/deleted`、`chat_messages_appended`（记条数）、`chat_message_deleted`，metadata 仅记录 id、计数、`has_custom_name`、`context_rounds` 等安全字段，不记录名称与消息正文。
+
+配置（`.env`）：
+
+```bash
+# 新建会话的默认上下文轮次；-1 表示每次把全部历史发给大模型
+CHAT_SESSION_DEFAULT_CONTEXT_ROUNDS=1
+```
 
 ---
 

@@ -882,6 +882,12 @@ def parse_args() -> argparse.Namespace:
         "AGENT_WORKFLOW_PROMPT_MAX_LENGTH", 16384, int
     )
 
+    # Per-user chat conversation management (/chat): default context rounds for
+    # newly created sessions (-1 = send the full history to the LLM).
+    args.chat_session_default_context_rounds = get_env_value(
+        "CHAT_SESSION_DEFAULT_CONTEXT_ROUNDS", 1, int
+    )
+
     # Bilingual (zh<->en) dual-path query (docs/BilingualQuery-zh.md)
     args.bilingual_query_enabled = get_env_value("BILINGUAL_QUERY_ENABLED", False, bool)
     args.bilingual_query_default_mode = get_env_value(

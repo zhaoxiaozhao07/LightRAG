@@ -37,6 +37,9 @@ from lightrag.api.kb_service import utc_now_iso
 from lightrag.api.metadata_store import (
     ArtifactRecord,
     AuditEventRecord,
+    ChatMessageRecord,
+    ChatProjectRecord,
+    ChatSessionRecord,
     ConfigVersionRecord,
     DocumentRecord,
     EnterpriseAPIKeyRecord,
@@ -375,6 +378,237 @@ async def test_enterprise_metadata_contract(store):
 
     assert await store.delete_kb_acl(kb_id, user.id) is True
     assert await store.get_kb_acl_role(kb_id, user.id) is None
+
+
+def _chat_project(user_id: str, name: str) -> ChatProjectRecord:
+    now = utc_now_iso()
+    return ChatProjectRecord(
+        id=f"proj_{uuid.uuid4().hex[:12]}",
+        user_id=user_id,
+        name=name,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _chat_session(
+    user_id: str, project_id: str, name: str, *, context_rounds: int = 1
+) -> ChatSessionRecord:
+    now = utc_now_iso()
+    return ChatSessionRecord(
+        id=f"sess_{uuid.uuid4().hex[:12]}",
+        project_id=project_id,
+        user_id=user_id,
+        name=name,
+        created_at=now,
+        updated_at=now,
+        context_rounds=context_rounds,
+    )
+
+
+def _chat_message(
+    user_id: str,
+    project_id: str,
+    session_id: str,
+    role: str,
+    content: str,
+    *,
+    metadata: dict | None = None,
+) -> ChatMessageRecord:
+    return ChatMessageRecord(
+        id=f"msg_{uuid.uuid4().hex[:12]}",
+        session_id=session_id,
+        project_id=project_id,
+        user_id=user_id,
+        role=role,
+        content=content,
+        metadata=metadata or {},
+        seq=0,
+        created_at=utc_now_iso(),
+    )
+
+
+async def test_chat_project_and_session_contract(store):
+    owner = await store.upsert_enterprise_user(
+        _enterprise_user(f"chat_owner_{uuid.uuid4().hex[:8]}")
+    )
+    stranger = await store.upsert_enterprise_user(
+        _enterprise_user(f"chat_stranger_{uuid.uuid4().hex[:8]}")
+    )
+
+    project = await store.create_chat_project(_chat_project(owner.id, "我的项目"))
+    fetched = await store.get_chat_project(owner.id, project.id)
+    assert fetched is not None
+    assert fetched.name == "我的项目"
+    # Ownership scoping: another user cannot see/rename/delete it.
+    assert await store.get_chat_project(stranger.id, project.id) is None
+    assert await store.rename_chat_project(stranger.id, project.id, name="hax") is None
+    assert await store.delete_chat_project(stranger.id, project.id) == (False, 0, 0)
+
+    second = await store.create_chat_project(_chat_project(owner.id, "second"))
+    projects, total = await store.list_chat_projects(owner.id)
+    assert total == 2
+    assert {p.id for p in projects} == {project.id, second.id}
+    page, page_total = await store.list_chat_projects(owner.id, limit=1, offset=1)
+    assert page_total == 2
+    assert len(page) == 1
+    stranger_projects, stranger_total = await store.list_chat_projects(stranger.id)
+    assert stranger_total == 0
+    assert stranger_projects == []
+
+    renamed = await store.rename_chat_project(owner.id, project.id, name="改名后")
+    assert renamed is not None
+    assert renamed.name == "改名后"
+    assert renamed.created_at == project.created_at
+    assert renamed.updated_at > project.updated_at
+    # Rename bumps recency: the renamed project sorts first.
+    projects, _ = await store.list_chat_projects(owner.id)
+    assert projects[0].id == project.id
+
+    # Sessions: parent project must exist and belong to the same user.
+    with pytest.raises(MetadataRecordNotFoundError):
+        await store.create_chat_session(_chat_session(owner.id, "proj_missing", "s"))
+    with pytest.raises(MetadataRecordNotFoundError):
+        await store.create_chat_session(_chat_session(stranger.id, project.id, "s"))
+
+    s1 = await store.create_chat_session(
+        _chat_session(owner.id, project.id, "2026-07-10 10:00:00")
+    )
+    s2 = await store.create_chat_session(
+        _chat_session(owner.id, project.id, "自定义会话", context_rounds=-1)
+    )
+    got = await store.get_chat_session(owner.id, project.id, s1.id)
+    assert got is not None
+    assert got.name == "2026-07-10 10:00:00"
+    assert got.context_rounds == 1
+    got_s2 = await store.get_chat_session(owner.id, project.id, s2.id)
+    assert got_s2 is not None
+    assert got_s2.context_rounds == -1
+    assert await store.get_chat_session(stranger.id, project.id, s1.id) is None
+    # Session lookups are anchored to the parent project id.
+    assert await store.get_chat_session(owner.id, second.id, s1.id) is None
+
+    sessions, total = await store.list_chat_sessions(owner.id, project.id)
+    assert total == 2
+    assert {s.id for s in sessions} == {s1.id, s2.id}
+    page, page_total = await store.list_chat_sessions(
+        owner.id, project.id, limit=1, offset=1
+    )
+    assert page_total == 2
+    assert len(page) == 1
+
+    # Name-only update keeps context_rounds untouched.
+    renamed_session = await store.update_chat_session(
+        owner.id, project.id, s2.id, name="改名会话"
+    )
+    assert renamed_session is not None
+    assert renamed_session.name == "改名会话"
+    assert renamed_session.context_rounds == -1
+    # Rounds-only update keeps the name untouched.
+    rounds_updated = await store.update_chat_session(
+        owner.id, project.id, s2.id, context_rounds=5
+    )
+    assert rounds_updated is not None
+    assert rounds_updated.name == "改名会话"
+    assert rounds_updated.context_rounds == 5
+    # Both fields at once.
+    both_updated = await store.update_chat_session(
+        owner.id, project.id, s2.id, name="再改名", context_rounds=-1
+    )
+    assert both_updated is not None
+    assert both_updated.name == "再改名"
+    assert both_updated.context_rounds == -1
+    assert (
+        await store.update_chat_session(stranger.id, project.id, s2.id, name="hax")
+        is None
+    )
+
+    # Messages: append is atomic, assigns consecutive per-session seq values
+    # and bumps the session's updated_at (recency) in the same transaction.
+    session_before = await store.get_chat_session(owner.id, project.id, s1.id)
+    with pytest.raises(MetadataRecordNotFoundError):
+        await store.append_chat_messages(
+            [_chat_message(stranger.id, project.id, s1.id, "user", "hax")]
+        )
+    first_batch = await store.append_chat_messages(
+        [
+            _chat_message(owner.id, project.id, s1.id, "user", "问题一"),
+            _chat_message(
+                owner.id,
+                project.id,
+                s1.id,
+                "assistant",
+                "回答一 [A1]",
+                metadata={"references": [{"reference_id": "A1", "kb_id": "kb_x"}]},
+            ),
+        ]
+    )
+    assert [m.seq for m in first_batch] == [1, 2]
+    second_batch = await store.append_chat_messages(
+        [_chat_message(owner.id, project.id, s1.id, "user", "问题二")]
+    )
+    assert [m.seq for m in second_batch] == [3]
+    session_after = await store.get_chat_session(owner.id, project.id, s1.id)
+    assert session_after is not None
+    assert session_after.updated_at > session_before.updated_at
+
+    messages, total = await store.list_chat_messages(owner.id, project.id, s1.id)
+    assert total == 3
+    assert [m.seq for m in messages] == [1, 2, 3]
+    assert [m.role for m in messages] == ["user", "assistant", "user"]
+    assert messages[1].metadata == {
+        "references": [{"reference_id": "A1", "kb_id": "kb_x"}]
+    }
+    page, page_total = await store.list_chat_messages(
+        owner.id, project.id, s1.id, limit=2, offset=1
+    )
+    assert page_total == 3
+    assert [m.seq for m in page] == [2, 3]
+    stranger_msgs, stranger_total = await store.list_chat_messages(
+        stranger.id, project.id, s1.id
+    )
+    assert stranger_total == 0
+    assert stranger_msgs == []
+
+    assert (
+        await store.delete_chat_message(
+            stranger.id, project.id, s1.id, messages[0].id
+        )
+        is False
+    )
+    assert (
+        await store.delete_chat_message(owner.id, project.id, s1.id, messages[0].id)
+        is True
+    )
+    _, total_after_delete = await store.list_chat_messages(
+        owner.id, project.id, s1.id
+    )
+    assert total_after_delete == 2
+
+    assert await store.delete_chat_session(owner.id, project.id, s2.id) == (True, 0)
+    assert await store.delete_chat_session(owner.id, project.id, s2.id) == (False, 0)
+    _, remaining = await store.list_chat_sessions(owner.id, project.id)
+    assert remaining == 1
+
+    # Project delete cascades its sessions and their messages.
+    assert await store.delete_chat_project(owner.id, project.id) == (True, 1, 2)
+    assert await store.get_chat_project(owner.id, project.id) is None
+    assert await store.get_chat_session(owner.id, project.id, s1.id) is None
+    _, orphan_total = await store.list_chat_messages(owner.id, project.id, s1.id)
+    assert orphan_total == 0
+
+    # User delete cascades remaining chat projects/sessions/messages.
+    s3 = await store.create_chat_session(_chat_session(owner.id, second.id, "left"))
+    await store.append_chat_messages(
+        [_chat_message(owner.id, second.id, s3.id, "user", "遗留消息")]
+    )
+    assert await store.delete_enterprise_user(owner.id) is True
+    assert await store.get_chat_project(owner.id, second.id) is None
+    assert await store.get_chat_session(owner.id, second.id, s3.id) is None
+    _, user_cascade_total = await store.list_chat_messages(
+        owner.id, second.id, s3.id
+    )
+    assert user_cascade_total == 0
 
 
 async def test_enterprise_tenant_entity_contract(store):

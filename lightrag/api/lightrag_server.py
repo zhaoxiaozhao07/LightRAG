@@ -102,6 +102,7 @@ from lightrag.api.auth import auth_handler
 from lightrag.api.enterprise_auth import (
     AuditService,
     AuthorizationService,
+    ChatConversationService,
     EnterpriseLimitService,
     InvitationService,
     LoginAttemptTracker,
@@ -111,6 +112,7 @@ from lightrag.api.enterprise_auth import (
     UserKBQuerySettingsService,
     UserService,
 )
+from lightrag.api.routers.chat_routes import create_chat_routes
 from lightrag.api.routers.enterprise_routes import create_enterprise_routes
 
 # use the .env that is inside the current folder
@@ -967,6 +969,11 @@ def create_app(args):
         if enterprise_enabled
         else None
     )
+    enterprise_chat_conversation_service = (
+        ChatConversationService(metadata_store, enterprise_audit_service)
+        if enterprise_enabled
+        else None
+    )
     enterprise_api_key_service = (
         ServiceAPIKeyService(metadata_store, enterprise_audit_service)
         if enterprise_enabled
@@ -1154,6 +1161,9 @@ def create_app(args):
         )
         app.state.enterprise_user_agent_workflow_prompt_service = (
             enterprise_user_agent_workflow_prompt_service
+        )
+        app.state.enterprise_chat_conversation_service = (
+            enterprise_chat_conversation_service
         )
         app.state.enterprise_api_key_service = enterprise_api_key_service
         app.state.enterprise_invitation_service = enterprise_invitation_service
@@ -2582,6 +2592,7 @@ def create_app(args):
     )
     if enterprise_enabled:
         app.include_router(create_enterprise_routes(api_key=api_key))
+        app.include_router(create_chat_routes(api_key=api_key))
     app.include_router(create_document_routes(rag, doc_manager, api_key))
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))

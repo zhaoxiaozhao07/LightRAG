@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import contextvars
@@ -22,6 +23,9 @@ from lightrag.api.kb_service import (
 )
 from lightrag.api.metadata_store import (
     AuditEventRecord,
+    ChatMessageRecord,
+    ChatProjectRecord,
+    ChatSessionRecord,
     EnterpriseAPIKeyRecord,
     EnterpriseInvitationRecord,
     EnterpriseUserKBQuerySettingsRecord,
@@ -30,6 +34,7 @@ from lightrag.api.metadata_store import (
     EnterpriseTenantKBACLRecord,
     EnterpriseTenantMembershipRecord,
     EnterpriseTenantRecord,
+    MetadataRecordNotFoundError,
 )
 from lightrag.api.passwords import hash_password, verify_password
 
@@ -106,6 +111,7 @@ _ENTERPRISE_PROTECTED_PREFIXES = (
     "/agent",
     "/graph",
     "/api",
+    "/chat",
 )
 _LEGACY_GLOBAL_PREFIXES = ("/documents", "/query", "/graph", "/api")
 _ENV_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
@@ -137,6 +143,70 @@ class EnterpriseMetadataStore(Protocol):
 
     async def delete_enterprise_user_kb_query_settings(
         self, user_id: str, kb_id: str
+    ) -> bool: ...
+
+    async def create_chat_project(
+        self, record: ChatProjectRecord
+    ) -> ChatProjectRecord: ...
+
+    async def get_chat_project(
+        self, user_id: str, project_id: str
+    ) -> ChatProjectRecord | None: ...
+
+    async def list_chat_projects(
+        self, user_id: str, *, limit: int = 50, offset: int = 0
+    ) -> tuple[list[ChatProjectRecord], int]: ...
+
+    async def rename_chat_project(
+        self, user_id: str, project_id: str, *, name: str
+    ) -> ChatProjectRecord | None: ...
+
+    async def delete_chat_project(
+        self, user_id: str, project_id: str
+    ) -> tuple[bool, int, int]: ...
+
+    async def create_chat_session(
+        self, record: ChatSessionRecord
+    ) -> ChatSessionRecord: ...
+
+    async def get_chat_session(
+        self, user_id: str, project_id: str, session_id: str
+    ) -> ChatSessionRecord | None: ...
+
+    async def list_chat_sessions(
+        self, user_id: str, project_id: str, *, limit: int = 50, offset: int = 0
+    ) -> tuple[list[ChatSessionRecord], int]: ...
+
+    async def update_chat_session(
+        self,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        *,
+        name: str | None = None,
+        context_rounds: int | None = None,
+    ) -> ChatSessionRecord | None: ...
+
+    async def delete_chat_session(
+        self, user_id: str, project_id: str, session_id: str
+    ) -> tuple[bool, int]: ...
+
+    async def append_chat_messages(
+        self, records: Sequence[ChatMessageRecord]
+    ) -> list[ChatMessageRecord]: ...
+
+    async def list_chat_messages(
+        self,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[ChatMessageRecord], int]: ...
+
+    async def delete_chat_message(
+        self, user_id: str, project_id: str, session_id: str, message_id: str
     ) -> bool: ...
 
     async def create_enterprise_api_key(
@@ -343,6 +413,22 @@ def agent_workflow_prompt_max_length() -> int:
         0,
         int(getattr(_global_args(), "agent_workflow_prompt_max_length", 16384) or 16384),
     )
+
+
+def chat_session_default_context_rounds() -> int:
+    """Default context rounds for newly created chat sessions.
+
+    Configured via ``CHAT_SESSION_DEFAULT_CONTEXT_ROUNDS``; valid values are
+    ``-1`` (send the full history to the LLM) or a positive round count. An
+    invalid configuration falls back to ``1``.
+    """
+    try:
+        value = int(
+            getattr(_global_args(), "chat_session_default_context_rounds", 1)
+        )
+    except (TypeError, ValueError):
+        return 1
+    return value if value == -1 or value >= 1 else 1
 
 
 def enterprise_artifact_download_min_role() -> str:
@@ -1043,6 +1129,328 @@ class UserAgentWorkflowPromptService:
             workflow_prompt="",
             actor_user_id=actor_user_id,
         )
+
+
+class ChatConversationService:
+    """Per-user chat conversation management (projects + sessions).
+
+    Projects and sessions are pure control-plane records that let a client
+    organize per-user Q&A history (user > project > session); they never touch
+    LightRAG engine storage. Every operation is scoped to the owning
+    ``user_id`` so users cannot read or mutate each other's records. Audit
+    events record ids and flags only, never user-supplied names.
+    """
+
+    def __init__(
+        self,
+        metadata_store: EnterpriseMetadataStore,
+        audit_service: AuditService | None = None,
+    ):
+        self._metadata_store = metadata_store
+        self._audit_service = audit_service
+
+    @staticmethod
+    def default_session_name() -> str:
+        # Sessions are named after their creation time (server local time)
+        # unless the client supplies an explicit name.
+        return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+    async def _audit(
+        self,
+        event_type: str,
+        *,
+        actor_user_id: str,
+        target_type: str,
+        target_id: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                event_type,
+                actor_user_id=actor_user_id,
+                target_type=target_type,
+                target_id=target_id,
+                metadata=metadata,
+            )
+
+    async def create_project(
+        self, *, user_id: str, name: str, actor_user_id: str | None = None
+    ) -> ChatProjectRecord:
+        now = utc_now_iso()
+        record = ChatProjectRecord(
+            id=f"proj_{uuid4().hex[:12]}",
+            user_id=user_id,
+            name=name,
+            created_at=now,
+            updated_at=now,
+        )
+        saved = await self._metadata_store.create_chat_project(record)
+        await self._audit(
+            "chat_project_created",
+            actor_user_id=actor_user_id or user_id,
+            target_type="chat_project",
+            target_id=saved.id,
+            metadata={"user_id": user_id},
+        )
+        return saved
+
+    async def get_project(
+        self, user_id: str, project_id: str
+    ) -> ChatProjectRecord | None:
+        return await self._metadata_store.get_chat_project(user_id, project_id)
+
+    async def list_projects(
+        self, user_id: str, *, limit: int = 50, offset: int = 0
+    ) -> tuple[list[ChatProjectRecord], int]:
+        return await self._metadata_store.list_chat_projects(
+            user_id, limit=limit, offset=offset
+        )
+
+    async def rename_project(
+        self,
+        *,
+        user_id: str,
+        project_id: str,
+        name: str,
+        actor_user_id: str | None = None,
+    ) -> ChatProjectRecord | None:
+        renamed = await self._metadata_store.rename_chat_project(
+            user_id, project_id, name=name
+        )
+        if renamed is not None:
+            await self._audit(
+                "chat_project_renamed",
+                actor_user_id=actor_user_id or user_id,
+                target_type="chat_project",
+                target_id=project_id,
+                metadata={"user_id": user_id},
+            )
+        return renamed
+
+    async def delete_project(
+        self, *, user_id: str, project_id: str, actor_user_id: str | None = None
+    ) -> tuple[bool, int, int]:
+        deleted, deleted_sessions, deleted_messages = (
+            await self._metadata_store.delete_chat_project(user_id, project_id)
+        )
+        if deleted:
+            await self._audit(
+                "chat_project_deleted",
+                actor_user_id=actor_user_id or user_id,
+                target_type="chat_project",
+                target_id=project_id,
+                metadata={
+                    "user_id": user_id,
+                    "deleted_sessions": deleted_sessions,
+                    "deleted_messages": deleted_messages,
+                },
+            )
+        return deleted, deleted_sessions, deleted_messages
+
+    async def create_session(
+        self,
+        *,
+        user_id: str,
+        project_id: str,
+        name: str | None = None,
+        context_rounds: int | None = None,
+        actor_user_id: str | None = None,
+    ) -> ChatSessionRecord | None:
+        """Create a session under an owned project.
+
+        Returns ``None`` when the project does not exist for this user. A
+        blank/omitted ``name`` falls back to the creation-time default; an
+        omitted ``context_rounds`` falls back to the deployment default
+        (``CHAT_SESSION_DEFAULT_CONTEXT_ROUNDS``).
+        """
+        effective_name = (name or "").strip() or self.default_session_name()
+        effective_rounds = (
+            context_rounds
+            if context_rounds is not None
+            else chat_session_default_context_rounds()
+        )
+        now = utc_now_iso()
+        record = ChatSessionRecord(
+            id=f"sess_{uuid4().hex[:12]}",
+            project_id=project_id,
+            user_id=user_id,
+            name=effective_name,
+            created_at=now,
+            updated_at=now,
+            context_rounds=effective_rounds,
+        )
+        try:
+            saved = await self._metadata_store.create_chat_session(record)
+        except MetadataRecordNotFoundError:
+            return None
+        await self._audit(
+            "chat_session_created",
+            actor_user_id=actor_user_id or user_id,
+            target_type="chat_session",
+            target_id=saved.id,
+            metadata={
+                "user_id": user_id,
+                "project_id": project_id,
+                "has_custom_name": bool((name or "").strip()),
+                "context_rounds": saved.context_rounds,
+            },
+        )
+        return saved
+
+    async def get_session(
+        self, user_id: str, project_id: str, session_id: str
+    ) -> ChatSessionRecord | None:
+        return await self._metadata_store.get_chat_session(
+            user_id, project_id, session_id
+        )
+
+    async def list_sessions(
+        self, user_id: str, project_id: str, *, limit: int = 50, offset: int = 0
+    ) -> tuple[list[ChatSessionRecord], int]:
+        return await self._metadata_store.list_chat_sessions(
+            user_id, project_id, limit=limit, offset=offset
+        )
+
+    async def update_session(
+        self,
+        *,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        name: str | None = None,
+        context_rounds: int | None = None,
+        actor_user_id: str | None = None,
+    ) -> ChatSessionRecord | None:
+        updated = await self._metadata_store.update_chat_session(
+            user_id,
+            project_id,
+            session_id,
+            name=name,
+            context_rounds=context_rounds,
+        )
+        if updated is not None:
+            await self._audit(
+                "chat_session_updated",
+                actor_user_id=actor_user_id or user_id,
+                target_type="chat_session",
+                target_id=session_id,
+                metadata={
+                    "user_id": user_id,
+                    "project_id": project_id,
+                    "renamed": name is not None,
+                    "context_rounds_changed": context_rounds is not None,
+                    "context_rounds": updated.context_rounds,
+                },
+            )
+        return updated
+
+    async def delete_session(
+        self,
+        *,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        actor_user_id: str | None = None,
+    ) -> tuple[bool, int]:
+        deleted, deleted_messages = await self._metadata_store.delete_chat_session(
+            user_id, project_id, session_id
+        )
+        if deleted:
+            await self._audit(
+                "chat_session_deleted",
+                actor_user_id=actor_user_id or user_id,
+                target_type="chat_session",
+                target_id=session_id,
+                metadata={
+                    "user_id": user_id,
+                    "project_id": project_id,
+                    "deleted_messages": deleted_messages,
+                },
+            )
+        return deleted, deleted_messages
+
+    async def append_messages(
+        self,
+        *,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        messages: Sequence[dict[str, Any]],
+        actor_user_id: str | None = None,
+    ) -> list[ChatMessageRecord] | None:
+        """Append messages (dicts with ``role``/``content``/``metadata``) to an
+        owned session. Returns ``None`` when the session does not exist for
+        this user."""
+        now = utc_now_iso()
+        records = [
+            ChatMessageRecord(
+                id=f"msg_{uuid4().hex[:12]}",
+                session_id=session_id,
+                project_id=project_id,
+                user_id=user_id,
+                role=str(message["role"]),
+                content=str(message["content"]),
+                metadata=dict(message.get("metadata") or {}),
+                seq=0,
+                created_at=now,
+            )
+            for message in messages
+        ]
+        try:
+            saved = await self._metadata_store.append_chat_messages(records)
+        except MetadataRecordNotFoundError:
+            return None
+        await self._audit(
+            "chat_messages_appended",
+            actor_user_id=actor_user_id or user_id,
+            target_type="chat_session",
+            target_id=session_id,
+            metadata={
+                "user_id": user_id,
+                "project_id": project_id,
+                "message_count": len(saved),
+            },
+        )
+        return saved
+
+    async def list_messages(
+        self,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[ChatMessageRecord], int]:
+        return await self._metadata_store.list_chat_messages(
+            user_id, project_id, session_id, limit=limit, offset=offset
+        )
+
+    async def delete_message(
+        self,
+        *,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        message_id: str,
+        actor_user_id: str | None = None,
+    ) -> bool:
+        deleted = await self._metadata_store.delete_chat_message(
+            user_id, project_id, session_id, message_id
+        )
+        if deleted:
+            await self._audit(
+                "chat_message_deleted",
+                actor_user_id=actor_user_id or user_id,
+                target_type="chat_session",
+                target_id=session_id,
+                metadata={
+                    "user_id": user_id,
+                    "project_id": project_id,
+                    "message_id": message_id,
+                },
+            )
+        return deleted
 
 
 class InvitationService:
@@ -2206,6 +2614,18 @@ def get_enterprise_user_agent_workflow_prompt_service(
         raise HTTPException(
             status_code=500,
             detail="Enterprise user Agent workflow prompt service unavailable",
+        )
+    return service
+
+
+def get_enterprise_chat_conversation_service(
+    request: Request,
+) -> ChatConversationService:
+    service = getattr(request.app.state, "enterprise_chat_conversation_service", None)
+    if not isinstance(service, ChatConversationService):
+        raise HTTPException(
+            status_code=500,
+            detail="Enterprise chat conversation service unavailable",
         )
     return service
 

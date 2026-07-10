@@ -18,6 +18,9 @@ from lightrag.api.metadata_store import (
     ActiveDocumentReplaceJobError,
     ArtifactRecord,
     AuditEventRecord,
+    ChatMessageRecord,
+    ChatProjectRecord,
+    ChatSessionRecord,
     ConfigVersionRecord,
     DocumentNotParsedError,
     DocumentRecord,
@@ -100,6 +103,24 @@ def _enterprise_user_kb_query_settings_from_row(
 ) -> EnterpriseUserKBQuerySettingsRecord:
     data = _loads_json_object(row["data_json"])
     return EnterpriseUserKBQuerySettingsRecord(**data)
+
+
+def _chat_project_from_row(row: Any) -> ChatProjectRecord:
+    data = _loads_json_object(row["data_json"])
+    return ChatProjectRecord(**data)
+
+
+def _chat_session_from_row(row: Any) -> ChatSessionRecord:
+    data = _loads_json_object(row["data_json"])
+    # Legacy JSONB rows predate context_rounds; default it so the dataclass
+    # deserializes without raising on the missing key.
+    data.setdefault("context_rounds", 1)
+    return ChatSessionRecord(**data)
+
+
+def _chat_message_from_row(row: Any) -> ChatMessageRecord:
+    data = _loads_json_object(row["data_json"])
+    return ChatMessageRecord(**data)
 
 
 def _enterprise_api_key_from_row(row: Any) -> EnterpriseAPIKeyRecord:
@@ -1428,8 +1449,9 @@ class PostgresMetadataStore:
         return await self._write(write)
 
     async def delete_enterprise_user(self, user_id: str) -> bool:
-        """Delete a user and cascade-remove related tenant memberships, KB ACLs
-        and per-user query settings.  Returns ``True`` if the user existed."""
+        """Delete a user and cascade-remove related tenant memberships, KB ACLs,
+        per-user query settings and chat projects/sessions.  Returns ``True`` if
+        the user existed."""
         await self._ensure_initialized()
 
         async def write(conn: Any) -> bool:
@@ -1444,6 +1466,18 @@ class PostgresMetadataStore:
             )
             await conn.execute(
                 "DELETE FROM enterprise_user_kb_query_settings WHERE user_id = $1",
+                user_id,
+            )
+            await conn.execute(
+                "DELETE FROM enterprise_chat_messages WHERE user_id = $1",
+                user_id,
+            )
+            await conn.execute(
+                "DELETE FROM enterprise_chat_sessions WHERE user_id = $1",
+                user_id,
+            )
+            await conn.execute(
+                "DELETE FROM enterprise_chat_projects WHERE user_id = $1",
                 user_id,
             )
             status = await conn.execute(
@@ -1527,6 +1561,459 @@ class PostgresMetadataStore:
                 """,
                 user_id,
                 kb_id,
+            )
+            return _rowcount(status) > 0
+
+        return await self._write(write)
+
+    async def create_chat_project(self, record: ChatProjectRecord) -> ChatProjectRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> ChatProjectRecord:
+            await conn.execute(
+                """
+                INSERT INTO enterprise_chat_projects (
+                    id, user_id, name, created_at, updated_at, data_json
+                ) VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                """,
+                record.id,
+                record.user_id,
+                record.name,
+                record.created_at,
+                record.updated_at,
+                _record_json(record),
+            )
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_chat_projects WHERE id = $1",
+                record.id,
+            )
+            if row is None:
+                raise MetadataRecordNotFoundError("Chat project not found")
+            return _chat_project_from_row(row)
+
+        return await self._write(write)
+
+    async def get_chat_project(
+        self, user_id: str, project_id: str
+    ) -> ChatProjectRecord | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT data_json FROM enterprise_chat_projects
+                WHERE id = $1 AND user_id = $2
+                """,
+                project_id,
+                user_id,
+            )
+        return _chat_project_from_row(row) if row is not None else None
+
+    async def list_chat_projects(
+        self, user_id: str, *, limit: int = 50, offset: int = 0
+    ) -> tuple[list[ChatProjectRecord], int]:
+        await self._ensure_initialized()
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        async with self._pool_or_raise().acquire() as conn:
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM enterprise_chat_projects WHERE user_id = $1",
+                user_id,
+            )
+            rows = await conn.fetch(
+                """
+                SELECT data_json FROM enterprise_chat_projects
+                WHERE user_id = $1
+                ORDER BY updated_at DESC, id DESC
+                LIMIT $2 OFFSET $3
+                """,
+                user_id,
+                limit,
+                offset,
+            )
+        return [_chat_project_from_row(row) for row in rows], int(total)
+
+    async def rename_chat_project(
+        self, user_id: str, project_id: str, *, name: str
+    ) -> ChatProjectRecord | None:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> ChatProjectRecord | None:
+            row = await conn.fetchrow(
+                """
+                SELECT data_json FROM enterprise_chat_projects
+                WHERE id = $1 AND user_id = $2
+                FOR UPDATE
+                """,
+                project_id,
+                user_id,
+            )
+            if row is None:
+                return None
+            record = _chat_project_from_row(row)
+            record.name = name
+            record.updated_at = utc_now_iso()
+            await conn.execute(
+                """
+                UPDATE enterprise_chat_projects
+                SET name = $3, updated_at = $4, data_json = $5::jsonb
+                WHERE id = $1 AND user_id = $2
+                """,
+                project_id,
+                user_id,
+                record.name,
+                record.updated_at,
+                _record_json(record),
+            )
+            return record
+
+        return await self._write(write)
+
+    async def delete_chat_project(
+        self, user_id: str, project_id: str
+    ) -> tuple[bool, int, int]:
+        """Delete a chat project owned by ``user_id`` and cascade-delete its
+        sessions and messages. Returns ``(deleted, deleted_sessions,
+        deleted_messages)``."""
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> tuple[bool, int, int]:
+            owner = await conn.fetchval(
+                """
+                SELECT id FROM enterprise_chat_projects
+                WHERE id = $1 AND user_id = $2
+                """,
+                project_id,
+                user_id,
+            )
+            if owner is None:
+                return False, 0, 0
+            messages_status = await conn.execute(
+                "DELETE FROM enterprise_chat_messages WHERE project_id = $1",
+                project_id,
+            )
+            sessions_status = await conn.execute(
+                "DELETE FROM enterprise_chat_sessions WHERE project_id = $1",
+                project_id,
+            )
+            await conn.execute(
+                "DELETE FROM enterprise_chat_projects WHERE id = $1",
+                project_id,
+            )
+            return True, _rowcount(sessions_status), _rowcount(messages_status)
+
+        return await self._write(write)
+
+    async def create_chat_session(self, record: ChatSessionRecord) -> ChatSessionRecord:
+        """Insert a chat session. Raises :class:`MetadataRecordNotFoundError`
+        when the parent project does not exist or is not owned by the user."""
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> ChatSessionRecord:
+            project = await conn.fetchval(
+                """
+                SELECT id FROM enterprise_chat_projects
+                WHERE id = $1 AND user_id = $2
+                """,
+                record.project_id,
+                record.user_id,
+            )
+            if project is None:
+                raise MetadataRecordNotFoundError(
+                    f"Chat project '{record.project_id}' not found"
+                )
+            await conn.execute(
+                """
+                INSERT INTO enterprise_chat_sessions (
+                    id, project_id, user_id, name, created_at, updated_at, data_json
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                """,
+                record.id,
+                record.project_id,
+                record.user_id,
+                record.name,
+                record.created_at,
+                record.updated_at,
+                _record_json(record),
+            )
+            row = await conn.fetchrow(
+                "SELECT data_json FROM enterprise_chat_sessions WHERE id = $1",
+                record.id,
+            )
+            if row is None:
+                raise MetadataRecordNotFoundError("Chat session not found")
+            return _chat_session_from_row(row)
+
+        return await self._write(write)
+
+    async def get_chat_session(
+        self, user_id: str, project_id: str, session_id: str
+    ) -> ChatSessionRecord | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT data_json FROM enterprise_chat_sessions
+                WHERE id = $1 AND project_id = $2 AND user_id = $3
+                """,
+                session_id,
+                project_id,
+                user_id,
+            )
+        return _chat_session_from_row(row) if row is not None else None
+
+    async def list_chat_sessions(
+        self, user_id: str, project_id: str, *, limit: int = 50, offset: int = 0
+    ) -> tuple[list[ChatSessionRecord], int]:
+        await self._ensure_initialized()
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        async with self._pool_or_raise().acquire() as conn:
+            total = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM enterprise_chat_sessions
+                WHERE project_id = $1 AND user_id = $2
+                """,
+                project_id,
+                user_id,
+            )
+            rows = await conn.fetch(
+                """
+                SELECT data_json FROM enterprise_chat_sessions
+                WHERE project_id = $1 AND user_id = $2
+                ORDER BY updated_at DESC, id DESC
+                LIMIT $3 OFFSET $4
+                """,
+                project_id,
+                user_id,
+                limit,
+                offset,
+            )
+        return [_chat_session_from_row(row) for row in rows], int(total)
+
+    async def update_chat_session(
+        self,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        *,
+        name: str | None = None,
+        context_rounds: int | None = None,
+    ) -> ChatSessionRecord | None:
+        """Update the provided fields of an owned session; ``None`` leaves a
+        field unchanged. Returns ``None`` when the session is not found."""
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> ChatSessionRecord | None:
+            row = await conn.fetchrow(
+                """
+                SELECT data_json FROM enterprise_chat_sessions
+                WHERE id = $1 AND project_id = $2 AND user_id = $3
+                FOR UPDATE
+                """,
+                session_id,
+                project_id,
+                user_id,
+            )
+            if row is None:
+                return None
+            record = _chat_session_from_row(row)
+            if name is not None:
+                record.name = name
+            if context_rounds is not None:
+                record.context_rounds = context_rounds
+            record.updated_at = utc_now_iso()
+            await conn.execute(
+                """
+                UPDATE enterprise_chat_sessions
+                SET name = $4, updated_at = $5, data_json = $6::jsonb
+                WHERE id = $1 AND project_id = $2 AND user_id = $3
+                """,
+                session_id,
+                project_id,
+                user_id,
+                record.name,
+                record.updated_at,
+                _record_json(record),
+            )
+            return record
+
+        return await self._write(write)
+
+    async def delete_chat_session(
+        self, user_id: str, project_id: str, session_id: str
+    ) -> tuple[bool, int]:
+        """Delete an owned session and cascade-delete its messages. Returns
+        ``(deleted, deleted_messages)``."""
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> tuple[bool, int]:
+            owner = await conn.fetchval(
+                """
+                SELECT id FROM enterprise_chat_sessions
+                WHERE id = $1 AND project_id = $2 AND user_id = $3
+                """,
+                session_id,
+                project_id,
+                user_id,
+            )
+            if owner is None:
+                return False, 0
+            messages_status = await conn.execute(
+                "DELETE FROM enterprise_chat_messages WHERE session_id = $1",
+                session_id,
+            )
+            await conn.execute(
+                "DELETE FROM enterprise_chat_sessions WHERE id = $1",
+                session_id,
+            )
+            return True, _rowcount(messages_status)
+
+        return await self._write(write)
+
+    async def append_chat_messages(
+        self, records: Sequence[ChatMessageRecord]
+    ) -> list[ChatMessageRecord]:
+        """Atomically append messages to a single owned session.
+
+        Assigns consecutive per-session ``seq`` values and bumps the session's
+        ``updated_at`` in the same transaction. All records must target the
+        same ``(user_id, project_id, session_id)``. Raises
+        :class:`MetadataRecordNotFoundError` when the session does not exist
+        or is not owned by the user."""
+        if not records:
+            return []
+        head = records[0]
+        if any(
+            record.session_id != head.session_id
+            or record.project_id != head.project_id
+            or record.user_id != head.user_id
+            for record in records
+        ):
+            raise ValueError("All appended messages must target the same session")
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> list[ChatMessageRecord]:
+            session_row = await conn.fetchrow(
+                """
+                SELECT data_json FROM enterprise_chat_sessions
+                WHERE id = $1 AND project_id = $2 AND user_id = $3
+                FOR UPDATE
+                """,
+                head.session_id,
+                head.project_id,
+                head.user_id,
+            )
+            if session_row is None:
+                raise MetadataRecordNotFoundError(
+                    f"Chat session '{head.session_id}' not found"
+                )
+            next_seq = (
+                int(
+                    await conn.fetchval(
+                        """
+                        SELECT COALESCE(MAX(seq), 0) FROM enterprise_chat_messages
+                        WHERE session_id = $1
+                        """,
+                        head.session_id,
+                    )
+                )
+                + 1
+            )
+            for index, record in enumerate(records):
+                record.seq = next_seq + index
+                await conn.execute(
+                    """
+                    INSERT INTO enterprise_chat_messages (
+                        id, session_id, project_id, user_id, seq, created_at,
+                        data_json
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                    """,
+                    record.id,
+                    record.session_id,
+                    record.project_id,
+                    record.user_id,
+                    record.seq,
+                    record.created_at,
+                    _record_json(record),
+                )
+            session = _chat_session_from_row(session_row)
+            session.updated_at = utc_now_iso()
+            await conn.execute(
+                """
+                UPDATE enterprise_chat_sessions
+                SET updated_at = $2, data_json = $3::jsonb
+                WHERE id = $1
+                """,
+                head.session_id,
+                session.updated_at,
+                _record_json(session),
+            )
+            rows = await conn.fetch(
+                """
+                SELECT data_json FROM enterprise_chat_messages
+                WHERE session_id = $1 AND seq >= $2
+                ORDER BY seq ASC, id ASC
+                """,
+                head.session_id,
+                next_seq,
+            )
+            return [_chat_message_from_row(row) for row in rows]
+
+        return await self._write(write)
+
+    async def list_chat_messages(
+        self,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[ChatMessageRecord], int]:
+        await self._ensure_initialized()
+        limit = max(1, min(limit, 500))
+        offset = max(0, offset)
+        async with self._pool_or_raise().acquire() as conn:
+            total = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM enterprise_chat_messages
+                WHERE session_id = $1 AND project_id = $2 AND user_id = $3
+                """,
+                session_id,
+                project_id,
+                user_id,
+            )
+            rows = await conn.fetch(
+                """
+                SELECT data_json FROM enterprise_chat_messages
+                WHERE session_id = $1 AND project_id = $2 AND user_id = $3
+                ORDER BY seq ASC, id ASC
+                LIMIT $4 OFFSET $5
+                """,
+                session_id,
+                project_id,
+                user_id,
+                limit,
+                offset,
+            )
+        return [_chat_message_from_row(row) for row in rows], int(total)
+
+    async def delete_chat_message(
+        self, user_id: str, project_id: str, session_id: str, message_id: str
+    ) -> bool:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> bool:
+            status = await conn.execute(
+                """
+                DELETE FROM enterprise_chat_messages
+                WHERE id = $1 AND session_id = $2 AND project_id = $3
+                    AND user_id = $4
+                """,
+                message_id,
+                session_id,
+                project_id,
+                user_id,
             )
             return _rowcount(status) > 0
 
@@ -2554,6 +3041,52 @@ class PostgresMetadataStore:
             );
             CREATE INDEX IF NOT EXISTS idx_enterprise_user_kb_query_settings_kb
                 ON enterprise_user_kb_query_settings (kb_id, user_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_chat_projects (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                data_json JSONB NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES enterprise_users(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_projects_user
+                ON enterprise_chat_projects (user_id, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS enterprise_chat_sessions (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                data_json JSONB NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES enterprise_chat_projects(id),
+                FOREIGN KEY (user_id) REFERENCES enterprise_users(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_sessions_project
+                ON enterprise_chat_sessions (project_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_sessions_user
+                ON enterprise_chat_sessions (user_id, project_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_chat_messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                seq BIGINT NOT NULL,
+                created_at TEXT NOT NULL,
+                data_json JSONB NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES enterprise_chat_sessions(id),
+                FOREIGN KEY (user_id) REFERENCES enterprise_users(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_messages_session
+                ON enterprise_chat_messages (session_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_messages_project
+                ON enterprise_chat_messages (project_id);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_messages_user
+                ON enterprise_chat_messages (user_id);
 
             CREATE TABLE IF NOT EXISTS enterprise_api_keys (
                 id TEXT PRIMARY KEY,
