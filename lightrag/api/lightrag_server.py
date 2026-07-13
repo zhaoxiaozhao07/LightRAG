@@ -113,6 +113,7 @@ from lightrag.api.enterprise_auth import (
     UserService,
 )
 from lightrag.api.routers.chat_routes import create_chat_routes
+from lightrag.api.chat_memory_service import ChatMemoryConfig, ChatMemoryService
 from lightrag.api.routers.enterprise_routes import create_enterprise_routes
 
 # use the .env that is inside the current folder
@@ -974,6 +975,12 @@ def create_app(args):
         if enterprise_enabled
         else None
     )
+    # Per-user-per-project chat memory (graphiti); only built when the
+    # feature flag is on so deployments without the memory extra stay clean.
+    # Constructed further below, after the server rerank function exists (the
+    # memory search cross-encoder reuses it); the lifespan closure reads this
+    # variable at startup time, well after the reassignment.
+    enterprise_chat_memory_service = None
     enterprise_api_key_service = (
         ServiceAPIKeyService(metadata_store, enterprise_audit_service)
         if enterprise_enabled
@@ -1043,6 +1050,11 @@ def create_app(args):
             if object_storage is not None:
                 await object_storage.initialize()
 
+            if enterprise_chat_memory_service is not None:
+                # Fail-soft: an unreachable Neo4j / missing graphiti install
+                # logs an error and the service retries lazily on first use.
+                await enterprise_chat_memory_service.initialize()
+
             # Recover orphan jobs left in queued/running/cancelling/retrying
             # by a previous process. When the durable job worker is enabled,
             # queued jobs of resumable types are LEFT queued for the worker to
@@ -1080,6 +1092,8 @@ def create_app(args):
             worker = getattr(app.state, "job_worker", None)
             if worker is not None:
                 await worker.stop()
+            if enterprise_chat_memory_service is not None:
+                await enterprise_chat_memory_service.finalize()
             await kb_registry.shutdown()
             if object_storage is not None:
                 await object_storage.close()
@@ -1165,6 +1179,7 @@ def create_app(args):
         app.state.enterprise_chat_conversation_service = (
             enterprise_chat_conversation_service
         )
+        app.state.enterprise_chat_memory_service = enterprise_chat_memory_service
         app.state.enterprise_api_key_service = enterprise_api_key_service
         app.state.enterprise_invitation_service = enterprise_invitation_service
         app.state.enterprise_limit_service = enterprise_limit_service
@@ -2240,6 +2255,19 @@ def create_app(args):
     else:
         logger.info("Reranking is disabled")
 
+    # Build the chat memory service now that the server rerank function exists
+    # (its search cross-encoder recipe reuses it when MEMORY_RERANK_ENABLED).
+    if enterprise_enabled:
+        chat_memory_config = ChatMemoryConfig.from_args(args)
+        if chat_memory_config.enabled:
+            enterprise_chat_memory_service = ChatMemoryService(
+                chat_memory_config,
+                audit_service=enterprise_audit_service,
+                metadata_store=metadata_store,
+                rerank_fn=rerank_model_func,
+            )
+            app.state.enterprise_chat_memory_service = enterprise_chat_memory_service
+
     # Create ollama_server_infos from command line arguments
     from lightrag.api.config import OllamaServerInfos
 
@@ -2668,6 +2696,13 @@ def create_app(args):
                 "auth_configured": True,
                 "auth_mode": "enterprise",
                 "registration_enabled": registration_enabled,
+                # Front-end capability probe: whether the per-project chat
+                # memory feature is on, so the UI can show/hide memory controls
+                # without having to trip a 503 from memory:search.
+                "chat_memory_enabled": (
+                    enterprise_chat_memory_service is not None
+                    and enterprise_chat_memory_service.config.enabled
+                ),
                 "core_version": core_version,
                 "api_version": api_version_display,
                 "webui_title": webui_title,
@@ -2947,6 +2982,28 @@ def create_app(args):
                 "llm_queue_status": await rag.get_llm_queue_status(include_base=True),
                 "embedding_queue_status": await rag.get_embedding_queue_status(),
                 "rerank_queue_status": await rag.get_rerank_queue_status(),
+                # Chat memory (graphiti) runtime state. ``enabled`` reflects the
+                # config flag; ``available`` is False when the flag is on but
+                # graphiti/Neo4j failed to initialize (lazy-retry pending) —
+                # the signal ops needs since memory is fail-open and users see
+                # no error when the backend is down.
+                "chat_memory": {
+                    "enabled": (
+                        enterprise_chat_memory_service.config.enabled
+                        if enterprise_chat_memory_service is not None
+                        else False
+                    ),
+                    "available": (
+                        enterprise_chat_memory_service.available
+                        if enterprise_chat_memory_service is not None
+                        else False
+                    ),
+                    "pending_tasks": (
+                        enterprise_chat_memory_service.pending_background_tasks
+                        if enterprise_chat_memory_service is not None
+                        else 0
+                    ),
+                },
                 "core_version": core_version,
                 "api_version": api_version_display,
                 "webui_title": webui_title,

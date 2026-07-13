@@ -611,6 +611,178 @@ async def test_chat_project_and_session_contract(store):
     assert user_cascade_total == 0
 
 
+async def test_chat_memory_episode_contract(store):
+    """Episode-mapping surface backing the graphiti chat memory: watermark,
+    covering lookups, backlog scan and scoped deletes behave identically on
+    both backends (docs/ChatMemory-zh.md)."""
+    owner = await store.upsert_enterprise_user(
+        _enterprise_user(f"mem_owner_{uuid.uuid4().hex[:8]}")
+    )
+    project = await store.create_chat_project(_chat_project(owner.id, "记忆项目"))
+    session = await store.create_chat_session(
+        _chat_session(owner.id, project.id, "记忆会话")
+    )
+    saved = await store.append_chat_messages(
+        [
+            _chat_message(owner.id, project.id, session.id, "user", "问题一"),
+            _chat_message(owner.id, project.id, session.id, "assistant", "回答一"),
+            _chat_message(owner.id, project.id, session.id, "user", "问题二"),
+        ]
+    )
+    assert [m.seq for m in saved] == [1, 2, 3]
+
+    # Point lookup used by the message-delete hook.
+    got = await store.get_chat_message(owner.id, project.id, session.id, saved[1].id)
+    assert got is not None
+    assert (got.seq, got.role) == (2, "assistant")
+    assert (
+        await store.get_chat_message("usr_other", project.id, session.id, saved[1].id)
+        is None
+    )
+
+    # Tail fetch used by compensation.
+    tail = await store.list_chat_messages_after_seq(
+        owner.id, project.id, session.id, after_seq=1
+    )
+    assert [m.seq for m in tail] == [2, 3]
+    assert (
+        await store.list_chat_messages_after_seq(
+            owner.id, project.id, session.id, after_seq=3
+        )
+        == []
+    )
+
+    # No episodes yet: watermark 0 and the session shows up as backlog.
+    assert await store.get_chat_memory_watermark(owner.id, project.id, session.id) == 0
+    backlog = await store.list_chat_memory_backlog()
+    entry = next(item for item in backlog if item.session_id == session.id)
+    assert (entry.ingested_seq, entry.max_seq) == (0, 3)
+    assert (entry.user_id, entry.project_id) == (owner.id, project.id)
+
+    def _episode(uuid_str: str, first_seq: int, last_seq: int):
+        from lightrag.api.metadata_store import ChatMemoryEpisodeRecord
+
+        return ChatMemoryEpisodeRecord(
+            episode_uuid=uuid_str,
+            session_id=session.id,
+            project_id=project.id,
+            user_id=owner.id,
+            first_seq=first_seq,
+            last_seq=last_seq,
+            created_at=utc_now_iso(),
+        )
+
+    await store.record_chat_memory_episode(_episode("ep-1", 1, 2))
+    # Upsert semantics on the same uuid.
+    await store.record_chat_memory_episode(_episode("ep-1", 1, 2))
+    assert await store.get_chat_memory_watermark(owner.id, project.id, session.id) == 2
+    entry = next(
+        item
+        for item in await store.list_chat_memory_backlog()
+        if item.session_id == session.id
+    )
+    assert (entry.ingested_seq, entry.max_seq) == (2, 3)
+
+    await store.record_chat_memory_episode(_episode("ep-2", 3, 3))
+    assert await store.get_chat_memory_watermark(owner.id, project.id, session.id) == 3
+    assert all(
+        item.session_id != session.id
+        for item in await store.list_chat_memory_backlog()
+    )
+
+    covering = await store.find_chat_memory_episodes_covering(
+        owner.id, project.id, session.id, 2
+    )
+    assert [e.episode_uuid for e in covering] == ["ep-1"]
+    assert (covering[0].first_seq, covering[0].last_seq) == (1, 2)
+    listed = await store.list_chat_memory_episodes_for_session(
+        owner.id, project.id, session.id
+    )
+    assert [e.episode_uuid for e in listed] == ["ep-1", "ep-2"]
+    # Ownership scoping mirrors the chat tables.
+    assert (
+        await store.find_chat_memory_episodes_covering(
+            "usr_other", project.id, session.id, 2
+        )
+        == []
+    )
+
+    # Deleting one episode row lowers the watermark and reopens the backlog.
+    assert await store.delete_chat_memory_episodes(["ep-2", "ep-missing"]) == 1
+    assert await store.delete_chat_memory_episodes([]) == 0
+    assert await store.get_chat_memory_watermark(owner.id, project.id, session.id) == 2
+
+    # Scoped bulk deletes for project/user purges.
+    await store.record_chat_memory_episode(_episode("ep-3", 3, 3))
+    assert await store.delete_chat_memory_episodes_for_project(project.id) == 2
+    assert await store.get_chat_memory_watermark(owner.id, project.id, session.id) == 0
+    await store.record_chat_memory_episode(_episode("ep-4", 1, 3))
+    assert await store.delete_chat_memory_episodes_for_user(owner.id) == 1
+    assert (
+        await store.list_chat_memory_episodes_for_session(
+            owner.id, project.id, session.id
+        )
+        == []
+    )
+
+
+async def test_chat_memory_episode_counts_contract(store):
+    """Episode-count surface backing the project overview + admin dashboard:
+    counts exclude ``noop_`` placeholder rows and scope per user/project."""
+    from lightrag.api.metadata_store import ChatMemoryEpisodeRecord
+
+    owner = await store.upsert_enterprise_user(
+        _enterprise_user(f"cnt_owner_{uuid.uuid4().hex[:8]}")
+    )
+    project = await store.create_chat_project(_chat_project(owner.id, "计数项目"))
+    session = await store.create_chat_session(
+        _chat_session(owner.id, project.id, "会话")
+    )
+
+    async def _record(uuid_str, first, last, created_at):
+        await store.record_chat_memory_episode(
+            ChatMemoryEpisodeRecord(
+                episode_uuid=uuid_str,
+                session_id=session.id,
+                project_id=project.id,
+                user_id=owner.id,
+                first_seq=first,
+                last_seq=last,
+                created_at=created_at,
+            )
+        )
+
+    # Empty project => zero count, null last-ingested.
+    count, last_at = await store.count_chat_memory_episodes_for_project(
+        owner.id, project.id
+    )
+    assert (count, last_at) == (0, None)
+
+    await _record("ep-1", 1, 2, "2026-07-10T08:00:00+00:00")
+    await _record("ep-2", 3, 4, "2026-07-11T09:00:00+00:00")
+    # noop rows advance the watermark but must NOT count as real memories.
+    await _record("noop_abc", 5, 5, "2026-07-12T10:00:00+00:00")
+
+    count, last_at = await store.count_chat_memory_episodes_for_project(
+        owner.id, project.id
+    )
+    assert count == 2
+    assert last_at == "2026-07-11T09:00:00+00:00"
+
+    # Ownership scoping: a foreign user sees nothing.
+    other_count, _ = await store.count_chat_memory_episodes_for_project(
+        "usr_other", project.id
+    )
+    assert other_count == 0
+
+    # Global stats (super-admin dashboard): count + distinct users/projects,
+    # noop excluded.
+    episodes, users, projects = await store.count_chat_memory_episodes()
+    assert episodes >= 2
+    assert users >= 1
+    assert projects >= 1
+
+
 async def test_enterprise_tenant_entity_contract(store):
     now = utc_now_iso()
     tid = f"tenant-{uuid.uuid4().hex[:8]}"

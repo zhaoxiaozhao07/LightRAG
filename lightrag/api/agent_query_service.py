@@ -15,6 +15,7 @@ from lightrag.api.bilingual_query_service import (
     bilingual_applies,
     resolve_bilingual_mode,
 )
+from lightrag.api.chat_memory_routing import ChatMemoryScope, resolve_memory_injection
 from lightrag.api.enterprise_auth import (
     agent_max_rounds,
     agent_query_enabled,
@@ -190,6 +191,22 @@ class AgentQueryRequest(BaseModel):
     include_chunk_content: bool = False
     filters: KBQueryFilters | None = None
     user_prompt: str | None = None
+    conversation_history: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Prior conversation turns ([{role, content}]) passed to the "
+            "planning and synthesis LLM as context (not used for retrieval)."
+        ),
+    )
+    memory: ChatMemoryScope | None = Field(
+        default=None,
+        description=(
+            "Server-side chat memory injection (docs/ChatMemory-zh.md §6). "
+            "Provide the chat project_id to prepend that project's memory facts "
+            "to the final-answer synthesis. Requires an interactive user owning "
+            "the project and LIGHTRAG_CHAT_MEMORY_ENABLED."
+        ),
+    )
     bilingual: bool | None = Field(
         default=None,
         description=(
@@ -203,6 +220,20 @@ class AgentQueryRequest(BaseModel):
     @classmethod
     def _strip_query(cls, value: str) -> str:
         return value.strip()
+
+    @field_validator("conversation_history", mode="after")
+    @classmethod
+    def _validate_history(
+        cls, value: list[dict[str, Any]] | None
+    ) -> list[dict[str, Any]] | None:
+        if value is None:
+            return None
+        for message in value:
+            if "role" not in message:
+                raise ValueError("Each message must have a 'role' key.")
+            if not isinstance(message["role"], str) or not message["role"].strip():
+                raise ValueError("Each message 'role' must be a non-empty string.")
+        return value
 
 
 @dataclass(slots=True)
@@ -669,6 +700,7 @@ class AgentQueryService:
                 yield {"event": "response", "session_id": session_id, "delta": answer}
             else:
                 async for delta in self._synthesize_answer(
+                    request=request,
                     body=body,
                     synth_result=synth_result,
                     references=references,
@@ -1090,6 +1122,7 @@ class AgentQueryService:
     async def _synthesize_answer(
         self,
         *,
+        request: Request,
         body: AgentQueryRequest,
         synth_result: QueryToolResult,
         references: list[dict[str, Any]],
@@ -1114,6 +1147,15 @@ class AgentQueryService:
             reference_list_str=reference_list_str,
         )
         user_prompt = body.user_prompt or "n/a"
+        # Server-side project memory: prepend distilled facts to the answer
+        # prompt (fail-open — an unavailable backend just skips injection).
+        memory_block, _memory_info = await resolve_memory_injection(
+            request, body.memory, body.query
+        )
+        if memory_block:
+            user_prompt = (
+                memory_block if user_prompt == "n/a" else f"{memory_block}\n\n{user_prompt}"
+            )
         agent_rules = (
             "你只能基于给定证据回答。引用必须使用 [A1]、[A2] 这样的 Agent 级引用编号。"
             "如果证据不足或存在冲突，必须明确说明缺口或冲突；不要编造未在证据中的事实。"
@@ -1136,6 +1178,7 @@ class AgentQueryService:
         response = await query_func(
             body.query,
             system_prompt=sys_prompt,
+            history_messages=body.conversation_history or [],
             stream=stream,
             enable_cot=True,
         )

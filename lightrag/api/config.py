@@ -888,6 +888,92 @@ def parse_args() -> argparse.Namespace:
         "CHAT_SESSION_DEFAULT_CONTEXT_ROUNDS", 1, int
     )
 
+    # Per-user-per-project chat memory backed by graphiti
+    # (docs/ChatMemory-zh.md). MEMORY_* fields left unset inherit the QUERY
+    # role / deployment EMBEDDING_* / NEO4J_* values in ChatMemoryConfig.
+    args.chat_memory_enabled = get_env_value(
+        "LIGHTRAG_CHAT_MEMORY_ENABLED", False, bool
+    )
+    args.memory_llm_binding_host = get_env_value(
+        "MEMORY_LLM_BINDING_HOST", None, str, special_none=True
+    )
+    args.memory_llm_binding_api_key = get_env_value(
+        "MEMORY_LLM_BINDING_API_KEY", None, str, special_none=True
+    )
+    args.memory_llm_model = get_env_value(
+        "MEMORY_LLM_MODEL", None, str, special_none=True
+    )
+    args.memory_llm_small_model = get_env_value(
+        "MEMORY_LLM_SMALL_MODEL", None, str, special_none=True
+    )
+    args.memory_llm_timeout = get_env_value("MEMORY_LLM_TIMEOUT", 300, int)
+    args.memory_llm_temperature = get_env_value(
+        "MEMORY_LLM_TEMPERATURE", 0.0, float
+    )
+    args.memory_llm_max_tokens = get_env_value(
+        "MEMORY_LLM_MAX_TOKENS", 16384, int
+    )
+    args.memory_openai_llm_extra_body = get_env_value(
+        "MEMORY_OPENAI_LLM_EXTRA_BODY", None, str, special_none=True
+    )
+    args.memory_structured_output_mode = get_env_value(
+        "MEMORY_STRUCTURED_OUTPUT_MODE", "json_schema"
+    )
+    args.memory_embedding_binding_host = get_env_value(
+        "MEMORY_EMBEDDING_BINDING_HOST", None, str, special_none=True
+    )
+    args.memory_embedding_binding_api_key = get_env_value(
+        "MEMORY_EMBEDDING_BINDING_API_KEY", None, str, special_none=True
+    )
+    args.memory_embedding_model = get_env_value(
+        "MEMORY_EMBEDDING_MODEL", None, str, special_none=True
+    )
+    args.memory_embedding_dim = get_env_value(
+        "MEMORY_EMBEDDING_DIM", None, int, special_none=True
+    )
+    args.memory_neo4j_uri = get_env_value(
+        "MEMORY_NEO4J_URI", None, str, special_none=True
+    )
+    args.memory_neo4j_username = get_env_value(
+        "MEMORY_NEO4J_USERNAME", None, str, special_none=True
+    )
+    args.memory_neo4j_password = get_env_value(
+        "MEMORY_NEO4J_PASSWORD", None, str, special_none=True
+    )
+    args.memory_neo4j_database = get_env_value(
+        "MEMORY_NEO4J_DATABASE", None, str, special_none=True
+    )
+    args.memory_search_limit = get_env_value("MEMORY_SEARCH_LIMIT", 10, int)
+    args.memory_ingest_concurrency = get_env_value(
+        "MEMORY_INGEST_CONCURRENCY", 2, int
+    )
+    args.memory_max_coroutines = get_env_value("MEMORY_MAX_COROUTINES", 4, int)
+    args.memory_ingest_max_chars = get_env_value(
+        "MEMORY_INGEST_MAX_CHARS", 6000, int
+    )
+    # Rerank memory facts with the deployment reranker (cross-encoder recipe).
+    args.memory_rerank_enabled = get_env_value(
+        "MEMORY_RERANK_ENABLED", False, bool
+    )
+    # immediate: distill each persisted batch right away; debounced: buffer
+    # per session and flush after MEMORY_INGEST_DEBOUNCE_SECONDS of quiet.
+    args.memory_ingest_mode = get_env_value("MEMORY_INGEST_MODE", "immediate")
+    args.memory_ingest_debounce_seconds = get_env_value(
+        "MEMORY_INGEST_DEBOUNCE_SECONDS", 20.0, float
+    )
+    # Startup compensation scan re-ingesting messages past the watermark.
+    args.memory_backlog_scan_on_start = get_env_value(
+        "MEMORY_BACKLOG_SCAN_ON_START", True, bool
+    )
+    args.memory_backlog_batch_messages = get_env_value(
+        "MEMORY_BACKLOG_BATCH_MESSAGES", 20, int
+    )
+    # Per-user in-flight ingest cap (fairness; 0 disables). Skipped batches are
+    # recovered by the backlog scan.
+    args.memory_max_inflight_per_user = get_env_value(
+        "MEMORY_MAX_INFLIGHT_PER_USER", 8, int
+    )
+
     # Bilingual (zh<->en) dual-path query (docs/BilingualQuery-zh.md)
     args.bilingual_query_enabled = get_env_value("BILINGUAL_QUERY_ENABLED", False, bool)
     args.bilingual_query_default_mode = get_env_value(

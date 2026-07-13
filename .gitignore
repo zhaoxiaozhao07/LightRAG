@@ -92,3 +92,5 @@ memory-bank
 模拟文件/
 
 node_modules/
+# graphiti upstream clone (reference only; runtime dep is the graphiti-core PyPI package via the "memory" extra)
+graphiti/

@@ -24,6 +24,7 @@ from lightrag.api.enterprise_auth import (
     get_enterprise_api_key_service,
     get_enterprise_audit_service,
     get_enterprise_authorization_service,
+    get_enterprise_chat_memory_service,
     get_enterprise_invitation_service,
     get_enterprise_settings_service,
     get_enterprise_user_agent_workflow_prompt_service,
@@ -31,6 +32,7 @@ from lightrag.api.enterprise_auth import (
     get_enterprise_user_service,
     get_request_principal,
 )
+from lightrag.api.chat_memory_service import ChatMemoryUnavailableError
 from lightrag.api.kb_service import KnowledgeBaseNotFoundError, KnowledgeBaseService
 from lightrag.api.metadata_store import (
     AuditEventRecord,
@@ -398,6 +400,15 @@ class EnterpriseUserAgentWorkflowPromptRequest(BaseModel):
 class EnterpriseUserAgentWorkflowPromptResponse(BaseModel):
     user_id: str
     workflow_prompt: str
+
+
+class AdminChatMemoryPurgeRequest(BaseModel):
+    # Omitted / empty => purge every project of the target user.
+    project_ids: list[str] | None = Field(default=None)
+
+
+class AdminChatMemoryBacklogScanRequest(BaseModel):
+    limit: int | None = Field(default=None, ge=1, le=1000)
 
 
 def create_enterprise_routes(
@@ -926,6 +937,12 @@ def create_enterprise_routes(
         enterprise = await store.aggregate_enterprise_stats()
         documents_by_status = control["documents_by_status"]
         jobs_by_status = control["jobs_by_status"]
+        memory_service = get_enterprise_chat_memory_service(request)
+        chat_memory = (
+            await memory_service.global_stats()
+            if memory_service is not None
+            else {"enabled": False, "available": False, "episode_count": 0}
+        )
         return {
             "kbs": {"total": sum(kbs_by_status.values()), "by_status": kbs_by_status},
             "documents": {
@@ -940,7 +957,75 @@ def create_enterprise_routes(
             },
             "artifacts": {"total": control["artifacts"]},
             "enterprise": enterprise,
+            "chat_memory": chat_memory,
         }
+
+    @router.post(
+        "/admin/users/{user_id}/chat-memory:purge",
+        dependencies=[Depends(combined_auth)],
+    )
+    async def admin_purge_user_chat_memory(
+        user_id: str, request: Request, body: AdminChatMemoryPurgeRequest | None = None
+    ):
+        """Super-admin: purge a user's project memory graphs (all projects, or
+        the given ``project_ids``). Clears both the graphiti partitions and the
+        episode mapping rows. Useful for dirty data or a model upgrade."""
+        require_principal(request)
+        memory_service = get_enterprise_chat_memory_service(request)
+        if memory_service is None:
+            raise HTTPException(status_code=503, detail="Chat memory is not enabled")
+        await get_enterprise_user_service(request).get_user_or_404(user_id)
+        project_ids = list(body.project_ids) if body and body.project_ids else None
+        if project_ids is None:
+            chat_service = getattr(
+                request.app.state, "enterprise_chat_conversation_service", None
+            )
+            project_ids = []
+            if chat_service is not None:
+                offset = 0
+                while True:
+                    projects, total = await chat_service.list_projects(
+                        user_id, limit=200, offset=offset
+                    )
+                    if not projects:
+                        break
+                    project_ids.extend(project.id for project in projects)
+                    offset += len(projects)
+                    if offset >= total:
+                        break
+        if not project_ids:
+            return {"purged": 0, "project_ids": []}
+        try:
+            purged = await memory_service.purge_projects(user_id, project_ids)
+        except ChatMemoryUnavailableError:
+            raise HTTPException(
+                status_code=503, detail="Chat memory is temporarily unavailable"
+            )
+        return {"purged": purged, "project_ids": project_ids}
+
+    @router.post(
+        "/admin/chat-memory:backlog-scan",
+        dependencies=[Depends(combined_auth)],
+    )
+    async def admin_chat_memory_backlog_scan(
+        request: Request, body: AdminChatMemoryBacklogScanRequest | None = None
+    ):
+        """Super-admin: manually run the memory backlog compensation scan
+        (re-ingest sessions whose messages ran ahead of the watermark). The
+        scan otherwise only runs at startup; this lets ops recover after an LLM
+        outage without a restart."""
+        require_principal(request)
+        memory_service = get_enterprise_chat_memory_service(request)
+        if memory_service is None:
+            raise HTTPException(status_code=503, detail="Chat memory is not enabled")
+        limit = body.limit if body and body.limit else 100
+        try:
+            batches = await memory_service.run_backlog_scan(limit=limit)
+        except ChatMemoryUnavailableError:
+            raise HTTPException(
+                status_code=503, detail="Chat memory is temporarily unavailable"
+            )
+        return {"reingested_batches": batches}
 
     @router.post(
         "/admin/users/{user_id}:disable",
@@ -1039,9 +1124,32 @@ def create_enterprise_routes(
     async def delete_enterprise_user(user_id: str, request: Request):
         principal = require_principal(request)
         user_service = get_enterprise_user_service(request)
+        memory_service = get_enterprise_chat_memory_service(request)
+        chat_project_ids: list[str] = []
+        if memory_service is not None:
+            # Enumerate the user's chat projects BEFORE deletion — the user
+            # delete cascades chat rows, after which the project ids (and the
+            # derived memory group ids) are unrecoverable.
+            chat_service = getattr(
+                request.app.state, "enterprise_chat_conversation_service", None
+            )
+            if chat_service is not None:
+                offset = 0
+                while True:
+                    projects, total = await chat_service.list_projects(
+                        user_id, limit=200, offset=offset
+                    )
+                    if not projects:
+                        break
+                    chat_project_ids.extend(project.id for project in projects)
+                    offset += len(projects)
+                    if offset >= total:
+                        break
         deleted = await user_service.delete_user(
             user_id, actor_user_id=principal.user_id
         )
+        if deleted and memory_service is not None and chat_project_ids:
+            memory_service.schedule_purge(user_id, chat_project_ids)
         return {"deleted": deleted}
 
     @router.post(

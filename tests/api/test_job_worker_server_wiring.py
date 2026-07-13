@@ -46,6 +46,10 @@ _ENV_TO_ISOLATE = (
     "LIGHTRAG_DOC_STATUS_STORAGE",
     "LIGHTRAG_KB_METADATA_BACKEND",
     "LIGHTRAG_OBJECT_STORAGE",
+    # Keep the graphiti-backed chat memory off: a leaked
+    # LIGHTRAG_CHAT_MEMORY_ENABLED=true from a developer .env would make the
+    # lifespan test reach out to the configured Neo4j.
+    "LIGHTRAG_CHAT_MEMORY_ENABLED",
     "LIGHTRAG_KB_JOB_WORKER",
     "LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS",
     "LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS",

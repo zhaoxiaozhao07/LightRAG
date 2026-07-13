@@ -132,6 +132,13 @@ offline-llm = [
     "google-genai>=1.0.0,<3.0.0",
 ]
 
+memory = [
+    # Per-user-per-project chat memory (docs/ChatMemory-zh.md): graphiti
+    # temporal knowledge graphs on Neo4j. Optional — the API server runs
+    # without it while LIGHTRAG_CHAT_MEMORY_ENABLED stays off.
+    "graphiti-core>=0.29.2,<0.30.0",
+]
+
 offline = [
     # Complete offline package (includes api for document processing, plus storage and LLM)
     "lightrag-hku[api,offline-storage,offline-llm]",
@@ -190,6 +197,11 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+filterwarnings = [
+    # graphiti-core 0.29.x still uses class-based pydantic Config; it is a
+    # third-party deprecation we do not control (chat memory optional dep).
+    "ignore:Support for class-based `config`:DeprecationWarning",
+]
 
 [tool.ruff]
 target-version = "py310"

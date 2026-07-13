@@ -50,6 +50,12 @@ from lightrag.api.enterprise_auth import (
     get_enterprise_authorization_service,
     get_request_principal,
 )
+from lightrag.api.chat_memory_routing import (
+    ChatMemoryScope,
+    memory_audit_fields,
+    merge_memory_block,
+    resolve_memory_injection,
+)
 from lightrag.api.kb_service import KnowledgeBaseNotFoundError
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry
 from lightrag.api.metadata_store import DocumentRecord
@@ -124,6 +130,7 @@ def _query_audit_metadata(
     route: str,
     stream: bool,
     bilingual_info: dict[str, Any] | None = None,
+    memory_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "route": route,
@@ -147,6 +154,7 @@ def _query_audit_metadata(
             metadata[f"active_{key}"] = active_metadata[key]
     if bilingual_info is not None:
         metadata.update(bilingual_audit_fields(bilingual_info))
+    metadata.update(memory_audit_fields(memory_info))
     return metadata
 
 
@@ -248,6 +256,16 @@ class KBQueryRequest(BaseModel):
     include_chunk_content: Optional[bool] = False
     stream: Optional[bool] = True
     filters: Optional[KBQueryFilters] = None
+    memory: Optional[ChatMemoryScope] = Field(
+        default=None,
+        description=(
+            "Server-side chat memory injection. Provide the chat project_id to "
+            "have the server search that project's long-term memory and prepend "
+            "the facts to the effective user_prompt (docs/ChatMemory-zh.md §6). "
+            "Requires an interactive user owning the project and "
+            "LIGHTRAG_CHAT_MEMORY_ENABLED."
+        ),
+    )
     bilingual: Optional[bool] = Field(
         default=None,
         description=(
@@ -283,7 +301,13 @@ class KBQueryRequest(BaseModel):
         is_stream: bool,
         active_defaults: dict[str, Any] | None = None,
     ) -> QueryParam:
-        route_only_fields = {"query", "include_chunk_content", "filters", "bilingual"}
+        route_only_fields = {
+            "query",
+            "include_chunk_content",
+            "filters",
+            "bilingual",
+            "memory",
+        }
         request_data = self.model_dump(
             exclude_none=True,
             exclude=route_only_fields,
@@ -588,6 +612,15 @@ class MultiKBQueryRequest(BaseModel):
     include_references: Optional[bool] = True
     include_chunk_content: Optional[bool] = False
     filters: Optional[KBQueryFilters] = None
+    memory: Optional[ChatMemoryScope] = Field(
+        default=None,
+        description=(
+            "Server-side chat memory injection (docs/ChatMemory-zh.md §6). "
+            "Provide the chat project_id to prepend that project's memory facts "
+            "to the synthesis user_prompt. Requires an interactive user owning "
+            "the project and LIGHTRAG_CHAT_MEMORY_ENABLED."
+        ),
+    )
     bilingual: Optional[bool] = Field(
         default=None,
         description=(
@@ -642,6 +675,7 @@ class MultiKBQueryRequest(BaseModel):
             "include_references",
             "filters",
             "bilingual",
+            "memory",
         }
         request_data = self.model_dump(exclude_none=True, exclude=route_only_fields)
         explicit_fields = self.model_fields_set - route_only_fields
@@ -703,6 +737,7 @@ def _multi_kb_query_audit_metadata(
     reranked: bool,
     final_count: int,
     bilingual_info: Dict[str, Any] | None = None,
+    memory_info: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     metadata = {
         "route": "multi_query",
@@ -720,6 +755,7 @@ def _multi_kb_query_audit_metadata(
     }
     if bilingual_info is not None:
         metadata.update(bilingual_audit_fields(bilingual_info))
+    metadata.update(memory_audit_fields(memory_info))
     return metadata
 
 
@@ -1055,6 +1091,13 @@ def create_kb_query_routes(
             )
             _enforce_resolved_bypass_permission(http_request, param)
             param.stream = False
+            memory_block, memory_info = await resolve_memory_injection(
+                http_request, request.memory, request.query
+            )
+            if memory_block:
+                param.user_prompt = merge_memory_block(
+                    memory_block, param.user_prompt
+                )
             # Enforce per-document retrieval scoping: ``filters.doc_ids`` plus
             # the enabled/archived control-plane state are translated into a
             # ``lightrag_doc_id`` allow-list applied inside retrieval. Cross-KB
@@ -1083,6 +1126,8 @@ def create_kb_query_routes(
             response_metadata = dict(active_metadata)
             if bilingual_info is not None:
                 response_metadata["bilingual"] = bilingual_info
+            if memory_info is not None:
+                response_metadata["memory"] = memory_info
             await append_enterprise_audit_event(
                 http_request,
                 "query_executed",
@@ -1095,6 +1140,7 @@ def create_kb_query_routes(
                     route="query",
                     stream=False,
                     bilingual_info=bilingual_info,
+                    memory_info=memory_info,
                 ),
             )
             return KBQueryResponse(
@@ -1145,6 +1191,13 @@ def create_kb_query_routes(
                 active_defaults=active_defaults,
             )
             _enforce_resolved_bypass_permission(http_request, param)
+            memory_block, memory_info = await resolve_memory_injection(
+                http_request, request.memory, request.query
+            )
+            if memory_block:
+                param.user_prompt = merge_memory_block(
+                    memory_block, param.user_prompt
+                )
             param.ids = await _resolve_doc_id_scope(
                 document_service,
                 kb_id,
@@ -1160,6 +1213,8 @@ def create_kb_query_routes(
             response_metadata = dict(active_metadata)
             if bilingual_info is not None:
                 response_metadata["bilingual"] = bilingual_info
+            if memory_info is not None:
+                response_metadata["memory"] = memory_info
             await append_enterprise_audit_event(
                 http_request,
                 "query_stream_started",
@@ -1172,6 +1227,7 @@ def create_kb_query_routes(
                     route="query_stream",
                     stream=True,
                     bilingual_info=bilingual_info,
+                    memory_info=memory_info,
                 ),
             )
 
@@ -1335,6 +1391,14 @@ def create_kb_query_routes(
                 document_service, registry, request, http_request
             )
 
+            memory_block, memory_info = await resolve_memory_injection(
+                http_request, request.memory, request.query
+            )
+            if memory_block and synth_param is not None:
+                synth_param.user_prompt = merge_memory_block(
+                    memory_block, synth_param.user_prompt
+                )
+
             response_text = "No relevant context found for the query."
             (
                 sys_prompt,
@@ -1381,6 +1445,7 @@ def create_kb_query_routes(
                     reranked=reranked,
                     final_count=final_count,
                     bilingual_info=bilingual_info,
+                    memory_info=memory_info,
                 ),
             )
             return MultiKBQueryResponse(
@@ -1388,7 +1453,7 @@ def create_kb_query_routes(
                 mode=cast(QueryMode, request.mode),
                 response=response_text,
                 references=references_out if request.include_references else None,
-                metadata=metadata,
+                metadata={**metadata, **({"memory": memory_info} if memory_info else {})},
             )
         except HTTPException:
             raise
@@ -1420,6 +1485,13 @@ def create_kb_query_routes(
             ) = await _multi_kb_retrieve(
                 document_service, registry, request, http_request
             )
+            memory_block, memory_info = await resolve_memory_injection(
+                http_request, request.memory, request.query
+            )
+            if memory_block and synth_param is not None:
+                synth_param.user_prompt = merge_memory_block(
+                    memory_block, synth_param.user_prompt
+                )
             (
                 sys_prompt,
                 use_model_func,
@@ -1440,6 +1512,8 @@ def create_kb_query_routes(
             }
             if bilingual_info is not None:
                 metadata["bilingual"] = bilingual_info
+            if memory_info is not None:
+                metadata["memory"] = memory_info
             await append_enterprise_audit_event(
                 http_request,
                 "multi_kb_query_stream_started",
@@ -1453,6 +1527,7 @@ def create_kb_query_routes(
                     reranked=reranked,
                     final_count=final_count,
                     bilingual_info=bilingual_info,
+                    memory_info=memory_info,
                 ),
             )
 

@@ -75,6 +75,10 @@ _SERVER_ENV_VARS_TO_ISOLATE = (
     "LIGHTRAG_GRAPH_STORAGE",
     "LIGHTRAG_DOC_STATUS_STORAGE",
     "LIGHTRAG_KB_METADATA_BACKEND",
+    # Keep the graphiti-backed chat memory off in create_app tests: a leaked
+    # LIGHTRAG_CHAT_MEMORY_ENABLED=true from a developer .env would make the
+    # lifespan reach out to the configured Neo4j during unit tests.
+    "LIGHTRAG_CHAT_MEMORY_ENABLED",
     "LIGHTRAG_OBJECT_STORAGE",
     "LIGHTRAG_OBJECT_STORAGE_ENDPOINT",
     "LIGHTRAG_OBJECT_STORAGE_BUCKET",

@@ -1426,6 +1426,17 @@ class ChatConversationService:
             user_id, project_id, session_id, limit=limit, offset=offset
         )
 
+    async def get_message(
+        self,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        message_id: str,
+    ) -> ChatMessageRecord | None:
+        return await self._metadata_store.get_chat_message(
+            user_id, project_id, session_id, message_id
+        )
+
     async def delete_message(
         self,
         *,
@@ -2628,6 +2639,16 @@ def get_enterprise_chat_conversation_service(
             detail="Enterprise chat conversation service unavailable",
         )
     return service
+
+
+def get_enterprise_chat_memory_service(request: Request) -> Any:
+    """Optional per-user-per-project chat memory service (graphiti).
+
+    Returns ``None`` when the feature is disabled (``LIGHTRAG_CHAT_MEMORY_ENABLED``
+    off or non-enterprise mode). Deliberately duck-typed — tests inject fakes
+    and the real service lives in ``lightrag.api.chat_memory_service``.
+    """
+    return getattr(request.app.state, "enterprise_chat_memory_service", None)
 
 
 def get_enterprise_invitation_service(request: Request) -> InvitationService:

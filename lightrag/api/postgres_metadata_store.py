@@ -18,6 +18,8 @@ from lightrag.api.metadata_store import (
     ActiveDocumentReplaceJobError,
     ArtifactRecord,
     AuditEventRecord,
+    ChatMemoryBacklogItem,
+    ChatMemoryEpisodeRecord,
     ChatMessageRecord,
     ChatProjectRecord,
     ChatSessionRecord,
@@ -121,6 +123,18 @@ def _chat_session_from_row(row: Any) -> ChatSessionRecord:
 def _chat_message_from_row(row: Any) -> ChatMessageRecord:
     data = _loads_json_object(row["data_json"])
     return ChatMessageRecord(**data)
+
+
+def _chat_memory_episode_from_row(row: Any) -> ChatMemoryEpisodeRecord:
+    return ChatMemoryEpisodeRecord(
+        episode_uuid=str(row["episode_uuid"]),
+        session_id=str(row["session_id"]),
+        project_id=str(row["project_id"]),
+        user_id=str(row["user_id"]),
+        first_seq=int(row["first_seq"]),
+        last_seq=int(row["last_seq"]),
+        created_at=str(row["created_at"]),
+    )
 
 
 def _enterprise_api_key_from_row(row: Any) -> EnterpriseAPIKeyRecord:
@@ -2019,6 +2033,258 @@ class PostgresMetadataStore:
 
         return await self._write(write)
 
+    async def get_chat_message(
+        self, user_id: str, project_id: str, session_id: str, message_id: str
+    ) -> ChatMessageRecord | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT data_json FROM enterprise_chat_messages
+                WHERE id = $1 AND session_id = $2 AND project_id = $3
+                    AND user_id = $4
+                """,
+                message_id,
+                session_id,
+                project_id,
+                user_id,
+            )
+        return _chat_message_from_row(row) if row is not None else None
+
+    async def list_chat_messages_after_seq(
+        self,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        *,
+        after_seq: int,
+        limit: int = 200,
+    ) -> list[ChatMessageRecord]:
+        """Messages of an owned session with ``seq > after_seq``, ascending."""
+        await self._ensure_initialized()
+        limit = max(1, min(int(limit), 1000))
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT data_json FROM enterprise_chat_messages
+                WHERE session_id = $1 AND project_id = $2 AND user_id = $3
+                    AND seq > $4
+                ORDER BY seq ASC, id ASC
+                LIMIT $5
+                """,
+                session_id,
+                project_id,
+                user_id,
+                int(after_seq),
+                limit,
+            )
+        return [_chat_message_from_row(row) for row in rows]
+
+    async def record_chat_memory_episode(
+        self, record: ChatMemoryEpisodeRecord
+    ) -> None:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> None:
+            await conn.execute(
+                """
+                INSERT INTO enterprise_chat_memory_episodes (
+                    episode_uuid, session_id, project_id, user_id,
+                    first_seq, last_seq, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (episode_uuid) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    project_id = excluded.project_id,
+                    user_id = excluded.user_id,
+                    first_seq = excluded.first_seq,
+                    last_seq = excluded.last_seq,
+                    created_at = excluded.created_at
+                """,
+                record.episode_uuid,
+                record.session_id,
+                record.project_id,
+                record.user_id,
+                record.first_seq,
+                record.last_seq,
+                record.created_at,
+            )
+
+        await self._write(write)
+
+    async def get_chat_memory_watermark(
+        self, user_id: str, project_id: str, session_id: str
+    ) -> int:
+        """Highest ingested ``last_seq`` for a session (0 when none)."""
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            value = await conn.fetchval(
+                """
+                SELECT COALESCE(MAX(last_seq), 0)
+                FROM enterprise_chat_memory_episodes
+                WHERE session_id = $1 AND project_id = $2 AND user_id = $3
+                """,
+                session_id,
+                project_id,
+                user_id,
+            )
+        return int(value or 0)
+
+    async def find_chat_memory_episodes_covering(
+        self, user_id: str, project_id: str, session_id: str, seq: int
+    ) -> list[ChatMemoryEpisodeRecord]:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM enterprise_chat_memory_episodes
+                WHERE session_id = $1 AND project_id = $2 AND user_id = $3
+                    AND first_seq <= $4 AND last_seq >= $4
+                ORDER BY first_seq ASC
+                """,
+                session_id,
+                project_id,
+                user_id,
+                int(seq),
+            )
+        return [_chat_memory_episode_from_row(row) for row in rows]
+
+    async def list_chat_memory_episodes_for_session(
+        self, user_id: str, project_id: str, session_id: str
+    ) -> list[ChatMemoryEpisodeRecord]:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM enterprise_chat_memory_episodes
+                WHERE session_id = $1 AND project_id = $2 AND user_id = $3
+                ORDER BY first_seq ASC
+                """,
+                session_id,
+                project_id,
+                user_id,
+            )
+        return [_chat_memory_episode_from_row(row) for row in rows]
+
+    async def delete_chat_memory_episodes(
+        self, episode_uuids: Sequence[str]
+    ) -> int:
+        ids = [uuid for uuid in episode_uuids if uuid]
+        if not ids:
+            return 0
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> int:
+            status = await conn.execute(
+                """
+                DELETE FROM enterprise_chat_memory_episodes
+                WHERE episode_uuid = ANY($1::text[])
+                """,
+                ids,
+            )
+            return _rowcount(status)
+
+        return await self._write(write)
+
+    async def delete_chat_memory_episodes_for_project(self, project_id: str) -> int:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> int:
+            status = await conn.execute(
+                "DELETE FROM enterprise_chat_memory_episodes WHERE project_id = $1",
+                project_id,
+            )
+            return _rowcount(status)
+
+        return await self._write(write)
+
+    async def delete_chat_memory_episodes_for_user(self, user_id: str) -> int:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> int:
+            status = await conn.execute(
+                "DELETE FROM enterprise_chat_memory_episodes WHERE user_id = $1",
+                user_id,
+            )
+            return _rowcount(status)
+
+        return await self._write(write)
+
+    async def list_chat_memory_backlog(
+        self, *, limit: int = 100
+    ) -> list[ChatMemoryBacklogItem]:
+        """Sessions whose max message ``seq`` exceeds the ingestion watermark."""
+        await self._ensure_initialized()
+        limit = max(1, min(int(limit), 1000))
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT m.user_id AS user_id, m.project_id AS project_id,
+                       m.session_id AS session_id,
+                       COALESCE(e.max_last, 0) AS ingested_seq,
+                       MAX(m.seq) AS max_seq
+                FROM enterprise_chat_messages m
+                LEFT JOIN (
+                    SELECT session_id, MAX(last_seq) AS max_last
+                    FROM enterprise_chat_memory_episodes
+                    GROUP BY session_id
+                ) e ON e.session_id = m.session_id
+                GROUP BY m.session_id, m.project_id, m.user_id, e.max_last
+                HAVING MAX(m.seq) > COALESCE(e.max_last, 0)
+                ORDER BY m.session_id
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [
+            ChatMemoryBacklogItem(
+                user_id=str(row["user_id"]),
+                project_id=str(row["project_id"]),
+                session_id=str(row["session_id"]),
+                ingested_seq=int(row["ingested_seq"]),
+                max_seq=int(row["max_seq"]),
+            )
+            for row in rows
+        ]
+
+    async def count_chat_memory_episodes_for_project(
+        self, user_id: str, project_id: str
+    ) -> tuple[int, str | None]:
+        """Return ``(episode_count, last_ingested_at)`` for a project (noop
+        placeholder rows excluded)."""
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT COUNT(*) AS c, MAX(created_at) AS last_at
+                FROM enterprise_chat_memory_episodes
+                WHERE user_id = $1 AND project_id = $2
+                    AND episode_uuid NOT LIKE 'noop\\_%'
+                """,
+                user_id,
+                project_id,
+            )
+        if row is None:
+            return 0, None
+        return int(row["c"] or 0), (row["last_at"] if row["last_at"] else None)
+
+    async def count_chat_memory_episodes(self) -> tuple[int, int, int]:
+        """Global ``(episode_count, distinct_users, distinct_projects)`` for
+        admin observability (noop rows excluded)."""
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT COUNT(*) AS c,
+                       COUNT(DISTINCT user_id) AS u,
+                       COUNT(DISTINCT project_id) AS p
+                FROM enterprise_chat_memory_episodes
+                WHERE episode_uuid NOT LIKE 'noop\\_%'
+                """
+            )
+        if row is None:
+            return 0, 0, 0
+        return int(row["c"] or 0), int(row["u"] or 0), int(row["p"] or 0)
+
     async def set_enterprise_system_setting(
         self, key: str, value: str, *, updated_by: str | None = None
     ) -> None:
@@ -3087,6 +3353,22 @@ class PostgresMetadataStore:
                 ON enterprise_chat_messages (project_id);
             CREATE INDEX IF NOT EXISTS idx_enterprise_chat_messages_user
                 ON enterprise_chat_messages (user_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_chat_memory_episodes (
+                episode_uuid TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                first_seq BIGINT NOT NULL,
+                last_seq BIGINT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_memory_episodes_session
+                ON enterprise_chat_memory_episodes (session_id, last_seq);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_memory_episodes_project
+                ON enterprise_chat_memory_episodes (project_id);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_memory_episodes_user
+                ON enterprise_chat_memory_episodes (user_id);
 
             CREATE TABLE IF NOT EXISTS enterprise_api_keys (
                 id TEXT PRIMARY KEY,

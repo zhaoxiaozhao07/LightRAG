@@ -1085,6 +1085,7 @@ class AgentStagedRunner:
                 clipped_notes=clipped_notes,
             )
             async for delta in self._service._synthesize_answer(
+                request=request,
                 body=body,
                 synth_result=synth_result,
                 references=references,
