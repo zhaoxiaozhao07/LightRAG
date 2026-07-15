@@ -9,10 +9,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from lightrag.api.config_version_service import ConfigVersionService
 from lightrag.api.job_service import JobService
-from lightrag.api.kb_deletion_service import KBDeletionService
+from lightrag.api.kb_deletion_service import (
+    KBDeletionService,
+    KBHardDeleteInProgressError,
+)
 from lightrag.api.kb_service import (
+    LEGACY_PROVENANCE_METADATA_KEYS,
     KnowledgeBaseConflictError,
     KnowledgeBaseNotFoundError,
+    KnowledgeBaseOrigin,
     KnowledgeBaseRecord,
     KnowledgeBaseService,
     KnowledgeBaseStatus,
@@ -23,6 +28,7 @@ from lightrag.api.lightrag_registry import LightRAGInstanceRegistry
 from lightrag.api.metadata_store import (
     ConfigVersionRecord,
     JobRecord,
+    KBLifecycleConflictError,
     MetadataRecordNotFoundError,
 )
 from lightrag.api.utils_api import get_combined_auth_dependency
@@ -30,7 +36,6 @@ from lightrag.api.enterprise_auth import (
     KB_ROLE_OWNER,
     append_enterprise_audit_event,
     enterprise_auth_enabled,
-    get_enterprise_audit_service,
     get_enterprise_authorization_service,
     get_request_principal,
 )
@@ -128,6 +133,7 @@ class KnowledgeBaseResponse(BaseModel):
     updated_at: str
     deleted_at: Optional[str]
     metadata: dict[str, Any] = Field(default_factory=dict)
+    origin: KnowledgeBaseOrigin
 
     @classmethod
     def from_record(cls, record: KnowledgeBaseRecord) -> "KnowledgeBaseResponse":
@@ -341,6 +347,91 @@ def _hard_delete_worker_enabled(request: Request) -> bool:
     return "clear_kb" in set(resumable_types)
 
 
+async def _purge_catalog_generation(
+    kb_service: KnowledgeBaseService,
+    record: KnowledgeBaseRecord,
+) -> bool:
+    """Purge only the catalog generation created by the current request."""
+
+    return bool(
+        await kb_service.purge(
+            record.id,
+            expected_generation=record.generation,
+            expected_status=record.status,
+        )
+    )
+
+
+async def _cleanup_failed_kb_initialization(
+    kb_service: KnowledgeBaseService,
+    metadata_store: Any,
+    record: KnowledgeBaseRecord,
+) -> None:
+    """Best-effort rollback for a catalog row that was never fully initialized."""
+
+    cleanup_errors: list[str] = []
+    try:
+        await metadata_store.purge_kb_metadata(
+            record.id,
+            generation=record.generation,
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the initialization error
+        cleanup_errors.append(f"metadata: {exc}")
+    try:
+        await _purge_catalog_generation(kb_service, record)
+    except Exception as exc:  # noqa: BLE001 - preserve the initialization error
+        cleanup_errors.append(f"catalog: {exc}")
+        # Do not leave an active, discoverable half-initialized row if the hard
+        # purge itself is temporarily unavailable.
+        try:
+            current = await kb_service.get(record.id, include_deleted=True)
+            if current.generation == record.generation and current.status != "deleted":
+                await kb_service.delete(
+                    record.id,
+                    expected_generation=record.generation,
+                )
+        except Exception as quarantine_exc:  # noqa: BLE001
+            cleanup_errors.append(f"catalog quarantine: {quarantine_exc}")
+    if cleanup_errors:
+        logger.error(
+            "Failed to fully clean up KB initialization for '%s' generation '%s': %s",
+            record.id,
+            record.generation,
+            "; ".join(cleanup_errors),
+        )
+
+
+def _tenant_managed_metadata(
+    metadata: dict[str, Any] | None,
+    tenant_id: str,
+) -> dict[str, Any]:
+    """Canonicalize metadata for a non-platform tenant-created KB."""
+
+    normalized = {
+        key: value
+        for key, value in dict(metadata or {}).items()
+        if key not in LEGACY_PROVENANCE_METADATA_KEYS
+    }
+    raw_tags = normalized.get("tags", [])
+    if not isinstance(raw_tags, list) or any(
+        not isinstance(tag, str) for tag in raw_tags
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Knowledge base metadata tags must be a list of strings",
+        )
+    tenant_tag = f"tenant:{tenant_id}"
+    deduplicated: list[str] = []
+    seen: set[str] = set()
+    for tag in raw_tags:
+        if tag.startswith("tenant:") or tag in seen:
+            continue
+        seen.add(tag)
+        deduplicated.append(tag)
+    normalized["tags"] = [*deduplicated, tenant_tag]
+    return normalized
+
+
 def _config_follow_up_idempotency_key(
     kb_id: str, version_id: str, job_type: str, document_ids: list[str]
 ) -> str:
@@ -431,46 +522,110 @@ def create_kb_routes(
             principal = get_request_principal(request)
             owner_id = body.owner_id
             tenant_id = body.tenant_id
+            visibility = body.visibility
+            metadata = {
+                key: value
+                for key, value in dict(body.metadata or {}).items()
+                if key not in LEGACY_PROVENANCE_METADATA_KEYS
+            }
+            origin: KnowledgeBaseOrigin = "platform"
+            initial_status: KnowledgeBaseStatus = "active"
             if enterprise_auth_enabled():
+                initial_status = "creating"
                 if principal is None:
                     raise HTTPException(status_code=401, detail="Login required")
-                owner_id = principal.user_id
-                tenant_id = principal.tenant_id
+                if metadata_store is None:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Metadata store is required in enterprise mode",
+                    )
+                if principal.is_super_admin:
+                    owner_id = (
+                        principal.user_id if body.owner_id is None else body.owner_id
+                    )
+                    tenant_id = body.tenant_id
+                else:
+                    owner_id = principal.user_id
+                    tenant_id = principal.tenant_id
+                    if tenant_id is not None:
+                        origin = "tenant"
+                        if visibility != "private":
+                            raise HTTPException(
+                                status_code=400,
+                                detail=(
+                                    "Tenant-managed knowledge bases must use private "
+                                    "visibility"
+                                ),
+                            )
+                        metadata = _tenant_managed_metadata(metadata, tenant_id)
+            if metadata_store is not None and body.id is not None:
+                # Reject a known id before writing a tentative catalog row when
+                # an incomplete hard-delete tail still owns its lifecycle.
+                await metadata_store.assert_kb_not_deleting(body.id)
             record = await kb_service.create(
                 kb_id=body.id,
                 name=body.name,
                 description=body.description,
                 owner_id=owner_id,
                 tenant_id=tenant_id,
-                visibility=body.visibility,
-                metadata=body.metadata,
+                visibility=visibility,
+                metadata=metadata,
+                origin=origin,
+                initial_status=initial_status,
             )
-            if enterprise_auth_enabled() and principal is not None:
+            if metadata_store is not None:
                 try:
-                    authz_service = get_enterprise_authorization_service(request)
-                    await authz_service.grant_kb_role(
+                    await metadata_store.activate_kb_generation(
                         record.id,
-                        principal.user_id,
-                        KB_ROLE_OWNER,
-                        granted_by=principal.user_id,
+                        record.generation,
                     )
-                    await append_enterprise_audit_event(
-                        request,
-                        "kb_created",
-                        target_type="kb",
-                        target_id=record.id,
-                        metadata={
-                            "workspace": record.workspace,
-                            "tenant_id": record.tenant_id,
-                            "visibility": record.visibility,
-                        },
-                    )
+                    if enterprise_auth_enabled() and principal is not None:
+                        authz_service = get_enterprise_authorization_service(request)
+                        await authz_service.grant_kb_role(
+                            record.id,
+                            (
+                                record.owner_id
+                                if record.owner_id is not None
+                                else principal.user_id
+                            ),
+                            KB_ROLE_OWNER,
+                            granted_by=principal.user_id,
+                            expected_generation=record.generation,
+                        )
+                        await append_enterprise_audit_event(
+                            request,
+                            "kb_created",
+                            target_type="kb",
+                            target_id=record.id,
+                            metadata={
+                                "workspace": record.workspace,
+                                "tenant_id": record.tenant_id,
+                                "visibility": record.visibility,
+                                "origin": record.origin,
+                            },
+                        )
+                        record = await kb_service.update(
+                            record.id,
+                            status="active",
+                            expected_generation=record.generation,
+                        )
                 except Exception:
-                    await kb_service.delete(record.id)
+                    await _cleanup_failed_kb_initialization(
+                        kb_service,
+                        metadata_store,
+                        record,
+                    )
                     raise
             return KnowledgeBaseResponse.from_record(record)
+        except HTTPException:
+            raise
         except KnowledgeBaseConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KBLifecycleConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Knowledge base changed concurrently; retry the request",
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -514,22 +669,58 @@ def create_kb_routes(
         dependencies=[Depends(combined_auth)],
         summary="Update a knowledge base",
     )
-    async def update_knowledge_base(kb_id: str, request: KnowledgeBaseUpdateRequest):
-        data = request.model_dump(exclude_unset=True)
-        if enterprise_auth_enabled():
-            data.pop("owner_id", None)
-            data.pop("tenant_id", None)
-        if "active_config_version_id" in data:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "active_config_version_id must be changed via "
-                    "POST /kbs/{kb_id}/configs/{version_id}:activate"
-                ),
-            )
+    async def update_knowledge_base(
+        kb_id: str,
+        request: Request,
+        body: KnowledgeBaseUpdateRequest,
+    ):
+        data = body.model_dump(exclude_unset=True)
         try:
+            metadata_patch = data.get("metadata")
+            if isinstance(metadata_patch, dict):
+                reserved_keys = sorted(
+                    LEGACY_PROVENANCE_METADATA_KEYS.intersection(metadata_patch)
+                )
+                if reserved_keys:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Knowledge base metadata provenance keys are reserved: "
+                            + ", ".join(reserved_keys)
+                        ),
+                    )
+            if enterprise_auth_enabled():
+                principal = get_request_principal(request)
+                if principal is None:
+                    raise HTTPException(status_code=401, detail="Login required")
+                if "visibility" in data and not principal.is_super_admin:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=(
+                            "Only super administrators may update knowledge base "
+                            "visibility"
+                        ),
+                    )
+                data.pop("owner_id", None)
+                data.pop("tenant_id", None)
+                if not principal.is_super_admin:
+                    current = await kb_service.get(kb_id)
+                    if current.origin == "tenant":
+                        data["visibility"] = "private"
+            if "active_config_version_id" in data:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "active_config_version_id must be changed via "
+                        "POST /kbs/{kb_id}/configs/{version_id}:activate"
+                    ),
+                )
             record = await kb_service.update(kb_id, **data)
             return KnowledgeBaseResponse.from_record(record)
+        except HTTPException:
+            raise
+        except KnowledgeBaseConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KnowledgeBaseNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -546,47 +737,59 @@ def create_kb_routes(
     )
     async def delete_knowledge_base(kb_id: str, request: Request, hard: bool = False):
         try:
+            try:
+                authorized_record = await kb_service.get(kb_id, include_deleted=True)
+            except KnowledgeBaseNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            if enterprise_auth_enabled():
+                principal = get_request_principal(request)
+                authz_service = get_enterprise_authorization_service(request)
+                await authz_service.authorize_kb_lifecycle(
+                    principal,
+                    authorized_record,
+                    "hard-delete" if hard else "soft-delete",
+                )
             if hard:
                 # Idempotent hard delete: if the KB is already soft-deleted,
                 # skip the (now failing) soft-delete step and run the destructive
                 # clear directly. Without this, a hard delete that fails midway
                 # (or any soft-delete-then-retry-with-hard flow) gets stuck with
                 # the catalog row in 'deleted' status forever.
-                try:
-                    record = await kb_service.get(kb_id, include_deleted=True)
-                except KnowledgeBaseNotFoundError as exc:
-                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                record = authorized_record
                 if record.status != "deleted":
-                    record = await kb_service.delete(kb_id)
+                    record = await kb_service.delete(
+                        kb_id,
+                        expected_generation=authorized_record.generation,
+                    )
                 if deletion_service is None:
                     raise HTTPException(
                         status_code=503,
                         detail="KB hard-delete service is not configured",
                     )
                 if _hard_delete_worker_enabled(request):
-                    try:
-                        await registry.discard(record.id)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "Hard delete queued but registry discard failed for '%s': %s",
-                            kb_id,
-                            exc,
-                        )
-                    job = await deletion_service.enqueue_hard_delete(record.id)
+                    job = await deletion_service.enqueue_hard_delete(
+                        authorized_record.id,
+                        expected_generation=authorized_record.generation,
+                    )
                     if enterprise_auth_enabled():
-                        principal = get_request_principal(request)
-                        audit_service = get_enterprise_audit_service(request)
-                        await audit_service.append(
+                        await append_enterprise_audit_event(
+                            request,
                             "kb_hard_delete_queued",
-                            actor_user_id=principal.user_id if principal else None,
                             target_type="kb",
                             target_id=record.id,
-                            metadata={"hard": True, "job_id": job.id},
+                            metadata={
+                                "hard": True,
+                                "job_id": job.id,
+                                "generation": authorized_record.generation,
+                            },
                         )
                     return KnowledgeBaseDeleteResponse.from_record_and_job(record, job)
                 # Synchronous (in-process) clear when durable worker is disabled.
                 # Failures are surfaced via the clear_kb job and HTTP 500.
-                result = await deletion_service.hard_delete(record.id)
+                result = await deletion_service.hard_delete(
+                    authorized_record.id,
+                    expected_generation=authorized_record.generation,
+                )
                 if result.errors:
                     raise HTTPException(
                         status_code=500,
@@ -597,7 +800,10 @@ def create_kb_routes(
                         },
                     )
             else:
-                record = await kb_service.delete(kb_id)
+                record = await kb_service.delete(
+                    kb_id,
+                    expected_generation=authorized_record.generation,
+                )
                 try:
                     await registry.discard(record.id)
                 except Exception as exc:  # noqa: BLE001
@@ -607,20 +813,32 @@ def create_kb_routes(
                         exc,
                     )
             if enterprise_auth_enabled():
-                principal = get_request_principal(request)
-                audit_service = get_enterprise_audit_service(request)
-                await audit_service.append(
+                await append_enterprise_audit_event(
+                    request,
                     "kb_hard_deleted" if hard else "kb_deleted",
-                    actor_user_id=principal.user_id if principal else None,
                     target_type="kb",
                     target_id=record.id,
-                    metadata={"hard": hard},
+                    metadata={
+                        "hard": hard,
+                        "generation": authorized_record.generation,
+                    },
                 )
             return KnowledgeBaseDeleteResponse.from_record_and_job(record)
         except HTTPException:
             raise
         except KnowledgeBaseNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except KnowledgeBaseConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KBHardDeleteInProgressError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_code": "kb_hard_delete_in_progress",
+                    "job_id": exc.job.id,
+                    "job_status": exc.job.status,
+                },
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -635,51 +853,124 @@ def create_kb_routes(
     )
     async def restore_knowledge_base(kb_id: str, request: Request):
         try:
+            active_metadata_store = metadata_store
+            if active_metadata_store is None and deletion_service is not None:
+                active_metadata_store = getattr(
+                    deletion_service, "_metadata_store", None
+                )
             try:
                 record = await kb_service.get(kb_id, include_deleted=True)
             except KnowledgeBaseNotFoundError as exc:
+                if active_metadata_store is not None:
+                    lifecycle = await active_metadata_store.get_kb_lifecycle(kb_id)
+                    if lifecycle is not None and lifecycle.state == "deleting":
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "error_code": "kb_hard_delete_in_progress",
+                                "job_id": lifecycle.delete_job_id,
+                            },
+                        ) from exc
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if enterprise_auth_enabled():
+                principal = get_request_principal(request)
+                authz_service = get_enterprise_authorization_service(request)
+                await authz_service.authorize_kb_lifecycle(
+                    principal,
+                    record,
+                    "restore",
+                )
             if record.status != "deleted":
                 raise HTTPException(
                     status_code=409,
                     detail="Knowledge base is not deleted",
                 )
-            if job_service is not None:
-                # A queued/running clear_kb job will still wipe storages after
-                # the catalog row flips back to active — refuse to restore
-                # while a hard delete is in flight.
-                active_clears = [
-                    job
-                    for job in await job_service.list_running_jobs(
-                        record.id, include_deleted=True
+
+            async def restore_after_guarded_rechecks() -> KnowledgeBaseRecord:
+                if active_metadata_store is not None:
+                    lifecycle = await active_metadata_store.get_kb_lifecycle(record.id)
+                    if lifecycle is not None and lifecycle.state == "deleting":
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "error_code": "kb_hard_delete_in_progress",
+                                "job_id": lifecycle.delete_job_id,
+                            },
+                        )
+                if job_service is not None:
+                    # Failed clear jobs remain retryable and retain hard-delete
+                    # intent, so they block restore just like queued/running jobs.
+                    unfinished_jobs, _total = await job_service.list_jobs(
+                        record.id,
+                        statuses=(
+                            "queued",
+                            "running",
+                            "retrying",
+                            "cancelling",
+                            "failed",
+                        ),
+                        limit=200,
+                        include_deleted=True,
                     )
-                    if job.job_type == "clear_kb"
-                ]
-                if active_clears:
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "error_code": "kb_hard_delete_in_progress",
-                            "job_id": active_clears[0].id,
-                        },
-                    )
-            restored = await kb_service.restore(record.id)
+                    active_clears = [
+                        job
+                        for job in unfinished_jobs
+                        if job.job_type == "clear_kb"
+                        and job.payload.get("kb_generation")
+                        in {None, record.generation}
+                    ]
+                    if active_clears:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "error_code": "kb_hard_delete_in_progress",
+                                "job_id": active_clears[0].id,
+                            },
+                        )
+                return await kb_service.restore(
+                    record.id,
+                    expected_generation=record.generation,
+                )
+
+            if active_metadata_store is not None:
+                async with active_metadata_store.kb_write_guard(
+                    record.id,
+                    record.generation,
+                ):
+                    restored = await restore_after_guarded_rechecks()
+            else:
+                restored = await restore_after_guarded_rechecks()
             if enterprise_auth_enabled():
-                principal = get_request_principal(request)
-                audit_service = get_enterprise_audit_service(request)
-                await audit_service.append(
+                await append_enterprise_audit_event(
+                    request,
                     "kb_restored",
-                    actor_user_id=principal.user_id if principal else None,
                     target_type="kb",
                     target_id=restored.id,
+                    metadata={"generation": record.generation},
                 )
             return KnowledgeBaseResponse.from_record(restored)
         except HTTPException:
             raise
         except KnowledgeBaseNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except KnowledgeBaseConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KBLifecycleConflictError as exc:
+            current = exc.current
+            if current.get("state") == "deleting":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error_code": "kb_hard_delete_in_progress",
+                        "job_id": current.get("delete_job_id"),
+                    },
+                ) from exc
+            raise HTTPException(
+                status_code=409,
+                detail="Knowledge base changed concurrently; retry the request",
+            ) from exc
         except ValueError as exc:
             # restore() raced with another state change — surface as conflict.
             raise HTTPException(status_code=409, detail=str(exc)) from exc

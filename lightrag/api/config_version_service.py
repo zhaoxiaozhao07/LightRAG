@@ -5,7 +5,12 @@ import hashlib
 import json
 from typing import Any
 
-from lightrag.api.kb_service import KnowledgeBaseService, utc_now_iso
+from lightrag.api.job_service import assert_active_kb_generation
+from lightrag.api.kb_service import (
+    KnowledgeBaseConflictError,
+    KnowledgeBaseService,
+    utc_now_iso,
+)
 from lightrag.api.lightrag_registry import (
     DestructiveLockBusyError,
     LightRAGInstanceRegistry,
@@ -707,23 +712,36 @@ class ConfigVersionService:
         config: dict[str, Any],
         created_by: str | None = None,
     ) -> ConfigVersionRecord:
-        record = await self._kb_service.get(kb_id)
-        self._validate_config(config)
-        derived = self._derive_hashes(config)
-        version_record = ConfigVersionRecord(
-            id=generate_track_id("cfg"),
-            kb_id=record.id,
-            workspace=record.workspace,
-            version=0,
-            config=config,
-            parser_hash=derived["parser_hash"],
-            index_hash=derived["index_hash"],
-            query_hash=derived["query_hash"],
-            created_at=utc_now_iso(),
-            activated_at=None,
-            created_by=created_by,
-        )
-        return await self._metadata_store.create_config_version(version_record)
+        captured = await self._kb_service.get(kb_id, include_deleted=True)
+        async with self._metadata_store.kb_write_guard(
+            captured.id, captured.generation
+        ):
+            record = await assert_active_kb_generation(
+                self._kb_service,
+                self._metadata_store,
+                captured.id,
+                captured.generation,
+            )
+            if record.workspace != captured.workspace:
+                raise KnowledgeBaseConflictError(
+                    f"Knowledge base '{record.id}' changed workspace"
+                )
+            self._validate_config(config)
+            derived = self._derive_hashes(config)
+            version_record = ConfigVersionRecord(
+                id=generate_track_id("cfg"),
+                kb_id=record.id,
+                workspace=record.workspace,
+                version=0,
+                config=config,
+                parser_hash=derived["parser_hash"],
+                index_hash=derived["index_hash"],
+                query_hash=derived["query_hash"],
+                created_at=utc_now_iso(),
+                activated_at=None,
+                created_by=created_by,
+            )
+            return await self._metadata_store.create_config_version(version_record)
 
     async def list(
         self, kb_id: str, *, limit: int = 50, offset: int = 0
@@ -738,21 +756,38 @@ class ConfigVersionService:
         return await self._metadata_store.get_config_version(record.id, version_id)
 
     async def activate(self, kb_id: str, version_id: str) -> ConfigVersionRecord:
-        record = await self._kb_service.get(kb_id)
-        version = await self._metadata_store.get_config_version(record.id, version_id)
-        await self._kb_service.update(
-            record.id, active_config_version_id=version.id
-        )
-        marked = await self._metadata_store.mark_config_version_activated(
-            record.id, version.id
-        )
-        # Drop cached instance so the next request rebuilds with the new
-        # config version. If a destructive job is in flight, leave it alone.
-        try:
-            await self._registry.discard(record.id)
-        except DestructiveLockBusyError:
-            pass
-        return marked
+        captured = await self._kb_service.get(kb_id, include_deleted=True)
+        async with self._metadata_store.kb_write_guard(
+            captured.id, captured.generation
+        ):
+            record = await assert_active_kb_generation(
+                self._kb_service,
+                self._metadata_store,
+                captured.id,
+                captured.generation,
+            )
+            if record.workspace != captured.workspace:
+                raise KnowledgeBaseConflictError(
+                    f"Knowledge base '{record.id}' changed workspace"
+                )
+            version = await self._metadata_store.get_config_version(
+                record.id, version_id
+            )
+            await self._kb_service.update(
+                record.id,
+                active_config_version_id=version.id,
+                expected_generation=record.generation,
+            )
+            marked = await self._metadata_store.mark_config_version_activated(
+                record.id, version.id
+            )
+            # Drop cached instance so the next request rebuilds with the new
+            # config version. If a destructive job is in flight, leave it alone.
+            try:
+                await self._registry.discard(record.id)
+            except DestructiveLockBusyError:
+                pass
+            return marked
 
     async def diff(
         self, kb_id: str, version_id: str

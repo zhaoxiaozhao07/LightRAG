@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import sqlite3
-from collections.abc import Callable, Sequence
+import threading
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -13,6 +19,16 @@ from lightrag.api.kb_service import _MetadataFileLock, utc_now_iso
 MetadataJobStatus = Literal[
     "queued", "running", "succeeded", "failed", "cancelling", "cancelled", "retrying"
 ]
+
+TenantUserKBOverrideEffect = Literal["allow", "deny"]
+
+_TENANT_USER_KB_OVERRIDE_ROLES = frozenset(
+    {"kb_viewer", "kb_editor", "kb_admin", "kb_owner"}
+)
+_TENANT_MEMBERSHIP_ROLES = frozenset(
+    {"tenant_member", "tenant_admin", "tenant_owner"}
+)
+_LEGACY_KB_TOMBSTONE_PREFIX = "legacy-tombstone:"
 
 DocumentStatus = Literal[
     "uploaded",
@@ -31,8 +47,293 @@ DocumentStatus = Literal[
     "deleted",
 ]
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _T = TypeVar("_T")
+_EXPECTATION_UNSET: Any = object()
+_KB_OPERATION_LOCK_POLL_SECONDS = 0.05
+_JOB_EXECUTION_LOCK_POLL_SECONDS = 0.05
+_ORPHANED_JOB_STATUSES = frozenset({"running", "retrying", "cancelling"})
+_ORPHANED_DOCUMENT_STATUS_TARGETS = {
+    "parse_queued": "parse_failed",
+    "parsing": "parse_failed",
+    "build_queued": "build_failed",
+    "building": "build_failed",
+    "deleting": "delete_failed",
+    "replacing": "replace_failed",
+}
+
+
+class _AsyncKBOperationLock:
+    """Process-local writer-preferring shared/exclusive KB operation lock."""
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+    @asynccontextmanager
+    async def shared(self) -> AsyncIterator[None]:
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: not self._writer and self._waiting_writers == 0
+            )
+            self._readers += 1
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._condition.notify_all()
+
+    @asynccontextmanager
+    async def exclusive(self) -> AsyncIterator[None]:
+        async with self._condition:
+            self._waiting_writers += 1
+            acquired = False
+            try:
+                await self._condition.wait_for(
+                    lambda: not self._writer and self._readers == 0
+                )
+                self._writer = True
+                acquired = True
+            finally:
+                self._waiting_writers -= 1
+                if not acquired:
+                    self._condition.notify_all()
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._writer = False
+                self._condition.notify_all()
+
+
+_PROCESS_KB_OPERATION_LOCKS: dict[
+    tuple[asyncio.AbstractEventLoop, str], _AsyncKBOperationLock
+] = {}
+_PROCESS_KB_OPERATION_LOCKS_GUARD = threading.Lock()
+
+
+def _process_kb_operation_lock(db_path: Path, kb_id: str) -> _AsyncKBOperationLock:
+    lock_name = (
+        f"{db_path.resolve()}:"
+        f"{hashlib.sha256(kb_id.encode('utf-8')).hexdigest()}"
+    )
+    key = (asyncio.get_running_loop(), lock_name)
+    with _PROCESS_KB_OPERATION_LOCKS_GUARD:
+        lock = _PROCESS_KB_OPERATION_LOCKS.get(key)
+        if lock is None:
+            lock = _AsyncKBOperationLock()
+            _PROCESS_KB_OPERATION_LOCKS[key] = lock
+        return lock
+
+
+class _KBOperationFileLock:
+    """Cross-process shared/exclusive byte-range lock for one KB operation."""
+
+    def __init__(self, lock_path: Path, *, shared: bool) -> None:
+        self.lock_path = lock_path
+        self.shared = shared
+        self._file: Any | None = None
+
+    def try_acquire(self) -> bool:
+        if self._file is not None:
+            return True
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        file = self.lock_path.open("a+b")
+        try:
+            if file.seek(0, os.SEEK_END) == 0:
+                file.write(b"0")
+                file.flush()
+                os.fsync(file.fileno())
+            file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                mode = msvcrt.LK_NBRLCK if self.shared else msvcrt.LK_NBLCK
+                msvcrt.locking(file.fileno(), mode, 1)
+            else:
+                import fcntl
+
+                mode = fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX
+                fcntl.flock(file.fileno(), mode | fcntl.LOCK_NB)
+        except OSError:
+            file.close()
+            return False
+        except BaseException:
+            file.close()
+            raise
+        self._file = file
+        return True
+
+    def release(self) -> None:
+        if self._file is None:
+            return
+        try:
+            self._file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._file.close()
+            self._file = None
+
+
+async def _acquire_kb_operation_file_lock(lock: _KBOperationFileLock) -> None:
+    while not lock.try_acquire():
+        await asyncio.sleep(_KB_OPERATION_LOCK_POLL_SECONDS)
+
+
+class _AsyncJobExecutionLock:
+    """Process-local exclusive lock with a real non-blocking acquire mode."""
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._locked = False
+
+    async def acquire(self, *, wait: bool) -> bool:
+        async with self._condition:
+            if not wait:
+                if self._locked:
+                    return False
+                self._locked = True
+                return True
+            await self._condition.wait_for(lambda: not self._locked)
+            self._locked = True
+            return True
+
+    async def release(self) -> None:
+        async with self._condition:
+            self._locked = False
+            self._condition.notify(1)
+
+
+_PROCESS_JOB_EXECUTION_LOCKS: dict[
+    tuple[asyncio.AbstractEventLoop, str], _AsyncJobExecutionLock
+] = {}
+_PROCESS_JOB_EXECUTION_LOCKS_GUARD = threading.Lock()
+
+
+def _process_job_execution_lock(
+    db_path: Path, job_id: str
+) -> _AsyncJobExecutionLock:
+    digest = hashlib.sha256(job_id.encode("utf-8")).hexdigest()
+    lock_name = f"{db_path.resolve()}:{digest}"
+    key = (asyncio.get_running_loop(), lock_name)
+    with _PROCESS_JOB_EXECUTION_LOCKS_GUARD:
+        lock = _PROCESS_JOB_EXECUTION_LOCKS.get(key)
+        if lock is None:
+            lock = _AsyncJobExecutionLock()
+            _PROCESS_JOB_EXECUTION_LOCKS[key] = lock
+        return lock
+
+
+@dataclass(slots=True)
+class _SQLiteJobGuardTaskState:
+    owner_task: asyncio.Task[Any] | None
+    depths: dict[str, int]
+
+
+@dataclass(slots=True)
+class _SQLiteKBWriteGuardTaskState:
+    owner_task: asyncio.Task[Any] | None
+    depths: dict[tuple[str, str | None], int]
+    idle_events: dict[tuple[str, str | None], asyncio.Event]
+
+
+async def _wait_for_kb_guard_borrowers(event: asyncio.Event) -> None:
+    wait_task = asyncio.create_task(event.wait())
+    try:
+        await asyncio.shield(wait_task)
+    except asyncio.CancelledError:
+        await asyncio.gather(wait_task, return_exceptions=True)
+        raise
+
+
+def _validate_job_execution_id(job_id: str) -> None:
+    if not isinstance(job_id, str) or not job_id.strip() or job_id != job_id.strip():
+        raise MetadataStoreError(
+            "Job execution lock id must be a normalized non-empty string"
+        )
+
+
+def _orphan_recovery_cutoff(grace_seconds: float) -> str:
+    grace = max(0.0, float(grace_seconds))
+    return (datetime.now(timezone.utc) - timedelta(seconds=grace)).isoformat()
+
+
+def _same_job_execution_identity(left: JobRecord, right: JobRecord) -> bool:
+    """Compare one durable claim incarnation without adding a run-token column."""
+
+    return (
+        left.id,
+        left.kb_id,
+        left.workspace,
+        left.batch_id,
+        left.document_id,
+        left.job_type,
+        left.created_at,
+        left.queued_at,
+        left.started_at,
+        left.retry_count,
+    ) == (
+        right.id,
+        right.kb_id,
+        right.workspace,
+        right.batch_id,
+        right.document_id,
+        right.job_type,
+        right.created_at,
+        right.queued_at,
+        right.started_at,
+        right.retry_count,
+    )
+
+
+def _job_recovery_document_ids(job: JobRecord) -> set[str]:
+    document_ids: set[str] = set()
+    if job.document_id:
+        document_ids.add(job.document_id)
+    payload = job.payload or {}
+    raw_document_ids = payload.get("document_ids")
+    if isinstance(raw_document_ids, list):
+        document_ids.update(
+            item for item in raw_document_ids if isinstance(item, str) and item
+        )
+    raw_items = payload.get("items")
+    if isinstance(raw_items, list):
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            document_id = item.get("document_id")
+            if isinstance(document_id, str) and document_id:
+                document_ids.add(document_id)
+    return document_ids
+
+
+def _document_job_ids(document: DocumentRecord) -> set[str]:
+    metadata = document.metadata or {}
+    return {
+        value
+        for key in (
+            "pending_parse_job_id",
+            "current_parse_job_id",
+            "pending_build_job_id",
+            "current_build_job_id",
+            "pending_delete_job_id",
+            "current_delete_job_id",
+            "pending_replace_job_id",
+            "current_replace_job_id",
+        )
+        if isinstance((value := metadata.get(key)), str) and value
+    }
 
 # Aggregate jobs (``document_id IS NULL``) that a durable worker can still
 # re-drive after a restart because everything they need is persisted:
@@ -56,6 +357,15 @@ _AGGREGATE_RESUMABLE_JOB_TYPES: frozenset[str] = frozenset(
 )
 
 
+def _should_requeue_orphaned_clear_job(
+    job: JobRecord,
+    resumable_job_types: set[str],
+) -> bool:
+    """Return whether crash recovery should directly requeue this clear job."""
+
+    return job.job_type == "clear_kb" and "clear_kb" in resumable_job_types
+
+
 def _worker_eligibility_sql(job_types: Sequence[str]) -> tuple[str, list[Any]]:
     """SQL fragment + params selecting worker-claimable jobs.
 
@@ -75,6 +385,31 @@ def _worker_eligibility_sql(job_types: Sequence[str]) -> tuple[str, list[Any]]:
 
 
 class MetadataStoreError(RuntimeError):
+    pass
+
+
+class MetadataConflictError(MetadataStoreError):
+    """An optimistic concurrency or lifecycle precondition did not match."""
+
+    def __init__(
+        self,
+        entity_type: str,
+        entity_id: str,
+        *,
+        expected: dict[str, Any],
+        current: dict[str, Any],
+    ):
+        self.entity_type = entity_type
+        self.entity_id = entity_id
+        self.expected = expected
+        self.current = current
+        super().__init__(
+            f"{entity_type} metadata conflict for '{entity_id}': "
+            f"expected {expected}, current {current}"
+        )
+
+
+class KBLifecycleConflictError(MetadataConflictError):
     pass
 
 
@@ -139,6 +474,10 @@ class DuplicateDocumentSourceKeyError(MetadataStoreError):
         super().__init__(
             f"Source key '{source_key}' already belongs to document '{existing_document_id}'"
         )
+
+
+class InvalidTenantUserKBOverrideError(MetadataStoreError, ValueError):
+    pass
 
 
 @dataclass(slots=True)
@@ -354,6 +693,9 @@ class EnterpriseUserRecord:
     can_delete_documents: bool = False
     # Capability to use the high-cost server-side Agent query mode.
     can_use_agent_query: bool = False
+    # New users are denied original-file downloads until explicitly granted.
+    # Backend migrations preserve access for records created before this field.
+    can_download_files: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "EnterpriseUserRecord":
@@ -372,6 +714,113 @@ class EnterpriseUserRecord:
             updated_at=str(row["updated_at"]),
             can_delete_documents=bool(row["can_delete_documents"]),
             can_use_agent_query=bool(row["can_use_agent_query"]),
+            can_download_files=bool(row["can_download_files"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _assert_enterprise_user_write_preconditions(
+    user: EnterpriseUserRecord,
+    current_user: EnterpriseUserRecord | None,
+    *,
+    expected_updated_at: Any,
+    expected_token_version: Any,
+    expected_tenant_id: Any,
+    allow_tenant_change: bool,
+) -> None:
+    """Validate the revision used by an enterprise-user whole-record write.
+
+    Creation intentionally has no expected revision. Every existing-user write
+    must provide all three values from the snapshot that produced ``user``.
+    Keeping the expected revision separate from the candidate's new
+    ``updated_at`` prevents a stale whole-record replay from restoring security
+    fields changed by another request.
+    """
+
+    expectation_values = {
+        "updated_at": expected_updated_at,
+        "token_version": expected_token_version,
+        "tenant_id": expected_tenant_id,
+    }
+    supplied = {
+        key: value is not _EXPECTATION_UNSET
+        for key, value in expectation_values.items()
+    }
+    display_expected = {
+        key: value if supplied[key] else "<missing>"
+        for key, value in expectation_values.items()
+    }
+
+    if current_user is None:
+        if any(supplied.values()):
+            raise MetadataConflictError(
+                "enterprise_user",
+                user.id,
+                expected=display_expected,
+                current={"exists": False},
+            )
+        if not allow_tenant_change and user.tenant_id is not None:
+            raise MetadataConflictError(
+                "enterprise_user",
+                user.id,
+                expected={"tenant_id": None},
+                current={"candidate_tenant_id": user.tenant_id},
+            )
+        return
+
+    current = {
+        "updated_at": current_user.updated_at,
+        "token_version": current_user.token_version,
+        "tenant_id": current_user.tenant_id,
+    }
+    if not all(supplied.values()) or expectation_values != current:
+        raise MetadataConflictError(
+            "enterprise_user",
+            user.id,
+            expected=display_expected,
+            current=current,
+        )
+    if not allow_tenant_change and user.tenant_id != current_user.tenant_id:
+        raise MetadataConflictError(
+            "enterprise_user",
+            user.id,
+            expected={"tenant_id": current_user.tenant_id},
+            current={"candidate_tenant_id": user.tenant_id},
+        )
+    if user.token_version < current_user.token_version:
+        raise MetadataConflictError(
+            "enterprise_user",
+            user.id,
+            expected={"minimum_token_version": current_user.token_version},
+            current={"candidate_token_version": user.token_version},
+        )
+
+
+@dataclass(slots=True)
+class KBLifecycleRecord:
+    kb_id: str
+    generation: str
+    state: Literal["active", "deleting", "deleted"]
+    activated_at: str
+    deleted_at: str | None
+    updated_at: str
+    delete_job_id: str | None = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "KBLifecycleRecord":
+        columns = set(row.keys())
+        return cls(
+            kb_id=str(row["kb_id"]),
+            generation=str(row["generation"]),
+            state=str(row["state"]),  # type: ignore[arg-type]
+            activated_at=str(row["activated_at"]),
+            deleted_at=row["deleted_at"],
+            updated_at=str(row["updated_at"]),
+            delete_job_id=(
+                row["delete_job_id"] if "delete_job_id" in columns else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -663,6 +1112,35 @@ class EnterpriseTenantMembershipRecord:
         return asdict(self)
 
 
+def _assert_enterprise_user_membership_precondition(
+    user_id: str,
+    current_memberships: Sequence[EnterpriseTenantMembershipRecord],
+    *,
+    expected_membership: Any,
+) -> None:
+    """Compare the unique canonical membership with a captured snapshot."""
+
+    if expected_membership is _EXPECTATION_UNSET:
+        return
+    if expected_membership is not None and not isinstance(
+        expected_membership, EnterpriseTenantMembershipRecord
+    ):
+        raise MetadataStoreError(
+            "Expected tenant membership must be a membership record or null"
+        )
+    expected = (
+        [] if expected_membership is None else [expected_membership.to_dict()]
+    )
+    current = [membership.to_dict() for membership in current_memberships]
+    if current != expected:
+        raise MetadataConflictError(
+            "enterprise_user_membership",
+            user_id,
+            expected={"memberships": expected},
+            current={"memberships": current},
+        )
+
+
 @dataclass(slots=True)
 class EnterpriseTenantKBACLRecord:
     tenant_id: str
@@ -678,6 +1156,36 @@ class EnterpriseTenantKBACLRecord:
             tenant_id=str(row["tenant_id"]),
             kb_id=str(row["kb_id"]),
             role=str(row["role"]),
+            granted_by=row["granted_by"],
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class EnterpriseTenantUserKBOverrideRecord:
+    tenant_id: str
+    kb_id: str
+    user_id: str
+    effect: TenantUserKBOverrideEffect
+    role: str | None
+    granted_by: str | None
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(
+        cls, row: sqlite3.Row
+    ) -> "EnterpriseTenantUserKBOverrideRecord":
+        return cls(
+            tenant_id=str(row["tenant_id"]),
+            kb_id=str(row["kb_id"]),
+            user_id=str(row["user_id"]),
+            effect=str(row["effect"]),  # type: ignore[arg-type]
+            role=row["role"],
             granted_by=row["granted_by"],
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
@@ -724,6 +1232,8 @@ class AuditEventRecord:
     target_id: str | None
     metadata: dict[str, Any]
     created_at: str
+    # Event-time snapshot. Legacy events remain unscoped (None).
+    actor_tenant_id: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "AuditEventRecord":
@@ -735,6 +1245,7 @@ class AuditEventRecord:
             target_id=row["target_id"],
             metadata=_loads_json_object(row["metadata_json"]),
             created_at=str(row["created_at"]),
+            actor_tenant_id=row["actor_tenant_id"],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -768,11 +1279,212 @@ def _metadata_source_key(metadata: dict[str, Any]) -> str | None:
     return source_key or None
 
 
+def _validate_tenant_user_kb_override(
+    record: EnterpriseTenantUserKBOverrideRecord,
+) -> None:
+    for field_name in ("tenant_id", "kb_id", "user_id"):
+        value = getattr(record, field_name)
+        if not isinstance(value, str) or not value.strip() or value != value.strip():
+            raise InvalidTenantUserKBOverrideError(
+                f"Override {field_name} must be a non-empty normalized string"
+            )
+    for field_name in ("created_at", "updated_at"):
+        value = getattr(record, field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise InvalidTenantUserKBOverrideError(
+                f"Override {field_name} must be a non-empty string"
+            )
+    if record.granted_by is not None and (
+        not isinstance(record.granted_by, str)
+        or not record.granted_by.strip()
+        or record.granted_by != record.granted_by.strip()
+    ):
+        raise InvalidTenantUserKBOverrideError(
+            "Override granted_by must be null or a normalized non-empty string"
+        )
+    if record.effect == "allow":
+        if record.role not in _TENANT_USER_KB_OVERRIDE_ROLES:
+            raise InvalidTenantUserKBOverrideError(
+                "Allow override role must be a canonical KB role"
+            )
+    elif record.effect == "deny":
+        if record.role is not None:
+            raise InvalidTenantUserKBOverrideError(
+                "Deny override must not include a role"
+            )
+    else:
+        raise InvalidTenantUserKBOverrideError(
+            "Override effect must be either 'allow' or 'deny'"
+        )
+
+
+def _tenant_user_kb_override_target_snapshot(
+    tenant_id: str,
+    user_id: str,
+    user: EnterpriseUserRecord | None,
+    membership: EnterpriseTenantMembershipRecord | None,
+) -> dict[str, Any]:
+    """Return the security-relevant target revision for an override write."""
+
+    user_snapshot = (
+        None
+        if user is None
+        else {
+            "id": user.id,
+            "tenant_id": user.tenant_id,
+            "system_role": user.system_role,
+            "token_version": user.token_version,
+            "updated_at": user.updated_at,
+        }
+    )
+    membership_snapshot = (
+        None
+        if membership is None
+        else {
+            "tenant_id": membership.tenant_id,
+            "user_id": membership.user_id,
+            "role": membership.role,
+            "updated_at": membership.updated_at,
+        }
+    )
+    eligible = bool(
+        user is not None
+        and user.id == user_id
+        and user.tenant_id == tenant_id
+        and user.system_role != "super_admin"
+        and membership is not None
+        and membership.tenant_id == tenant_id
+        and membership.user_id == user_id
+        and membership.role == "tenant_member"
+    )
+    return {
+        "eligible": eligible,
+        "user": user_snapshot,
+        "membership": membership_snapshot,
+    }
+
+
+def _assert_tenant_user_kb_override_target_preconditions(
+    tenant_id: str,
+    user_id: str,
+    current_user: EnterpriseUserRecord | None,
+    current_membership: EnterpriseTenantMembershipRecord | None,
+    *,
+    expected_user: Any = _EXPECTATION_UNSET,
+    expected_membership: Any = _EXPECTATION_UNSET,
+) -> None:
+    """CAS-check an override target's user and membership in the write txn."""
+
+    if (
+        expected_user is _EXPECTATION_UNSET
+        and expected_membership is _EXPECTATION_UNSET
+    ):
+        return
+    if not isinstance(expected_user, EnterpriseUserRecord) or not isinstance(
+        expected_membership, EnterpriseTenantMembershipRecord
+    ):
+        raise MetadataStoreError(
+            "Override target CAS requires both user and membership snapshots"
+        )
+
+    expected = _tenant_user_kb_override_target_snapshot(
+        tenant_id,
+        user_id,
+        expected_user,
+        expected_membership,
+    )
+    current = _tenant_user_kb_override_target_snapshot(
+        tenant_id,
+        user_id,
+        current_user,
+        current_membership,
+    )
+    if not expected["eligible"] or not current["eligible"] or current != expected:
+        raise MetadataConflictError(
+            "tenant_user_kb_override_target",
+            f"{tenant_id}:{user_id}",
+            expected=expected,
+            current=current,
+        )
+
+
+def _validate_kb_lifecycle_identity(kb_id: str, generation: str) -> None:
+    for name, value in (("kb_id", kb_id), ("generation", generation)):
+        if not isinstance(value, str) or not value.strip() or value != value.strip():
+            raise MetadataStoreError(
+                f"KB lifecycle {name} must be a normalized non-empty string"
+            )
+
+
+def _validate_delete_job_id(delete_job_id: str) -> None:
+    if (
+        not isinstance(delete_job_id, str)
+        or not delete_job_id.strip()
+        or delete_job_id != delete_job_id.strip()
+    ):
+        raise MetadataStoreError(
+            "KB lifecycle delete_job_id must be a normalized non-empty string"
+        )
+
+
+def _kb_lifecycle_conflict(
+    kb_id: str,
+    expected_generation: str | None,
+    current: KBLifecycleRecord,
+    *,
+    expected_state: str = "active",
+    expected_delete_job_id: str | None = None,
+) -> KBLifecycleConflictError:
+    expected: dict[str, Any] = {
+        "generation": expected_generation,
+        "state": expected_state,
+    }
+    if expected_delete_job_id is not None:
+        expected["delete_job_id"] = expected_delete_job_id
+    return KBLifecycleConflictError(
+        "kb_lifecycle",
+        kb_id,
+        expected=expected,
+        current={
+            "generation": current.generation,
+            "state": current.state,
+            "delete_job_id": current.delete_job_id,
+        },
+    )
+
+
+def _missing_kb_lifecycle_conflict(
+    kb_id: str,
+    expected_generation: str,
+    *,
+    expected_state: str,
+    expected_delete_job_id: str | None = None,
+) -> KBLifecycleConflictError:
+    expected: dict[str, Any] = {
+        "generation": expected_generation,
+        "state": expected_state,
+    }
+    if expected_delete_job_id is not None:
+        expected["delete_job_id"] = expected_delete_job_id
+    return KBLifecycleConflictError(
+        "kb_lifecycle",
+        kb_id,
+        expected=expected,
+        current={"exists": False},
+    )
+
+
 class SQLiteMetadataStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.lock_path = Path(f"{self.db_path}.lock")
         self._lock = asyncio.Lock()
+        self._job_guard_state: ContextVar[_SQLiteJobGuardTaskState | None] = (
+            ContextVar(f"sqlite_job_guard_state_{id(self)}", default=None)
+        )
+        self._kb_write_guard_state: ContextVar[
+            _SQLiteKBWriteGuardTaskState | None
+        ] = ContextVar(f"sqlite_kb_write_guard_state_{id(self)}", default=None)
         self._initialized = False
 
     async def initialize(self) -> None:
@@ -2329,68 +3041,151 @@ class SQLiteMetadataStore:
         return [EnterpriseUserRecord.from_row(row) for row in rows]
 
     async def upsert_enterprise_user(
-        self, user: EnterpriseUserRecord
+        self,
+        user: EnterpriseUserRecord,
+        *,
+        expected_updated_at: Any = _EXPECTATION_UNSET,
+        expected_token_version: Any = _EXPECTATION_UNSET,
+        expected_tenant_id: Any = _EXPECTATION_UNSET,
     ) -> EnterpriseUserRecord:
+        """Create a tenant-less user or CAS-update an existing user."""
         await self._ensure_initialized()
-
-        def write(conn: sqlite3.Connection) -> EnterpriseUserRecord:
-            conn.execute(
-                """
-                INSERT INTO enterprise_users (
-                    id, username, password_hash, system_role, status, tenant_id,
-                    can_create_kb, can_use_bypass_query, can_delete_documents,
-                    can_use_agent_query,
-                    token_version, metadata_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    username = excluded.username,
-                    password_hash = excluded.password_hash,
-                    system_role = excluded.system_role,
-                    status = excluded.status,
-                    tenant_id = excluded.tenant_id,
-                    can_create_kb = excluded.can_create_kb,
-                    can_use_bypass_query = excluded.can_use_bypass_query,
-                    can_delete_documents = excluded.can_delete_documents,
-                    can_use_agent_query = excluded.can_use_agent_query,
-                    token_version = excluded.token_version,
-                    metadata_json = excluded.metadata_json,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    user.id,
-                    user.username,
-                    user.password_hash,
-                    user.system_role,
-                    user.status,
-                    user.tenant_id,
-                    int(user.can_create_kb),
-                    int(user.can_use_bypass_query),
-                    int(user.can_delete_documents),
-                    int(user.can_use_agent_query),
-                    user.token_version,
-                    _dumps_json(user.metadata),
-                    user.created_at,
-                    user.updated_at,
-                ),
+        saved, _membership = await self._write(
+            lambda conn: self._upsert_enterprise_user_with_membership(
+                conn,
+                user,
+                membership=None,
+                expected_updated_at=expected_updated_at,
+                expected_token_version=expected_token_version,
+                expected_tenant_id=expected_tenant_id,
+                allow_tenant_change=False,
             )
-            row = conn.execute(
-                "SELECT * FROM enterprise_users WHERE id = ?", (user.id,)
-            ).fetchone()
-            assert row is not None
-            return EnterpriseUserRecord.from_row(row)
+        )
+        return saved
 
-        return await self._write(write)
+    async def update_enterprise_user_cas(
+        self,
+        user: EnterpriseUserRecord,
+        *,
+        expected_updated_at: str,
+        expected_token_version: int,
+        expected_tenant_id: str | None,
+    ) -> EnterpriseUserRecord:
+        return await self.upsert_enterprise_user(
+            user,
+            expected_updated_at=expected_updated_at,
+            expected_token_version=expected_token_version,
+            expected_tenant_id=expected_tenant_id,
+        )
 
-    async def delete_enterprise_user(self, user_id: str) -> bool:
+    async def upsert_enterprise_user_with_membership(
+        self,
+        user: EnterpriseUserRecord,
+        membership: EnterpriseTenantMembershipRecord | None,
+        *,
+        expected_updated_at: Any = _EXPECTATION_UNSET,
+        expected_token_version: Any = _EXPECTATION_UNSET,
+        expected_tenant_id: Any = _EXPECTATION_UNSET,
+        expected_membership: Any = _EXPECTATION_UNSET,
+    ) -> tuple[EnterpriseUserRecord, EnterpriseTenantMembershipRecord | None]:
+        """Atomically save a user and synchronize its canonical membership.
+
+        ``user.tenant_id`` is authoritative. A null tenant produces no
+        membership. For a non-null tenant, an explicitly supplied matching
+        membership is used; otherwise the existing canonical membership is
+        preserved or a ``tenant_member`` row is created. Overrides belonging to
+        every tenant the user leaves are removed in the same transaction.
+        """
+        await self._ensure_initialized()
+        return await self._write(
+            lambda conn: self._upsert_enterprise_user_with_membership(
+                conn,
+                user,
+                membership=membership,
+                expected_updated_at=expected_updated_at,
+                expected_token_version=expected_token_version,
+                expected_tenant_id=expected_tenant_id,
+                expected_membership=expected_membership,
+                allow_tenant_change=True,
+            )
+        )
+
+    async def delete_enterprise_user(
+        self,
+        user_id: str,
+        *,
+        expected_updated_at: Any = _EXPECTATION_UNSET,
+        expected_token_version: Any = _EXPECTATION_UNSET,
+        expected_tenant_id: Any = _EXPECTATION_UNSET,
+        expected_membership: Any = _EXPECTATION_UNSET,
+    ) -> bool:
         """Delete a user and cascade-remove related tenant memberships, KB ACLs,
         per-user query settings and chat projects/sessions.  Returns ``True`` if
         the user existed."""
         await self._ensure_initialized()
 
         def write(conn: sqlite3.Connection) -> bool:
+            current_row = conn.execute(
+                "SELECT * FROM enterprise_users WHERE id = ?", (user_id,)
+            ).fetchone()
+            conditional = any(
+                value is not _EXPECTATION_UNSET
+                for value in (
+                    expected_updated_at,
+                    expected_token_version,
+                    expected_tenant_id,
+                    expected_membership,
+                )
+            )
+            if current_row is None:
+                if conditional:
+                    raise MetadataConflictError(
+                        "enterprise_user",
+                        user_id,
+                        expected={"exists": True},
+                        current={"exists": False},
+                    )
+                return False
+            current_user = EnterpriseUserRecord.from_row(current_row)
+            if any(
+                value is not _EXPECTATION_UNSET
+                for value in (
+                    expected_updated_at,
+                    expected_token_version,
+                    expected_tenant_id,
+                )
+            ):
+                _assert_enterprise_user_write_preconditions(
+                    current_user,
+                    current_user,
+                    expected_updated_at=expected_updated_at,
+                    expected_token_version=expected_token_version,
+                    expected_tenant_id=expected_tenant_id,
+                    allow_tenant_change=False,
+                )
+            if expected_membership is not _EXPECTATION_UNSET:
+                membership_rows = conn.execute(
+                    """
+                    SELECT * FROM enterprise_tenant_memberships
+                    WHERE user_id = ? ORDER BY tenant_id ASC
+                    """,
+                    (user_id,),
+                ).fetchall()
+                _assert_enterprise_user_membership_precondition(
+                    user_id,
+                    [
+                        EnterpriseTenantMembershipRecord.from_row(row)
+                        for row in membership_rows
+                    ],
+                    expected_membership=expected_membership,
+                )
             # Cascade: remove related records first.
             conn.execute(
                 "DELETE FROM enterprise_tenant_memberships WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.execute(
+                "DELETE FROM enterprise_tenant_user_kb_overrides WHERE user_id = ?",
                 (user_id,),
             )
             conn.execute(
@@ -3157,12 +3952,364 @@ class SQLiteMetadataStore:
             ).fetchone()
         return default if row is None else str(row["value"])
 
+    async def get_kb_lifecycle(self, kb_id: str) -> KBLifecycleRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_kb_lifecycle WHERE kb_id = ?", (kb_id,)
+            ).fetchone()
+        return KBLifecycleRecord.from_row(row) if row is not None else None
+
+    async def assert_kb_not_deleting(
+        self, kb_id: str, expected_generation: str | None = None
+    ) -> KBLifecycleRecord | None:
+        """Return lifecycle state unless an in-progress hard delete owns the KB."""
+
+        if expected_generation is not None:
+            _validate_kb_lifecycle_identity(kb_id, expected_generation)
+        current = await self.get_kb_lifecycle(kb_id)
+        if current is not None and (
+            current.state == "deleting"
+            or (
+                expected_generation is not None
+                and current.generation != expected_generation
+            )
+        ):
+            raise _kb_lifecycle_conflict(kb_id, expected_generation, current)
+        return current
+
+    async def activate_kb_generation(
+        self,
+        kb_id: str,
+        generation: str,
+        *,
+        activated_at: str | None = None,
+    ) -> KBLifecycleRecord:
+        _validate_kb_lifecycle_identity(kb_id, generation)
+        await self._ensure_initialized()
+        return await self._write(
+            lambda conn: self._activate_kb_generation(
+                conn,
+                kb_id,
+                generation,
+                activated_at=activated_at or utc_now_iso(),
+            )
+        )
+
+    async def register_kb_generation(
+        self,
+        kb_id: str,
+        generation: str,
+        *,
+        activated_at: str | None = None,
+    ) -> KBLifecycleRecord:
+        return await self.activate_kb_generation(
+            kb_id, generation, activated_at=activated_at
+        )
+
+    async def assert_kb_generation(
+        self, kb_id: str, expected_generation: str | None
+    ) -> KBLifecycleRecord | None:
+        await self._ensure_initialized()
+        return await self._write(
+            lambda conn: self._assert_kb_generation(
+                conn, kb_id, expected_generation
+            )
+        )
+
+    async def assert_current_kb_generation(
+        self, kb_id: str, expected_generation: str | None
+    ) -> KBLifecycleRecord | None:
+        return await self.assert_kb_generation(kb_id, expected_generation)
+
+    @asynccontextmanager
+    async def job_execution_guard(
+        self, job_id: str, *, wait: bool = True
+    ) -> AsyncIterator[bool]:
+        """Own one durable job across processes for the complete context.
+
+        The lock is a stable job-id hash in a sibling lock directory, combined
+        with a process-local lock shared by store instances using the same DB.
+        Standard crash-stop cleanup closes the file descriptor and releases the
+        OS lock. This is intentionally session ownership, not a durable lease or
+        run token. ``wait=False`` is a single non-blocking ownership attempt.
+        The same asyncio task may re-enter the same job on this store safely.
+        """
+
+        _validate_job_execution_id(job_id)
+        await self._ensure_initialized()
+        task = asyncio.current_task()
+        state = self._job_guard_state.get()
+        state_token: Any | None = None
+        if state is None or state.owner_task is not task:
+            state = _SQLiteJobGuardTaskState(owner_task=task, depths={})
+            state_token = self._job_guard_state.set(state)
+
+        current_depth = state.depths.get(job_id, 0)
+        if current_depth:
+            state.depths[job_id] = current_depth + 1
+            try:
+                yield True
+            finally:
+                remaining = state.depths[job_id] - 1
+                if remaining:
+                    state.depths[job_id] = remaining
+                else:
+                    state.depths.pop(job_id, None)
+                if state_token is not None:
+                    self._job_guard_state.reset(state_token)
+            return
+
+        process_lock = _process_job_execution_lock(self.db_path, job_id)
+        process_acquired = False
+        file_lock: _KBOperationFileLock | None = None
+        file_acquired = False
+        try:
+            process_acquired = await process_lock.acquire(wait=wait)
+            if not process_acquired:
+                yield False
+                return
+            file_lock = _KBOperationFileLock(
+                self._job_execution_lock_path(job_id), shared=False
+            )
+            if wait:
+                while not file_lock.try_acquire():
+                    await asyncio.sleep(_JOB_EXECUTION_LOCK_POLL_SECONDS)
+                file_acquired = True
+            else:
+                file_acquired = file_lock.try_acquire()
+            if not file_acquired:
+                yield False
+                return
+            state.depths[job_id] = 1
+            try:
+                yield True
+            finally:
+                state.depths.pop(job_id, None)
+        finally:
+            try:
+                if file_acquired and file_lock is not None:
+                    file_lock.release()
+            finally:
+                try:
+                    if process_acquired:
+                        release_task = asyncio.create_task(process_lock.release())
+                        try:
+                            await asyncio.shield(release_task)
+                        except asyncio.CancelledError:
+                            await asyncio.gather(release_task, return_exceptions=True)
+                            raise
+                finally:
+                    if state_token is not None:
+                        self._job_guard_state.reset(state_token)
+
+    @asynccontextmanager
+    async def kb_write_guard(
+        self, kb_id: str, expected_generation: str | None
+    ) -> AsyncIterator[KBLifecycleRecord | None]:
+        """Hold the cross-process shared KB operation fence for a write.
+
+        The same task may re-enter the same store/KB/generation without taking
+        a second process or file lock. This is required when request middleware,
+        a service operation, and a worker executor all enforce the same fence.
+        """
+
+        await self._ensure_initialized()
+        # Fast rejection avoids waiting behind a deletion guard whose lifecycle
+        # transition is already committed. The guarded assertion below closes
+        # the race between this preflight and lock acquisition.
+        await self.assert_kb_generation(kb_id, expected_generation)
+        task = asyncio.current_task()
+        guard_key = (kb_id, expected_generation)
+        state = self._kb_write_guard_state.get()
+        if (
+            state is not None
+            and state.owner_task is not task
+            and state.depths.get(guard_key, 0)
+        ):
+            # Child tasks inherit ContextVar values. Borrow the active parent
+            # fence while the parent awaits this task; the owner will not
+            # release its process/file lock until every borrower exits.
+            state.depths[guard_key] += 1
+            idle_event = state.idle_events[guard_key]
+            idle_event.clear()
+            try:
+                yield await self.assert_kb_generation(kb_id, expected_generation)
+            finally:
+                remaining = state.depths[guard_key] - 1
+                if remaining:
+                    state.depths[guard_key] = remaining
+                else:
+                    state.depths.pop(guard_key, None)
+                    idle_event.set()
+            return
+
+        state_token: Any | None = None
+        if state is None or state.owner_task is not task:
+            state = _SQLiteKBWriteGuardTaskState(
+                owner_task=task,
+                depths={},
+                idle_events={},
+            )
+            state_token = self._kb_write_guard_state.set(state)
+
+        current_depth = state.depths.get(guard_key, 0)
+        if current_depth:
+            state.depths[guard_key] = current_depth + 1
+            try:
+                yield await self.assert_kb_generation(kb_id, expected_generation)
+            finally:
+                remaining = state.depths[guard_key] - 1
+                if remaining:
+                    state.depths[guard_key] = remaining
+                else:
+                    state.depths.pop(guard_key, None)
+                    state.idle_events[guard_key].set()
+                if state_token is not None:
+                    self._kb_write_guard_state.reset(state_token)
+            return
+
+        process_lock = _process_kb_operation_lock(self.db_path, kb_id)
+        try:
+            async with process_lock.shared():
+                file_lock = _KBOperationFileLock(
+                    self._kb_operation_lock_path(kb_id), shared=True
+                )
+                await _acquire_kb_operation_file_lock(file_lock)
+                try:
+                    current = await self.assert_kb_generation(
+                        kb_id, expected_generation
+                    )
+                    idle_event = asyncio.Event()
+                    state.idle_events[guard_key] = idle_event
+                    state.depths[guard_key] = 1
+                    try:
+                        yield current
+                    finally:
+                        remaining = state.depths[guard_key] - 1
+                        if remaining:
+                            state.depths[guard_key] = remaining
+                            await _wait_for_kb_guard_borrowers(idle_event)
+                        else:
+                            state.depths.pop(guard_key, None)
+                            idle_event.set()
+                        state.idle_events.pop(guard_key, None)
+                finally:
+                    file_lock.release()
+        finally:
+            if state_token is not None:
+                self._kb_write_guard_state.reset(state_token)
+
+    @asynccontextmanager
+    async def kb_exclusive_operation_guard(
+        self,
+        kb_id: str,
+    ) -> AsyncIterator[None]:
+        """Hold only the cross-process exclusive KB operation fence.
+
+        This context deliberately does not mutate lifecycle state. Hard-delete
+        orchestration can therefore re-read the catalog while exclusion is held
+        and call :meth:`begin_kb_deletion` only after that catalog precondition
+        still matches.
+        """
+
+        await self._ensure_initialized()
+        process_lock = _process_kb_operation_lock(self.db_path, kb_id)
+        async with process_lock.exclusive():
+            file_lock = _KBOperationFileLock(
+                self._kb_operation_lock_path(kb_id), shared=False
+            )
+            await _acquire_kb_operation_file_lock(file_lock)
+            try:
+                yield
+            finally:
+                file_lock.release()
+
+    @asynccontextmanager
+    async def kb_deletion_guard(
+        self,
+        kb_id: str,
+        expected_generation: str | None = None,
+        delete_job_id: str | None = None,
+    ) -> AsyncIterator[KBLifecycleRecord | None]:
+        """Compatibility wrapper around the split delete lock/state APIs.
+
+        Calling this with only ``kb_id`` is the new pure-exclusive form. Older
+        callers may still pass generation/job; that form begins deletion after
+        acquiring the same fence and retains the historical durable binding.
+        """
+
+        if (expected_generation is None) != (delete_job_id is None):
+            raise MetadataStoreError(
+                "KB deletion guard requires both generation and delete_job_id"
+            )
+        async with self.kb_exclusive_operation_guard(kb_id):
+            if expected_generation is None or delete_job_id is None:
+                yield None
+                return
+            yield await self.begin_kb_deletion(
+                kb_id,
+                expected_generation,
+                delete_job_id,
+            )
+
+    async def begin_kb_deletion(
+        self,
+        kb_id: str,
+        generation: str,
+        delete_job_id: str,
+    ) -> KBLifecycleRecord:
+        """Atomically bind ``active -> deleting``; exact retries are idempotent."""
+
+        _validate_kb_lifecycle_identity(kb_id, generation)
+        _validate_delete_job_id(delete_job_id)
+        await self._ensure_initialized()
+        return await self._write(
+            lambda conn: self._begin_kb_deletion(
+                conn,
+                kb_id,
+                generation,
+                delete_job_id,
+            )
+        )
+
+    async def complete_kb_deletion(
+        self, kb_id: str, generation: str, delete_job_id: str
+    ) -> KBLifecycleRecord:
+        """Atomically finish ``deleting`` -> ``deleted``; exact retries are safe."""
+
+        _validate_kb_lifecycle_identity(kb_id, generation)
+        _validate_delete_job_id(delete_job_id)
+        await self._ensure_initialized()
+        return await self._write(
+            lambda conn: self._complete_kb_deletion(
+                conn, kb_id, generation, delete_job_id
+            )
+        )
+
     async def create_enterprise_api_key(
-        self, record: EnterpriseAPIKeyRecord
+        self,
+        record: EnterpriseAPIKeyRecord,
+        *,
+        expected_kb_generations: dict[str, str] | None = None,
     ) -> EnterpriseAPIKeyRecord:
         await self._ensure_initialized()
 
         def write(conn: sqlite3.Connection) -> EnterpriseAPIKeyRecord:
+            if not isinstance(record.scopes, dict):
+                raise MetadataStoreError("Service API key scopes must be an object")
+            kb_roles = record.scopes.get("kb_roles", {})
+            if not isinstance(kb_roles, dict):
+                raise MetadataStoreError("Service API key kb_roles must be an object")
+            for kb_id in kb_roles:
+                if not isinstance(kb_id, str) or not kb_id:
+                    raise MetadataStoreError("Service API key KB id must be non-empty")
+            for kb_id in sorted(kb_roles):
+                self._assert_kb_generation(
+                    conn,
+                    kb_id,
+                    (expected_kb_generations or {}).get(kb_id),
+                )
             conn.execute(
                 """
                 INSERT INTO enterprise_api_keys (
@@ -3389,10 +4536,13 @@ class SQLiteMetadataStore:
 
         return await self._write(write)
 
-    async def upsert_kb_acl(self, acl: KBACLRecord) -> KBACLRecord:
+    async def upsert_kb_acl(
+        self, acl: KBACLRecord, *, expected_generation: str | None = None
+    ) -> KBACLRecord:
         await self._ensure_initialized()
 
         def write(conn: sqlite3.Connection) -> KBACLRecord:
+            self._assert_kb_generation(conn, acl.kb_id, expected_generation)
             conn.execute(
                 """
                 INSERT INTO enterprise_kb_acl (
@@ -3424,10 +4574,17 @@ class SQLiteMetadataStore:
 
         return await self._write(write)
 
-    async def delete_kb_acl(self, kb_id: str, user_id: str) -> bool:
+    async def delete_kb_acl(
+        self,
+        kb_id: str,
+        user_id: str,
+        *,
+        expected_generation: str | None = None,
+    ) -> bool:
         await self._ensure_initialized()
 
         def write(conn: sqlite3.Connection) -> bool:
+            self._assert_kb_generation(conn, kb_id, expected_generation)
             cursor = conn.execute(
                 "DELETE FROM enterprise_kb_acl WHERE kb_id = ? AND user_id = ?",
                 (kb_id, user_id),
@@ -3537,6 +4694,34 @@ class SQLiteMetadataStore:
         await self._ensure_initialized()
 
         def write(conn: sqlite3.Connection) -> bool:
+            if (
+                conn.execute(
+                    "SELECT 1 FROM enterprise_tenants WHERE id = ?", (tenant_id,)
+                ).fetchone()
+                is None
+            ):
+                return False
+            now = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE enterprise_users
+                SET tenant_id = NULL, updated_at = ?
+                WHERE tenant_id = ?
+                """,
+                (now, tenant_id),
+            )
+            conn.execute(
+                "DELETE FROM enterprise_tenant_memberships WHERE tenant_id = ?",
+                (tenant_id,),
+            )
+            conn.execute(
+                "DELETE FROM enterprise_tenant_kb_acl WHERE tenant_id = ?",
+                (tenant_id,),
+            )
+            conn.execute(
+                "DELETE FROM enterprise_tenant_user_kb_overrides WHERE tenant_id = ?",
+                (tenant_id,),
+            )
             cursor = conn.execute(
                 "DELETE FROM enterprise_tenants WHERE id = ?", (tenant_id,)
             )
@@ -3550,34 +4735,34 @@ class SQLiteMetadataStore:
         await self._ensure_initialized()
 
         def write(conn: sqlite3.Connection) -> EnterpriseTenantMembershipRecord:
-            conn.execute(
-                """
-                INSERT INTO enterprise_tenant_memberships (
-                    tenant_id, user_id, role, granted_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(tenant_id, user_id) DO UPDATE SET
-                    role = excluded.role,
-                    granted_by = excluded.granted_by,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    membership.tenant_id,
-                    membership.user_id,
-                    membership.role,
-                    membership.granted_by,
-                    membership.created_at,
-                    membership.updated_at,
-                ),
-            )
-            row = conn.execute(
-                """
-                SELECT * FROM enterprise_tenant_memberships
-                WHERE tenant_id = ? AND user_id = ?
-                """,
-                (membership.tenant_id, membership.user_id),
+            user_row = conn.execute(
+                "SELECT * FROM enterprise_users WHERE id = ?", (membership.user_id,)
             ).fetchone()
-            assert row is not None
-            return EnterpriseTenantMembershipRecord.from_row(row)
+            if user_row is None:
+                raise MetadataRecordNotFoundError(
+                    f"User '{membership.user_id}' not found"
+                )
+            user = EnterpriseUserRecord.from_row(user_row)
+            updated_user = EnterpriseUserRecord(
+                **{
+                    **user.to_dict(),
+                    "tenant_id": membership.tenant_id,
+                    "updated_at": membership.updated_at,
+                }
+            )
+            _saved_user, saved_membership = (
+                self._upsert_enterprise_user_with_membership(
+                    conn,
+                    updated_user,
+                    membership=membership,
+                    expected_updated_at=user.updated_at,
+                    expected_token_version=user.token_version,
+                    expected_tenant_id=user.tenant_id,
+                    allow_tenant_change=True,
+                )
+            )
+            assert saved_membership is not None
+            return saved_membership
 
         return await self._write(write)
 
@@ -3585,14 +4770,52 @@ class SQLiteMetadataStore:
         await self._ensure_initialized()
 
         def write(conn: sqlite3.Connection) -> bool:
-            cursor = conn.execute(
+            membership_row = conn.execute(
                 """
-                DELETE FROM enterprise_tenant_memberships
+                SELECT * FROM enterprise_tenant_memberships
                 WHERE tenant_id = ? AND user_id = ?
                 """,
                 (tenant_id, user_id),
-            )
-            return bool(cursor.rowcount)
+            ).fetchone()
+            if membership_row is None:
+                return False
+            user_row = conn.execute(
+                "SELECT * FROM enterprise_users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if user_row is not None and user_row["tenant_id"] == tenant_id:
+                user = EnterpriseUserRecord.from_row(user_row)
+                cleared_user = EnterpriseUserRecord(
+                    **{
+                        **user.to_dict(),
+                        "tenant_id": None,
+                        "updated_at": utc_now_iso(),
+                    }
+                )
+                self._upsert_enterprise_user_with_membership(
+                    conn,
+                    cleared_user,
+                    membership=None,
+                    expected_updated_at=user.updated_at,
+                    expected_token_version=user.token_version,
+                    expected_tenant_id=user.tenant_id,
+                    allow_tenant_change=True,
+                )
+            else:
+                conn.execute(
+                    """
+                    DELETE FROM enterprise_tenant_memberships
+                    WHERE tenant_id = ? AND user_id = ?
+                    """,
+                    (tenant_id, user_id),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM enterprise_tenant_user_kb_overrides
+                    WHERE tenant_id = ? AND user_id = ?
+                    """,
+                    (tenant_id, user_id),
+                )
+            return True
 
         return await self._write(write)
 
@@ -3641,11 +4864,15 @@ class SQLiteMetadataStore:
         return None if row is None else EnterpriseTenantMembershipRecord.from_row(row)
 
     async def upsert_tenant_kb_acl(
-        self, acl: EnterpriseTenantKBACLRecord
+        self,
+        acl: EnterpriseTenantKBACLRecord,
+        *,
+        expected_generation: str | None = None,
     ) -> EnterpriseTenantKBACLRecord:
         await self._ensure_initialized()
 
         def write(conn: sqlite3.Connection) -> EnterpriseTenantKBACLRecord:
+            self._assert_kb_generation(conn, acl.kb_id, expected_generation)
             conn.execute(
                 """
                 INSERT INTO enterprise_tenant_kb_acl (
@@ -3677,10 +4904,17 @@ class SQLiteMetadataStore:
 
         return await self._write(write)
 
-    async def delete_tenant_kb_acl(self, tenant_id: str, kb_id: str) -> bool:
+    async def delete_tenant_kb_acl(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        *,
+        expected_generation: str | None = None,
+    ) -> bool:
         await self._ensure_initialized()
 
         def write(conn: sqlite3.Connection) -> bool:
+            self._assert_kb_generation(conn, kb_id, expected_generation)
             cursor = conn.execute(
                 """
                 DELETE FROM enterprise_tenant_kb_acl
@@ -3736,6 +4970,249 @@ class SQLiteMetadataStore:
             ).fetchall()
         return [str(row["kb_id"]) for row in rows]
 
+    async def get_tenant_user_kb_override(
+        self, tenant_id: str, kb_id: str, user_id: str
+    ) -> EnterpriseTenantUserKBOverrideRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM enterprise_tenant_user_kb_overrides
+                WHERE tenant_id = ? AND kb_id = ? AND user_id = ?
+                """,
+                (tenant_id, kb_id, user_id),
+            ).fetchone()
+        return (
+            EnterpriseTenantUserKBOverrideRecord.from_row(row)
+            if row is not None
+            else None
+        )
+
+    async def list_tenant_user_kb_overrides(
+        self, tenant_id: str, kb_id: str
+    ) -> list[EnterpriseTenantUserKBOverrideRecord]:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM enterprise_tenant_user_kb_overrides
+                WHERE tenant_id = ? AND kb_id = ?
+                ORDER BY created_at ASC, user_id ASC
+                """,
+                (tenant_id, kb_id),
+            ).fetchall()
+        return [EnterpriseTenantUserKBOverrideRecord.from_row(row) for row in rows]
+
+    async def list_user_tenant_kb_overrides(
+        self,
+        user_id: str,
+        *,
+        tenant_ids: Sequence[str] | None = None,
+        kb_id: str | None = None,
+    ) -> list[EnterpriseTenantUserKBOverrideRecord]:
+        """List a user's overrides, optionally constrained to memberships/KB."""
+        await self._ensure_initialized()
+        clauses = ["user_id = ?"]
+        params: list[Any] = [user_id]
+        if tenant_ids is not None:
+            normalized_ids = sorted({item for item in tenant_ids if item})
+            if not normalized_ids:
+                return []
+            placeholders = ",".join("?" for _ in normalized_ids)
+            clauses.append(f"tenant_id IN ({placeholders})")
+            params.extend(normalized_ids)
+        if kb_id is not None:
+            clauses.append("kb_id = ?")
+            params.append(kb_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM enterprise_tenant_user_kb_overrides
+                WHERE {" AND ".join(clauses)}
+                ORDER BY tenant_id ASC, kb_id ASC
+                """,
+                params,
+            ).fetchall()
+        return [EnterpriseTenantUserKBOverrideRecord.from_row(row) for row in rows]
+
+    async def list_tenant_user_kb_overrides_for_user(
+        self,
+        user_id: str,
+        *,
+        tenant_ids: Sequence[str] | None = None,
+        kb_id: str | None = None,
+    ) -> list[EnterpriseTenantUserKBOverrideRecord]:
+        return await self.list_user_tenant_kb_overrides(
+            user_id, tenant_ids=tenant_ids, kb_id=kb_id
+        )
+
+    async def upsert_tenant_user_kb_override(
+        self,
+        record: EnterpriseTenantUserKBOverrideRecord,
+        *,
+        expected_generation: str | None = None,
+        expected_user: Any = _EXPECTATION_UNSET,
+        expected_membership: Any = _EXPECTATION_UNSET,
+    ) -> EnterpriseTenantUserKBOverrideRecord:
+        _validate_tenant_user_kb_override(record)
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterpriseTenantUserKBOverrideRecord:
+            self._assert_kb_generation(conn, record.kb_id, expected_generation)
+            user_row = conn.execute(
+                "SELECT * FROM enterprise_users WHERE id = ?",
+                (record.user_id,),
+            ).fetchone()
+            membership_row = conn.execute(
+                """
+                SELECT * FROM enterprise_tenant_memberships
+                WHERE tenant_id = ? AND user_id = ?
+                """,
+                (record.tenant_id, record.user_id),
+            ).fetchone()
+            current_user = (
+                EnterpriseUserRecord.from_row(user_row)
+                if user_row is not None
+                else None
+            )
+            current_membership = (
+                EnterpriseTenantMembershipRecord.from_row(membership_row)
+                if membership_row is not None
+                else None
+            )
+            _assert_tenant_user_kb_override_target_preconditions(
+                record.tenant_id,
+                record.user_id,
+                current_user,
+                current_membership,
+                expected_user=expected_user,
+                expected_membership=expected_membership,
+            )
+            if (
+                current_user is None
+                or current_user.tenant_id != record.tenant_id
+                or current_membership is None
+            ):
+                raise InvalidTenantUserKBOverrideError(
+                    "Override user must have a matching canonical tenant membership"
+                )
+            conn.execute(
+                """
+                INSERT INTO enterprise_tenant_user_kb_overrides (
+                    tenant_id, kb_id, user_id, effect, role, granted_by,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id, kb_id, user_id) DO UPDATE SET
+                    effect = excluded.effect,
+                    role = excluded.role,
+                    granted_by = excluded.granted_by,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    record.tenant_id,
+                    record.kb_id,
+                    record.user_id,
+                    record.effect,
+                    record.role,
+                    record.granted_by,
+                    record.created_at,
+                    record.updated_at,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM enterprise_tenant_user_kb_overrides
+                WHERE tenant_id = ? AND kb_id = ? AND user_id = ?
+                """,
+                (record.tenant_id, record.kb_id, record.user_id),
+            ).fetchone()
+            assert row is not None
+            return EnterpriseTenantUserKBOverrideRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def delete_tenant_user_kb_override(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        user_id: str,
+        *,
+        granted_by: str | None = None,
+        updated_at: str | None = None,
+        expected_generation: str | None = None,
+        expected_user: Any = _EXPECTATION_UNSET,
+        expected_membership: Any = _EXPECTATION_UNSET,
+    ) -> EnterpriseTenantUserKBOverrideRecord:
+        """Write a tenant-scoped deny; reset physically removes the row."""
+        now = updated_at or utc_now_iso()
+        return await self.upsert_tenant_user_kb_override(
+            EnterpriseTenantUserKBOverrideRecord(
+                tenant_id=tenant_id,
+                kb_id=kb_id,
+                user_id=user_id,
+                effect="deny",
+                role=None,
+                granted_by=granted_by,
+                created_at=now,
+                updated_at=now,
+            ),
+            expected_generation=expected_generation,
+            expected_user=expected_user,
+            expected_membership=expected_membership,
+        )
+
+    async def reset_tenant_user_kb_override(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        user_id: str,
+        *,
+        expected_generation: str | None = None,
+        expected_user: Any = _EXPECTATION_UNSET,
+        expected_membership: Any = _EXPECTATION_UNSET,
+    ) -> bool:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> bool:
+            self._assert_kb_generation(conn, kb_id, expected_generation)
+            if (
+                expected_user is not _EXPECTATION_UNSET
+                or expected_membership is not _EXPECTATION_UNSET
+            ):
+                user_row = conn.execute(
+                    "SELECT * FROM enterprise_users WHERE id = ?",
+                    (user_id,),
+                ).fetchone()
+                membership_row = conn.execute(
+                    """
+                    SELECT * FROM enterprise_tenant_memberships
+                    WHERE tenant_id = ? AND user_id = ?
+                    """,
+                    (tenant_id, user_id),
+                ).fetchone()
+                _assert_tenant_user_kb_override_target_preconditions(
+                    tenant_id,
+                    user_id,
+                    EnterpriseUserRecord.from_row(user_row)
+                    if user_row is not None
+                    else None,
+                    EnterpriseTenantMembershipRecord.from_row(membership_row)
+                    if membership_row is not None
+                    else None,
+                    expected_user=expected_user,
+                    expected_membership=expected_membership,
+                )
+            cursor = conn.execute(
+                """
+                DELETE FROM enterprise_tenant_user_kb_overrides
+                WHERE tenant_id = ? AND kb_id = ? AND user_id = ?
+                """,
+                (tenant_id, kb_id, user_id),
+            )
+            return bool(cursor.rowcount)
+
+        return await self._write(write)
+
     async def append_audit_event(
         self, event: AuditEventRecord
     ) -> AuditEventRecord:
@@ -3745,14 +5222,15 @@ class SQLiteMetadataStore:
             conn.execute(
                 """
                 INSERT INTO enterprise_audit_events (
-                    id, event_type, actor_user_id, target_type, target_id,
-                    metadata_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    id, event_type, actor_user_id, actor_tenant_id, target_type,
+                    target_id, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.id,
                     event.event_type,
                     event.actor_user_id,
+                    event.actor_tenant_id,
                     event.target_type,
                     event.target_id,
                     _dumps_json(event.metadata),
@@ -3774,6 +5252,7 @@ class SQLiteMetadataStore:
         offset: int = 0,
         event_type: str | None = None,
         actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
         target_type: str | None = None,
         target_id: str | None = None,
         created_after: str | None = None,
@@ -3787,6 +5266,7 @@ class SQLiteMetadataStore:
         for column, value in (
             ("event_type", event_type),
             ("actor_user_id", actor_user_id),
+            ("actor_tenant_id", actor_tenant_id),
             ("target_type", target_type),
             ("target_id", target_id),
         ):
@@ -3813,27 +5293,164 @@ class SQLiteMetadataStore:
             ).fetchall()
         return [AuditEventRecord.from_row(row) for row in rows]
 
-    async def purge_kb_metadata(self, kb_id: str) -> dict[str, int]:
+    async def purge_kb_metadata(
+        self,
+        kb_id: str,
+        generation: str | None = None,
+        *,
+        delete_job_id: str | None = None,
+    ) -> dict[str, int]:
         """Hard delete all SQLite control-plane state for a KB.
 
         Returns the row count removed per table for audit purposes. Does
         NOT touch on-disk artifacts / inputs / vector / graph storage —
-        callers must orchestrate those separately.
+        callers must orchestrate those separately. Supplying ``delete_job_id``
+        enables the strict hard-delete path: lifecycle must already be bound to
+        that deleting generation/job, the clear job row is retained, and the
+        lifecycle remains ``deleting`` until :meth:`complete_kb_deletion`.
         """
         await self._ensure_initialized()
 
         def write(conn: sqlite3.Connection) -> dict[str, int]:
             counts: dict[str, int] = {}
+            updated_keys = 0
+            now = utc_now_iso()
+            if generation is not None:
+                _validate_kb_lifecycle_identity(kb_id, generation)
+            strict_generation = generation
+            if delete_job_id is not None:
+                _validate_delete_job_id(delete_job_id)
+                if strict_generation is None:
+                    raise MetadataStoreError(
+                        "Strict KB metadata purge requires a generation"
+                    )
+            lifecycle_row = conn.execute(
+                "SELECT * FROM enterprise_kb_lifecycle WHERE kb_id = ?", (kb_id,)
+            ).fetchone()
+            if delete_job_id is not None:
+                assert strict_generation is not None
+                if lifecycle_row is None:
+                    raise _missing_kb_lifecycle_conflict(
+                        kb_id,
+                        strict_generation,
+                        expected_state="deleting",
+                        expected_delete_job_id=delete_job_id,
+                    )
+                lifecycle = KBLifecycleRecord.from_row(lifecycle_row)
+                if (
+                    lifecycle.state != "deleting"
+                    or lifecycle.generation != strict_generation
+                    or lifecycle.delete_job_id != delete_job_id
+                ):
+                    raise _kb_lifecycle_conflict(
+                        kb_id,
+                        strict_generation,
+                        lifecycle,
+                        expected_state="deleting",
+                        expected_delete_job_id=delete_job_id,
+                    )
+            elif lifecycle_row is None:
+                tombstone_generation = generation or (
+                    f"{_LEGACY_KB_TOMBSTONE_PREFIX}{kb_id}"
+                )
+                _validate_kb_lifecycle_identity(kb_id, tombstone_generation)
+                conn.execute(
+                    """
+                    INSERT INTO enterprise_kb_lifecycle (
+                        kb_id, generation, state, activated_at, deleted_at,
+                        updated_at, delete_job_id
+                    ) VALUES (?, ?, 'deleted', ?, ?, ?, NULL)
+                    """,
+                    (kb_id, tombstone_generation, now, now, now),
+                )
+            else:
+                lifecycle = KBLifecycleRecord.from_row(lifecycle_row)
+                legacy_retry = (
+                    generation is None
+                    and lifecycle.state == "deleted"
+                    and lifecycle.generation
+                    == f"{_LEGACY_KB_TOMBSTONE_PREFIX}{kb_id}"
+                )
+                if not legacy_retry and generation != lifecycle.generation:
+                    raise _kb_lifecycle_conflict(kb_id, generation, lifecycle)
+                if lifecycle.state == "deleting":
+                    raise _kb_lifecycle_conflict(kb_id, generation, lifecycle)
+                if lifecycle.state == "active":
+                    cursor = conn.execute(
+                        """
+                        UPDATE enterprise_kb_lifecycle
+                        SET state = 'deleted', deleted_at = ?, updated_at = ?,
+                            delete_job_id = NULL
+                        WHERE kb_id = ? AND generation = ? AND state = 'active'
+                        """,
+                        (now, now, kb_id, lifecycle.generation),
+                    )
+                    if cursor.rowcount != 1:
+                        refreshed_row = conn.execute(
+                            "SELECT * FROM enterprise_kb_lifecycle WHERE kb_id = ?",
+                            (kb_id,),
+                        ).fetchone()
+                        if refreshed_row is None:
+                            raise _missing_kb_lifecycle_conflict(
+                                kb_id,
+                                lifecycle.generation,
+                                expected_state="active",
+                            )
+                        raise _kb_lifecycle_conflict(
+                            kb_id,
+                            lifecycle.generation,
+                            KBLifecycleRecord.from_row(refreshed_row),
+                        )
+            key_rows = conn.execute(
+                "SELECT id, scopes_json FROM enterprise_api_keys"
+            ).fetchall()
+            for key_row in key_rows:
+                scopes = _loads_json_object(key_row["scopes_json"])
+                kb_roles = scopes.get("kb_roles", {})
+                if not isinstance(kb_roles, dict):
+                    raise MetadataStoreError(
+                        "Service API key kb_roles must be an object"
+                    )
+                if kb_id not in kb_roles:
+                    continue
+                scopes["kb_roles"] = {
+                    role_kb_id: role
+                    for role_kb_id, role in kb_roles.items()
+                    if role_kb_id != kb_id
+                }
+                conn.execute(
+                    """
+                    UPDATE enterprise_api_keys
+                    SET scopes_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (_dumps_json(scopes), now, key_row["id"]),
+                )
+                updated_keys += 1
+            counts["enterprise_api_keys"] = updated_keys
             for table in (
                 "document_artifacts",
                 "document_source_keys",
+                "enterprise_kb_acl",
+                "enterprise_tenant_kb_acl",
+                "enterprise_tenant_user_kb_overrides",
                 "enterprise_user_kb_query_settings",
                 "kb_config_versions",
-                "jobs",
-                "documents",
             ):
                 cursor = conn.execute(f"DELETE FROM {table} WHERE kb_id = ?", (kb_id,))
                 counts[table] = cursor.rowcount or 0
+            if delete_job_id is None:
+                jobs_cursor = conn.execute("DELETE FROM jobs WHERE kb_id = ?", (kb_id,))
+            else:
+                jobs_cursor = conn.execute(
+                    "DELETE FROM jobs WHERE kb_id = ? AND id <> ?",
+                    (kb_id, delete_job_id),
+                )
+            counts["jobs"] = jobs_cursor.rowcount or 0
+            documents_cursor = conn.execute(
+                "DELETE FROM documents WHERE kb_id = ?", (kb_id,)
+            )
+            counts["documents"] = documents_cursor.rowcount or 0
             return counts
 
         return await self._write(write)
@@ -3844,50 +5461,45 @@ class SQLiteMetadataStore:
         error_code: str = "worker_orphaned",
         error_message: str = "Job worker crashed before completion; please retry",
         resumable_job_types: set[str] | None = None,
+        grace_seconds: float = 0.0,
     ) -> list[JobRecord]:
-        """Mark queued / running / cancelling / retrying jobs as failed.
+        """Recover transient jobs without stealing one from a live owner.
 
-        Used at server startup: in-process background workers cannot resume
-        after a crash, so any jobs still in transient states are orphans
-        and must be transitioned to ``failed`` so the user can retry them
-        through the normal cancel/retry API. Documents stuck in
-        parse_queued / parsing / build_queued / building are also reset to
-        the corresponding ``*_failed`` state so the active-claim guard
-        stops treating them as having an in-flight job.
+        Queued semantics are unchanged: resumable queued jobs remain queued and
+        every other queued job is failed immediately. Running/retrying/
+        cancelling rows are recovered only when their ``updated_at`` is older
+        than ``grace_seconds`` and a non-blocking :meth:`job_execution_guard`
+        succeeds. Status, timestamp, and claim identity are checked again while
+        ownership is held. Resumable ``clear_kb`` rows are requeued in place so
+        their post-catalog-purge tail can finish; other orphan rows and their
+        documents retain the existing failed-recovery behavior.
 
-        When a durable :class:`~lightrag.api.job_worker.JobWorker` is enabled,
-        ``resumable_job_types`` lists job types the worker can re-drive from
-        persisted state (e.g. ``{"parse", "build_kg", "reindex", "delete", "sync"}``).
-        Jobs of those types that are still ``queued`` (created but never started,
-        or reset by ``:retry``) are LEFT queued so the worker consumes them
-        instead of failing them. ``delete`` and ``sync`` are special: aggregate
-        jobs are resumable only when their document ids/options or staged source
-        bytes are persisted in the job payload/files. Jobs that were already
-        ``running`` (their in-process task died mid-flight) are still failed —
-        they cannot be safely resumed — and the document reset below makes their
-        next retry re-claimable. Default ``None`` preserves the original "fail
-        everything transient" behaviour.
+        This is a standard crash-stop boundary, not a lease: a live owner holds
+        the OS/session lock, while process or database-session death releases it
+        for exactly one recovery owner. Retry and claim continue on the same
+        durable job row; no run-token column is required.
+
+        Direct store calls default to zero grace for backwards compatibility.
+        Production startup and :class:`~lightrag.api.job_worker.JobWorker` pass
+        a safe grace at least as large as the worker claim gap.
         """
         await self._ensure_initialized()
         resumable = set(resumable_job_types or set())
+        cutoff = _orphan_recovery_cutoff(grace_seconds)
 
-        def write(conn: sqlite3.Connection) -> list[JobRecord]:
+        def recover_queued(conn: sqlite3.Connection) -> list[JobRecord]:
             rows = conn.execute(
                 """
                 SELECT * FROM jobs
-                WHERE status IN ('queued', 'running', 'cancelling', 'retrying')
+                WHERE status = 'queued'
+                ORDER BY created_at ASC, id ASC
                 """
             ).fetchall()
             updated: list[JobRecord] = []
             now = utc_now_iso()
             for row in rows:
-                # Leave resumable queued jobs for the durable worker to pick up.
-                # Single-document jobs and the aggregate types that are
-                # re-drivable from persisted state (batch-delete/parse/build/
-                # reindex/sync) are kept queued; other aggregates still fail.
                 if (
-                    row["status"] == "queued"
-                    and row["job_type"] in resumable
+                    row["job_type"] in resumable
                     and (
                         row["document_id"] is not None
                         or row["job_type"] in _AGGREGATE_RESUMABLE_JOB_TYPES
@@ -3907,46 +5519,151 @@ class SQLiteMetadataStore:
                     "SELECT * FROM jobs WHERE id = ?", (row["id"],)
                 ).fetchone()
                 if refreshed is not None:
-                    updated.append(JobRecord.from_row(refreshed))
-            conn.execute(
-                """
-                UPDATE documents
-                SET status = 'parse_failed', error_code = ?, error_message = ?,
-                    updated_at = ?
-                WHERE status IN ('parse_queued', 'parsing')
-                """,
-                (error_code, error_message, now),
-            )
-            conn.execute(
-                """
-                UPDATE documents
-                SET status = 'build_failed', error_code = ?, error_message = ?,
-                    updated_at = ?
-                WHERE status IN ('build_queued', 'building')
-                """,
-                (error_code, error_message, now),
-            )
-            conn.execute(
-                """
-                UPDATE documents
-                SET status = 'delete_failed', error_code = ?, error_message = ?,
-                    updated_at = ?
-                WHERE status = 'deleting'
-                """,
-                (error_code, error_message, now),
-            )
-            conn.execute(
-                """
-                UPDATE documents
-                SET status = 'replace_failed', error_code = ?, error_message = ?,
-                    updated_at = ?
-                WHERE status = 'replacing'
-                """,
-                (error_code, error_message, now),
-            )
+                    recovered = JobRecord.from_row(refreshed)
+                    self._recover_documents_for_job(
+                        conn,
+                        recovered,
+                        error_code=error_code,
+                        error_message=error_message,
+                        now=now,
+                    )
+                    updated.append(recovered)
             return updated
 
-        return await self._write(write)
+        updated = await self._write(recover_queued)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status IN ('running', 'retrying', 'cancelling')
+                    AND updated_at <= ?
+                ORDER BY updated_at ASC, id ASC
+                """,
+                (cutoff,),
+            ).fetchall()
+        candidates = [JobRecord.from_row(row) for row in rows]
+
+        for candidate in candidates:
+            async with self.job_execution_guard(
+                candidate.id, wait=False
+            ) as acquired:
+                if not acquired:
+                    continue
+
+                def recover_candidate(
+                    conn: sqlite3.Connection,
+                ) -> JobRecord | None:
+                    row = conn.execute(
+                        "SELECT * FROM jobs WHERE id = ?", (candidate.id,)
+                    ).fetchone()
+                    if row is None:
+                        return None
+                    current = JobRecord.from_row(row)
+                    if (
+                        current.status not in _ORPHANED_JOB_STATUSES
+                        or current.updated_at > cutoff
+                        or current.updated_at != candidate.updated_at
+                        or not _same_job_execution_identity(candidate, current)
+                    ):
+                        return None
+                    now = utc_now_iso()
+                    requeue_clear = _should_requeue_orphaned_clear_job(
+                        current,
+                        resumable,
+                    )
+                    if requeue_clear:
+                        conn.execute(
+                            """
+                            UPDATE jobs
+                            SET status = 'queued', error_code = NULL,
+                                error_message = NULL, updated_at = ?, queued_at = ?,
+                                started_at = NULL, finished_at = NULL,
+                                cancelled_at = NULL,
+                                retry_count = MIN(retry_count + 1, max_retries)
+                            WHERE id = ?
+                            """,
+                            (now, now, current.id),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE jobs
+                            SET status = 'failed', error_code = ?, error_message = ?,
+                                updated_at = ?, finished_at = COALESCE(finished_at, ?)
+                            WHERE id = ?
+                            """,
+                            (error_code, error_message, now, now, current.id),
+                        )
+                    refreshed = conn.execute(
+                        "SELECT * FROM jobs WHERE id = ?", (current.id,)
+                    ).fetchone()
+                    if refreshed is None:
+                        return None
+                    recovered = JobRecord.from_row(refreshed)
+                    if not requeue_clear:
+                        self._recover_documents_for_job(
+                            conn,
+                            recovered,
+                            error_code=error_code,
+                            error_message=error_message,
+                            now=now,
+                        )
+                    return recovered
+
+                recovered = await self._write(recover_candidate)
+                if recovered is not None:
+                    updated.append(recovered)
+        return updated
+
+    def _recover_documents_for_job(
+        self,
+        conn: sqlite3.Connection,
+        job: JobRecord,
+        *,
+        error_code: str,
+        error_message: str,
+        now: str,
+    ) -> None:
+        document_ids = _job_recovery_document_ids(job)
+        rows = conn.execute(
+            """
+            SELECT * FROM documents
+            WHERE kb_id = ? AND deleted_at IS NULL
+                AND status IN (
+                    'parse_queued', 'parsing', 'build_queued', 'building',
+                    'deleting', 'replacing'
+                )
+            """,
+            (job.kb_id,),
+        ).fetchall()
+        for row in rows:
+            document = DocumentRecord.from_row(row)
+            active_job_ids = _document_job_ids(document)
+            belongs_to_job = (
+                job.id in active_job_ids
+                if active_job_ids
+                else document.id in document_ids
+            )
+            if not belongs_to_job:
+                continue
+            target_status = _ORPHANED_DOCUMENT_STATUS_TARGETS.get(document.status)
+            if target_status is None:
+                continue
+            conn.execute(
+                """
+                UPDATE documents
+                SET status = ?, error_code = ?, error_message = ?, updated_at = ?
+                WHERE kb_id = ? AND id = ?
+                """,
+                (
+                    target_status,
+                    error_code,
+                    error_message,
+                    now,
+                    document.kb_id,
+                    document.id,
+                ),
+            )
 
     async def claim_next_worker_job(
         self,
@@ -4023,6 +5740,460 @@ class SQLiteMetadataStore:
 
         return await self._write(write)
 
+    def _upsert_enterprise_user_with_membership(
+        self,
+        conn: sqlite3.Connection,
+        user: EnterpriseUserRecord,
+        *,
+        membership: EnterpriseTenantMembershipRecord | None,
+        expected_updated_at: Any,
+        expected_token_version: Any,
+        expected_tenant_id: Any,
+        expected_membership: Any = _EXPECTATION_UNSET,
+        allow_tenant_change: bool,
+    ) -> tuple[EnterpriseUserRecord, EnterpriseTenantMembershipRecord | None]:
+        canonical_tenant = user.tenant_id
+        if canonical_tenant is not None and (
+            not isinstance(canonical_tenant, str)
+            or not canonical_tenant.strip()
+            or canonical_tenant != canonical_tenant.strip()
+        ):
+            raise MetadataStoreError(
+                "Enterprise user tenant_id must be null or a normalized non-empty string"
+            )
+        if membership is not None:
+            if membership.user_id != user.id:
+                raise MetadataStoreError("Membership user_id must match the saved user")
+            if canonical_tenant is None or membership.tenant_id != canonical_tenant:
+                raise MetadataStoreError(
+                    "Membership tenant_id must match the user's canonical tenant_id"
+                )
+            if membership.role not in _TENANT_MEMBERSHIP_ROLES:
+                raise MetadataStoreError("Membership role is not recognized")
+
+        current_row = conn.execute(
+            "SELECT * FROM enterprise_users WHERE id = ?", (user.id,)
+        ).fetchone()
+        current_user = (
+            EnterpriseUserRecord.from_row(current_row)
+            if current_row is not None
+            else None
+        )
+        _assert_enterprise_user_write_preconditions(
+            user,
+            current_user,
+            expected_updated_at=expected_updated_at,
+            expected_token_version=expected_token_version,
+            expected_tenant_id=expected_tenant_id,
+            allow_tenant_change=allow_tenant_change,
+        )
+
+        if expected_membership is not _EXPECTATION_UNSET:
+            membership_rows = conn.execute(
+                """
+                SELECT * FROM enterprise_tenant_memberships
+                WHERE user_id = ? ORDER BY tenant_id ASC
+                """,
+                (user.id,),
+            ).fetchall()
+            _assert_enterprise_user_membership_precondition(
+                user.id,
+                [
+                    EnterpriseTenantMembershipRecord.from_row(row)
+                    for row in membership_rows
+                ],
+                expected_membership=expected_membership,
+            )
+
+        existing_membership: EnterpriseTenantMembershipRecord | None = None
+        if canonical_tenant is not None:
+            row = conn.execute(
+                """
+                SELECT * FROM enterprise_tenant_memberships
+                WHERE tenant_id = ? AND user_id = ?
+                """,
+                (canonical_tenant, user.id),
+            ).fetchone()
+            if row is not None:
+                existing_membership = EnterpriseTenantMembershipRecord.from_row(row)
+
+        selected_membership = membership
+        if canonical_tenant is not None and selected_membership is None:
+            selected_membership = existing_membership or EnterpriseTenantMembershipRecord(
+                tenant_id=canonical_tenant,
+                user_id=user.id,
+                role="tenant_member",
+                granted_by=None,
+                created_at=user.updated_at,
+                updated_at=user.updated_at,
+            )
+        elif selected_membership is not None and existing_membership is not None:
+            selected_membership = EnterpriseTenantMembershipRecord(
+                **{
+                    **selected_membership.to_dict(),
+                    "created_at": existing_membership.created_at,
+                }
+            )
+
+        conn.execute(
+            """
+            INSERT INTO enterprise_users (
+                id, username, password_hash, system_role, status, tenant_id,
+                can_create_kb, can_use_bypass_query, can_delete_documents,
+                can_use_agent_query, can_download_files, token_version,
+                metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                username = excluded.username,
+                password_hash = excluded.password_hash,
+                system_role = excluded.system_role,
+                status = excluded.status,
+                tenant_id = excluded.tenant_id,
+                can_create_kb = excluded.can_create_kb,
+                can_use_bypass_query = excluded.can_use_bypass_query,
+                can_delete_documents = excluded.can_delete_documents,
+                can_use_agent_query = excluded.can_use_agent_query,
+                can_download_files = excluded.can_download_files,
+                token_version = excluded.token_version,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                user.id,
+                user.username,
+                user.password_hash,
+                user.system_role,
+                user.status,
+                canonical_tenant,
+                int(user.can_create_kb),
+                int(user.can_use_bypass_query),
+                int(user.can_delete_documents),
+                int(user.can_use_agent_query),
+                int(user.can_download_files),
+                user.token_version,
+                _dumps_json(user.metadata),
+                user.created_at,
+                user.updated_at,
+            ),
+        )
+        if canonical_tenant is None:
+            conn.execute(
+                "DELETE FROM enterprise_tenant_memberships WHERE user_id = ?",
+                (user.id,),
+            )
+        else:
+            conn.execute(
+                """
+                DELETE FROM enterprise_tenant_memberships
+                WHERE user_id = ? AND tenant_id <> ?
+                """,
+                (user.id, canonical_tenant),
+            )
+        persisted_membership: EnterpriseTenantMembershipRecord | None = None
+        if selected_membership is not None:
+            conn.execute(
+                """
+                INSERT INTO enterprise_tenant_memberships (
+                    tenant_id, user_id, role, granted_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id, user_id) DO UPDATE SET
+                    role = excluded.role,
+                    granted_by = excluded.granted_by,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    selected_membership.tenant_id,
+                    selected_membership.user_id,
+                    selected_membership.role,
+                    selected_membership.granted_by,
+                    selected_membership.created_at,
+                    selected_membership.updated_at,
+                ),
+            )
+            persisted_membership = selected_membership
+
+        if canonical_tenant is None:
+            conn.execute(
+                "DELETE FROM enterprise_tenant_user_kb_overrides WHERE user_id = ?",
+                (user.id,),
+            )
+        else:
+            conn.execute(
+                """
+                DELETE FROM enterprise_tenant_user_kb_overrides
+                WHERE user_id = ? AND tenant_id <> ?
+                """,
+                (user.id, canonical_tenant),
+            )
+
+        row = conn.execute(
+            "SELECT * FROM enterprise_users WHERE id = ?", (user.id,)
+        ).fetchone()
+        assert row is not None
+        return EnterpriseUserRecord.from_row(row), persisted_membership
+
+    def _assert_kb_generation(
+        self,
+        conn: sqlite3.Connection,
+        kb_id: str,
+        expected_generation: str | None,
+    ) -> KBLifecycleRecord | None:
+        if expected_generation is not None:
+            _validate_kb_lifecycle_identity(kb_id, expected_generation)
+        row = conn.execute(
+            "SELECT * FROM enterprise_kb_lifecycle WHERE kb_id = ?", (kb_id,)
+        ).fetchone()
+        if row is None:
+            # KBs that predate lifecycle registration remain writable.
+            return None
+        current = KBLifecycleRecord.from_row(row)
+        if (
+            current.state != "active"
+            or expected_generation is None
+            or expected_generation != current.generation
+        ):
+            raise _kb_lifecycle_conflict(kb_id, expected_generation, current)
+        return current
+
+    def _activate_kb_generation(
+        self,
+        conn: sqlite3.Connection,
+        kb_id: str,
+        generation: str,
+        *,
+        activated_at: str,
+    ) -> KBLifecycleRecord:
+        _validate_kb_lifecycle_identity(kb_id, generation)
+        row = conn.execute(
+            "SELECT * FROM enterprise_kb_lifecycle WHERE kb_id = ?", (kb_id,)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO enterprise_kb_lifecycle (
+                    kb_id, generation, state, activated_at, deleted_at, updated_at,
+                    delete_job_id
+                ) VALUES (?, ?, 'active', ?, NULL, ?, NULL)
+                """,
+                (kb_id, generation, activated_at, activated_at),
+            )
+            return KBLifecycleRecord(
+                kb_id=kb_id,
+                generation=generation,
+                state="active",
+                activated_at=activated_at,
+                deleted_at=None,
+                updated_at=activated_at,
+                delete_job_id=None,
+            )
+
+        current = KBLifecycleRecord.from_row(row)
+        if current.state == "active":
+            if current.generation == generation:
+                return current
+            raise _kb_lifecycle_conflict(kb_id, generation, current)
+        if current.state == "deleting":
+            # No generation, including a fresh one, may replace an identity
+            # while its destructive cleanup is incomplete.
+            raise _kb_lifecycle_conflict(kb_id, generation, current)
+        if current.generation == generation:
+            # A tombstoned identity cannot be resurrected; recreations need a
+            # fresh generation so delayed grants from the old KB stay invalid.
+            raise _kb_lifecycle_conflict(kb_id, generation, current)
+
+        cursor = conn.execute(
+            """
+            UPDATE enterprise_kb_lifecycle
+            SET generation = ?, state = 'active', activated_at = ?,
+                deleted_at = NULL, updated_at = ?, delete_job_id = NULL
+            WHERE kb_id = ? AND generation = ? AND state = 'deleted'
+            """,
+            (
+                generation,
+                activated_at,
+                activated_at,
+                kb_id,
+                current.generation,
+            ),
+        )
+        if cursor.rowcount != 1:
+            refreshed_row = conn.execute(
+                "SELECT * FROM enterprise_kb_lifecycle WHERE kb_id = ?", (kb_id,)
+            ).fetchone()
+            if refreshed_row is None:
+                raise _missing_kb_lifecycle_conflict(
+                    kb_id, generation, expected_state="deleted"
+                )
+            raise _kb_lifecycle_conflict(
+                kb_id, generation, KBLifecycleRecord.from_row(refreshed_row)
+            )
+        return KBLifecycleRecord(
+            kb_id=kb_id,
+            generation=generation,
+            state="active",
+            activated_at=activated_at,
+            deleted_at=None,
+            updated_at=activated_at,
+            delete_job_id=None,
+        )
+
+    def _begin_kb_deletion(
+        self,
+        conn: sqlite3.Connection,
+        kb_id: str,
+        generation: str,
+        delete_job_id: str,
+    ) -> KBLifecycleRecord:
+        row = conn.execute(
+            "SELECT * FROM enterprise_kb_lifecycle WHERE kb_id = ?", (kb_id,)
+        ).fetchone()
+        if row is None:
+            raise _missing_kb_lifecycle_conflict(
+                kb_id,
+                generation,
+                expected_state="active",
+                expected_delete_job_id=delete_job_id,
+            )
+        current = KBLifecycleRecord.from_row(row)
+        if current.state == "active":
+            if current.generation != generation:
+                raise _kb_lifecycle_conflict(kb_id, generation, current)
+            now = utc_now_iso()
+            cursor = conn.execute(
+                """
+                UPDATE enterprise_kb_lifecycle
+                SET state = 'deleting', delete_job_id = ?, deleted_at = NULL,
+                    updated_at = ?
+                WHERE kb_id = ? AND generation = ? AND state = 'active'
+                    AND delete_job_id IS NULL
+                """,
+                (delete_job_id, now, kb_id, generation),
+            )
+            if cursor.rowcount == 1:
+                return KBLifecycleRecord(
+                    kb_id=kb_id,
+                    generation=generation,
+                    state="deleting",
+                    activated_at=current.activated_at,
+                    deleted_at=None,
+                    updated_at=now,
+                    delete_job_id=delete_job_id,
+                )
+            refreshed_row = conn.execute(
+                "SELECT * FROM enterprise_kb_lifecycle WHERE kb_id = ?", (kb_id,)
+            ).fetchone()
+            if refreshed_row is None:
+                raise _missing_kb_lifecycle_conflict(
+                    kb_id,
+                    generation,
+                    expected_state="active",
+                    expected_delete_job_id=delete_job_id,
+                )
+            current = KBLifecycleRecord.from_row(refreshed_row)
+
+        if (
+            current.state in {"deleting", "deleted"}
+            and current.generation == generation
+            and current.delete_job_id == delete_job_id
+        ):
+            return current
+        raise _kb_lifecycle_conflict(
+            kb_id,
+            generation,
+            current,
+            expected_state="deleting",
+            expected_delete_job_id=delete_job_id,
+        )
+
+    def _complete_kb_deletion(
+        self,
+        conn: sqlite3.Connection,
+        kb_id: str,
+        generation: str,
+        delete_job_id: str,
+    ) -> KBLifecycleRecord:
+        row = conn.execute(
+            "SELECT * FROM enterprise_kb_lifecycle WHERE kb_id = ?", (kb_id,)
+        ).fetchone()
+        if row is None:
+            raise _missing_kb_lifecycle_conflict(
+                kb_id,
+                generation,
+                expected_state="deleting",
+                expected_delete_job_id=delete_job_id,
+            )
+        current = KBLifecycleRecord.from_row(row)
+        if (
+            current.state == "deleted"
+            and current.generation == generation
+            and current.delete_job_id == delete_job_id
+        ):
+            return current
+        if not (
+            current.state == "deleting"
+            and current.generation == generation
+            and current.delete_job_id == delete_job_id
+        ):
+            raise _kb_lifecycle_conflict(
+                kb_id,
+                generation,
+                current,
+                expected_state="deleting",
+                expected_delete_job_id=delete_job_id,
+            )
+        now = utc_now_iso()
+        cursor = conn.execute(
+            """
+            UPDATE enterprise_kb_lifecycle
+            SET state = 'deleted', deleted_at = ?, updated_at = ?
+            WHERE kb_id = ? AND generation = ? AND state = 'deleting'
+                AND delete_job_id = ?
+            """,
+            (now, now, kb_id, generation, delete_job_id),
+        )
+        if cursor.rowcount != 1:
+            refreshed_row = conn.execute(
+                "SELECT * FROM enterprise_kb_lifecycle WHERE kb_id = ?", (kb_id,)
+            ).fetchone()
+            if refreshed_row is None:
+                raise _missing_kb_lifecycle_conflict(
+                    kb_id,
+                    generation,
+                    expected_state="deleting",
+                    expected_delete_job_id=delete_job_id,
+                )
+            refreshed = KBLifecycleRecord.from_row(refreshed_row)
+            if (
+                refreshed.state == "deleted"
+                and refreshed.generation == generation
+                and refreshed.delete_job_id == delete_job_id
+            ):
+                return refreshed
+            raise _kb_lifecycle_conflict(
+                kb_id,
+                generation,
+                refreshed,
+                expected_state="deleting",
+                expected_delete_job_id=delete_job_id,
+            )
+        return KBLifecycleRecord(
+            kb_id=kb_id,
+            generation=generation,
+            state="deleted",
+            activated_at=current.activated_at,
+            deleted_at=now,
+            updated_at=now,
+            delete_job_id=delete_job_id,
+        )
+
+    def _kb_operation_lock_path(self, kb_id: str) -> Path:
+        digest = hashlib.sha256(kb_id.encode("utf-8")).hexdigest()
+        return Path(f"{self.db_path}.kb-operation-locks") / f"{digest}.lock"
+
+    def _job_execution_lock_path(self, job_id: str) -> Path:
+        digest = hashlib.sha256(job_id.encode("utf-8")).hexdigest()
+        return Path(f"{self.db_path}.job-execution-locks") / f"{digest}.lock"
+
     async def _ensure_initialized(self) -> None:
         if not self._initialized:
             await self.initialize()
@@ -4051,6 +6222,8 @@ class SQLiteMetadataStore:
     def _initialize_schema(self, conn: sqlite3.Connection) -> None:
         conn.executescript(
             """
+            BEGIN IMMEDIATE;
+
             CREATE TABLE IF NOT EXISTS metadata_schema (
                 version INTEGER PRIMARY KEY,
                 applied_at TEXT NOT NULL
@@ -4191,6 +6364,7 @@ class SQLiteMetadataStore:
                 can_use_bypass_query INTEGER NOT NULL DEFAULT 0,
                 can_delete_documents INTEGER NOT NULL DEFAULT 0,
                 can_use_agent_query INTEGER NOT NULL DEFAULT 0,
+                can_download_files INTEGER NOT NULL DEFAULT 0,
                 token_version INTEGER NOT NULL DEFAULT 1,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
@@ -4208,6 +6382,29 @@ class SQLiteMetadataStore:
                 updated_by TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS enterprise_kb_lifecycle (
+                kb_id TEXT PRIMARY KEY,
+                generation TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('active', 'deleting', 'deleted')),
+                activated_at TEXT NOT NULL,
+                deleted_at TEXT,
+                updated_at TEXT NOT NULL,
+                delete_job_id TEXT,
+                CHECK (kb_id <> '' AND kb_id = trim(kb_id)),
+                CHECK (generation <> '' AND generation = trim(generation)),
+                CHECK (delete_job_id IS NULL OR (
+                    delete_job_id <> '' AND delete_job_id = trim(delete_job_id)
+                )),
+                CHECK (
+                    (state = 'active' AND deleted_at IS NULL AND delete_job_id IS NULL)
+                    OR (
+                        state = 'deleting' AND deleted_at IS NULL
+                        AND delete_job_id IS NOT NULL
+                    )
+                    OR (state = 'deleted' AND deleted_at IS NOT NULL)
+                )
             );
 
             CREATE TABLE IF NOT EXISTS enterprise_user_kb_query_settings (
@@ -4372,10 +6569,45 @@ class SQLiteMetadataStore:
             CREATE INDEX IF NOT EXISTS idx_enterprise_tenant_kb_acl_kb
                 ON enterprise_tenant_kb_acl (kb_id, tenant_id);
 
+            CREATE TABLE IF NOT EXISTS enterprise_tenant_user_kb_overrides (
+                tenant_id TEXT NOT NULL,
+                kb_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                effect TEXT NOT NULL CHECK (effect IN ('allow', 'deny')),
+                role TEXT,
+                granted_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, kb_id, user_id),
+                FOREIGN KEY (tenant_id, user_id)
+                    REFERENCES enterprise_tenant_memberships(tenant_id, user_id)
+                    ON DELETE CASCADE,
+                CHECK (tenant_id <> '' AND tenant_id = trim(tenant_id)),
+                CHECK (kb_id <> '' AND kb_id = trim(kb_id)),
+                CHECK (user_id <> '' AND user_id = trim(user_id)),
+                CHECK (created_at <> '' AND updated_at <> ''),
+                CHECK (granted_by IS NULL OR (
+                    granted_by <> '' AND granted_by = trim(granted_by)
+                )),
+                CHECK (
+                    (effect = 'deny' AND role IS NULL)
+                    OR
+                    (effect = 'allow' AND role IN (
+                        'kb_viewer', 'kb_editor', 'kb_admin', 'kb_owner'
+                    ))
+                )
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_tenant_user_kb_overrides_user
+                ON enterprise_tenant_user_kb_overrides (user_id, tenant_id, kb_id);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_tenant_user_kb_overrides_kb
+                ON enterprise_tenant_user_kb_overrides (tenant_id, kb_id, user_id);
+
             CREATE TABLE IF NOT EXISTS enterprise_audit_events (
                 id TEXT PRIMARY KEY,
                 event_type TEXT NOT NULL,
                 actor_user_id TEXT,
+                actor_tenant_id TEXT,
                 target_type TEXT,
                 target_id TEXT,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -4421,12 +6653,17 @@ class SQLiteMetadataStore:
         migrates those tables forward; fresh databases already have the column
         from the DDL and skip the ALTER.
         """
+        self._migrate_kb_lifecycle_schema(conn)
         additions: dict[str, dict[str, str]] = {
             "enterprise_api_keys": {"expires_at": "TEXT"},
             "enterprise_users": {
                 "can_delete_documents": "INTEGER NOT NULL DEFAULT 0",
                 "can_use_agent_query": "INTEGER NOT NULL DEFAULT 0",
+                # Existing users retain historical download access. Fresh
+                # tables declare DEFAULT 0 and explicit records write a value.
+                "can_download_files": "INTEGER NOT NULL DEFAULT 1",
             },
+            "enterprise_audit_events": {"actor_tenant_id": "TEXT"},
             "enterprise_chat_sessions": {
                 "context_rounds": "INTEGER NOT NULL DEFAULT 1",
             },
@@ -4439,6 +6676,134 @@ class SQLiteMetadataStore:
             for column, ddl in columns.items():
                 if column not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+        self._repair_enterprise_tenant_memberships(conn)
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_enterprise_tenant_memberships_user
+            ON enterprise_tenant_memberships (user_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_enterprise_audit_events_actor_tenant
+            ON enterprise_audit_events (actor_tenant_id, created_at DESC, id)
+            """
+        )
+
+    def _migrate_kb_lifecycle_schema(self, conn: sqlite3.Connection) -> None:
+        """Rebuild the lifecycle table when the old two-state CHECK is present."""
+
+        table_row = conn.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'table' AND name = 'enterprise_kb_lifecycle'
+            """
+        ).fetchone()
+        if table_row is None:
+            return
+        table_sql = str(table_row["sql"] or "").lower()
+        columns = {
+            str(info["name"])
+            for info in conn.execute(
+                "PRAGMA table_info(enterprise_kb_lifecycle)"
+            ).fetchall()
+        }
+        if "delete_job_id" in columns and "'deleting'" in table_sql:
+            return
+
+        delete_job_projection = (
+            "delete_job_id" if "delete_job_id" in columns else "NULL"
+        )
+        conn.execute("DROP TABLE IF EXISTS enterprise_kb_lifecycle_migrated")
+        conn.execute(
+            """
+            CREATE TABLE enterprise_kb_lifecycle_migrated (
+                kb_id TEXT PRIMARY KEY,
+                generation TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (
+                    state IN ('active', 'deleting', 'deleted')
+                ),
+                activated_at TEXT NOT NULL,
+                deleted_at TEXT,
+                updated_at TEXT NOT NULL,
+                delete_job_id TEXT,
+                CHECK (kb_id <> '' AND kb_id = trim(kb_id)),
+                CHECK (generation <> '' AND generation = trim(generation)),
+                CHECK (delete_job_id IS NULL OR (
+                    delete_job_id <> '' AND delete_job_id = trim(delete_job_id)
+                )),
+                CHECK (
+                    (state = 'active' AND deleted_at IS NULL AND delete_job_id IS NULL)
+                    OR (
+                        state = 'deleting' AND deleted_at IS NULL
+                        AND delete_job_id IS NOT NULL
+                    )
+                    OR (state = 'deleted' AND deleted_at IS NOT NULL)
+                )
+            )
+            """
+        )
+        conn.execute(
+            f"""
+            INSERT INTO enterprise_kb_lifecycle_migrated (
+                kb_id, generation, state, activated_at, deleted_at, updated_at,
+                delete_job_id
+            )
+            SELECT kb_id, generation, state, activated_at, deleted_at, updated_at,
+                   {delete_job_projection}
+            FROM enterprise_kb_lifecycle
+            """
+        )
+        conn.execute("DROP TABLE enterprise_kb_lifecycle")
+        conn.execute(
+            "ALTER TABLE enterprise_kb_lifecycle_migrated "
+            "RENAME TO enterprise_kb_lifecycle"
+        )
+
+    def _repair_enterprise_tenant_memberships(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """Reconcile legacy memberships to enterprise_users.tenant_id."""
+        conn.execute(
+            """
+            DELETE FROM enterprise_tenant_memberships
+            WHERE NOT EXISTS (
+                SELECT 1 FROM enterprise_users u
+                WHERE u.id = enterprise_tenant_memberships.user_id
+                  AND u.tenant_id IS NOT NULL
+                  AND u.tenant_id = enterprise_tenant_memberships.tenant_id
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO enterprise_tenant_memberships (
+                tenant_id, user_id, role, granted_by, created_at, updated_at
+            )
+            SELECT u.tenant_id, u.id, 'tenant_member', NULL,
+                   u.updated_at, u.updated_at
+            FROM enterprise_users u
+            WHERE u.tenant_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM enterprise_tenant_memberships m
+                  WHERE m.user_id = u.id AND m.tenant_id = u.tenant_id
+              )
+            """
+        )
+        conn.execute(
+            """
+            DELETE FROM enterprise_tenant_user_kb_overrides
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM enterprise_users u
+                JOIN enterprise_tenant_memberships m
+                  ON m.user_id = u.id AND m.tenant_id = u.tenant_id
+                WHERE u.id = enterprise_tenant_user_kb_overrides.user_id
+                  AND u.tenant_id = enterprise_tenant_user_kb_overrides.tenant_id
+            )
+            """
+        )
 
     def _backfill_document_source_keys(self, conn: sqlite3.Connection) -> None:
         rows = conn.execute(

@@ -5,6 +5,8 @@ import hashlib
 import json
 import mimetypes
 import shutil
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
@@ -12,7 +14,16 @@ from uuid import uuid4
 
 from lightrag.api.config_version_service import active_parser_runtime_config_from_version
 from lightrag.api.enterprise_auth import enterprise_auth_enabled, get_current_principal
-from lightrag.api.kb_service import KnowledgeBaseService, utc_now_iso
+from lightrag.api.job_service import (
+    assert_active_kb_generation,
+    prepare_kb_job_payload,
+)
+from lightrag.api.kb_service import (
+    KnowledgeBaseConflictError,
+    KnowledgeBaseRecord,
+    KnowledgeBaseService,
+    utc_now_iso,
+)
 from lightrag.api.metadata_store import (
     ActiveDocumentParseJobError,
     ArtifactRecord,
@@ -266,6 +277,34 @@ class DocumentLifecycleService:
         )
         return active_parser_runtime_config_from_version(active_config_version)
 
+    @asynccontextmanager
+    async def kb_write_guard(
+        self,
+        kb_id: str,
+        *,
+        expected_generation: str | None = None,
+    ) -> AsyncIterator[KnowledgeBaseRecord]:
+        """Hold the shared deletion fence for one direct service mutation."""
+
+        captured = await self._kb_service.get(kb_id, include_deleted=True)
+        generation = expected_generation or captured.generation
+        if captured.generation != generation:
+            raise KnowledgeBaseConflictError(
+                f"Knowledge base '{captured.id}' changed generation"
+            )
+        async with self._metadata_store.kb_write_guard(captured.id, generation):
+            current = await assert_active_kb_generation(
+                self._kb_service,
+                self._metadata_store,
+                captured.id,
+                generation,
+            )
+            if current.workspace != captured.workspace:
+                raise KnowledgeBaseConflictError(
+                    f"Knowledge base '{current.id}' changed workspace"
+                )
+            yield current
+
     async def create_source_batch(
         self,
         kb_id: str,
@@ -280,7 +319,49 @@ class DocumentLifecycleService:
         if not sources:
             raise ValueError("At least one document source is required")
 
-        record = await self._kb_service.get(kb_id)
+        job_type = "parse" if auto_parse else "upload"
+        record, generation_payload = await prepare_kb_job_payload(
+            self._kb_service,
+            self._metadata_store,
+            kb_id,
+            job_type=job_type,
+            payload=None,
+        )
+        async with self.kb_write_guard(
+            record.id,
+            expected_generation=record.generation,
+        ) as guarded_record:
+            if guarded_record.workspace != record.workspace:
+                raise KnowledgeBaseConflictError(
+                    f"Knowledge base '{record.id}' changed workspace"
+                )
+            return await self._create_source_batch_guarded(
+                record,
+                generation_payload,
+                sources,
+                auto_parse=auto_parse,
+                auto_index=auto_index,
+                parser_engine=parser_engine,
+                process_options=process_options,
+                idempotency_key=idempotency_key,
+            )
+
+    async def _create_source_batch_guarded(
+        self,
+        record: KnowledgeBaseRecord,
+        generation_payload: dict[str, Any],
+        sources: list[DocumentSourceInput],
+        *,
+        auto_parse: bool = False,
+        auto_index: bool = False,
+        parser_engine: str | None = None,
+        process_options: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> DocumentBatchResult:
+        if not sources:
+            raise ValueError("At least one document source is required")
+
+        job_type = "parse" if auto_parse else "upload"
         if auto_parse:
             defaults = await self._active_parser_defaults_for_record(record)
             parser_engine, process_options = _apply_parse_defaults(
@@ -288,7 +369,6 @@ class DocumentLifecycleService:
                 process_options,
                 defaults,
             )
-        job_type = "parse" if auto_parse else "upload"
         workspace_dir = self._source_root / record.workspace
         workspace_dir.mkdir(parents=True, exist_ok=True)
         batch_id = generate_track_id("batch")
@@ -407,6 +487,7 @@ class DocumentLifecycleService:
                 retry_count=0,
                 max_retries=3,
                 payload={
+                    **generation_payload,
                     "auto_parse": auto_parse,
                     "auto_index": auto_index,
                     "parser_engine": parser_engine,
@@ -435,6 +516,20 @@ class DocumentLifecycleService:
                 finished_at=now if not auto_parse else None,
                 cancelled_at=None,
             )
+            # Re-assert immediately before the atomic metadata write. HTTP
+            # callers also hold the pure-ASGI shared fence across all file /
+            # object staging; this second check protects direct service users
+            # from persisting a job after a lifecycle transition.
+            final_record = await assert_active_kb_generation(
+                self._kb_service,
+                self._metadata_store,
+                record.id,
+                record.generation,
+            )
+            if final_record.workspace != record.workspace:
+                raise KnowledgeBaseConflictError(
+                    f"Knowledge base '{record.id}' changed workspace"
+                )
             (
                 created_documents,
                 created_job,
@@ -498,20 +593,23 @@ class DocumentLifecycleService:
         metadata_patch: dict[str, Any] | None = None,
         enabled: bool | None = None,
         archived: bool | None = None,
+        expected_generation: str | None = None,
     ) -> DocumentRecord:
-        record = await self._kb_service.get(kb_id)
-        document = await self._metadata_store.update_document(
-            record.id,
-            document_id,
-            metadata_patch=metadata_patch,
-            enabled=enabled,
-            archived=archived,
-        )
-        if enabled is not None or archived is not None:
-            await self._notify_agent_profile_dirty(
-                record.id, document_id, "document_lifecycle_changed"
+        async with self.kb_write_guard(
+            kb_id, expected_generation=expected_generation
+        ) as record:
+            document = await self._metadata_store.update_document(
+                record.id,
+                document_id,
+                metadata_patch=metadata_patch,
+                enabled=enabled,
+                archived=archived,
             )
-        return document
+            if enabled is not None or archived is not None:
+                await self._notify_agent_profile_dirty(
+                    record.id, document_id, "document_lifecycle_changed"
+                )
+            return document
 
     async def claim_delete(
         self,
@@ -522,16 +620,16 @@ class DocumentLifecycleService:
         delete_source_file: bool = False,
         delete_artifacts: bool = False,
     ) -> DocumentRecord:
-        record = await self._kb_service.get(kb_id)
-        return await self._metadata_store.claim_document_deleting(
-            record.id,
-            document_id,
-            metadata_patch={
-                "pending_delete_job_id": job.id,
-                "delete_source_file": delete_source_file,
-                "delete_artifacts": delete_artifacts,
-            },
-        )
+        async with self.kb_write_guard(kb_id) as record:
+            return await self._metadata_store.claim_document_deleting(
+                record.id,
+                document_id,
+                metadata_patch={
+                    "pending_delete_job_id": job.id,
+                    "delete_source_file": delete_source_file,
+                    "delete_artifacts": delete_artifacts,
+                },
+            )
 
     async def claim_batch_delete(
         self,
@@ -542,19 +640,21 @@ class DocumentLifecycleService:
         delete_source_file: bool = False,
         delete_artifacts: bool = False,
     ) -> tuple[list[DocumentRecord], list[dict[str, Any]]]:
-        record = await self._kb_service.get(kb_id)
-        claims = [
-            (
-                document_id,
-                {
-                    "pending_delete_job_id": job.id,
-                    "delete_source_file": delete_source_file,
-                    "delete_artifacts": delete_artifacts,
-                },
+        async with self.kb_write_guard(kb_id) as record:
+            claims = [
+                (
+                    document_id,
+                    {
+                        "pending_delete_job_id": job.id,
+                        "delete_source_file": delete_source_file,
+                        "delete_artifacts": delete_artifacts,
+                    },
+                )
+                for document_id in document_ids
+            ]
+            return await self._metadata_store.claim_documents_deleting(
+                record.id, claims
             )
-            for document_id in document_ids
-        ]
-        return await self._metadata_store.claim_documents_deleting(record.id, claims)
 
     async def complete_delete(
         self,
@@ -565,21 +665,23 @@ class DocumentLifecycleService:
         lightrag_result: dict[str, Any] | None = None,
         file_result: DocumentDeleteFileResult | None = None,
     ) -> DocumentRecord:
-        record = await self._kb_service.get(kb_id)
-        document = await self._metadata_store.complete_document_delete(
-            record.id,
-            document_id,
-            metadata_patch={
-                "pending_delete_job_id": None,
-                "current_delete_job_id": None,
-                "last_delete_job_id": job_id,
-                "last_deleted_at": utc_now_iso(),
-                "lightrag_delete_result": lightrag_result,
-                "file_delete_result": asdict(file_result) if file_result else None,
-            },
-        )
-        await self._notify_agent_profile_dirty(record.id, document_id, "document_deleted")
-        return document
+        async with self.kb_write_guard(kb_id) as record:
+            document = await self._metadata_store.complete_document_delete(
+                record.id,
+                document_id,
+                metadata_patch={
+                    "pending_delete_job_id": None,
+                    "current_delete_job_id": None,
+                    "last_delete_job_id": job_id,
+                    "last_deleted_at": utc_now_iso(),
+                    "lightrag_delete_result": lightrag_result,
+                    "file_delete_result": asdict(file_result) if file_result else None,
+                },
+            )
+            await self._notify_agent_profile_dirty(
+                record.id, document_id, "document_deleted"
+            )
+            return document
 
     async def _notify_agent_profile_dirty(
         self, kb_id: str, document_id: str, reason: str
@@ -605,18 +707,18 @@ class DocumentLifecycleService:
         error_code: str,
         error_message: str,
     ) -> DocumentRecord:
-        record = await self._kb_service.get(kb_id)
-        return await self._metadata_store.fail_document_delete(
-            record.id,
-            document_id,
-            error_code=error_code,
-            error_message=error_message,
-            metadata_patch={
-                "pending_delete_job_id": None,
-                "current_delete_job_id": None,
-                "last_failed_delete_job_id": job_id,
-            },
-        )
+        async with self.kb_write_guard(kb_id) as record:
+            return await self._metadata_store.fail_document_delete(
+                record.id,
+                document_id,
+                error_code=error_code,
+                error_message=error_message,
+                metadata_patch={
+                    "pending_delete_job_id": None,
+                    "current_delete_job_id": None,
+                    "last_failed_delete_job_id": job_id,
+                },
+            )
 
     def prepare_replacement_source(
         self, source: DocumentSourceInput
@@ -682,16 +784,16 @@ class DocumentLifecycleService:
         durable worker can rebuild the ``DocumentReplacementSource`` from disk
         instead of needing the original request bytes.
         """
-        record = await self._kb_service.get(kb_id)
-        document_dir = (self._source_root / record.workspace / document_id).resolve(
-            strict=False
-        )
-        document_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        staging_path = self._replacement_staging_path(
-            record.workspace, document_id, job_id
-        )
-        staging_path.write_bytes(replacement.content)
-        return str(staging_path)
+        async with self.kb_write_guard(kb_id) as record:
+            document_dir = (
+                self._source_root / record.workspace / document_id
+            ).resolve(strict=False)
+            document_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            staging_path = self._replacement_staging_path(
+                record.workspace, document_id, job_id
+            )
+            staging_path.write_bytes(replacement.content)
+            return str(staging_path)
 
     async def load_staged_replacement(
         self,
@@ -776,16 +878,16 @@ class DocumentLifecycleService:
         """
         if not source.content:
             raise ValueError("Sync document content cannot be empty")
-        record = await self._kb_service.get(kb_id)
-        staging_dir = self._sync_staging_dir(record.workspace, batch_id)
-        staging_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        staging_path = self._sync_staging_path(
-            record.workspace, batch_id, item_index, source.source_name
-        )
-        with staging_path.open("xb") as output:
-            output.write(source.content)
-            output.flush()
-        return str(staging_path)
+        async with self.kb_write_guard(kb_id) as record:
+            staging_dir = self._sync_staging_dir(record.workspace, batch_id)
+            staging_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            staging_path = self._sync_staging_path(
+                record.workspace, batch_id, item_index, source.source_name
+            )
+            with staging_path.open("xb") as output:
+                output.write(source.content)
+                output.flush()
+            return str(staging_path)
 
     async def load_staged_sync_source(
         self,
@@ -847,24 +949,24 @@ class DocumentLifecycleService:
         process_options: str | None = None,
         force_reparse: bool = False,
     ) -> DocumentRecord:
-        record = await self._kb_service.get(kb_id)
-        return await self._metadata_store.claim_document_replacing(
-            record.id,
-            document_id,
-            metadata_patch={
-                "pending_replace_job_id": job.id,
-                "replacement_source_name": replacement.source_name,
-                "replacement_source_hash": replacement.source_hash,
-                "delete_source_file": delete_source_file,
-                "delete_artifacts": delete_artifacts,
-                "delete_llm_cache": delete_llm_cache,
-                "auto_parse": auto_parse,
-                "auto_index": auto_index,
-                "parser_engine": parser_engine,
-                "process_options": process_options,
-                "force_reparse": force_reparse,
-            },
-        )
+        async with self.kb_write_guard(kb_id) as record:
+            return await self._metadata_store.claim_document_replacing(
+                record.id,
+                document_id,
+                metadata_patch={
+                    "pending_replace_job_id": job.id,
+                    "replacement_source_name": replacement.source_name,
+                    "replacement_source_hash": replacement.source_hash,
+                    "delete_source_file": delete_source_file,
+                    "delete_artifacts": delete_artifacts,
+                    "delete_llm_cache": delete_llm_cache,
+                    "auto_parse": auto_parse,
+                    "auto_index": auto_index,
+                    "parser_engine": parser_engine,
+                    "process_options": process_options,
+                    "force_reparse": force_reparse,
+                },
+            )
 
     async def replace_document_source(
         self,
@@ -877,70 +979,72 @@ class DocumentLifecycleService:
         delete_artifacts: bool = True,
         lightrag_delete_result: dict[str, Any] | None = None,
     ) -> tuple[DocumentRecord, DocumentDeleteFileResult]:
-        record = await self._kb_service.get(kb_id)
-        workspace_dir = (self._source_root / record.workspace).resolve(strict=False)
-        document_dir = (workspace_dir / document.id).resolve(strict=False)
-        try:
-            document_dir.relative_to(workspace_dir)
-        except ValueError as exc:
-            raise ValueError(
-                "Document replacement path escapes workspace directory"
-            ) from exc
-        document_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        staging_path = document_dir / f".replace-{job_id}.tmp"
-        staging_path.unlink(missing_ok=True)
-        try:
-            with staging_path.open("xb") as output:
-                output.write(replacement.content)
-                output.flush()
-
-            file_result = await self.cleanup_document_files(
-                kb_id,
-                document,
-                delete_source_file=delete_source_file,
-                delete_artifacts=delete_artifacts,
+        async with self.kb_write_guard(kb_id) as record:
+            workspace_dir = (self._source_root / record.workspace).resolve(
+                strict=False
             )
-            if file_result.errors:
-                raise RuntimeError("; ".join(file_result.errors))
-
-            target_path = _replacement_source_target(
-                document_dir, replacement.source_name, job_id
-            )
-            shutil.move(str(staging_path), str(target_path))
-            source_object_uri = await self._persist_source_file(
-                record.workspace,
-                document.id,
-                target_path,
-                content_type=replacement.content_type,
-            )
-            replaced = await self._metadata_store.complete_document_replace(
-                record.id,
-                document.id,
-                source_name=replacement.source_name,
-                source_uri=str(target_path),
-                source_type=replacement.source_type,
-                source_hash=replacement.source_hash,
-                content_type=replacement.content_type,
-                size_bytes=replacement.size_bytes,
-                metadata_patch={
-                    "pending_replace_job_id": None,
-                    "current_replace_job_id": None,
-                    "last_replace_job_id": job_id,
-                    "last_replaced_at": utc_now_iso(),
-                    "previous_lightrag_doc_id": document.lightrag_doc_id,
-                    "lightrag_delete_result": lightrag_delete_result,
-                    "file_replace_result": asdict(file_result),
-                    **(
-                        {"source_object_uri": source_object_uri}
-                        if source_object_uri
-                        else {}
-                    ),
-                },
-            )
-            return replaced, file_result
-        except Exception:
+            document_dir = (workspace_dir / document.id).resolve(strict=False)
+            try:
+                document_dir.relative_to(workspace_dir)
+            except ValueError as exc:
+                raise ValueError(
+                    "Document replacement path escapes workspace directory"
+                ) from exc
+            document_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            staging_path = document_dir / f".replace-{job_id}.tmp"
             staging_path.unlink(missing_ok=True)
-            raise
+            try:
+                with staging_path.open("xb") as output:
+                    output.write(replacement.content)
+                    output.flush()
+
+                file_result = await self.cleanup_document_files(
+                    kb_id,
+                    document,
+                    delete_source_file=delete_source_file,
+                    delete_artifacts=delete_artifacts,
+                )
+                if file_result.errors:
+                    raise RuntimeError("; ".join(file_result.errors))
+
+                target_path = _replacement_source_target(
+                    document_dir, replacement.source_name, job_id
+                )
+                shutil.move(str(staging_path), str(target_path))
+                source_object_uri = await self._persist_source_file(
+                    record.workspace,
+                    document.id,
+                    target_path,
+                    content_type=replacement.content_type,
+                )
+                replaced = await self._metadata_store.complete_document_replace(
+                    record.id,
+                    document.id,
+                    source_name=replacement.source_name,
+                    source_uri=str(target_path),
+                    source_type=replacement.source_type,
+                    source_hash=replacement.source_hash,
+                    content_type=replacement.content_type,
+                    size_bytes=replacement.size_bytes,
+                    metadata_patch={
+                        "pending_replace_job_id": None,
+                        "current_replace_job_id": None,
+                        "last_replace_job_id": job_id,
+                        "last_replaced_at": utc_now_iso(),
+                        "previous_lightrag_doc_id": document.lightrag_doc_id,
+                        "lightrag_delete_result": lightrag_delete_result,
+                        "file_replace_result": asdict(file_result),
+                        **(
+                            {"source_object_uri": source_object_uri}
+                            if source_object_uri
+                            else {}
+                        ),
+                    },
+                )
+                return replaced, file_result
+            except Exception:
+                staging_path.unlink(missing_ok=True)
+                raise
 
     async def preflight_replace_cleanup(
         self,
@@ -974,22 +1078,38 @@ class DocumentLifecycleService:
         clear_index_metadata: bool = False,
         lightrag_delete_result: dict[str, Any] | None = None,
     ) -> DocumentRecord:
-        record = await self._kb_service.get(kb_id)
-        return await self._metadata_store.fail_document_replace(
-            record.id,
-            document_id,
-            error_code=error_code,
-            error_message=error_message,
-            clear_index_metadata=clear_index_metadata,
-            metadata_patch={
-                "pending_replace_job_id": None,
-                "current_replace_job_id": None,
-                "last_failed_replace_job_id": job_id,
-                "lightrag_delete_result": lightrag_delete_result,
-            },
-        )
+        async with self.kb_write_guard(kb_id) as record:
+            return await self._metadata_store.fail_document_replace(
+                record.id,
+                document_id,
+                error_code=error_code,
+                error_message=error_message,
+                clear_index_metadata=clear_index_metadata,
+                metadata_patch={
+                    "pending_replace_job_id": None,
+                    "current_replace_job_id": None,
+                    "last_failed_replace_job_id": job_id,
+                    "lightrag_delete_result": lightrag_delete_result,
+                },
+            )
 
     async def cleanup_document_files(
+        self,
+        kb_id: str,
+        document: DocumentRecord,
+        *,
+        delete_source_file: bool,
+        delete_artifacts: bool,
+    ) -> DocumentDeleteFileResult:
+        async with self.kb_write_guard(kb_id):
+            return await self._cleanup_document_files_guarded(
+                kb_id,
+                document,
+                delete_source_file=delete_source_file,
+                delete_artifacts=delete_artifacts,
+            )
+
+    async def _cleanup_document_files_guarded(
         self,
         kb_id: str,
         document: DocumentRecord,
@@ -1053,6 +1173,26 @@ class DocumentLifecycleService:
         return result
 
     async def create_parse_plan(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        parser_engine: str | None = None,
+        process_options: str | None = None,
+        force_reparse: bool = False,
+        auto_index: bool = False,
+    ) -> DocumentParsePlan:
+        async with self.kb_write_guard(kb_id):
+            return await self._create_parse_plan_guarded(
+                kb_id,
+                document_id,
+                parser_engine=parser_engine,
+                process_options=process_options,
+                force_reparse=force_reparse,
+                auto_index=auto_index,
+            )
+
+    async def _create_parse_plan_guarded(
         self,
         kb_id: str,
         document_id: str,
@@ -1164,12 +1304,36 @@ class DocumentLifecycleService:
     async def claim_batch_parse_queued(
         self, kb_id: str, *, job: JobRecord, plans: list[DocumentParsePlan]
     ) -> tuple[list[DocumentRecord], list[dict[str, Any]]]:
-        claims = [
-            (
-                plan.document.id,
-                {
+        async with self.kb_write_guard(kb_id) as record:
+            claims = [
+                (
+                    plan.document.id,
+                    {
+                        "pending_parse_job_id": job.id,
+                        "pending_parse_batch_id": job.batch_id,
+                        "pending_parser_hash": plan.parser_hash,
+                        "pending_lightrag_doc_id": plan.lightrag_doc_id,
+                        "parser_engine": plan.parser_engine,
+                        "process_options": plan.process_options,
+                        "force_reparse": plan.force_reparse,
+                        "auto_index": plan.auto_index,
+                    },
+                )
+                for plan in plans
+            ]
+            return await self._metadata_store.claim_documents_parse_queued(
+                record.id, claims
+            )
+
+    async def mark_parse_queued(
+        self, kb_id: str, document_id: str, *, job: JobRecord, plan: DocumentParsePlan
+    ) -> DocumentRecord:
+        async with self.kb_write_guard(kb_id) as record:
+            return await self._metadata_store.mark_document_parse_queued(
+                record.id,
+                document_id,
+                metadata_patch={
                     "pending_parse_job_id": job.id,
-                    "pending_parse_batch_id": job.batch_id,
                     "pending_parser_hash": plan.parser_hash,
                     "pending_lightrag_doc_id": plan.lightrag_doc_id,
                     "parser_engine": plan.parser_engine,
@@ -1178,38 +1342,19 @@ class DocumentLifecycleService:
                     "auto_index": plan.auto_index,
                 },
             )
-            for plan in plans
-        ]
-        return await self._metadata_store.claim_documents_parse_queued(kb_id, claims)
-
-    async def mark_parse_queued(
-        self, kb_id: str, document_id: str, *, job: JobRecord, plan: DocumentParsePlan
-    ) -> DocumentRecord:
-        return await self._metadata_store.mark_document_parse_queued(
-            kb_id,
-            document_id,
-            metadata_patch={
-                "pending_parse_job_id": job.id,
-                "pending_parser_hash": plan.parser_hash,
-                "pending_lightrag_doc_id": plan.lightrag_doc_id,
-                "parser_engine": plan.parser_engine,
-                "process_options": plan.process_options,
-                "force_reparse": plan.force_reparse,
-                "auto_index": plan.auto_index,
-            },
-        )
 
     async def mark_parse_running(
         self, kb_id: str, document_id: str, *, job_id: str
     ) -> DocumentRecord:
-        return await self._metadata_store.mark_document_parsing(
-            kb_id,
-            document_id,
-            metadata_patch={
-                "current_parse_job_id": job_id,
-                "parse_started_at": utc_now_iso(),
-            },
-        )
+        async with self.kb_write_guard(kb_id) as record:
+            return await self._metadata_store.mark_document_parsing(
+                record.id,
+                document_id,
+                metadata_patch={
+                    "current_parse_job_id": job_id,
+                    "parse_started_at": utc_now_iso(),
+                },
+            )
 
     async def run_parse(self, rag: Any, plan: DocumentParsePlan) -> dict[str, Any]:
         content_data = {
@@ -1249,32 +1394,37 @@ class DocumentLifecycleService:
         plan: DocumentParsePlan,
         parsed_data: dict[str, Any],
     ) -> DocumentParseResult:
-        artifacts = _build_parse_artifacts(plan, parsed_data)
-        artifacts.extend(_build_preview_artifacts(plan, parsed_data))
-        artifacts = await self._persist_parse_artifacts(plan, artifacts)
-        (
-            document,
-            created_artifacts,
-        ) = await self._metadata_store.complete_document_parse(
-            kb_id,
-            document_id,
-            parser_hash=plan.parser_hash,
-            lightrag_doc_id=plan.lightrag_doc_id,
-            artifacts=artifacts,
-            metadata_patch={
-                "last_parse_job_id": job_id,
-                "last_parsed_at": utc_now_iso(),
-                "parse_engine": plan.parser_engine,
-                "process_options": plan.process_options,
-                "parse_format": parsed_data.get(
-                    "parse_format", FULL_DOCS_FORMAT_LIGHTRAG
-                ),
-                "blocks_path": parsed_data.get("blocks_path"),
-                "artifact_count": len(artifacts),
-                "parse_stage_skipped": bool(parsed_data.get("parse_stage_skipped")),
-            },
-        )
-        return DocumentParseResult(document=document, artifacts=created_artifacts)
+        async with self.kb_write_guard(kb_id) as record:
+            artifacts = _build_parse_artifacts(plan, parsed_data)
+            artifacts.extend(_build_preview_artifacts(plan, parsed_data))
+            artifacts = await self._persist_parse_artifacts(plan, artifacts)
+            (
+                document,
+                created_artifacts,
+            ) = await self._metadata_store.complete_document_parse(
+                record.id,
+                document_id,
+                parser_hash=plan.parser_hash,
+                lightrag_doc_id=plan.lightrag_doc_id,
+                artifacts=artifacts,
+                metadata_patch={
+                    "last_parse_job_id": job_id,
+                    "last_parsed_at": utc_now_iso(),
+                    "parse_engine": plan.parser_engine,
+                    "process_options": plan.process_options,
+                    "parse_format": parsed_data.get(
+                        "parse_format", FULL_DOCS_FORMAT_LIGHTRAG
+                    ),
+                    "blocks_path": parsed_data.get("blocks_path"),
+                    "artifact_count": len(artifacts),
+                    "parse_stage_skipped": bool(
+                        parsed_data.get("parse_stage_skipped")
+                    ),
+                },
+            )
+            return DocumentParseResult(
+                document=document, artifacts=created_artifacts
+            )
 
     async def fail_parse(
         self,
@@ -1286,16 +1436,17 @@ class DocumentLifecycleService:
         error_code: str,
         error_message: str,
     ) -> DocumentRecord:
-        return await self._metadata_store.fail_document_parse(
-            kb_id,
-            document_id,
-            error_code=error_code,
-            error_message=error_message,
-            metadata_patch={
-                "last_failed_parse_job_id": job_id,
-                "last_failed_parser_hash": plan.parser_hash,
-            },
-        )
+        async with self.kb_write_guard(kb_id) as record:
+            return await self._metadata_store.fail_document_parse(
+                record.id,
+                document_id,
+                error_code=error_code,
+                error_message=error_message,
+                metadata_patch={
+                    "last_failed_parse_job_id": job_id,
+                    "last_failed_parser_hash": plan.parser_hash,
+                },
+            )
 
     async def list_document_artifacts(
         self,
@@ -1434,28 +1585,30 @@ class DocumentLifecycleService:
     async def get_document_artifact_file(
         self, kb_id: str, document_id: str, artifact_id: str
     ) -> ArtifactFileResult:
-        record = await self._kb_service.get(kb_id)
-        document = await self._metadata_store.get_document(record.id, document_id)
-        artifact = await self._metadata_store.get_document_artifact(
-            record.id, document_id, artifact_id
-        )
-        artifact_path, is_directory = _resolve_artifact_path(
-            self._source_root, document, artifact
-        )
-        artifact_path = await self._ensure_artifact_cached(
-            document, artifact, artifact_path
-        )
-        is_directory = artifact_path.is_dir()
-        media_type = _artifact_media_type(
-            document, artifact, artifact_path, is_directory
-        )
-        return ArtifactFileResult(
-            artifact=artifact,
-            path=artifact_path,
-            filename=artifact_path.name + (".zip" if is_directory else ""),
-            media_type=media_type,
-            is_directory=is_directory,
-        )
+        async with self.kb_write_guard(kb_id) as record:
+            document = await self._metadata_store.get_document(
+                record.id, document_id
+            )
+            artifact = await self._metadata_store.get_document_artifact(
+                record.id, document_id, artifact_id
+            )
+            artifact_path, is_directory = _resolve_artifact_path(
+                self._source_root, document, artifact
+            )
+            artifact_path = await self._ensure_artifact_cached(
+                document, artifact, artifact_path
+            )
+            is_directory = artifact_path.is_dir()
+            media_type = _artifact_media_type(
+                document, artifact, artifact_path, is_directory
+            )
+            return ArtifactFileResult(
+                artifact=artifact,
+                path=artifact_path,
+                filename=artifact_path.name + (".zip" if is_directory else ""),
+                media_type=media_type,
+                is_directory=is_directory,
+            )
 
     async def get_document_artifact_download_url(
         self,

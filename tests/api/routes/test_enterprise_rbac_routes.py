@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from fastapi import Depends, FastAPI, HTTPException
@@ -30,9 +32,11 @@ from lightrag.api.enterprise_auth import (
     service_api_key_is_expired,
 )
 from lightrag.api.job_service import JobService
-from lightrag.api.kb_service import KnowledgeBaseService
+from lightrag.api.kb_operation_fence import KBWriteAdmissionMiddleware
+from lightrag.api.kb_deletion_service import KBDeletionService
+from lightrag.api.kb_service import is_tenant_owned_kb, KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
-from lightrag.api.metadata_store import SQLiteMetadataStore
+from lightrag.api.metadata_store import KBLifecycleConflictError, SQLiteMetadataStore
 from lightrag.api.routers.enterprise_routes import create_enterprise_routes
 from lightrag.api.routers.kb_document_routes import create_kb_document_routes
 from lightrag.api.routers.kb_graph_routes import create_kb_graph_routes
@@ -204,12 +208,25 @@ def _token(user_service: UserService, user) -> str:
     )
 
 
+def _grant_file_download(
+    user_service: UserService, user, *, actor_user_id: str
+):
+    return asyncio.run(
+        user_service.update_user(
+            user.id,
+            can_download_files=True,
+            actor_user_id=actor_user_id,
+        )
+    )
+
+
 def _build_enterprise_client(
     monkeypatch,
     tmp_path: Path,
     *,
     api_key: str | None = _API_KEY,
     args: SimpleNamespace | None = None,
+    inject_enterprise_router_kb_service: bool = True,
 ):
     args = args or _enterprise_args()
     _patch_enterprise_args(monkeypatch, args)
@@ -226,7 +243,9 @@ def _build_enterprise_client(
     user_kb_query_settings_service = UserKBQuerySettingsService(
         metadata_store, audit_service
     )
-    api_key_service = ServiceAPIKeyService(metadata_store, audit_service)
+    api_key_service = ServiceAPIKeyService(
+        metadata_store, audit_service, kb_service=kb_service
+    )
     invitation_service = InvitationService(metadata_store, audit_service)
     limit_service = EnterpriseLimitService(audit_service)
     authz_service = AuthorizationService(
@@ -235,6 +254,13 @@ def _build_enterprise_client(
     probe = BuilderProbe()
     registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
     config_service = ConfigVersionService(kb_service, metadata_store, registry)
+    deletion_service = KBDeletionService(
+        kb_service,
+        metadata_store,
+        registry,
+        input_root=tmp_path / "inputs",
+        working_dir=tmp_path / "working",
+    )
 
     async def seed():
         await kb_service.initialize()
@@ -260,6 +286,7 @@ def _build_enterprise_client(
 
     app = FastAPI()
     app.state.enterprise_enabled = True
+    app.state.kb_service = kb_service
     app.state.metadata_store = metadata_store
     app.state.enterprise_user_service = user_service
     app.state.enterprise_settings_service = settings_service
@@ -269,6 +296,11 @@ def _build_enterprise_client(
     app.state.enterprise_limit_service = limit_service
     app.state.enterprise_authorization_service = authz_service
     app.state.enterprise_audit_service = audit_service
+    app.add_middleware(
+        KBWriteAdmissionMiddleware,
+        kb_service=kb_service,
+        metadata_store=metadata_store,
+    )
     app.include_router(
         create_kb_routes(
             kb_service,
@@ -276,6 +308,7 @@ def _build_enterprise_client(
             api_key=api_key,
             job_service=job_service,
             config_service=config_service,
+            deletion_service=deletion_service,
             metadata_store=metadata_store,
         )
     )
@@ -289,7 +322,14 @@ def _build_enterprise_client(
     )
     app.include_router(create_kb_query_routes(document_service, registry, api_key=api_key))
     app.include_router(create_kb_graph_routes(registry, api_key=api_key))
-    app.include_router(create_enterprise_routes(api_key=api_key, kb_service=kb_service))
+    app.include_router(
+        create_enterprise_routes(
+            api_key=api_key,
+            kb_service=kb_service
+            if inject_enterprise_router_kb_service
+            else None,
+        )
+    )
     return (
         TestClient(app),
         user_service,
@@ -321,6 +361,11 @@ def test_enterprise_kb_create_list_acl_delete_and_bypass(monkeypatch, tmp_path):
             "name": "Alpha",
             "owner_id": "spoofed-owner",
             "tenant_id": "spoofed-tenant",
+            "metadata": {
+                "tenant_managed": True,
+                "tenant_tag": "tenant:spoofed-tenant",
+                "tags": ["tenant:spoofed-tenant"],
+            },
         },
         headers=alice_headers,
     )
@@ -328,6 +373,8 @@ def test_enterprise_kb_create_list_acl_delete_and_bypass(monkeypatch, tmp_path):
     created_body = created.json()
     assert created_body["owner_id"] == alice.id
     assert created_body["tenant_id"] is None
+    assert created_body["origin"] == "platform"
+    assert created_body["metadata"] == {"tags": ["tenant:spoofed-tenant"]}
 
     alice_list = client.get("/kbs", headers=alice_headers)
     assert alice_list.status_code == 200
@@ -370,13 +417,19 @@ def test_enterprise_kb_create_list_acl_delete_and_bypass(monkeypatch, tmp_path):
 
     spoof_update = client.patch(
         "/kbs/kb_alpha",
-        json={"owner_id": "evil-owner", "tenant_id": "evil-tenant", "name": "Safe"},
+        json={
+            "owner_id": "evil-owner",
+            "tenant_id": "evil-tenant",
+            "origin": "tenant",
+            "name": "Safe",
+        },
         headers=alice_headers,
     )
     assert spoof_update.status_code == 200, spoof_update.text
     assert spoof_update.json()["name"] == "Safe"
     assert spoof_update.json()["owner_id"] == alice.id
     assert spoof_update.json()["tenant_id"] is None
+    assert spoof_update.json()["origin"] == "platform"
 
     owner_delete_denied = client.delete("/kbs/kb_alpha", headers=alice_headers)
     assert owner_delete_denied.status_code == 403
@@ -388,6 +441,382 @@ def test_enterprise_kb_create_list_acl_delete_and_bypass(monkeypatch, tmp_path):
     audit_events = client.get("/admin/audit-events", headers=admin_headers)
     assert audit_events.status_code == 200
     assert any(event["event_type"] == "kb_deleted" for event in audit_events.json())
+
+
+def test_enterprise_tenant_admin_create_policy_and_generation(monkeypatch, tmp_path):
+    from lightrag.api.enterprise_auth import Principal
+
+    client, user_service, authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-a",
+            alice.id,
+            "tenant_admin",
+            granted_by=admin.id,
+        )
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-a",
+            bob.id,
+            "tenant_member",
+            granted_by=admin.id,
+        )
+    )
+    alice = asyncio.run(
+        user_service.update_user(
+            alice.id,
+            can_create_kb=False,
+            actor_user_id=admin.id,
+        )
+    )
+    assert alice.can_create_kb is False
+    bob = asyncio.run(user_service.get_user_or_404(bob.id))
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    created = client.post(
+        "/kbs",
+        json={
+            "id": "kb_tenant_created",
+            "name": "Tenant Created",
+            "owner_id": bob.id,
+            "tenant_id": "spoofed-tenant",
+            "metadata": {
+                "tags": [
+                    "custom",
+                    "tenant:tenant-a",
+                    "custom",
+                    "tenant:tenant-a",
+                    "tenant:foreign",
+                    "other",
+                    "other",
+                ],
+                "team": "legal",
+                "platform_provisioned": True,
+            },
+        },
+        headers=alice_headers,
+    )
+    assert created.status_code == 200, created.text
+    payload = created.json()
+    assert payload["owner_id"] == alice.id
+    assert payload["tenant_id"] == "tenant-a"
+    assert payload["visibility"] == "private"
+    assert payload["origin"] == "tenant"
+    assert payload["metadata"] == {
+        "tags": ["custom", "other", "tenant:tenant-a"],
+        "team": "legal",
+    }
+
+    store = client.app.state.metadata_store
+    lifecycle = asyncio.run(store.get_kb_lifecycle("kb_tenant_created"))
+    assert lifecycle is not None
+    assert lifecycle.state == "active"
+    owner_acl = asyncio.run(store.list_kb_acl("kb_tenant_created"))
+    assert [(item.user_id, item.role) for item in owner_acl] == [
+        (alice.id, "kb_owner")
+    ]
+
+    non_private = client.post(
+        "/kbs",
+        json={
+            "id": "kb_tenant_internal",
+            "name": "Not Private",
+            "visibility": "internal",
+        },
+        headers=alice_headers,
+    )
+    assert non_private.status_code == 400
+    invalid_tags = client.post(
+        "/kbs",
+        json={
+            "id": "kb_bad_tags",
+            "name": "Bad Tags",
+            "metadata": {"tags": "not-a-list"},
+        },
+        headers=alice_headers,
+    )
+    assert invalid_tags.status_code == 400
+
+    for visibility in ("private", "public", "internal"):
+        blocked_patch = client.patch(
+            "/kbs/kb_tenant_created",
+            json={"visibility": visibility},
+            headers=alice_headers,
+        )
+        assert blocked_patch.status_code == 403
+    safe_patch = client.patch(
+        "/kbs/kb_tenant_created",
+        json={"name": "Tenant Created Renamed"},
+        headers=alice_headers,
+    )
+    assert safe_patch.status_code == 200, safe_patch.text
+    assert safe_patch.json()["visibility"] == "private"
+    assert safe_patch.json()["origin"] == "tenant"
+    for reserved_key in (
+        "platform_provisioned",
+        "tenant_managed",
+        "tenant_tag",
+    ):
+        reserved_patch = client.patch(
+            "/kbs/kb_tenant_created",
+            json={"metadata": {reserved_key: True}},
+            headers=alice_headers,
+        )
+        assert reserved_patch.status_code == 400
+
+    member_denied = client.post(
+        "/kbs",
+        json={"id": "kb_member_denied", "name": "Member Denied"},
+        headers=bob_headers,
+    )
+    assert member_denied.status_code == 403
+
+    provisioned = client.post(
+        "/kbs",
+        json={
+            "id": "kb_platform_tenant",
+            "name": "Platform Tenant",
+            "owner_id": bob.id,
+            "tenant_id": "tenant-a",
+            "visibility": "internal",
+            "metadata": {"team": "platform"},
+        },
+        headers=admin_headers,
+    )
+    assert provisioned.status_code == 200, provisioned.text
+    provisioned_payload = provisioned.json()
+    assert provisioned_payload["owner_id"] == bob.id
+    assert provisioned_payload["tenant_id"] == "tenant-a"
+    assert provisioned_payload["visibility"] == "internal"
+    assert provisioned_payload["origin"] == "platform"
+    assert provisioned_payload["metadata"] == {"team": "platform"}
+    platform_acl = asyncio.run(store.list_kb_acl("kb_platform_tenant"))
+    assert [(item.user_id, item.role) for item in platform_acl] == [
+        (bob.id, "kb_owner")
+    ]
+
+    tenant_admin_without_primary = Principal(
+        user_id="orphan-admin",
+        username="orphan-admin",
+        system_role="user",
+        status="active",
+        tenant_id=None,
+        tenant_roles={"tenant-a": "tenant_admin"},
+        can_create_kb=True,
+        can_use_bypass_query=False,
+        token_version=1,
+        auth_method="jwt",
+        metadata={},
+    )
+    with pytest.raises(HTTPException) as exc:
+        authz.require_create_kb(tenant_admin_without_primary)
+    assert exc.value.status_code == 403
+
+
+def test_enterprise_kb_lifecycle_uses_tenant_provenance_not_acl(
+    monkeypatch, tmp_path
+):
+    client, user_service, authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path, api_key=None
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-a",
+            alice.id,
+            "tenant_admin",
+            granted_by=admin.id,
+        )
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-b",
+            bob.id,
+            "tenant_admin",
+            granted_by=admin.id,
+        )
+    )
+    alice = asyncio.run(user_service.get_user_or_404(alice.id))
+    bob = asyncio.run(user_service.get_user_or_404(bob.id))
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    def create_as(headers, kb_id: str, **extra):
+        body = {"id": kb_id, "name": kb_id}
+        body.update(extra)
+        response = client.post("/kbs", json=body, headers=headers)
+        assert response.status_code == 200, response.text
+        return response
+
+    tenant_soft = create_as(
+        alice_headers,
+        "kb_tenant_soft",
+        metadata={"platform_provisioned": True},
+    )
+    assert tenant_soft.json()["origin"] == "tenant"
+    assert "platform_provisioned" not in tenant_soft.json()["metadata"]
+    cross_tenant = client.delete("/kbs/kb_tenant_soft", headers=bob_headers)
+    assert cross_tenant.status_code == 403
+    soft_deleted = client.delete("/kbs/kb_tenant_soft", headers=alice_headers)
+    assert soft_deleted.status_code == 200, soft_deleted.text
+    restored = client.post("/kbs/kb_tenant_soft:restore", headers=alice_headers)
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["status"] == "active"
+
+    create_as(alice_headers, "kb_tenant_hard")
+    hard_deleted = client.delete(
+        "/kbs/kb_tenant_hard?hard=true",
+        headers=alice_headers,
+    )
+    assert hard_deleted.status_code == 200, hard_deleted.text
+    assert hard_deleted.json()["status"] == "deleted"
+
+    create_as(
+        admin_headers,
+        "kb_platform_provisioned",
+        tenant_id="tenant-a",
+        metadata={
+            "tenant_managed": True,
+            "tenant_tag": "tenant:tenant-a",
+            "tags": ["tenant:tenant-a"],
+        },
+    )
+    platform_record = asyncio.run(
+        client.app.state.kb_service.get("kb_platform_provisioned")
+    )
+    assert platform_record.origin == "platform"
+    assert not is_tenant_owned_kb(platform_record, "tenant-a")
+    assert (
+        client.delete("/kbs/kb_platform_provisioned", headers=alice_headers).status_code
+        == 403
+    )
+    platform_deleted = client.delete(
+        "/kbs/kb_platform_provisioned", headers=admin_headers
+    )
+    assert platform_deleted.status_code == 200, platform_deleted.text
+    assert (
+        client.post(
+            "/kbs/kb_platform_provisioned:restore", headers=alice_headers
+        ).status_code
+        == 403
+    )
+    platform_restored = client.post(
+        "/kbs/kb_platform_provisioned:restore", headers=admin_headers
+    )
+    assert platform_restored.status_code == 200, platform_restored.text
+
+    legacy = create_as(
+        admin_headers,
+        "kb_legacy_spoofed_origin",
+        tenant_id="tenant-a",
+    )
+    catalog_path = client.app.state.kb_service.metadata_path
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    legacy_row = catalog["knowledge_bases"][legacy.json()["id"]]
+    legacy_row.pop("origin")
+    legacy_row["metadata"] = {
+        "tenant_managed": True,
+        "platform_provisioned": True,
+        "tenant_tag": "tenant:tenant-a",
+    }
+    catalog_path.write_text(
+        json.dumps(catalog, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    loaded_legacy = asyncio.run(
+        client.app.state.kb_service.get("kb_legacy_spoofed_origin")
+    )
+    assert loaded_legacy.origin == "platform"
+    assert loaded_legacy.metadata["tenant_managed"] is True
+    assert (
+        client.delete(
+            "/kbs/kb_legacy_spoofed_origin",
+            headers=alice_headers,
+        ).status_code
+        == 403
+    )
+
+    create_as(admin_headers, "kb_tenant_acl_only")
+    tenant_acl = client.put(
+        "/admin/kbs/kb_tenant_acl_only/acl",
+        json={"tenant_id": "tenant-a", "role": "kb_owner"},
+        headers=admin_headers,
+    )
+    assert tenant_acl.status_code == 200, tenant_acl.text
+    assert (
+        client.delete("/kbs/kb_tenant_acl_only", headers=alice_headers).status_code
+        == 403
+    )
+
+    create_as(
+        admin_headers,
+        "kb_direct_owner_only",
+        owner_id=alice.id,
+    )
+    direct_acl = asyncio.run(
+        client.app.state.metadata_store.get_kb_acl_role(
+            "kb_direct_owner_only", alice.id
+        )
+    )
+    assert direct_acl == "kb_owner"
+    assert (
+        client.delete("/kbs/kb_direct_owner_only", headers=alice_headers).status_code
+        == 403
+    )
+
+    create_as(
+        admin_headers,
+        "kb_public_only",
+        visibility="public",
+    )
+    assert client.get("/kbs/kb_public_only", headers=alice_headers).status_code == 200
+    assert (
+        client.delete("/kbs/kb_public_only", headers=alice_headers).status_code
+        == 403
+    )
+    super_delete = client.delete("/kbs/kb_public_only", headers=admin_headers)
+    assert super_delete.status_code == 200, super_delete.text
+
+    service_key = client.post(
+        "/admin/service-api-keys",
+        json={
+            "name": "lifecycle-denied",
+            "kb_roles": {"kb_direct_owner_only": "kb_owner"},
+        },
+        headers=admin_headers,
+    )
+    assert service_key.status_code == 200, service_key.text
+    service_headers = {"X-API-Key": service_key.json()["api_key"]}
+    service_denied = client.delete(
+        "/kbs/kb_direct_owner_only",
+        headers=service_headers,
+    )
+    assert service_denied.status_code == 403
+
+    lifecycle_events = asyncio.run(
+        client.app.state.metadata_store.list_audit_events(
+            target_type="kb",
+            target_id="kb_tenant_soft",
+        )
+    )
+    successful_lifecycle_events = [
+        event
+        for event in lifecycle_events
+        if event.event_type in {"kb_deleted", "kb_restored"}
+    ]
+    assert {event.event_type for event in successful_lifecycle_events} == {
+        "kb_deleted",
+        "kb_restored",
+    }
+    assert all(
+        event.actor_tenant_id == "tenant-a"
+        for event in successful_lifecycle_events
+    )
 
 
 def test_enterprise_user_kb_query_settings_are_per_user_and_used_by_query(
@@ -500,6 +929,195 @@ def test_enterprise_user_kb_query_settings_are_per_user_and_used_by_query(
     assert probe.instances["kb_prompt"].query_params[-1].user_prompt == (
         "kb default prompt"
     )
+
+
+def test_enterprise_query_settings_writes_run_inside_kb_guard(
+    monkeypatch, tmp_path
+):
+    client, user_service, _authz, _admin, alice, _bob, _probe = (
+        _build_enterprise_client(monkeypatch, tmp_path)
+    )
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_query_settings_guard", "name": "Settings Guard"},
+        headers=alice_headers,
+    )
+    assert created.status_code == 200, created.text
+
+    store = client.app.state.metadata_store
+    guard_depth = 0
+    original_guard = store.kb_write_guard
+
+    @asynccontextmanager
+    async def tracking_guard(kb_id, expected_generation):
+        nonlocal guard_depth
+        async with original_guard(kb_id, expected_generation) as lifecycle:
+            guard_depth += 1
+            try:
+                yield lifecycle
+            finally:
+                guard_depth -= 1
+
+    monkeypatch.setattr(store, "kb_write_guard", tracking_guard)
+    original_upsert = store.upsert_enterprise_user_kb_query_settings
+    original_delete = store.delete_enterprise_user_kb_query_settings
+
+    async def guarded_upsert(record):
+        # Pure-ASGI admission plus the service-owned direct-call fence.
+        assert guard_depth == 2
+        return await original_upsert(record)
+
+    async def guarded_delete(user_id, kb_id):
+        assert guard_depth == 2
+        return await original_delete(user_id, kb_id)
+
+    monkeypatch.setattr(
+        store,
+        "upsert_enterprise_user_kb_query_settings",
+        guarded_upsert,
+    )
+    monkeypatch.setattr(
+        store,
+        "delete_enterprise_user_kb_query_settings",
+        guarded_delete,
+    )
+    saved = client.put(
+        "/auth/me/kbs/kb_query_settings_guard/query-settings",
+        json={"user_prompt": "guarded prompt"},
+        headers=alice_headers,
+    )
+    assert saved.status_code == 200, saved.text
+    assert guard_depth == 0
+    cleared = client.put(
+        "/auth/me/kbs/kb_query_settings_guard/query-settings",
+        json={"user_prompt": ""},
+        headers=alice_headers,
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert guard_depth == 0
+
+
+def test_enterprise_query_settings_write_is_blocked_while_kb_deleting(
+    monkeypatch, tmp_path
+):
+    client, user_service, _authz, _admin, alice, _bob, _probe = (
+        _build_enterprise_client(monkeypatch, tmp_path)
+    )
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_query_settings_deleting", "name": "Deleting"},
+        headers=alice_headers,
+    )
+    assert created.status_code == 200, created.text
+
+    store = client.app.state.metadata_store
+    kb_service = client.app.state.kb_service
+
+    async def mark_deleting() -> None:
+        record = await kb_service.get("kb_query_settings_deleting")
+        async with store.kb_deletion_guard(
+            record.id,
+            record.generation,
+            "job_delete_query_settings_guard",
+        ):
+            pass
+
+    asyncio.run(mark_deleting())
+    response = client.put(
+        "/auth/me/kbs/kb_query_settings_deleting/query-settings",
+        json={"user_prompt": "must not persist"},
+        headers=alice_headers,
+    )
+    assert response.status_code == 409
+    settings = asyncio.run(
+        store.get_enterprise_user_kb_query_settings(
+            alice.id,
+            "kb_query_settings_deleting",
+        )
+    )
+    assert settings is None
+
+
+def test_query_settings_service_direct_set_and_clear_reject_deleting(
+    monkeypatch, tmp_path
+):
+    client, user_service, _authz, _admin, alice, _bob, _probe = (
+        _build_enterprise_client(monkeypatch, tmp_path)
+    )
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_query_settings_direct", "name": "Direct Settings"},
+        headers=alice_headers,
+    )
+    assert created.status_code == 200, created.text
+
+    store = client.app.state.metadata_store
+    kb_service = client.app.state.kb_service
+    service = client.app.state.enterprise_user_kb_query_settings_service
+
+    async def exercise_direct_calls() -> None:
+        record = await kb_service.get("kb_query_settings_direct")
+        saved = await service.set_user_prompt(
+            user_id=alice.id,
+            kb_id=record.id,
+            user_prompt="preserve me",
+        )
+        assert saved.user_prompt == "preserve me"
+        async with store.kb_deletion_guard(
+            record.id,
+            record.generation,
+            "job_delete_query_settings_direct",
+        ):
+            pass
+        with pytest.raises(KBLifecycleConflictError):
+            await service.set_user_prompt(
+                user_id=alice.id,
+                kb_id=record.id,
+                user_prompt="must not persist",
+            )
+        with pytest.raises(KBLifecycleConflictError):
+            await service.clear_user_prompt(
+                user_id=alice.id,
+                kb_id=record.id,
+            )
+
+    asyncio.run(exercise_direct_calls())
+    settings = asyncio.run(
+        store.get_enterprise_user_kb_query_settings(
+            alice.id,
+            "kb_query_settings_direct",
+        )
+    )
+    assert settings is not None
+    assert settings.user_prompt == "preserve me"
+
+
+def test_query_settings_service_keeps_legacy_no_lifecycle_compatibility(tmp_path):
+    store = SQLiteMetadataStore(tmp_path / "legacy-query-settings.sqlite3")
+    service = UserKBQuerySettingsService(store)
+
+    async def exercise_legacy_settings() -> None:
+        await store.initialize()
+        user = await UserService(store).create_user(
+            username="legacy-settings-user",
+            password="legacy-settings-password",
+        )
+        assert await store.get_kb_lifecycle("kb_legacy_settings") is None
+        saved = await service.set_user_prompt(
+            user_id=user.id,
+            kb_id="kb_legacy_settings",
+            user_prompt="legacy prompt",
+        )
+        assert saved.user_prompt == "legacy prompt"
+        assert await service.clear_user_prompt(
+            user_id=user.id,
+            kb_id="kb_legacy_settings",
+        )
+
+    asyncio.run(exercise_legacy_settings())
 
 
 def test_enterprise_user_kb_query_settings_reject_legacy_api_key_principal(
@@ -652,19 +1270,26 @@ def test_enterprise_tenant_kb_acl_authorizes_members_only(monkeypatch, tmp_path)
         json={"role": "tenant_member"},
         headers=dave_headers,
     )
-    assert tenant_admin_add_member.status_code == 200, tenant_admin_add_member.text
-    assert tenant_admin_add_member.json()["username"] == "carol"
+    # A tenant admin cannot move a known user out of another primary tenant.
+    assert tenant_admin_add_member.status_code == 404
+    super_admin_reassignment = client.put(
+        f"/admin/tenants/tenant-a/members/{carol.id}",
+        json={"role": "tenant_member"},
+        headers=admin_headers,
+    )
+    assert super_admin_reassignment.status_code == 200, super_admin_reassignment.text
+    assert super_admin_reassignment.json()["username"] == "carol"
     tenant_admin_promote_denied = client.put(
         f"/tenants/tenant-a/members/{carol.id}",
         json={"role": "tenant_admin"},
         headers=dave_headers,
     )
-    assert tenant_admin_promote_denied.status_code == 403
+    assert tenant_admin_promote_denied.status_code == 404
     tenant_admin_self_revoke_denied = client.delete(
         f"/tenants/tenant-a/members/{dave.id}",
         headers=dave_headers,
     )
-    assert tenant_admin_self_revoke_denied.status_code == 403
+    assert tenant_admin_self_revoke_denied.status_code == 409
     cross_tenant_admin_denied = client.get(
         "/tenants/tenant-b/members",
         headers=dave_headers,
@@ -872,6 +1497,7 @@ def test_enterprise_audit_events_cover_kb_config_query_document_and_artifact(
     client, user_service, _authz, admin, alice, _bob, _probe = _build_enterprise_client(
         monkeypatch, tmp_path
     )
+    alice = _grant_file_download(user_service, alice, actor_user_id=admin.id)
     admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
     alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
 
@@ -964,6 +1590,7 @@ def test_enterprise_artifact_download_can_require_stronger_role(monkeypatch, tmp
     client, user_service, _authz, admin, alice, bob, _probe = _build_enterprise_client(
         monkeypatch, tmp_path, args=args
     )
+    bob = _grant_file_download(user_service, bob, actor_user_id=admin.id)
     admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
     alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
     bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
@@ -1041,6 +1668,90 @@ def test_enterprise_artifact_download_can_require_stronger_role(monkeypatch, tmp
     assert allowed_download.status_code == 200, allowed_download.text
 
 
+def test_enterprise_file_download_capability_guards_exports_and_original_preview(
+    monkeypatch, tmp_path
+):
+    client, user_service, _authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+    assert bob.can_download_files is False
+
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_file_capability", "name": "File Capability"},
+        headers=alice_headers,
+    )
+    assert created.status_code == 200, created.text
+    granted = client.put(
+        "/admin/kbs/kb_file_capability/acl",
+        json={"user_id": bob.id, "role": "kb_viewer"},
+        headers=admin_headers,
+    )
+    assert granted.status_code == 200, granted.text
+    uploaded = client.post(
+        "/kbs/kb_file_capability/documents:upload",
+        files=[("files", ("source.pdf", b"source-bytes", "application/pdf"))],
+        headers=alice_headers,
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    document_id = uploaded.json()["documents"][0]["id"]
+    parsed = client.post(
+        f"/kbs/kb_file_capability/documents/{document_id}:parse",
+        json={"engine": "mineru", "process_options": "iF"},
+        headers=alice_headers,
+    )
+    assert parsed.status_code == 200, parsed.text
+    artifacts = client.get(
+        f"/kbs/kb_file_capability/documents/{document_id}/artifacts",
+        headers=bob_headers,
+    ).json()["artifacts"]
+    original = next(item for item in artifacts if item["artifact_type"] == "original")
+    blocks = next(item for item in artifacts if item["artifact_type"] == "blocks")
+
+    for suffix in (":download", ":download-url", ":preview"):
+        denied = client.get(
+            f"/kbs/kb_file_capability/documents/{document_id}/artifacts/"
+            f"{original['id']}{suffix}",
+            headers=bob_headers,
+        )
+        assert denied.status_code == 403
+        assert denied.json()["detail"] == "File download permission required"
+
+    # Derived previews remain a viewer surface, while exporting even a derived
+    # artifact requires the user-global capability.
+    derived_preview = client.get(
+        f"/kbs/kb_file_capability/documents/{document_id}/artifacts/"
+        f"{blocks['id']}:preview",
+        headers=bob_headers,
+    )
+    assert derived_preview.status_code == 200, derived_preview.text
+    derived_download = client.get(
+        f"/kbs/kb_file_capability/documents/{document_id}/artifacts/"
+        f"{blocks['id']}:download",
+        headers=bob_headers,
+    )
+    assert derived_download.status_code == 403
+
+    bob = _grant_file_download(user_service, bob, actor_user_id=admin.id)
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+    original_download = client.get(
+        f"/kbs/kb_file_capability/documents/{document_id}/artifacts/"
+        f"{original['id']}:download",
+        headers=bob_headers,
+    )
+    assert original_download.status_code == 200, original_download.text
+    assert original_download.content == b"source-bytes"
+    original_preview = client.get(
+        f"/kbs/kb_file_capability/documents/{document_id}/artifacts/"
+        f"{original['id']}:preview",
+        headers=bob_headers,
+    )
+    assert original_preview.status_code == 200, original_preview.text
+
+
 def test_enterprise_artifact_per_type_policy_and_storage_uri_masking(
     monkeypatch, tmp_path
 ):
@@ -1051,6 +1762,7 @@ def test_enterprise_artifact_per_type_policy_and_storage_uri_masking(
     client, user_service, _authz, admin, alice, bob, _probe = _build_enterprise_client(
         monkeypatch, tmp_path, args=args
     )
+    bob = _grant_file_download(user_service, bob, actor_user_id=admin.id)
     admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
     alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
     bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
@@ -1144,12 +1856,14 @@ def test_enterprise_artifact_action_policy_overrides_per_action(
             {
                 "preview": {"*": "kb_editor"},
                 "download": {"blocks": "kb_admin"},
+                "download-url": {"original": "kb_admin"},
             }
         )
     )
     client, user_service, _authz, admin, alice, bob, _probe = _build_enterprise_client(
         monkeypatch, tmp_path, args=args
     )
+    bob = _grant_file_download(user_service, bob, actor_user_id=admin.id)
     admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
     alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
     bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
@@ -1214,6 +1928,11 @@ def test_enterprise_artifact_action_policy_overrides_per_action(
         headers=bob_headers,
     )
     assert editor_blocks_download.status_code == 403
+    editor_original_presign = client.get(
+        f"/kbs/kb_artifact_action_policy/documents/{document_id}/artifacts/{original['id']}:download-url",
+        headers=bob_headers,
+    )
+    assert editor_original_presign.status_code == 403
 
     grant_admin = client.put(
         "/admin/kbs/kb_artifact_action_policy/acl",
@@ -2933,7 +3652,7 @@ def test_admin_user_access_view(monkeypatch, tmp_path):
 
 
 def test_enterprise_kb_visibility_public_grants_viewer_read_only(monkeypatch, tmp_path):
-    client, user_service, _authz, admin, alice, bob, _probe = _build_enterprise_client(
+    client, user_service, authz, admin, alice, bob, _probe = _build_enterprise_client(
         monkeypatch, tmp_path, api_key=None
     )
     admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
@@ -2951,8 +3670,43 @@ def test_enterprise_kb_visibility_public_grants_viewer_read_only(monkeypatch, tm
     assert client.get("/kbs/kb_pub", headers=bob_headers).status_code == 403
     assert client.get("/kbs", headers=bob_headers).json()["knowledge_bases"] == []
 
-    patched = client.patch(
+    same_value_denied = client.patch(
+        "/kbs/kb_pub", json={"visibility": "private"}, headers=alice_headers
+    )
+    assert same_value_denied.status_code == 403
+    direct_admin_denied = client.patch(
         "/kbs/kb_pub", json={"visibility": "public"}, headers=alice_headers
+    )
+    assert direct_admin_denied.status_code == 403
+
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-visibility",
+            bob.id,
+            "tenant_admin",
+            granted_by=admin.id,
+        )
+    )
+    bob = asyncio.run(user_service.get_user_or_404(bob.id))
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+    tenant_acl = client.put(
+        "/admin/kbs/kb_pub/acl",
+        json={"tenant_id": "tenant-visibility", "role": "kb_admin"},
+        headers=admin_headers,
+    )
+    assert tenant_acl.status_code == 200, tenant_acl.text
+    tenant_admin_denied = client.patch(
+        "/kbs/kb_pub", json={"visibility": "internal"}, headers=bob_headers
+    )
+    assert tenant_admin_denied.status_code == 403
+    revoked_tenant_acl = client.delete(
+        "/admin/kbs/kb_pub/acl/tenants/tenant-visibility",
+        headers=admin_headers,
+    )
+    assert revoked_tenant_acl.status_code == 200, revoked_tenant_acl.text
+
+    patched = client.patch(
+        "/kbs/kb_pub", json={"visibility": "public"}, headers=admin_headers
     )
     assert patched.status_code == 200, patched.text
     assert patched.json()["visibility"] == "public"
@@ -3018,15 +3772,22 @@ def test_enterprise_kb_visibility_internal_same_tenant_only(monkeypatch, tmp_pat
     )
     assert carol_created.status_code == 200, carol_created.text
     carol = asyncio.run(user_service.get_user_or_404(carol_created.json()["id"]))
-    carol_headers = {"Authorization": f"Bearer {_token(user_service, carol)}"}
 
     created = client.post(
         "/kbs",
-        json={"id": "kb_internal", "name": "Internal KB", "visibility": "internal"},
-        headers=carol_headers,
+        json={
+            "id": "kb_internal",
+            "name": "Internal KB",
+            "owner_id": carol.id,
+            "tenant_id": "tenant-a",
+            "visibility": "internal",
+        },
+        headers=admin_headers,
     )
     assert created.status_code == 200, created.text
     assert created.json()["tenant_id"] == "tenant-a"
+    assert created.json()["origin"] == "platform"
+    assert created.json()["metadata"] == {}
 
     # No tenant and a different tenant both stay denied.
     assert client.get("/kbs/kb_internal", headers=bob_headers).status_code == 403
@@ -3127,12 +3888,425 @@ def test_admin_patch_user_tenant_id_null_clears_and_empty_rejected(
     )
 
 
-def test_enterprise_kb_restore_super_admin_only_and_rebuild_editor_allowed(
-    monkeypatch, tmp_path
-):
-    client, user_service, _authz, admin, alice, bob, _probe = _build_enterprise_client(
+def test_enterprise_stale_user_mutation_returns_conflict(monkeypatch, tmp_path):
+    client, user_service, _authz, admin, _alice, bob, _probe = _build_enterprise_client(
         monkeypatch, tmp_path
     )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    stale_snapshot = asyncio.run(user_service.get_user_or_404(bob.id))
+
+    async def writer_b():
+        await user_service.update_user(
+            bob.id,
+            tenant_id="tenant-writer-b",
+            can_create_kb=True,
+            can_delete_documents=True,
+            actor_user_id=admin.id,
+        )
+        return await user_service.change_password(
+            bob.id, "writer-b-password", actor_user_id=admin.id
+        )
+
+    writer_b_state = asyncio.run(writer_b())
+    original_get_user = user_service.get_user_or_404
+
+    async def stale_get_user(user_id: str):
+        if user_id == bob.id:
+            return stale_snapshot
+        return await original_get_user(user_id)
+
+    monkeypatch.setattr(user_service, "get_user_or_404", stale_get_user)
+    response = client.patch(
+        f"/admin/users/{bob.id}",
+        json={"can_use_bypass_query": True},
+        headers=admin_headers,
+    )
+    assert response.status_code == 409, response.text
+    assert "modified concurrently" in response.json()["detail"]
+
+    current = asyncio.run(original_get_user(bob.id))
+    assert current == writer_b_state
+    assert current.tenant_id == "tenant-writer-b"
+    assert current.can_create_kb is True
+    assert current.can_delete_documents is True
+    assert current.can_use_bypass_query is False
+    assert asyncio.run(user_service.authenticate("bob", "bob-pass")) is None
+    assert asyncio.run(user_service.authenticate("bob", "writer-b-password")) is not None
+
+
+def test_enterprise_kb_create_is_hidden_until_final_generation_cas(
+    monkeypatch, tmp_path
+):
+    from lightrag.api.enterprise_auth import KB_ROLE_VIEWER, principal_from_user
+
+    client, user_service, authz, _admin, alice, _bob, _probe = (
+        _build_enterprise_client(monkeypatch, tmp_path)
+    )
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    principal = principal_from_user(
+        alice,
+        auth_method="jwt",
+        memberships=[],
+    )
+    kb_service = client.app.state.kb_service
+    store = client.app.state.metadata_store
+    original_update = kb_service.update
+    observed: dict[str, object] = {}
+
+    async def update_after_provisioning(kb_id: str, **kwargs):
+        if kwargs.get("status") == "active":
+            current = await kb_service.get(kb_id)
+            lifecycle = await store.get_kb_lifecycle(kb_id)
+            owner_acl = await store.list_kb_acl(kb_id)
+            events = await store.list_audit_events(
+                target_type="kb",
+                target_id=kb_id,
+            )
+            decision = await authz.resolve_kb_access(principal, current)
+            observed.update(
+                {
+                    "status_before_final": current.status,
+                    "expected_generation": kwargs.get("expected_generation"),
+                    "generation": current.generation,
+                    "lifecycle_state": lifecycle.state if lifecycle else None,
+                    "owner_acl": [(item.user_id, item.role) for item in owner_acl],
+                    "audit_complete": any(
+                        event.event_type == "kb_created" for event in events
+                    ),
+                    "decision_role": decision.effective_role,
+                    "filtered": await authz.filter_kbs_for_principal(
+                        principal, [current]
+                    ),
+                }
+            )
+            with pytest.raises(HTTPException) as denied:
+                await authz.require_kb_role(principal, kb_id, KB_ROLE_VIEWER)
+            observed["query_denied"] = denied.value.status_code
+        return await original_update(kb_id, **kwargs)
+
+    monkeypatch.setattr(kb_service, "update", update_after_provisioning)
+    response = client.post(
+        "/kbs",
+        json={"id": "kb_create_hidden", "name": "Create Hidden"},
+        headers=alice_headers,
+    )
+    assert response.status_code == 200, response.text
+    assert observed == {
+        "status_before_final": "creating",
+        "expected_generation": observed["generation"],
+        "generation": observed["generation"],
+        "lifecycle_state": "active",
+        "owner_acl": [(alice.id, "kb_owner")],
+        "audit_complete": True,
+        "decision_role": None,
+        "filtered": [],
+        "query_denied": 403,
+    }
+    assert response.json()["status"] == "active"
+    assert response.json()["origin"] == "platform"
+    assert asyncio.run(kb_service.get("kb_create_hidden")).status == "active"
+
+
+def test_enterprise_kb_create_failure_rolls_back_catalog_acl_and_tombstones(
+    monkeypatch, tmp_path
+):
+    client, user_service, authz, admin, alice, _bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    store = client.app.state.metadata_store
+    original_grant = authz.grant_kb_role
+    captured_generations: list[str | None] = []
+
+    async def grant_then_fail(*args, **kwargs):
+        captured_generations.append(kwargs.get("expected_generation"))
+        await original_grant(*args, **kwargs)
+        current = await client.app.state.kb_service.get("kb_init_rollback")
+        assert current.status == "creating"
+        raise HTTPException(status_code=409, detail="simulated owner grant race")
+
+    monkeypatch.setattr(authz, "grant_kb_role", grant_then_fail)
+    failed = client.post(
+        "/kbs",
+        json={"id": "kb_init_rollback", "name": "Rollback"},
+        headers=alice_headers,
+    )
+    assert failed.status_code == 409, failed.text
+    assert failed.json()["detail"] == "simulated owner grant race"
+    assert len(captured_generations) == 1
+    failed_generation = captured_generations[0]
+    assert failed_generation
+    assert asyncio.run(store.list_kb_acl("kb_init_rollback")) == []
+    tombstone = asyncio.run(store.get_kb_lifecycle("kb_init_rollback"))
+    assert tombstone is not None
+    assert tombstone.generation == failed_generation
+    assert tombstone.state == "deleted"
+    listed = client.get("/kbs?include_deleted=true", headers=admin_headers)
+    assert listed.status_code == 200, listed.text
+    assert all(
+        item["id"] != "kb_init_rollback"
+        for item in listed.json()["knowledge_bases"]
+    )
+
+    monkeypatch.setattr(authz, "grant_kb_role", original_grant)
+    retried = client.post(
+        "/kbs",
+        json={"id": "kb_init_rollback", "name": "Retry"},
+        headers=alice_headers,
+    )
+    assert retried.status_code == 200, retried.text
+    active = asyncio.run(store.get_kb_lifecycle("kb_init_rollback"))
+    assert active is not None
+    assert active.state == "active"
+    assert active.generation != failed_generation
+
+
+def test_enterprise_acl_generation_is_captured_before_other_awaits(
+    monkeypatch, tmp_path
+):
+    from lightrag.api.enterprise_auth import AuditService
+
+    kb_service = KnowledgeBaseService(tmp_path / "metadata" / "race-kbs.json")
+    store = SQLiteMetadataStore(tmp_path / "metadata" / "race.sqlite3")
+    audit = AuditService(store)
+    users = UserService(store, audit)
+    authz = AuthorizationService(store, audit, kb_service=kb_service)
+
+    async def scenario():
+        await kb_service.initialize()
+        await store.initialize()
+        user = await users.create_user(username="race-user", password="race-pass")
+        record = await kb_service.create(kb_id="kb_acl_race", name="ACL Race")
+        await store.activate_kb_generation(record.id, record.generation)
+        original_get_user = store.get_enterprise_user_by_id
+        replacement_generation = "replacement-generation"
+        raced = False
+
+        async def race_after_generation_capture(user_id: str):
+            nonlocal raced
+            if not raced:
+                raced = True
+                await store.purge_kb_metadata(
+                    record.id,
+                    generation=record.generation,
+                )
+                await store.activate_kb_generation(
+                    record.id,
+                    replacement_generation,
+                )
+            return await original_get_user(user_id)
+
+        monkeypatch.setattr(
+            store,
+            "get_enterprise_user_by_id",
+            race_after_generation_capture,
+        )
+        with pytest.raises(HTTPException) as exc:
+            await authz.grant_kb_role(record.id, user.id, "kb_owner")
+        assert exc.value.status_code == 409
+        assert raced is True
+        assert await store.list_kb_acl(record.id) == []
+        lifecycle = await store.get_kb_lifecycle(record.id)
+        assert lifecycle is not None
+        assert lifecycle.generation == replacement_generation
+
+        async def catalog_must_not_be_read(*_args, **_kwargs):
+            raise AssertionError("catalog was re-read for an explicit generation")
+
+        monkeypatch.setattr(kb_service, "get", catalog_must_not_be_read)
+        with pytest.raises(HTTPException) as stale:
+            await authz.grant_kb_role(
+                record.id,
+                user.id,
+                "kb_owner",
+                expected_generation=record.generation,
+            )
+        assert stale.value.status_code == 409
+
+    asyncio.run(scenario())
+
+
+def test_source_aware_kb_decision_lifecycle_and_generation_guard(tmp_path):
+    from lightrag.api.enterprise_auth import (
+        AuditService,
+        AuthorizationService,
+        KB_ROLE_ADMIN,
+        KB_ROLE_EDITOR,
+        KB_ROLE_VIEWER,
+        UserService,
+        principal_from_user,
+    )
+    from lightrag.api.kb_service import KnowledgeBaseService
+    from lightrag.api.metadata_store import SQLiteMetadataStore
+
+    kb_service = KnowledgeBaseService(tmp_path / "metadata" / "decision-kbs.json")
+    store = SQLiteMetadataStore(tmp_path / "metadata" / "decision.sqlite3")
+    audit = AuditService(store)
+    users = UserService(store, audit)
+    authz = AuthorizationService(store, audit, kb_service=kb_service)
+
+    async def scenario():
+        await kb_service.initialize()
+        await store.initialize()
+        member = await users.create_user(username="member", password="member-pass")
+        await authz.grant_tenant_membership(
+            "tenant-a",
+            member.id,
+            "tenant_admin",
+            granted_by="platform-admin",
+        )
+        member = await users.get_user_or_404(member.id)
+        memberships = await store.list_user_tenant_memberships(member.id)
+        principal = principal_from_user(
+            member,
+            auth_method="jwt",
+            memberships=memberships,
+        )
+
+        provisioned = await kb_service.create(
+            kb_id="kb_provisioned",
+            name="Provisioned",
+            tenant_id="tenant-a",
+            origin="platform",
+            metadata={
+                "tenant_managed": True,
+                "tenant_tag": "tenant:tenant-a",
+                "tags": ["tenant:tenant-a"],
+            },
+        )
+        await store.activate_kb_generation(
+            provisioned.id,
+            provisioned.generation,
+        )
+        assert not is_tenant_owned_kb(provisioned, "tenant-a")
+        without_acl = await authz.resolve_kb_access(principal, provisioned)
+        assert without_acl.effective_role is None
+        assert without_acl.tenant_owned is False
+
+        # These calls succeed only when AuthorizationService passes the loaded
+        # catalog generation through to the transactional ACL methods.
+        await authz.grant_tenant_kb_role(
+            provisioned.id,
+            "tenant-a",
+            KB_ROLE_ADMIN,
+            granted_by="platform-admin",
+        )
+        inherited = await authz.resolve_kb_access(principal, provisioned)
+        assert inherited.effective_role == KB_ROLE_ADMIN
+        assert inherited.tenant_role == KB_ROLE_ADMIN
+        assert inherited.sources == ("tenant_acl",)
+
+        await authz.grant_tenant_user_kb_override(
+            provisioned.id,
+            "tenant-a",
+            member.id,
+            KB_ROLE_VIEWER,
+            granted_by="tenant-admin",
+            expected_generation=provisioned.generation,
+        )
+        capped = await authz.resolve_kb_access(principal, provisioned)
+        assert capped.effective_role == KB_ROLE_VIEWER
+        assert capped.tenant_override_effect == "allow"
+        assert capped.sources == ("tenant_override_capped",)
+
+        assert await authz.revoke_tenant_kb_role(
+            provisioned.id,
+            "tenant-a",
+            expected_generation=provisioned.generation,
+        )
+        orphaned_allow = await authz.resolve_kb_access(principal, provisioned)
+        assert orphaned_allow.effective_role is None
+        assert orphaned_allow.tenant_acl_role is None
+        assert orphaned_allow.tenant_override_effect == "allow"
+        assert orphaned_allow.tenant_owned is False
+        await authz.grant_tenant_kb_role(
+            provisioned.id,
+            "tenant-a",
+            KB_ROLE_ADMIN,
+            granted_by="platform-admin",
+            expected_generation=provisioned.generation,
+        )
+
+        await authz.revoke_tenant_user_kb_override(
+            provisioned.id,
+            "tenant-a",
+            member.id,
+            granted_by="tenant-admin",
+            expected_generation=provisioned.generation,
+        )
+        denied = await authz.resolve_kb_access(principal, provisioned)
+        assert denied.effective_role is None
+        assert denied.tenant_override_effect == "deny"
+
+        await authz.grant_kb_role(
+            provisioned.id,
+            member.id,
+            KB_ROLE_EDITOR,
+            granted_by="platform-admin",
+        )
+        direct_survives_deny = await authz.resolve_kb_access(principal, provisioned)
+        assert direct_survives_deny.platform_role == KB_ROLE_EDITOR
+        assert direct_survives_deny.effective_role == KB_ROLE_EDITOR
+        assert direct_survives_deny.sources == ("direct",)
+        assert await authz.revoke_kb_role(provisioned.id, member.id)
+
+        # Tenant-owned KBs do not inherit the tenant ACL. Members need an allow
+        # override; public visibility remains an independent platform source.
+        owned = await kb_service.create(
+            kb_id="kb_tenant_owned",
+            name="Tenant Owned",
+            tenant_id="tenant-a",
+            origin="tenant",
+        )
+        await store.activate_kb_generation(owned.id, owned.generation)
+        await authz.grant_tenant_kb_role(
+            owned.id,
+            "tenant-a",
+            KB_ROLE_ADMIN,
+            granted_by="platform-admin",
+        )
+        no_owned_inheritance = await authz.resolve_kb_access(principal, owned)
+        assert is_tenant_owned_kb(owned, "tenant-a")
+        assert no_owned_inheritance.tenant_owned is True
+        assert no_owned_inheritance.effective_role is None
+        await authz.grant_tenant_user_kb_override(
+            owned.id,
+            "tenant-a",
+            member.id,
+            KB_ROLE_EDITOR,
+            granted_by="tenant-admin",
+            expected_generation=owned.generation,
+        )
+        owned_allowed = await authz.resolve_kb_access(principal, owned)
+        assert owned_allowed.effective_role == KB_ROLE_EDITOR
+        assert owned_allowed.sources == ("tenant_owned_override",)
+
+        assert await authz.authorize_kb_lifecycle(principal, owned, "hard-delete")
+        with pytest.raises(HTTPException) as exc:
+            await authz.authorize_kb_lifecycle(principal, provisioned, "delete")
+        assert exc.value.status_code == 403
+
+        assert await authz.revoke_tenant_kb_role(owned.id, "tenant-a")
+
+    asyncio.run(scenario())
+
+
+def test_enterprise_kb_restore_tenant_admin_and_rebuild_editor_allowed(
+    monkeypatch, tmp_path
+):
+    client, user_service, authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-restore",
+            alice.id,
+            "tenant_admin",
+            granted_by=admin.id,
+        )
+    )
+    alice = asyncio.run(user_service.get_user_or_404(alice.id))
     admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
     alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
     bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
@@ -3155,16 +4329,12 @@ def test_enterprise_kb_restore_super_admin_only_and_rebuild_editor_allowed(
     assert rebuild.status_code == 200, rebuild.text
     assert rebuild.json()["documents"] == []
 
-    deleted = client.delete("/kbs/kb_restorable", headers=admin_headers)
+    deleted = client.delete("/kbs/kb_restorable", headers=alice_headers)
     assert deleted.status_code == 200, deleted.text
 
-    # Restore mirrors DELETE: super admin only — even the kb_owner is denied.
-    assert (
-        client.post("/kbs/kb_restorable:restore", headers=alice_headers).status_code
-        == 403
-    )
-
-    restored = client.post("/kbs/kb_restorable:restore", headers=admin_headers)
+    # A canonical tenant administrator can restore a genuinely tenant-created
+    # KB; this no longer relies on a middleware super-admin shortcut.
+    restored = client.post("/kbs/kb_restorable:restore", headers=alice_headers)
     assert restored.status_code == 200, restored.text
     assert restored.json()["status"] == "active"
     assert client.get("/kbs/kb_restorable", headers=alice_headers).status_code == 200
@@ -3354,3 +4524,1476 @@ def _run_enterprise_kb_graph_write_requires_admin(monkeypatch, tmp_path):
     assert any(
         event["event_type"] == "kb_graph_entity_edited" for event in events.json()
     )
+
+
+def test_tenant_overview_active_union_fallback_and_exact_admin_detail(
+    monkeypatch, tmp_path
+):
+    client, user_service, authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch,
+        tmp_path,
+        api_key=None,
+        inject_enterprise_router_kb_service=False,
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    for tenant_id in ("tenant-a", "tenant-b"):
+        response = client.post(
+            "/admin/tenants",
+            json={"name": tenant_id, "tenant_id": tenant_id},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200, response.text
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-a", alice.id, "tenant_admin", granted_by=admin.id
+        )
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-b", bob.id, "tenant_admin", granted_by=admin.id
+        )
+    )
+    alice = asyncio.run(user_service.get_user_or_404(alice.id))
+    bob = asyncio.run(user_service.get_user_or_404(bob.id))
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    owned = client.post(
+        "/kbs",
+        json={"id": "kb_tenant_owned", "name": "Owned"},
+        headers=alice_headers,
+    )
+    assert owned.status_code == 200, owned.text
+    provisioned = client.post(
+        "/kbs",
+        json={"id": "kb_tenant_assigned", "name": "Assigned"},
+        headers=admin_headers,
+    )
+    assert provisioned.status_code == 200, provisioned.text
+    deleted = client.post(
+        "/kbs",
+        json={"id": "kb_tenant_deleted", "name": "Deleted"},
+        headers=admin_headers,
+    )
+    assert deleted.status_code == 200, deleted.text
+    for kb_id in ("kb_tenant_owned", "kb_tenant_assigned", "kb_tenant_deleted"):
+        grant = client.put(
+            f"/admin/kbs/{kb_id}/acl",
+            json={"tenant_id": "tenant-a", "role": "kb_viewer"},
+            headers=admin_headers,
+        )
+        assert grant.status_code == 200, grant.text
+    removed = client.delete("/kbs/kb_tenant_deleted", headers=admin_headers)
+    assert removed.status_code == 200, removed.text
+
+    # The router closure intentionally has no KB service. Production-style
+    # app.state fallback must still count owned + assigned exactly once.
+    scoped = client.get("/tenants/tenant-a", headers=alice_headers)
+    assert scoped.status_code == 200, scoped.text
+    assert scoped.json()["kb_count"] == 2
+    scoped_kbs = client.get("/tenants/tenant-a/kbs", headers=alice_headers)
+    assert scoped_kbs.status_code == 200, scoped_kbs.text
+    assert {item["id"] for item in scoped_kbs.json()} == {
+        "kb_tenant_owned",
+        "kb_tenant_assigned",
+    }
+
+    exact_admin = client.get("/admin/tenants/tenant-a", headers=alice_headers)
+    assert exact_admin.status_code == 200, exact_admin.text
+    assert exact_admin.json()["kb_count"] == 2
+    assert client.get("/admin/tenants/tenant-b", headers=alice_headers).status_code == 403
+    assert client.get("/admin/tenants/tenant-a", headers=bob_headers).status_code == 403
+
+    # No prefix/subpath broadening: only the exact detail route is deferred.
+    for path in (
+        "/admin/tenants/tenant-a/kbs",
+        "/admin/tenants/tenant-a/members",
+        "/admin/tenants",
+    ):
+        assert client.get(path, headers=alice_headers).status_code == 403
+    for path in (
+        "/admin/tenants/tenant-a/query",
+        "/admin/tenants/tenant-a%2Fkbs",
+    ):
+        assert client.get(path, headers=alice_headers).status_code in {403, 404}
+
+
+def test_tenant_scoped_user_lifecycle_capabilities_and_boundaries(
+    monkeypatch, tmp_path
+):
+    client, user_service, authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path, api_key=None
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    for tenant_id in ("tenant-users", "tenant-other"):
+        created_tenant = client.post(
+            "/admin/tenants",
+            json={"name": tenant_id, "tenant_id": tenant_id},
+            headers=admin_headers,
+        )
+        assert created_tenant.status_code == 200, created_tenant.text
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-users", alice.id, "tenant_admin", granted_by=admin.id
+        )
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-other", bob.id, "tenant_member", granted_by=admin.id
+        )
+    )
+    alice = asyncio.run(user_service.get_user_or_404(alice.id))
+    bob = asyncio.run(user_service.get_user_or_404(bob.id))
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+
+    wrong_tenant = client.post(
+        "/tenants/tenant-users/users",
+        json={
+            "username": "wrong",
+            "password": "pass",
+            "tenant_id": "tenant-other",
+        },
+        headers=alice_headers,
+    )
+    assert wrong_tenant.status_code == 400
+
+    created = client.post(
+        "/tenants/tenant-users/users",
+        json={
+            "username": "tenant-user",
+            "password": "initial-pass",
+            "can_create_kb": True,
+            "can_use_bypass_query": True,
+            "can_use_agent_query": True,
+            "can_delete_documents": True,
+            "can_download_files": True,
+        },
+        headers=alice_headers,
+    )
+    assert created.status_code == 200, created.text
+    payload = created.json()
+    user_id = payload["id"]
+    assert payload["system_role"] == "user"
+    assert payload["tenant_id"] == "tenant-users"
+    for capability in (
+        "can_create_kb",
+        "can_use_bypass_query",
+        "can_use_agent_query",
+        "can_delete_documents",
+        "can_download_files",
+    ):
+        assert payload[capability] is True
+
+    target = asyncio.run(user_service.get_user_or_404(user_id))
+    stale_headers = {"Authorization": f"Bearer {_token(user_service, target)}"}
+    listed = client.get("/tenants/tenant-users/users", headers=alice_headers)
+    assert listed.status_code == 200, listed.text
+    assert user_id in {item["id"] for item in listed.json()}
+    detail = client.get(
+        f"/tenants/tenant-users/users/{user_id}", headers=alice_headers
+    )
+    assert detail.status_code == 200, detail.text
+
+    updated = client.patch(
+        f"/tenants/tenant-users/users/{user_id}",
+        json={
+            "can_create_kb": False,
+            "can_use_bypass_query": False,
+            "can_use_agent_query": False,
+            "can_delete_documents": False,
+            "can_download_files": False,
+        },
+        headers=alice_headers,
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["token_version"] == target.token_version + 1
+    assert client.get("/auth/me", headers=stale_headers).status_code == 401
+    assert all(
+        updated.json()[field] is False
+        for field in (
+            "can_create_kb",
+            "can_use_bypass_query",
+            "can_use_agent_query",
+            "can_delete_documents",
+            "can_download_files",
+        )
+    )
+    forbidden_patch = client.patch(
+        f"/tenants/tenant-users/users/{user_id}",
+        json={"tenant_id": "tenant-other"},
+        headers=alice_headers,
+    )
+    assert forbidden_patch.status_code == 400
+
+    current_target = asyncio.run(user_service.get_user_or_404(user_id))
+    pre_disable_headers = {
+        "Authorization": f"Bearer {_token(user_service, current_target)}"
+    }
+    disabled = client.post(
+        f"/tenants/tenant-users/users/{user_id}:disable",
+        headers=alice_headers,
+    )
+    assert disabled.status_code == 200, disabled.text
+    assert disabled.json()["status"] == "disabled"
+    assert client.get("/auth/me", headers=pre_disable_headers).status_code == 401
+    enabled = client.post(
+        f"/tenants/tenant-users/users/{user_id}:enable",
+        headers=alice_headers,
+    )
+    assert enabled.status_code == 200, enabled.text
+    assert enabled.json()["status"] == "active"
+    reset = client.post(
+        f"/tenants/tenant-users/users/{user_id}:reset-password",
+        json={"password": "reset-pass"},
+        headers=alice_headers,
+    )
+    assert reset.status_code == 200, reset.text
+    assert asyncio.run(user_service.authenticate("tenant-user", "initial-pass")) is None
+    assert asyncio.run(user_service.authenticate("tenant-user", "reset-pass")) is not None
+
+    # Missing, cross-tenant, and super-admin targets are indistinguishable.
+    for hidden_id in ("usr_missing", bob.id, admin.id):
+        hidden = client.get(
+            f"/tenants/tenant-users/users/{hidden_id}", headers=alice_headers
+        )
+        assert hidden.status_code == 404
+    assert (
+        client.post(
+            f"/tenants/tenant-users/users/{alice.id}:disable",
+            headers=alice_headers,
+        ).status_code
+        == 409
+    )
+    assert (
+        client.delete(
+            f"/tenants/tenant-users/users/{alice.id}", headers=alice_headers
+        ).status_code
+        == 409
+    )
+
+    service_key = client.post(
+        "/admin/service-api-keys",
+        json={"name": "tenant-admin-denied"},
+        headers=admin_headers,
+    )
+    assert service_key.status_code == 200, service_key.text
+    assert (
+        client.get(
+            "/tenants/tenant-users/users",
+            headers={"X-API-Key": service_key.json()["api_key"]},
+        ).status_code
+        == 403
+    )
+
+    deleted = client.delete(
+        f"/tenants/tenant-users/users/{user_id}", headers=alice_headers
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json() == {"deleted": True}
+    scoped_audit = client.get(
+        "/tenants/tenant-users/audit-events",
+        params={"event_type": "user_deleted", "target_id": user_id},
+        headers=alice_headers,
+    )
+    assert scoped_audit.status_code == 200, scoped_audit.text
+    assert len(scoped_audit.json()) == 1
+    assert scoped_audit.json()[0]["actor_user_id"] == alice.id
+    assert (
+        client.get(
+            f"/tenants/tenant-users/users/{user_id}", headers=alice_headers
+        ).status_code
+        == 404
+    )
+
+    # Existing super-admin lifecycle remains compatible with the fifth flag.
+    admin_created = client.post(
+        "/admin/users",
+        json={
+            "username": "platform-user",
+            "password": "platform-pass",
+            "can_download_files": True,
+        },
+        headers=admin_headers,
+    )
+    assert admin_created.status_code == 200, admin_created.text
+    assert admin_created.json()["can_download_files"] is True
+
+
+def test_tenant_scoped_mutations_hide_protected_targets_and_block_self(
+    monkeypatch, tmp_path
+):
+    client, user_service, authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path, api_key=None
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    for tenant_id in ("tenant-protected", "tenant-cross"):
+        response = client.post(
+            "/admin/tenants",
+            json={"name": tenant_id, "tenant_id": tenant_id},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200, response.text
+
+    async def seed_targets():
+        tenant_admin = await user_service.create_user(
+            username="protected-admin", password="protected-admin-pass"
+        )
+        tenant_owner = await user_service.create_user(
+            username="protected-owner", password="protected-owner-pass"
+        )
+        await authz.grant_tenant_membership(
+            "tenant-protected", alice.id, "tenant_admin", granted_by=admin.id
+        )
+        await authz.grant_tenant_membership(
+            "tenant-protected",
+            tenant_admin.id,
+            "tenant_admin",
+            granted_by=admin.id,
+        )
+        await authz.grant_tenant_membership(
+            "tenant-protected",
+            tenant_owner.id,
+            "tenant_owner",
+            granted_by=admin.id,
+        )
+        await authz.grant_tenant_membership(
+            "tenant-cross", bob.id, "tenant_member", granted_by=admin.id
+        )
+        return (
+            await user_service.get_user_or_404(alice.id),
+            await user_service.get_user_or_404(tenant_admin.id),
+            await user_service.get_user_or_404(tenant_owner.id),
+            await user_service.get_user_or_404(bob.id),
+        )
+
+    alice, tenant_admin, tenant_owner, bob = asyncio.run(seed_targets())
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    created_kb = client.post(
+        "/kbs",
+        json={"id": "kb_protected_targets", "name": "Protected targets"},
+        headers=alice_headers,
+    )
+    assert created_kb.status_code == 200, created_kb.text
+    kb_member_path = (
+        "/tenants/tenant-protected/kbs/kb_protected_targets/members"
+    )
+
+    self_before = asyncio.run(user_service.get_user_or_404(alice.id))
+    self_patch = client.patch(
+        f"/tenants/tenant-protected/users/{alice.id}",
+        json={
+            "can_create_kb": not self_before.can_create_kb,
+            "can_use_bypass_query": not self_before.can_use_bypass_query,
+            "can_use_agent_query": not self_before.can_use_agent_query,
+            "can_delete_documents": not self_before.can_delete_documents,
+            "can_download_files": not self_before.can_download_files,
+        },
+        headers=alice_headers,
+    )
+    assert self_patch.status_code == 409
+    assert asyncio.run(user_service.get_user_or_404(alice.id)) == self_before
+    assert (
+        client.post(
+            f"/tenants/tenant-protected/users/{alice.id}:reset-password",
+            json={"password": "must-not-change"},
+            headers=alice_headers,
+        ).status_code
+        == 409
+    )
+    assert asyncio.run(user_service.authenticate("alice", "alice-pass")) is not None
+    assert (
+        client.put(
+            f"{kb_member_path}/{alice.id}",
+            json={"role": "viewer"},
+            headers=alice_headers,
+        ).status_code
+        == 409
+    )
+    assert (
+        client.delete(
+            f"{kb_member_path}/{alice.id}", headers=alice_headers
+        ).status_code
+        == 409
+    )
+    assert (
+        client.put(
+            f"/tenants/tenant-protected/members/{alice.id}",
+            json={"role": "tenant_member"},
+            headers=alice_headers,
+        ).status_code
+        == 409
+    )
+
+    listed = client.get(
+        "/tenants/tenant-protected/users", headers=alice_headers
+    )
+    assert listed.status_code == 200, listed.text
+    assert {tenant_admin.id, tenant_owner.id}.issubset(
+        {item["id"] for item in listed.json()}
+    )
+
+    passwords = {
+        tenant_admin.id: ("protected-admin", "protected-admin-pass"),
+        tenant_owner.id: ("protected-owner", "protected-owner-pass"),
+    }
+    for target in (tenant_admin, tenant_owner):
+        detail = client.get(
+            f"/tenants/tenant-protected/users/{target.id}", headers=alice_headers
+        )
+        assert detail.status_code == 200, detail.text
+        before = asyncio.run(user_service.get_user_or_404(target.id))
+        responses = [
+            client.patch(
+                f"/tenants/tenant-protected/users/{target.id}",
+                json={"can_create_kb": True},
+                headers=alice_headers,
+            ),
+            client.post(
+                f"/tenants/tenant-protected/users/{target.id}:reset-password",
+                json={"password": "must-not-change"},
+                headers=alice_headers,
+            ),
+            client.post(
+                f"/tenants/tenant-protected/users/{target.id}:disable",
+                headers=alice_headers,
+            ),
+            client.post(
+                f"/tenants/tenant-protected/users/{target.id}:enable",
+                headers=alice_headers,
+            ),
+            client.delete(
+                f"/tenants/tenant-protected/users/{target.id}",
+                headers=alice_headers,
+            ),
+            client.put(
+                f"{kb_member_path}/{target.id}",
+                json={"role": "viewer"},
+                headers=alice_headers,
+            ),
+            client.delete(
+                f"{kb_member_path}/{target.id}", headers=alice_headers
+            ),
+            client.put(
+                f"/tenants/tenant-protected/members/{target.id}",
+                json={"role": "tenant_member"},
+                headers=alice_headers,
+            ),
+            client.delete(
+                f"/tenants/tenant-protected/members/{target.id}",
+                headers=alice_headers,
+            ),
+        ]
+        assert {response.status_code for response in responses} == {404}
+        assert asyncio.run(user_service.get_user_or_404(target.id)) == before
+        username, password = passwords[target.id]
+        assert asyncio.run(user_service.authenticate(username, password)) is not None
+        assert (
+            asyncio.run(
+                client.app.state.metadata_store.get_tenant_user_kb_override(
+                    "tenant-protected", "kb_protected_targets", target.id
+                )
+            )
+            is None
+        )
+
+    for hidden_id in ("usr_missing", bob.id, admin.id):
+        hidden_responses = [
+            client.patch(
+                f"/tenants/tenant-protected/users/{hidden_id}",
+                json={"can_download_files": True},
+                headers=alice_headers,
+            ),
+            client.post(
+                f"/tenants/tenant-protected/users/{hidden_id}:reset-password",
+                json={"password": "hidden"},
+                headers=alice_headers,
+            ),
+            client.post(
+                f"/tenants/tenant-protected/users/{hidden_id}:disable",
+                headers=alice_headers,
+            ),
+            client.delete(
+                f"/tenants/tenant-protected/users/{hidden_id}",
+                headers=alice_headers,
+            ),
+            client.put(
+                f"{kb_member_path}/{hidden_id}",
+                json={"role": "viewer"},
+                headers=alice_headers,
+            ),
+            client.put(
+                f"/tenants/tenant-protected/members/{hidden_id}",
+                json={"role": "tenant_member"},
+                headers=alice_headers,
+            ),
+            client.delete(
+                f"/tenants/tenant-protected/members/{hidden_id}",
+                headers=alice_headers,
+            ),
+        ]
+        assert {response.status_code for response in hidden_responses} == {404}
+
+
+def test_tenant_scoped_user_and_membership_cas_reject_post_validation_races(
+    monkeypatch, tmp_path
+):
+    client, user_service, authz, admin, alice, _bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path, api_key=None
+    )
+
+    async def seed():
+        await authz.grant_tenant_membership(
+            "tenant-race-a", alice.id, "tenant_admin", granted_by=admin.id
+        )
+        update_target = await user_service.create_user(
+            username="race-update",
+            password="race-update-pass",
+            tenant_id="tenant-race-a",
+        )
+        password_target = await user_service.create_user(
+            username="race-password",
+            password="race-password-pass",
+            tenant_id="tenant-race-a",
+        )
+        delete_target = await user_service.create_user(
+            username="race-delete",
+            password="race-delete-pass",
+            tenant_id="tenant-race-a",
+        )
+        grant_target = await user_service.create_user(
+            username="race-grant", password="race-grant-pass"
+        )
+        revoke_target = await user_service.create_user(
+            username="race-revoke",
+            password="race-revoke-pass",
+            tenant_id="tenant-race-a",
+        )
+        return (
+            await user_service.get_user_or_404(alice.id),
+            update_target,
+            password_target,
+            delete_target,
+            grant_target,
+            revoke_target,
+        )
+
+    (
+        alice,
+        update_target,
+        password_target,
+        delete_target,
+        grant_target,
+        revoke_target,
+    ) = asyncio.run(seed())
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+
+    original_update = user_service.update_user
+
+    async def update_after_move(user_id, **kwargs):
+        await authz.grant_tenant_membership(
+            "tenant-race-b", user_id, "tenant_member", granted_by=admin.id
+        )
+        return await original_update(user_id, **kwargs)
+
+    monkeypatch.setattr(user_service, "update_user", update_after_move)
+    stale_update = client.patch(
+        f"/tenants/tenant-race-a/users/{update_target.id}",
+        json={"can_create_kb": True},
+        headers=alice_headers,
+    )
+    assert stale_update.status_code == 409, stale_update.text
+    moved = asyncio.run(user_service.get_user_or_404(update_target.id))
+    assert moved.tenant_id == "tenant-race-b"
+    assert moved.can_create_kb is False
+    monkeypatch.setattr(user_service, "update_user", original_update)
+
+    original_change_password = user_service.change_password
+
+    async def password_after_promotion(user_id, password, **kwargs):
+        await authz.grant_tenant_membership(
+            "tenant-race-a", user_id, "tenant_admin", granted_by=admin.id
+        )
+        return await original_change_password(user_id, password, **kwargs)
+
+    monkeypatch.setattr(
+        user_service, "change_password", password_after_promotion
+    )
+    stale_password = client.post(
+        f"/tenants/tenant-race-a/users/{password_target.id}:reset-password",
+        json={"password": "stale-new-password"},
+        headers=alice_headers,
+    )
+    assert stale_password.status_code == 409, stale_password.text
+    assert (
+        asyncio.run(user_service.authenticate("race-password", "race-password-pass"))
+        is not None
+    )
+    assert (
+        asyncio.run(user_service.authenticate("race-password", "stale-new-password"))
+        is None
+    )
+    promoted = asyncio.run(
+        authz.get_tenant_membership("tenant-race-a", password_target.id)
+    )
+    assert promoted is not None and promoted.role == "tenant_admin"
+    monkeypatch.setattr(
+        user_service, "change_password", original_change_password
+    )
+
+    original_delete = user_service.delete_user
+
+    async def delete_after_revision(user_id, **kwargs):
+        await original_update(
+            user_id, can_create_kb=True, actor_user_id=admin.id
+        )
+        return await original_delete(user_id, **kwargs)
+
+    monkeypatch.setattr(user_service, "delete_user", delete_after_revision)
+    stale_delete = client.delete(
+        f"/tenants/tenant-race-a/users/{delete_target.id}",
+        headers=alice_headers,
+    )
+    assert stale_delete.status_code == 409, stale_delete.text
+    retained = asyncio.run(user_service.get_user_or_404(delete_target.id))
+    assert retained.can_create_kb is True
+    monkeypatch.setattr(user_service, "delete_user", original_delete)
+
+    original_grant = authz.grant_tenant_membership
+
+    async def grant_after_move(tenant_id, user_id, role, **kwargs):
+        await original_grant(
+            "tenant-race-b", user_id, "tenant_member", granted_by=admin.id
+        )
+        return await original_grant(tenant_id, user_id, role, **kwargs)
+
+    monkeypatch.setattr(authz, "grant_tenant_membership", grant_after_move)
+    stale_grant = client.put(
+        f"/tenants/tenant-race-a/members/{grant_target.id}",
+        json={"role": "tenant_member"},
+        headers=alice_headers,
+    )
+    assert stale_grant.status_code == 409, stale_grant.text
+    grant_current = asyncio.run(user_service.get_user_or_404(grant_target.id))
+    assert grant_current.tenant_id == "tenant-race-b"
+    monkeypatch.setattr(authz, "grant_tenant_membership", original_grant)
+
+    original_revoke = authz.revoke_tenant_membership
+
+    async def revoke_after_promotion(tenant_id, user_id, **kwargs):
+        await original_grant(
+            tenant_id, user_id, "tenant_admin", granted_by=admin.id
+        )
+        return await original_revoke(tenant_id, user_id, **kwargs)
+
+    monkeypatch.setattr(authz, "revoke_tenant_membership", revoke_after_promotion)
+    stale_revoke = client.delete(
+        f"/tenants/tenant-race-a/members/{revoke_target.id}",
+        headers=alice_headers,
+    )
+    assert stale_revoke.status_code == 409, stale_revoke.text
+    revoke_current = asyncio.run(user_service.get_user_or_404(revoke_target.id))
+    revoke_membership = asyncio.run(
+        authz.get_tenant_membership("tenant-race-a", revoke_target.id)
+    )
+    assert revoke_current.tenant_id == "tenant-race-a"
+    assert revoke_membership is not None and revoke_membership.role == "tenant_admin"
+
+
+def test_tenant_kb_override_target_cas_rejects_route_races_without_enumeration(
+    monkeypatch, tmp_path
+):
+    client, user_service, authz, admin, alice, _bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path, api_key=None
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    for tenant_id in ("tenant-override-race-a", "tenant-override-race-b"):
+        created = client.post(
+            "/admin/tenants",
+            json={"name": tenant_id, "tenant_id": tenant_id},
+            headers=admin_headers,
+        )
+        assert created.status_code == 200, created.text
+
+    async def seed():
+        await authz.grant_tenant_membership(
+            "tenant-override-race-a",
+            alice.id,
+            "tenant_admin",
+            granted_by=admin.id,
+        )
+        promoted_target = await user_service.create_user(
+            username="override-race-promote",
+            password="pass",
+            tenant_id="tenant-override-race-a",
+        )
+        moved_target = await user_service.create_user(
+            username="override-race-move",
+            password="pass",
+            tenant_id="tenant-override-race-a",
+        )
+        revised_target = await user_service.create_user(
+            username="override-race-revision",
+            password="pass",
+            tenant_id="tenant-override-race-a",
+        )
+        return (
+            await user_service.get_user_or_404(alice.id),
+            promoted_target,
+            moved_target,
+            revised_target,
+        )
+
+    alice, promoted_target, moved_target, revised_target = asyncio.run(seed())
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    created_kb = client.post(
+        "/kbs",
+        json={"id": "kb_override_target_race", "name": "Override race"},
+        headers=alice_headers,
+    )
+    assert created_kb.status_code == 200, created_kb.text
+    member_path = (
+        "/tenants/tenant-override-race-a/kbs/"
+        "kb_override_target_race/members"
+    )
+    store = client.app.state.metadata_store
+
+    original_grant_override = authz.grant_tenant_user_kb_override
+
+    async def grant_after_promotion(kb_id, tenant_id, user_id, role, **kwargs):
+        await authz.grant_tenant_membership(
+            tenant_id,
+            user_id,
+            "tenant_admin",
+            granted_by=admin.id,
+        )
+        return await original_grant_override(
+            kb_id, tenant_id, user_id, role, **kwargs
+        )
+
+    monkeypatch.setattr(
+        authz, "grant_tenant_user_kb_override", grant_after_promotion
+    )
+    promoted = client.put(
+        f"{member_path}/{promoted_target.id}",
+        json={"role": "viewer"},
+        headers=alice_headers,
+    )
+    assert promoted.status_code == 404, promoted.text
+    assert promoted.json() == {"detail": "User not found"}
+    assert "tenant-override-race-b" not in promoted.text
+    assert (
+        asyncio.run(
+            store.get_tenant_user_kb_override(
+                "tenant-override-race-a",
+                "kb_override_target_race",
+                promoted_target.id,
+            )
+        )
+        is None
+    )
+    monkeypatch.setattr(
+        authz, "grant_tenant_user_kb_override", original_grant_override
+    )
+
+    original_revoke_override = authz.revoke_tenant_user_kb_override
+
+    async def revoke_after_move(kb_id, tenant_id, user_id, **kwargs):
+        await authz.grant_tenant_membership(
+            "tenant-override-race-b",
+            user_id,
+            "tenant_member",
+            granted_by=admin.id,
+        )
+        return await original_revoke_override(kb_id, tenant_id, user_id, **kwargs)
+
+    monkeypatch.setattr(
+        authz, "revoke_tenant_user_kb_override", revoke_after_move
+    )
+    moved = client.delete(
+        f"{member_path}/{moved_target.id}", headers=alice_headers
+    )
+    assert moved.status_code == 404, moved.text
+    assert moved.json() == {"detail": "User not found"}
+    assert "tenant-override-race-b" not in moved.text
+    assert (
+        asyncio.run(
+            store.get_tenant_user_kb_override(
+                "tenant-override-race-a",
+                "kb_override_target_race",
+                moved_target.id,
+            )
+        )
+        is None
+    )
+    monkeypatch.setattr(
+        authz, "revoke_tenant_user_kb_override", original_revoke_override
+    )
+
+    baseline = asyncio.run(
+        authz.grant_tenant_user_kb_override(
+            "kb_override_target_race",
+            "tenant-override-race-a",
+            revised_target.id,
+            "kb_viewer",
+            granted_by=admin.id,
+        )
+    )
+    original_reset_override = authz.reset_tenant_user_kb_override
+
+    async def reset_after_revision(kb_id, tenant_id, user_id, **kwargs):
+        await user_service.update_user(
+            user_id,
+            can_create_kb=True,
+            actor_user_id=admin.id,
+        )
+        return await original_reset_override(kb_id, tenant_id, user_id, **kwargs)
+
+    monkeypatch.setattr(
+        authz, "reset_tenant_user_kb_override", reset_after_revision
+    )
+    revised = client.delete(
+        f"{member_path}/{revised_target.id}",
+        params={"reset": True},
+        headers=alice_headers,
+    )
+    assert revised.status_code == 409, revised.text
+    assert revised.json() == {
+        "detail": "User was modified concurrently; retry the request"
+    }
+    assert "tenant_id" not in revised.text and "token_version" not in revised.text
+    assert (
+        asyncio.run(
+            store.get_tenant_user_kb_override(
+                "tenant-override-race-a",
+                "kb_override_target_race",
+                revised_target.id,
+            )
+        )
+        == baseline
+    )
+
+
+def test_tenant_mutation_audits_keep_request_principal_tenant_after_actor_move(
+    monkeypatch, tmp_path
+):
+    client, user_service, authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path, api_key=None
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    tenant_a = "tenant-event-snapshot-a"
+    tenant_b = "tenant-event-snapshot-b"
+    for tenant_id in (tenant_a, tenant_b):
+        created = client.post(
+            "/admin/tenants",
+            json={"name": tenant_id, "tenant_id": tenant_id},
+            headers=admin_headers,
+        )
+        assert created.status_code == 200, created.text
+
+    async def seed():
+        actor_user = await user_service.create_user(
+            username="audit-actor-user", password="pass"
+        )
+        actor_membership = await user_service.create_user(
+            username="audit-actor-membership", password="pass"
+        )
+        actor_override = await user_service.create_user(
+            username="audit-actor-override", password="pass"
+        )
+        for actor in (alice, actor_user, actor_membership, actor_override):
+            await authz.grant_tenant_membership(
+                tenant_a,
+                actor.id,
+                "tenant_admin",
+                granted_by=admin.id,
+            )
+        await authz.grant_tenant_membership(
+            tenant_b,
+            bob.id,
+            "tenant_admin",
+            granted_by=admin.id,
+        )
+        update_target = await user_service.create_user(
+            username="audit-update-target",
+            password="pass",
+            tenant_id=tenant_a,
+        )
+        membership_target = await user_service.create_user(
+            username="audit-membership-target",
+            password="pass",
+        )
+        override_target = await user_service.create_user(
+            username="audit-override-target",
+            password="pass",
+            tenant_id=tenant_a,
+        )
+        return (
+            await user_service.get_user_or_404(alice.id),
+            await user_service.get_user_or_404(bob.id),
+            await user_service.get_user_or_404(actor_user.id),
+            await user_service.get_user_or_404(actor_membership.id),
+            await user_service.get_user_or_404(actor_override.id),
+            update_target,
+            membership_target,
+            override_target,
+        )
+
+    (
+        observer_a,
+        observer_b,
+        actor_user,
+        actor_membership,
+        actor_override,
+        update_target,
+        membership_target,
+        override_target,
+    ) = asyncio.run(seed())
+    observer_a_headers = {
+        "Authorization": f"Bearer {_token(user_service, observer_a)}"
+    }
+    observer_b_headers = {
+        "Authorization": f"Bearer {_token(user_service, observer_b)}"
+    }
+    actor_headers = {
+        actor_user.id: {"Authorization": f"Bearer {_token(user_service, actor_user)}"},
+        actor_membership.id: {
+            "Authorization": f"Bearer {_token(user_service, actor_membership)}"
+        },
+        actor_override.id: {
+            "Authorization": f"Bearer {_token(user_service, actor_override)}"
+        },
+    }
+    created_kb = client.post(
+        "/kbs",
+        json={"id": "kb_event_snapshot", "name": "Audit event snapshot"},
+        headers=observer_a_headers,
+    )
+    assert created_kb.status_code == 200, created_kb.text
+
+    store = client.app.state.metadata_store
+    original_append = store.append_audit_event
+    move_on_event = {
+        ("user_updated", actor_user.id),
+        ("tenant_membership_granted", actor_membership.id),
+        ("tenant_user_kb_override_set", actor_override.id),
+    }
+    moved: set[tuple[str, str]] = set()
+
+    async def move_actor_after_event_construction(event):
+        key = (event.event_type, event.actor_user_id)
+        if key in move_on_event and key not in moved:
+            moved.add(key)
+            assert event.actor_tenant_id == tenant_a
+            await authz.grant_tenant_membership(
+                tenant_b,
+                event.actor_user_id,
+                "tenant_admin",
+                granted_by=admin.id,
+            )
+        return await original_append(event)
+
+    monkeypatch.setattr(
+        store, "append_audit_event", move_actor_after_event_construction
+    )
+
+    updated = client.patch(
+        f"/tenants/{tenant_a}/users/{update_target.id}",
+        json={"can_create_kb": True},
+        headers=actor_headers[actor_user.id],
+    )
+    assert updated.status_code == 200, updated.text
+    membership = client.put(
+        f"/tenants/{tenant_a}/members/{membership_target.id}",
+        json={"role": "tenant_member"},
+        headers=actor_headers[actor_membership.id],
+    )
+    assert membership.status_code == 200, membership.text
+    override = client.put(
+        f"/tenants/{tenant_a}/kbs/kb_event_snapshot/members/{override_target.id}",
+        json={"role": "viewer"},
+        headers=actor_headers[actor_override.id],
+    )
+    assert override.status_code == 200, override.text
+    assert moved == move_on_event
+
+    events_a = client.get(
+        f"/tenants/{tenant_a}/audit-events",
+        headers=observer_a_headers,
+    )
+    assert events_a.status_code == 200, events_a.text
+    relevant = {
+        (event["event_type"], event["actor_user_id"]): event
+        for event in events_a.json()
+        if (event["event_type"], event["actor_user_id"]) in move_on_event
+    }
+    assert set(relevant) == move_on_event
+    assert all(event["actor_tenant_id"] == tenant_a for event in relevant.values())
+
+    events_b = client.get(
+        f"/tenants/{tenant_b}/audit-events",
+        headers=observer_b_headers,
+    )
+    assert events_b.status_code == 200, events_b.text
+    assert not any(
+        (event["event_type"], event["actor_user_id"]) in move_on_event
+        for event in events_b.json()
+    )
+
+
+def test_tenant_audit_uses_event_time_tenant_and_reuses_filters(
+    monkeypatch, tmp_path
+):
+    client, user_service, authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path, api_key=None
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    for tenant_id in ("tenant-audit", "tenant-later"):
+        response = client.post(
+            "/admin/tenants",
+            json={"name": tenant_id, "tenant_id": tenant_id},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200, response.text
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-audit", alice.id, "tenant_admin", granted_by=admin.id
+        )
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-audit", bob.id, "tenant_member", granted_by=admin.id
+        )
+    )
+    alice = asyncio.run(user_service.get_user_or_404(alice.id))
+    bob = asyncio.run(user_service.get_user_or_404(bob.id))
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    audit_service = client.app.state.enterprise_audit_service
+
+    visible_first = asyncio.run(
+        audit_service.append(
+            "tenant_visible",
+            actor_user_id=bob.id,
+            actor_tenant_id="tenant-audit",
+            target_type="user",
+            target_id=bob.id,
+            metadata={"page": 1},
+        )
+    )
+    visible_second = asyncio.run(
+        audit_service.append(
+            "tenant_visible",
+            actor_user_id=bob.id,
+            actor_tenant_id="tenant-audit",
+            target_type="kb",
+            target_id="missing-kb",
+            metadata={"page": 2},
+        )
+    )
+    asyncio.run(
+        audit_service.append(
+            "legacy_null",
+            actor_user_id=None,
+            actor_tenant_id=None,
+        )
+    )
+    asyncio.run(
+        audit_service.append(
+            "other_tenant",
+            actor_user_id=bob.id,
+            actor_tenant_id="tenant-later",
+        )
+    )
+
+    # A later primary-tenant move cannot rewrite historical attribution.
+    asyncio.run(
+        user_service.update_user(
+            bob.id,
+            tenant_id="tenant-later",
+            actor_user_id=admin.id,
+        )
+    )
+    events = client.get(
+        "/tenants/tenant-audit/audit-events",
+        # An attempted caller override is ignored; SQL remains pinned to path.
+        params={"actor_tenant_id": "tenant-later"},
+        headers=alice_headers,
+    )
+    assert events.status_code == 200, events.text
+    ids = {event["id"] for event in events.json()}
+    assert visible_first.id in ids
+    assert visible_second.id in ids
+    assert all(
+        event["actor_tenant_id"] == "tenant-audit" for event in events.json()
+    )
+    assert all(event["event_type"] != "legacy_null" for event in events.json())
+    assert all(event["event_type"] != "other_tenant" for event in events.json())
+    assert {
+        event["actor_username"]
+        for event in events.json()
+        if event["event_type"] == "tenant_visible"
+    } == {"bob"}
+
+    filtered = client.get(
+        "/tenants/tenant-audit/audit-events",
+        params={"event_type": "tenant_visible", "target_type": "user"},
+        headers=alice_headers,
+    )
+    assert filtered.status_code == 200, filtered.text
+    assert [event["id"] for event in filtered.json()] == [visible_first.id]
+    page_one = client.get(
+        "/tenants/tenant-audit/audit-events",
+        params={"event_type": "tenant_visible", "limit": 1},
+        headers=alice_headers,
+    ).json()
+    page_two = client.get(
+        "/tenants/tenant-audit/audit-events",
+        params={"event_type": "tenant_visible", "limit": 1, "offset": 1},
+        headers=alice_headers,
+    ).json()
+    assert len(page_one) == len(page_two) == 1
+    assert page_one[0]["id"] != page_two[0]["id"]
+
+
+def test_tenant_kb_member_allow_deny_reset_caps_sources_and_generation(
+    monkeypatch, tmp_path
+):
+    client, user_service, authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path, api_key=None
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    for tenant_id in ("tenant-members", "tenant-cross"):
+        response = client.post(
+            "/admin/tenants",
+            json={"name": tenant_id, "tenant_id": tenant_id},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200, response.text
+    carol = asyncio.run(
+        user_service.create_user(username="carol-member", password="pass")
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-members", alice.id, "tenant_admin", granted_by=admin.id
+        )
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-members", bob.id, "tenant_member", granted_by=admin.id
+        )
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-cross", carol.id, "tenant_admin", granted_by=admin.id
+        )
+    )
+    alice = asyncio.run(user_service.get_user_or_404(alice.id))
+    bob = asyncio.run(user_service.get_user_or_404(bob.id))
+    carol = asyncio.run(user_service.get_user_or_404(carol.id))
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+    carol_headers = {"Authorization": f"Bearer {_token(user_service, carol)}"}
+
+    owned = client.post(
+        "/kbs",
+        json={"id": "kb_member_owned", "name": "Member Owned"},
+        headers=alice_headers,
+    )
+    assert owned.status_code == 200, owned.text
+    members_path = "/tenants/tenant-members/kbs/kb_member_owned/members"
+    initial = client.get(members_path, headers=alice_headers)
+    assert initial.status_code == 200, initial.text
+    initial_by_user = {item["user_id"]: item for item in initial.json()}
+    assert {alice.id, bob.id}.issubset(initial_by_user)
+    assert initial_by_user[bob.id]["effective_role"] is None
+
+    allowed = client.put(
+        f"{members_path}/{bob.id}",
+        json={"role": "viewer"},
+        headers=alice_headers,
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["override_effect"] == "allow"
+    assert allowed.json()["override_role"] == "kb_viewer"
+    assert allowed.json()["effective_role"] == "kb_viewer"
+    assert "tenant_owned_override" in allowed.json()["sources"]
+    assert "kb_member_owned" in {
+        item["id"]
+        for item in client.get("/kbs", headers=bob_headers).json()[
+            "knowledge_bases"
+        ]
+    }
+    query_allowed = client.post(
+        "/kbs/kb_member_owned/query",
+        json={"query": "allowed", "mode": "mix"},
+        headers=bob_headers,
+    )
+    assert query_allowed.status_code == 200, query_allowed.text
+
+    denied = client.delete(f"{members_path}/{bob.id}", headers=alice_headers)
+    assert denied.status_code == 200, denied.text
+    assert denied.json()["override_effect"] == "deny"
+    assert denied.json()["effective_role"] is None
+    assert "kb_member_owned" not in {
+        item["id"]
+        for item in client.get("/kbs", headers=bob_headers).json()[
+            "knowledge_bases"
+        ]
+    }
+    assert (
+        client.post(
+            "/kbs/kb_member_owned/query",
+            json={"query": "denied", "mode": "mix"},
+            headers=bob_headers,
+        ).status_code
+        == 403
+    )
+    reset = client.delete(
+        f"{members_path}/{bob.id}",
+        params={"reset": True},
+        headers=alice_headers,
+    )
+    assert reset.status_code == 200, reset.text
+    assert reset.json()["user_id"] == bob.id
+    assert reset.json()["override_effect"] is None
+
+    # A tenant deny never suppresses a direct platform grant.
+    direct = client.put(
+        "/admin/kbs/kb_member_owned/acl",
+        json={"user_id": bob.id, "role": "kb_viewer"},
+        headers=admin_headers,
+    )
+    assert direct.status_code == 200, direct.text
+    direct_remaining = client.delete(
+        f"{members_path}/{bob.id}", headers=alice_headers
+    )
+    assert direct_remaining.status_code == 200, direct_remaining.text
+    assert direct_remaining.json()["effective_role"] == "kb_viewer"
+    assert direct_remaining.json()["platform_role"] == "kb_viewer"
+    assert "direct" in direct_remaining.json()["sources"]
+
+    provisioned = client.post(
+        "/kbs",
+        json={
+            "id": "kb_member_provisioned",
+            "name": "Provisioned",
+            "tenant_id": "tenant-members",
+            "metadata": {
+                "tenant_managed": True,
+                "tenant_tag": "tenant:tenant-members",
+            },
+        },
+        headers=admin_headers,
+    )
+    assert provisioned.status_code == 200, provisioned.text
+    assert provisioned.json()["origin"] == "platform"
+    provisioned_path = (
+        "/tenants/tenant-members/kbs/kb_member_provisioned/members"
+    )
+    assert client.get(provisioned_path, headers=alice_headers).status_code == 403
+    tenant_acl = client.put(
+        "/admin/kbs/kb_member_provisioned/acl",
+        json={"tenant_id": "tenant-members", "role": "kb_editor"},
+        headers=admin_headers,
+    )
+    assert tenant_acl.status_code == 200, tenant_acl.text
+    too_high = client.put(
+        f"{provisioned_path}/{bob.id}",
+        json={"role": "admin"},
+        headers=alice_headers,
+    )
+    assert too_high.status_code == 400
+    capped = client.put(
+        f"{provisioned_path}/{bob.id}",
+        json={"role": "viewer"},
+        headers=alice_headers,
+    )
+    assert capped.status_code == 200, capped.text
+    assert capped.json()["effective_role"] == "kb_viewer"
+    assert capped.json()["tenant_acl_role"] == "kb_editor"
+    assert "tenant_override_capped" in capped.json()["sources"]
+
+    downgraded = client.put(
+        "/admin/kbs/kb_member_provisioned/acl",
+        json={"tenant_id": "tenant-members", "role": "kb_viewer"},
+        headers=admin_headers,
+    )
+    assert downgraded.status_code == 200, downgraded.text
+    after_downgrade = client.get(provisioned_path, headers=alice_headers)
+    assert after_downgrade.status_code == 200, after_downgrade.text
+    bob_after_downgrade = next(
+        item for item in after_downgrade.json() if item["user_id"] == bob.id
+    )
+    assert bob_after_downgrade["effective_role"] == "kb_viewer"
+    assert bob_after_downgrade["tenant_acl_role"] == "kb_viewer"
+    revoked_acl = client.delete(
+        "/admin/kbs/kb_member_provisioned/acl/tenants/tenant-members",
+        headers=admin_headers,
+    )
+    assert revoked_acl.status_code == 200, revoked_acl.text
+    bob_kbs_after_revoke = {
+        item["id"]
+        for item in client.get("/kbs", headers=bob_headers).json()[
+            "knowledge_bases"
+        ]
+    }
+    assert "kb_member_provisioned" not in bob_kbs_after_revoke
+    assert client.get(provisioned_path, headers=alice_headers).status_code == 403
+
+    # Visibility survives a tenant-scoped deny and is disclosed as a source.
+    public = client.post(
+        "/kbs",
+        json={
+            "id": "kb_member_public",
+            "name": "Public Provisioned",
+            "visibility": "public",
+        },
+        headers=admin_headers,
+    )
+    assert public.status_code == 200, public.text
+    public_acl = client.put(
+        "/admin/kbs/kb_member_public/acl",
+        json={"tenant_id": "tenant-members", "role": "kb_viewer"},
+        headers=admin_headers,
+    )
+    assert public_acl.status_code == 200, public_acl.text
+    public_path = "/tenants/tenant-members/kbs/kb_member_public/members"
+    visibility_remaining = client.delete(
+        f"{public_path}/{bob.id}", headers=alice_headers
+    )
+    assert visibility_remaining.status_code == 200, visibility_remaining.text
+    assert visibility_remaining.json()["effective_role"] == "kb_viewer"
+    assert visibility_remaining.json()["platform_role"] == "kb_viewer"
+    assert "visibility" in visibility_remaining.json()["sources"]
+    visibility_reset = client.delete(
+        f"{public_path}/{bob.id}",
+        params={"reset": True},
+        headers=alice_headers,
+    )
+    assert visibility_reset.status_code == 200, visibility_reset.text
+    assert visibility_reset.json()["user_id"] == bob.id
+
+    public_only = client.post(
+        "/kbs",
+        json={
+            "id": "kb_member_public_only",
+            "name": "Public Only",
+            "visibility": "public",
+        },
+        headers=admin_headers,
+    )
+    assert public_only.status_code == 200, public_only.text
+    assert (
+        client.get(
+            "/tenants/tenant-members/kbs/kb_member_public_only/members",
+            headers=alice_headers,
+        ).status_code
+        == 403
+    )
+    assert client.get(members_path, headers=carol_headers).status_code == 403
+    assert (
+        client.put(
+            f"{members_path}/{carol.id}",
+            json={"role": "viewer"},
+            headers=alice_headers,
+        ).status_code
+        == 404
+    )
+    service_key = client.post(
+        "/admin/service-api-keys",
+        json={"name": "member-admin-denied"},
+        headers=admin_headers,
+    )
+    assert service_key.status_code == 200, service_key.text
+    assert (
+        client.get(
+            members_path,
+            headers={"X-API-Key": service_key.json()["api_key"]},
+        ).status_code
+        == 403
+    )
+
+    # Capture the original catalog generation exactly once. If lifecycle state
+    # switches before the write, the old generation is rejected with 409 and
+    # the handler does not re-read/upgrade to the replacement identity.
+    kb_service = client.app.state.kb_service
+    metadata_store = client.app.state.metadata_store
+    original_get = kb_service.get
+    get_calls = 0
+
+    async def counted_get(*args, **kwargs):
+        nonlocal get_calls
+        get_calls += 1
+        return await original_get(*args, **kwargs)
+
+    original_grant_override = authz.grant_tenant_user_kb_override
+
+    async def race_grant_override(kb_id, tenant_id, user_id, role, **kwargs):
+        expected_generation = kwargs["expected_generation"]
+        await metadata_store.purge_kb_metadata(kb_id, expected_generation)
+        await metadata_store.activate_kb_generation(kb_id, str(uuid4()))
+        return await original_grant_override(
+            kb_id, tenant_id, user_id, role, **kwargs
+        )
+
+    monkeypatch.setattr(kb_service, "get", counted_get)
+    monkeypatch.setattr(
+        authz, "grant_tenant_user_kb_override", race_grant_override
+    )
+    stale_write = client.put(
+        f"{members_path}/{bob.id}",
+        json={"role": "viewer"},
+        headers=alice_headers,
+    )
+    assert stale_write.status_code == 409, stale_write.text
+    # One read belongs to the outer write-admission middleware and one to the
+    # authorization service's own generation capture; neither re-reads after
+    # the injected replacement.
+    assert get_calls == 2
+
+
+def test_service_api_key_create_and_rotate_use_catalog_generation_map(
+    monkeypatch, tmp_path
+):
+    client, user_service, _authz, admin, _alice, _bob, _probe = (
+        _build_enterprise_client(monkeypatch, tmp_path, api_key=None)
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    created_kb = client.post(
+        "/kbs",
+        json={"id": "kb_service_generation", "name": "Generation"},
+        headers=admin_headers,
+    )
+    assert created_kb.status_code == 200, created_kb.text
+    generation = asyncio.run(
+        client.app.state.kb_service.get("kb_service_generation")
+    ).generation
+
+    store = client.app.state.metadata_store
+    original_create = store.create_enterprise_api_key
+    generation_maps: list[dict[str, str]] = []
+
+    async def capture_create(record, *, expected_kb_generations=None):
+        generation_maps.append(dict(expected_kb_generations or {}))
+        return await original_create(
+            record, expected_kb_generations=expected_kb_generations
+        )
+
+    monkeypatch.setattr(store, "create_enterprise_api_key", capture_create)
+    created_key = client.post(
+        "/admin/service-api-keys",
+        json={
+            "name": "generation-reader",
+            "kb_roles": {"kb_service_generation": "kb_viewer"},
+        },
+        headers=admin_headers,
+    )
+    assert created_key.status_code == 200, created_key.text
+    rotated = client.post(
+        f"/admin/service-api-keys/{created_key.json()['key']['id']}:rotate",
+        headers=admin_headers,
+    )
+    assert rotated.status_code == 200, rotated.text
+    assert generation_maps == [
+        {"kb_service_generation": generation},
+        {"kb_service_generation": generation},
+    ]

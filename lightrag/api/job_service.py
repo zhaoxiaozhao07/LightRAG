@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from typing import Any
 
 from lightrag.api.enterprise_auth import (
@@ -11,7 +12,12 @@ from lightrag.api.enterprise_auth import (
     get_current_principal,
     principal_job_subject,
 )
-from lightrag.api.kb_service import KnowledgeBaseService, utc_now_iso
+from lightrag.api.kb_service import (
+    KnowledgeBaseConflictError,
+    KnowledgeBaseRecord,
+    KnowledgeBaseService,
+    utc_now_iso,
+)
 from lightrag.api.metadata_store import (
     JobRecord,
     MetadataJobStatus,
@@ -22,6 +28,75 @@ from lightrag.utils import generate_track_id
 
 _RUNNING_JOB_STATUSES = ("queued", "running", "retrying", "cancelling")
 MetadataStore = SQLiteMetadataStore | PostgresMetadataStore
+
+# Every production executor except ``clear_kb`` mutates KB-scoped state and
+# must run under the shared generation fence. ``clear_kb`` deliberately takes
+# the exclusive fence inside KBDeletionService instead.
+RESUMABLE_KB_MUTATION_JOB_TYPES: frozenset[str] = frozenset(
+    {"parse", "build_kg", "reindex", "delete", "replace", "sync", "agent_profile"}
+)
+_GENERATION_STAMP_EXEMPT_JOB_TYPES: frozenset[str] = frozenset({"clear_kb"})
+
+
+def _assert_active_catalog_generation(
+    record: KnowledgeBaseRecord,
+    expected_generation: str,
+) -> None:
+    if record.generation != expected_generation:
+        raise KnowledgeBaseConflictError(
+            f"Knowledge base '{record.id}' changed generation"
+        )
+    if record.status != "active":
+        raise KnowledgeBaseConflictError(
+            f"Knowledge base '{record.id}' is not active"
+        )
+
+
+async def assert_active_kb_generation(
+    kb_service: KnowledgeBaseService,
+    metadata_store: MetadataStore,
+    kb_id: str,
+    expected_generation: str,
+) -> KnowledgeBaseRecord:
+    """Assert one catalog generation is still active in both control planes."""
+
+    record = await kb_service.get(kb_id, include_deleted=True)
+    # Check lifecycle first so an in-progress hard delete surfaces the metadata
+    # conflict that owns admission, rather than being flattened into a catalog
+    # status error.
+    await metadata_store.assert_kb_generation(record.id, expected_generation)
+    _assert_active_catalog_generation(record, expected_generation)
+    return record
+
+
+async def prepare_kb_job_payload(
+    kb_service: KnowledgeBaseService,
+    metadata_store: MetadataStore,
+    kb_id: str,
+    *,
+    job_type: str,
+    payload: dict[str, Any] | None,
+) -> tuple[KnowledgeBaseRecord, dict[str, Any]]:
+    """Capture and stamp the catalog generation for a newly-created KB job."""
+
+    job_payload = dict(payload or {})
+    if job_type in _GENERATION_STAMP_EXEMPT_JOB_TYPES:
+        return await kb_service.get(kb_id, include_deleted=True), job_payload
+
+    record = await kb_service.get(kb_id, include_deleted=True)
+    supplied_generation = job_payload.get("kb_generation")
+    if supplied_generation is not None and supplied_generation != record.generation:
+        raise KnowledgeBaseConflictError(
+            f"Knowledge base '{record.id}' changed generation"
+        )
+    record = await assert_active_kb_generation(
+        kb_service,
+        metadata_store,
+        record.id,
+        record.generation,
+    )
+    job_payload["kb_generation"] = record.generation
+    return record, job_payload
 
 
 class JobService:
@@ -35,13 +110,99 @@ class JobService:
 
     async def _persist_job(self, job: JobRecord) -> JobRecord:
         await self._apply_enterprise_job_controls(job)
-        store = self._metadata_store
-        return await store.create_job(job)
+        async with self._job_persistence_guard(job):
+            return await self._metadata_store.create_job(job)
 
     async def _persist_job_once(self, job: JobRecord) -> tuple[JobRecord, bool]:
         await self._apply_enterprise_job_controls(job)
-        store = self._metadata_store
-        return await store.create_job_once(job)
+        async with self._job_persistence_guard(job):
+            return await self._metadata_store.create_job_once(job)
+
+    @asynccontextmanager
+    async def _job_persistence_guard(
+        self,
+        job: JobRecord,
+    ) -> AsyncIterator[None]:
+        """Fence the final persistence of every non-clear KB mutation job."""
+
+        if job.job_type in _GENERATION_STAMP_EXEMPT_JOB_TYPES:
+            yield
+            return
+
+        generation = job.payload.get("kb_generation")
+        if not isinstance(generation, str) or not generation.strip():
+            raise KnowledgeBaseConflictError(
+                f"Job '{job.id}' is missing its KB generation stamp"
+            )
+        async with self.kb_write_guard(job.kb_id, generation) as record:
+            self._assert_guarded_job_write_admitted(job, record, generation)
+            yield
+
+    async def _prepare_new_job(
+        self,
+        kb_id: str,
+        *,
+        job_type: str,
+        payload: dict[str, Any] | None,
+    ) -> tuple[KnowledgeBaseRecord, dict[str, Any]]:
+        return await prepare_kb_job_payload(
+            self._kb_service,
+            self._metadata_store,
+            kb_id,
+            job_type=job_type,
+            payload=payload,
+        )
+
+    @staticmethod
+    def _assert_guarded_job_write_admitted(
+        job: JobRecord,
+        record: KnowledgeBaseRecord,
+        generation: str,
+    ) -> None:
+        if record.id != job.kb_id:
+            raise KnowledgeBaseConflictError(
+                f"Knowledge base '{job.kb_id}' changed identity"
+            )
+        _assert_active_catalog_generation(record, generation)
+        if record.workspace != job.workspace:
+            raise KnowledgeBaseConflictError(
+                f"Knowledge base '{record.id}' changed workspace"
+            )
+
+    @asynccontextmanager
+    async def job_execution_guard(
+        self,
+        job_id: str,
+        *,
+        wait: bool = True,
+    ) -> AsyncIterator[bool]:
+        """Hold cross-process execution ownership for one durable job."""
+
+        async with self._metadata_store.job_execution_guard(
+            job_id, wait=wait
+        ) as acquired:
+            yield acquired
+
+    @asynccontextmanager
+    async def kb_write_guard(
+        self,
+        kb_id: str,
+        expected_generation: str,
+    ) -> AsyncIterator[KnowledgeBaseRecord]:
+        """Expose the stable shared fence used by durable/background executors.
+
+        The underlying SQLite file lock or PostgreSQL session advisory lock is
+        held for the complete caller context. It relies on standard crash-stop
+        cleanup by the OS/database; it is not a persistent run-token lease.
+        """
+
+        async with self._metadata_store.kb_write_guard(kb_id, expected_generation):
+            # The metadata guard has already asserted lifecycle state while
+            # holding its own connection/lock. Repeating that assertion here
+            # could deadlock a PostgreSQL pool configured with one connection.
+            record = await self._kb_service.get(kb_id, include_deleted=True)
+            _assert_active_catalog_generation(record, expected_generation)
+            yield record
 
     async def _apply_enterprise_job_controls(self, job: JobRecord) -> None:
         """Enforce the per-principal/tenant concurrent-job quota and stamp the
@@ -69,7 +230,11 @@ class JobService:
         payload: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> JobRecord:
-        record = await self._kb_service.get(kb_id)
+        record, job_payload = await self._prepare_new_job(
+            kb_id,
+            job_type=job_type,
+            payload=payload,
+        )
         now = utc_now_iso()
         job = JobRecord(
             id=generate_track_id(f"job_{job_type}"),
@@ -89,7 +254,7 @@ class JobService:
             config_hash=None,
             retry_count=0,
             max_retries=3,
-            payload=payload or {},
+            payload=job_payload,
             result=None,
             error_code=None,
             error_message=None,
@@ -114,9 +279,12 @@ class JobService:
         payload: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> tuple[JobRecord, bool]:
-        record = await self._kb_service.get(kb_id)
+        record, job_payload = await self._prepare_new_job(
+            kb_id,
+            job_type=job_type,
+            payload=payload,
+        )
         now = utc_now_iso()
-        job_payload = payload or {}
         job = JobRecord(
             id=generate_track_id(f"job_{job_type}"),
             kb_id=record.id,
@@ -163,8 +331,6 @@ class JobService:
         auto_index: bool = False,
         idempotency_key: str | None = None,
     ) -> JobRecord:
-        record = await self._kb_service.get(kb_id)
-        now = utc_now_iso()
         payload = {
             "document_id": document_id,
             "source_uri": source_uri,
@@ -177,6 +343,12 @@ class JobService:
             "auto_index": auto_index,
         }
         payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
+        record, payload = await self._prepare_new_job(
+            kb_id,
+            job_type="parse",
+            payload=payload,
+        )
+        now = utc_now_iso()
         job = JobRecord(
             id=generate_track_id("job_parse"),
             kb_id=record.id,
@@ -223,8 +395,6 @@ class JobService:
         auto_index: bool = False,
         idempotency_key: str | None = None,
     ) -> tuple[JobRecord, bool]:
-        record = await self._kb_service.get(kb_id)
-        now = utc_now_iso()
         payload = {
             "document_id": document_id,
             "source_uri": source_uri,
@@ -237,6 +407,12 @@ class JobService:
             "auto_index": auto_index,
         }
         payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
+        record, payload = await self._prepare_new_job(
+            kb_id,
+            job_type="parse",
+            payload=payload,
+        )
+        now = utc_now_iso()
         job = JobRecord(
             id=generate_track_id("job_parse"),
             kb_id=record.id,
@@ -428,7 +604,10 @@ class JobService:
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> JobRecord:
-        record = await self._kb_service.get(kb_id)
+        # Terminal bookkeeping must remain possible after the catalog has been
+        # soft-deleted. In particular, a worker that claims just before the
+        # lifecycle switches to ``deleting`` must fail the row closed.
+        record = await self._kb_service.get(kb_id, include_deleted=True)
         return await self._metadata_store.transition_job(
             record.id,
             job_id,
@@ -484,15 +663,19 @@ class JobService:
         )
 
     async def recover_orphan_jobs(
-        self, *, resumable_job_types: set[str] | None = None
+        self,
+        *,
+        resumable_job_types: set[str] | None = None,
+        grace_seconds: float = 0.0,
     ) -> list[JobRecord]:
-        """Mark queued/running/cancelling/retrying jobs as failed at startup.
+        """Recover orphan jobs while respecting live execution ownership.
 
         When ``resumable_job_types`` is given (durable worker enabled), queued
         jobs of those types are left in place for the worker to consume.
         """
         return await self._metadata_store.recover_orphan_jobs(
-            resumable_job_types=resumable_job_types
+            resumable_job_types=resumable_job_types,
+            grace_seconds=grace_seconds,
         )
 
     async def claim_next_worker_job(
@@ -506,6 +689,35 @@ class JobService:
             job_types=job_types,
             max_queued_at=max_queued_at,
         )
+
+    async def fail_claimed_worker_job(
+        self,
+        job: JobRecord,
+        *,
+        error_code: str,
+        error_message: str,
+    ) -> JobRecord:
+        """Fail a claimed row by its persisted identity, even without catalog.
+
+        Fence rejection commonly means the catalog is deleting, replaced, or
+        already absent. Re-reading it must not prevent the required
+        ``running -> failed`` terminal transition.
+        """
+
+        return await self._metadata_store.transition_job(
+            job.kb_id,
+            job.id,
+            status="failed",
+            progress=1.0,
+            failed_items=1,
+            error_code=error_code,
+            error_message=error_message,
+        )
+
+    async def get_persisted_job(self, job: JobRecord) -> JobRecord:
+        """Re-read a claimed row without requiring a live catalog record."""
+
+        return await self._metadata_store.get_job(job.kb_id, job.id)
 
     async def cancel_job(
         self, kb_id: str, job_id: str, *, include_deleted: bool = False
@@ -543,9 +755,12 @@ class JobService:
         include_deleted: bool = False,
     ) -> JobRecord:
         record = await self._kb_service.get(kb_id, include_deleted=include_deleted)
-        return await self._metadata_store.reset_job_for_retry(
-            record.id, job_id, new_idempotency_key=new_idempotency_key
-        )
+        async with self._metadata_store.job_execution_guard(job_id) as acquired:
+            if not acquired:  # wait=True always acquires; retained for API parity.
+                raise RuntimeError(f"Could not acquire execution guard for '{job_id}'")
+            return await self._metadata_store.reset_job_for_retry(
+                record.id, job_id, new_idempotency_key=new_idempotency_key
+            )
 
     async def create_build_job_once(
         self,
@@ -565,8 +780,6 @@ class JobService:
         job_type: str = "build_kg",
         idempotency_key: str | None = None,
     ) -> tuple[JobRecord, bool]:
-        record = await self._kb_service.get(kb_id)
-        now = utc_now_iso()
         payload = {
             "document_id": document_id,
             "parser_hash": parser_hash,
@@ -581,6 +794,12 @@ class JobService:
             "force_embedding": force_embedding,
         }
         payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
+        record, payload = await self._prepare_new_job(
+            kb_id,
+            job_type=job_type,
+            payload=payload,
+        )
+        now = utc_now_iso()
         job = JobRecord(
             id=generate_track_id("job_build"),
             kb_id=record.id,

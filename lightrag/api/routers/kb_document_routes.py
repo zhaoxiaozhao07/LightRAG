@@ -184,15 +184,25 @@ async def _enforce_artifact_content_policy(
 ) -> None:
     if not enterprise_auth_enabled():
         return
+    normalized_action = action.strip().replace("_", "-")
+    principal = get_request_principal(request)
+    authz = get_enterprise_authorization_service(request)
     min_role = enterprise_artifact_min_role_for_type(
         artifact.artifact_type,
-        action=action,
+        action=normalized_action,
     )
-    await get_enterprise_authorization_service(request).require_kb_role(
-        get_request_principal(request),
+    await authz.require_kb_role(
+        principal,
         kb_id,
         min_role,
     )
+    # Download and presign endpoints export bytes and always require the
+    # user-global capability. Preview requires it only for the original source,
+    # because derived preview artifacts remain safe viewer-level surfaces.
+    if normalized_action in {"download", "download-url"} or (
+        normalized_action == "preview" and artifact.artifact_type == "original"
+    ):
+        authz.require_file_download(principal)
 
 
 def _document_audit_metadata(
@@ -4091,61 +4101,64 @@ def create_kb_document_routes(
                     }
                 )
 
-            batch_id = generate_track_id("batch")
-            for item_index, prepared in enumerate(prepared_sources):
-                await document_service.stage_sync_source_bytes(
+            async with document_service.kb_write_guard(kb_id):
+                batch_id = generate_track_id("batch")
+                for item_index, prepared in enumerate(prepared_sources):
+                    await document_service.stage_sync_source_bytes(
+                        kb_id,
+                        batch_id=batch_id,
+                        item_index=item_index,
+                        source=cast(DocumentSourceInput, prepared["source"]),
+                    )
+                    sync_staged = True
+                fingerprint_payload = {
+                    "items": [
+                        {
+                            "source_key": item["source_key"],
+                            "source_name": cast(
+                                DocumentSourceInput, item["source"]
+                            ).source_name,
+                            "source_type": cast(
+                                DocumentSourceInput, item["source"]
+                            ).source_type,
+                            "source_hash": item["source_hash"],
+                            "content_type": item["content_type"],
+                            "size_bytes": item["size_bytes"],
+                        }
+                        for item in prepared_sources
+                    ],
+                    "auto_parse": auto_parse,
+                    "auto_index": auto_index,
+                    "parser_engine": parser_engine,
+                    "process_options": process_options,
+                    "force_reparse": force_reparse,
+                    "delete_source_file": delete_source_file,
+                    "delete_artifacts": delete_artifacts,
+                    "delete_llm_cache": delete_llm_cache,
+                }
+                payload = {
+                    **fingerprint_payload,
+                    "batch_id": batch_id,
+                    "source_keys": normalized_keys,
+                    "idempotency_fingerprint": _idempotency_fingerprint(
+                        fingerprint_payload
+                    ),
+                }
+                job, created_job = await job_service.create_job_once(
                     kb_id,
+                    job_type="sync",
                     batch_id=batch_id,
-                    item_index=item_index,
-                    source=cast(DocumentSourceInput, prepared["source"]),
+                    stage="syncing",
+                    total_items=len(prepared_sources),
+                    payload=payload,
+                    idempotency_key=idempotency_key,
                 )
-                sync_staged = True
-            fingerprint_payload = {
-                "items": [
-                    {
-                        "source_key": item["source_key"],
-                        "source_name": cast(
-                            DocumentSourceInput, item["source"]
-                        ).source_name,
-                        "source_type": cast(
-                            DocumentSourceInput, item["source"]
-                        ).source_type,
-                        "source_hash": item["source_hash"],
-                        "content_type": item["content_type"],
-                        "size_bytes": item["size_bytes"],
-                    }
-                    for item in prepared_sources
-                ],
-                "auto_parse": auto_parse,
-                "auto_index": auto_index,
-                "parser_engine": parser_engine,
-                "process_options": process_options,
-                "force_reparse": force_reparse,
-                "delete_source_file": delete_source_file,
-                "delete_artifacts": delete_artifacts,
-                "delete_llm_cache": delete_llm_cache,
-            }
-            payload = {
-                **fingerprint_payload,
-                "batch_id": batch_id,
-                "source_keys": normalized_keys,
-                "idempotency_fingerprint": _idempotency_fingerprint(
-                    fingerprint_payload
-                ),
-            }
-            job, created_job = await job_service.create_job_once(
-                kb_id,
-                job_type="sync",
-                batch_id=batch_id,
-                stage="syncing",
-                total_items=len(prepared_sources),
-                payload=payload,
-                idempotency_key=idempotency_key,
-            )
-            if not created_job:
-                await document_service.clear_staged_sync_sources(kb_id, batch_id=batch_id)
-                sync_staged = False
-                return JobResponse.from_record(job)
+                if not created_job:
+                    await document_service.clear_staged_sync_sources(
+                        kb_id, batch_id=batch_id
+                    )
+                    sync_staged = False
+                    return JobResponse.from_record(job)
             await _append_kb_document_audit_event(
                 http_request,
                 "documents_sync_queued",
@@ -6650,7 +6663,7 @@ def create_kb_document_routes(
                 kb_id, document_id, artifact_id
             )
             await _enforce_artifact_content_policy(
-                request, kb_id, artifact, action="download_url"
+                request, kb_id, artifact, action="download-url"
             )
             result = await document_service.get_document_artifact_download_url(
                 kb_id,

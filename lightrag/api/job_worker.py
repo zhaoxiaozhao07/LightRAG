@@ -32,6 +32,17 @@ bytes for aggregate parse-and-build upload jobs) are intentionally NOT
 registered as resumable; those job types still fail on restart and require a
 fresh request. Replace and aggregate sync jobs stage request bytes before they
 are queued, so the worker can resume them from persisted files.
+
+Execution fencing deliberately does not add a persistent ``run_token``. After
+claim, the worker holds a per-job SQLite file lock or PostgreSQL session advisory
+lock across status recheck, KB fencing, executor work, and failure transition.
+Recovery considers only stale rows and must first win that same lock in try
+mode, so a live owner cannot be marked failed. Process/session death releases
+the lock; one recovery owner then fails the same durable row, after which retry
+and claim continue on that row. This is the standard crash-stop boundary. If an
+external system detached a live owner's lock while its Python executor kept
+running, the fence could not identify that split brain; that stronger lease
+model would require a durable run token in a separate change.
 """
 
 from __future__ import annotations
@@ -40,8 +51,15 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
-from lightrag.api.job_service import JobService
-from lightrag.api.metadata_store import JobRecord, MetadataRecordNotFoundError
+from lightrag.api.job_service import (
+    RESUMABLE_KB_MUTATION_JOB_TYPES,
+    JobService,
+)
+from lightrag.api.metadata_store import (
+    JobRecord,
+    MetadataRecordNotFoundError,
+    _same_job_execution_identity,
+)
 from lightrag.utils import logger
 
 # Executor contract: given a freshly-claimed (already ``running``) job, drive
@@ -64,19 +82,34 @@ class JobWorker:
         executors: dict[str, JobExecutor],
         poll_interval_seconds: float = 1.0,
         claim_grace_seconds: float = 5.0,
+        recovery_interval_seconds: float = 30.0,
+        recovery_grace_seconds: float | None = None,
     ) -> None:
         self._job_service = job_service
         self._executors = dict(executors)
         self._poll_interval = max(0.05, float(poll_interval_seconds))
         self._claim_grace_seconds = max(0.0, float(claim_grace_seconds))
+        self._recovery_interval = max(0.0, float(recovery_interval_seconds))
+        self._recovery_grace_seconds = (
+            self._claim_grace_seconds
+            if recovery_grace_seconds is None
+            else max(0.0, float(recovery_grace_seconds))
+        )
         self._job_types = tuple(self._executors.keys())
         self._task: asyncio.Task[None] | None = None
+        self._recovery_task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
 
     @property
     def resumable_job_types(self) -> set[str]:
         """Job types this worker can re-drive from persisted state."""
         return set(self._job_types)
+
+    @property
+    def recovery_grace_seconds(self) -> float:
+        """Grace used by startup and periodic orphan recovery."""
+
+        return self._recovery_grace_seconds
 
     def _grace_cutoff(self) -> str | None:
         if self._claim_grace_seconds <= 0:
@@ -109,56 +142,194 @@ class JobWorker:
         if executor is None:  # pragma: no cover — job_types is derived from keys
             return job
         try:
-            await executor(job)
-        except Exception as exc:  # noqa: BLE001 — backstop terminal failure
-            logger.error(
-                "JobWorker executor for job '%s' (type=%s) raised: %s",
-                job.id,
-                job.job_type,
-                exc,
-            )
-            await self._fail_job_quietly(job, str(exc))
+            async with self._job_service.job_execution_guard(job.id) as acquired:
+                if not acquired:  # wait=True always acquires; kept for parity.
+                    return job
+                try:
+                    current = await self._job_service.get_persisted_job(job)
+                except MetadataRecordNotFoundError:
+                    return job
+                except Exception as exc:  # noqa: BLE001 — fail closed under owner lock
+                    logger.error(
+                        "JobWorker could not re-read claimed job '%s': %s",
+                        job.id,
+                        exc,
+                    )
+                    await self._fail_job_quietly(
+                        job,
+                        str(exc),
+                        error_code="worker_execution_recheck_error",
+                        use_persisted_identity=True,
+                    )
+                    return job
+
+                # The claim-to-lock gap is protected by recovery grace. If a
+                # recovery/retry cycle nevertheless completed before ownership,
+                # never execute that newer incarnation with this stale claim.
+                if current.status != "running" or not _same_job_execution_identity(
+                    job, current
+                ):
+                    return job
+
+                if current.job_type in RESUMABLE_KB_MUTATION_JOB_TYPES:
+                    generation = (current.payload or {}).get("kb_generation")
+                    if not isinstance(generation, str) or not generation.strip():
+                        await self._fail_job_quietly(
+                            current,
+                            "KB mutation job is missing payload.kb_generation",
+                            error_code="worker_kb_generation_missing",
+                            use_persisted_identity=True,
+                        )
+                        return job
+
+                    executor_started = False
+                    try:
+                        async with self._job_service.kb_write_guard(
+                            current.kb_id, generation
+                        ):
+                            executor_started = True
+                            await executor(current)
+                    except Exception as exc:  # noqa: BLE001 — terminal backstop
+                        if executor_started:
+                            logger.error(
+                                "JobWorker executor for job '%s' (type=%s) "
+                                "raised: %s",
+                                current.id,
+                                current.job_type,
+                                exc,
+                            )
+                            error_code = "worker_executor_error"
+                        else:
+                            logger.warning(
+                                "JobWorker rejected job '%s' (type=%s) at the "
+                                "KB generation fence: %s",
+                                current.id,
+                                current.job_type,
+                                exc,
+                            )
+                            error_code = "worker_kb_generation_conflict"
+                        await self._fail_job_quietly(
+                            current,
+                            str(exc),
+                            error_code=error_code,
+                            use_persisted_identity=not executor_started,
+                        )
+                    return job
+
+                # ``clear_kb`` deliberately skips the shared KB guard: its
+                # executor enters KBDeletionService's exclusive guard. It still
+                # remains under this job owner lock for the full execution and
+                # failure transition. Unknown types retain legacy semantics.
+                try:
+                    await executor(current)
+                except Exception as exc:  # noqa: BLE001 — terminal backstop
+                    logger.error(
+                        "JobWorker executor for job '%s' (type=%s) raised: %s",
+                        current.id,
+                        current.job_type,
+                        exc,
+                    )
+                    await self._fail_job_quietly(
+                        current,
+                        str(exc),
+                        error_code="worker_executor_error",
+                    )
+        except asyncio.CancelledError:
+            # Guard finalizers release session/file ownership before propagating.
+            raise
+        except Exception as exc:  # noqa: BLE001 — keep the polling loop alive
+            logger.error("JobWorker execution guard for job '%s' failed: %s", job.id, exc)
         return job
 
-    async def _fail_job_quietly(self, job: JobRecord, message: str) -> None:
+    async def _fail_job_quietly(
+        self,
+        job: JobRecord,
+        message: str,
+        *,
+        error_code: str,
+        use_persisted_identity: bool = False,
+    ) -> None:
         try:
-            await self._job_service.transition_job(
-                job.kb_id,
-                job.id,
-                status="failed",
-                progress=1.0,
-                failed_items=1,
-                error_code="worker_executor_error",
-                error_message=message,
-            )
+            if use_persisted_identity:
+                await self._job_service.fail_claimed_worker_job(
+                    job,
+                    error_code=error_code,
+                    error_message=message,
+                )
+            else:
+                await self._job_service.transition_job(
+                    job.kb_id,
+                    job.id,
+                    status="failed",
+                    progress=1.0,
+                    failed_items=1,
+                    error_code=error_code,
+                    error_message=message,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "JobWorker could not mark job '%s' failed: %s", job.id, exc
             )
 
+    async def _recover_orphans_quietly(self) -> None:
+        try:
+            recovered = await self._job_service.recover_orphan_jobs(
+                resumable_job_types=self.resumable_job_types,
+                grace_seconds=self._recovery_grace_seconds,
+            )
+            if recovered:
+                logger.warning(
+                    "JobWorker recovered %d orphan job(s)", len(recovered)
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — recovery must not stop polling
+            logger.error("JobWorker periodic orphan recovery failed: %s", exc)
+
     async def _run_loop(self) -> None:
         logger.info(
-            "JobWorker started (types=%s, poll=%.2fs, grace=%.2fs)",
+            "JobWorker started (types=%s, poll=%.2fs, claim_grace=%.2fs, "
+            "recovery=%.2fs/%.2fs)",
             ",".join(self._job_types) or "<none>",
             self._poll_interval,
             self._claim_grace_seconds,
+            self._recovery_interval,
+            self._recovery_grace_seconds,
         )
-        while not self._stop_event.is_set():
-            try:
-                # Drain all currently-eligible jobs before sleeping.
-                while not self._stop_event.is_set():
-                    claimed = await self.poll_once()
-                    if claimed is None:
-                        break
-            except Exception as exc:  # noqa: BLE001 — keep the loop alive
-                logger.error("JobWorker loop iteration failed: %s", exc)
-            try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(), timeout=self._poll_interval
-                )
-            except asyncio.TimeoutError:
-                pass
-        logger.info("JobWorker stopped")
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    # Drain all currently-eligible jobs before sleeping.
+                    while not self._stop_event.is_set():
+                        claimed = await self.poll_once()
+                        if claimed is None:
+                            break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 — keep the loop alive
+                    logger.error("JobWorker loop iteration failed: %s", exc)
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(), timeout=self._poll_interval
+                    )
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            logger.info("JobWorker stopped")
+
+    async def _run_recovery_loop(self) -> None:
+        """Run owner-aware recovery on a low-frequency independent timer."""
+
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(), timeout=self._recovery_interval
+                    )
+                except asyncio.TimeoutError:
+                    await self._recover_orphans_quietly()
+        finally:
+            logger.info("JobWorker orphan recovery stopped")
 
     def start(self) -> None:
         """Start the background polling loop (idempotent)."""
@@ -166,16 +337,23 @@ class JobWorker:
             return
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run_loop())
+        if self._recovery_interval > 0:
+            self._recovery_task = asyncio.create_task(self._run_recovery_loop())
 
     async def stop(self) -> None:
-        """Signal the loop to stop and await its completion."""
+        """Stop promptly, cancelling any in-flight executor and its guard."""
         self._stop_event.set()
-        if self._task is not None:
-            try:
-                await self._task
-            except asyncio.CancelledError:  # pragma: no cover
-                pass
-            self._task = None
+        tasks = [
+            task
+            for task in (self._task, self._recovery_task)
+            if task is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._task = None
+        self._recovery_task = None
 
 
 def build_parse_executor(

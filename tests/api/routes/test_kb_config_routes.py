@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,12 +23,14 @@ from lightrag.api.config_version_service import (
 )
 from lightrag.api.index_build_service import compute_index_hash
 from lightrag.api.job_service import JobService
+from lightrag.api.kb_operation_fence import KBWriteAdmissionMiddleware
 from lightrag.api.kb_service import KnowledgeBaseService, utc_now_iso
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
 from lightrag.api.metadata_store import (
     ConfigVersionRecord,
     DocumentRecord,
     JobRecord,
+    KBLifecycleConflictError,
     SQLiteMetadataStore,
 )
 from lightrag.base import TextChunkSchema
@@ -125,6 +129,11 @@ def _build_client(tmp_path: Path):
     registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
     config_service = ConfigVersionService(kb_service, metadata_store, registry)
     app = FastAPI()
+    app.add_middleware(
+        KBWriteAdmissionMiddleware,
+        kb_service=kb_service,
+        metadata_store=metadata_store,
+    )
     app.include_router(
         create_kb_routes(
             kb_service,
@@ -132,6 +141,7 @@ def _build_client(tmp_path: Path):
             api_key=_API_KEY,
             job_service=job_service,
             config_service=config_service,
+            metadata_store=metadata_store,
         )
     )
     return TestClient(app), kb_service, metadata_store, registry, probe
@@ -309,6 +319,114 @@ def test_config_version_activate_updates_kb_and_evicts_registry(tmp_path):
     # Activation must have discarded the cached LightRAG instance
     assert not registry.is_loaded("kb_activate")
     assert rag.finalized is True
+
+
+def test_config_create_and_activate_handlers_run_inside_write_guard(
+    tmp_path, monkeypatch
+):
+    client, _kb_service, store, _registry, _probe = _build_client(tmp_path)
+    _create_kb(client, "kb_config_guard")
+
+    guard_depth = 0
+    original_guard = store.kb_write_guard
+
+    @asynccontextmanager
+    async def tracking_guard(kb_id, expected_generation):
+        nonlocal guard_depth
+        async with original_guard(kb_id, expected_generation) as lifecycle:
+            guard_depth += 1
+            try:
+                yield lifecycle
+            finally:
+                guard_depth -= 1
+
+    monkeypatch.setattr(store, "kb_write_guard", tracking_guard)
+    original_create = store.create_config_version
+
+    async def guarded_create(record):
+        # Pure-ASGI admission plus the service-owned direct-call fence.
+        assert guard_depth == 2
+        return await original_create(record)
+
+    monkeypatch.setattr(store, "create_config_version", guarded_create)
+    created = client.post(
+        "/kbs/kb_config_guard/configs",
+        json={"config": _BASE_CONFIG},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 200, created.text
+    assert guard_depth == 0
+
+    original_mark = store.mark_config_version_activated
+
+    async def guarded_mark(kb_id, version_id):
+        assert guard_depth == 2
+        return await original_mark(kb_id, version_id)
+
+    monkeypatch.setattr(store, "mark_config_version_activated", guarded_mark)
+    activated = client.post(
+        f"/kbs/kb_config_guard/configs/{created.json()['id']}:activate",
+        headers=_HEADERS,
+    )
+    assert activated.status_code == 200, activated.text
+    assert guard_depth == 0
+
+
+def test_config_create_is_rejected_while_kb_is_deleting(tmp_path):
+    client, kb_service, store, _registry, _probe = _build_client(tmp_path)
+    kb = _create_kb(client, "kb_config_deleting")
+
+    async def mark_deleting() -> None:
+        record = await kb_service.get(kb["id"])
+        async with store.kb_deletion_guard(
+            record.id,
+            record.generation,
+            "job_delete_config_guard",
+        ):
+            pass
+
+    asyncio.run(mark_deleting())
+    response = client.post(
+        "/kbs/kb_config_deleting/configs",
+        json={"config": _BASE_CONFIG},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 409
+    versions, total = asyncio.run(store.list_config_versions(kb["id"]))
+    assert versions == []
+    assert total == 0
+
+
+@pytest.mark.asyncio
+async def test_config_service_direct_create_and_activate_reject_deleting(tmp_path):
+    kb_service = KnowledgeBaseService(tmp_path / "direct-config-kbs.json")
+    store = SQLiteMetadataStore(tmp_path / "direct-config.sqlite3")
+    await kb_service.initialize()
+    await store.initialize()
+    record = await kb_service.create(kb_id="kb_direct_config", name="Direct Config")
+    await store.activate_kb_generation(record.id, record.generation)
+    probe = BuilderProbe()
+    registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
+    service = ConfigVersionService(kb_service, store, registry)
+    version = await service.create(record.id, config=_BASE_CONFIG)
+
+    async with store.kb_deletion_guard(
+        record.id,
+        record.generation,
+        "job_delete_direct_config",
+    ):
+        pass
+
+    with pytest.raises(KBLifecycleConflictError):
+        await service.create(record.id, config=_BASE_CONFIG)
+    with pytest.raises(KBLifecycleConflictError):
+        await service.activate(record.id, version.id)
+
+    versions, total = await store.list_config_versions(record.id)
+    assert total == 1
+    assert [item.id for item in versions] == [version.id]
+    current = await kb_service.get(record.id)
+    assert current.active_config_version_id is None
 
 
 async def _fake_embed(texts: list[str]):

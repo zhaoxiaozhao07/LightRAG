@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 from collections import Counter
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, cast
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from lightrag.api.job_service import JobService
-from lightrag.api.kb_service import KnowledgeBaseRecord, KnowledgeBaseService, utc_now_iso
+from lightrag.api.kb_service import (
+    KnowledgeBaseConflictError,
+    KnowledgeBaseRecord,
+    KnowledgeBaseService,
+    utc_now_iso,
+)
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry
 from lightrag.api.llm_json_utils import LLMJsonError, call_llm_json
 from lightrag.api.metadata_store import DocumentRecord, JobRecord
@@ -514,10 +522,21 @@ class AgentProfileService:
     def _spawn_job(self, job: JobRecord) -> None:
         if self._job_runner is None:
             return
-        try:
-            self._job_runner(job)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to spawn agent profile job '%s': %s", job.id, exc)
+        runner = self._job_runner
+
+        def spawn() -> None:
+            try:
+                runner(job)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to spawn agent profile job '%s': %s", job.id, exc
+                )
+
+        # The runner creates a detached task. Do not let it inherit a request or
+        # worker's active KB-guard ContextVar: it must acquire and own its own
+        # shared fence rather than extending the parent request until the whole
+        # profile refresh completes.
+        asyncio.get_running_loop().call_soon(spawn, context=contextvars.Context())
 
     def _refresh_lock(self, kb_id: str) -> asyncio.Lock:
         lock = self._refresh_locks.get(kb_id)
@@ -525,6 +544,38 @@ class AgentProfileService:
             lock = asyncio.Lock()
             self._refresh_locks[kb_id] = lock
         return lock
+
+    @asynccontextmanager
+    async def _kb_metadata_write_guard(
+        self,
+        kb_id: str,
+        *,
+        expected_generation: str | None = None,
+    ) -> AsyncIterator[KnowledgeBaseRecord]:
+        """Fence direct KB catalog metadata writes without locking reads/LLM work."""
+
+        guard = getattr(self._document_service, "kb_write_guard", None)
+        if callable(guard):
+            guard_context = cast(
+                Any,
+                guard(kb_id, expected_generation=expected_generation),
+            )
+            async with guard_context as record:
+                yield record
+            return
+
+        # Lightweight compatibility for custom/test document services that do
+        # not expose the production mutation guard.
+        record = await self._kb_service.get(kb_id, include_deleted=True)
+        if expected_generation is not None and record.generation != expected_generation:
+            raise KnowledgeBaseConflictError(
+                f"Knowledge base '{record.id}' changed generation"
+            )
+        if record.status != "active":
+            raise KnowledgeBaseConflictError(
+                f"Knowledge base '{record.id}' is not active"
+            )
+        yield record
 
     async def get_profile(self, kb_id: str) -> dict[str, Any]:
         record = await self._kb_service.get(kb_id)
@@ -555,8 +606,13 @@ class AgentProfileService:
                 body.agent_negative_scope, max_items=20, max_chars=160
             )
             patch[MANUAL_NEGATIVE_SCOPE_KEY] = scope or None
-        record = await self._kb_service.update(kb_id, metadata=patch)
-        return agent_profile_response(record)
+        async with self._kb_metadata_write_guard(kb_id) as record:
+            updated = await self._kb_service.update(
+                record.id,
+                metadata=patch,
+                expected_generation=record.generation,
+            )
+            return agent_profile_response(updated)
 
     async def mark_dirty(
         self,
@@ -566,32 +622,34 @@ class AgentProfileService:
         document_id: str | None = None,
         enqueue: bool = True,
     ) -> JobRecord | None:
-        record = await self._kb_service.get(kb_id)
-        metadata = record.metadata or {}
-        previous_flag = _dirty_flag_from_metadata(metadata)
-        previous_auto = _auto_profile_from_metadata(metadata)
-        flag = {
-            "schema_version": PROFILE_SCHEMA_VERSION,
-            "dirty_at": utc_now_iso(),
-            "reason": reason,
-            "document_id": document_id,
-        }
-        await self._kb_service.update(
-            record.id, metadata={KB_AUTO_PROFILE_DIRTY_METADATA_KEY: flag}
-        )
-        if not enqueue or self._job_service is None:
-            return None
-        if not await self._should_enqueue_auto_refresh(
-            record, previous_flag, previous_auto
-        ):
-            return None
-        job, created = await self.enqueue_refresh(
-            record.id,
-            force=False,
-            reason=f"auto_{reason}",
-            document_id=document_id,
-        )
-        return job if created else None
+        async with self._kb_metadata_write_guard(kb_id) as record:
+            metadata = record.metadata or {}
+            previous_flag = _dirty_flag_from_metadata(metadata)
+            previous_auto = _auto_profile_from_metadata(metadata)
+            flag = {
+                "schema_version": PROFILE_SCHEMA_VERSION,
+                "dirty_at": utc_now_iso(),
+                "reason": reason,
+                "document_id": document_id,
+            }
+            await self._kb_service.update(
+                record.id,
+                metadata={KB_AUTO_PROFILE_DIRTY_METADATA_KEY: flag},
+                expected_generation=record.generation,
+            )
+            if not enqueue or self._job_service is None:
+                return None
+            if not await self._should_enqueue_auto_refresh(
+                record, previous_flag, previous_auto
+            ):
+                return None
+            job, created = await self.enqueue_refresh(
+                record.id,
+                force=False,
+                reason=f"auto_{reason}",
+                document_id=document_id,
+            )
+            return job if created else None
 
     async def _should_enqueue_auto_refresh(
         self,
@@ -698,6 +756,12 @@ class AgentProfileService:
     async def run_job(self, job: JobRecord) -> None:
         if self._job_service is None:
             raise RuntimeError("Job service is not configured")
+        generation_value = (job.payload or {}).get("kb_generation")
+        expected_generation = (
+            generation_value
+            if isinstance(generation_value, str) and generation_value.strip()
+            else None
+        )
         try:
             if job.status in {"queued", "retrying"}:
                 await self._job_service.transition_job(
@@ -730,10 +794,19 @@ class AgentProfileService:
                     "pending_document_profiles": result.pending_document_profiles,
                 },
             )
-            await self._after_refresh(job.kb_id, result)
+            await self._after_refresh(
+                job.kb_id,
+                result,
+                expected_generation=expected_generation,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("Agent profile job '%s' failed: %s", job.id, exc, exc_info=True)
-            await self._mark_profile_failed(job.kb_id, job_id=job.id, error=str(exc))
+            await self._mark_profile_failed(
+                job.kb_id,
+                job_id=job.id,
+                error=str(exc),
+                expected_generation=expected_generation,
+            )
             await self._job_service.transition_job(
                 job.kb_id,
                 job.id,
@@ -746,27 +819,35 @@ class AgentProfileService:
             )
 
     async def _after_refresh(
-        self, kb_id: str, result: AgentProfileRefreshResult
+        self,
+        kb_id: str,
+        result: AgentProfileRefreshResult,
+        *,
+        expected_generation: str | None = None,
     ) -> None:
         """Post-success bookkeeping: clear the dirty flag it covered, chain a
         follow-up refresh when documents changed mid-run or profile generation
         was capped. Never fails the already-succeeded job."""
         try:
-            record = await self._kb_service.get(kb_id)
-            flag = _dirty_flag_from_metadata(record.metadata or {})
-            dirty_during_run = flag is not None and _is_newer(
-                flag.get("dirty_at"), result.refresh_started_at
-            )
-            if flag is not None and not dirty_during_run:
-                await self._kb_service.update(
-                    kb_id, metadata={KB_AUTO_PROFILE_DIRTY_METADATA_KEY: None}
+            async with self._kb_metadata_write_guard(
+                kb_id, expected_generation=expected_generation
+            ) as record:
+                flag = _dirty_flag_from_metadata(record.metadata or {})
+                dirty_during_run = flag is not None and _is_newer(
+                    flag.get("dirty_at"), result.refresh_started_at
                 )
-            if dirty_during_run or result.pending_document_profiles > 0:
-                await self.enqueue_refresh(
-                    kb_id,
-                    force=False,
-                    reason="chained_refresh",
-                )
+                if flag is not None and not dirty_during_run:
+                    await self._kb_service.update(
+                        record.id,
+                        metadata={KB_AUTO_PROFILE_DIRTY_METADATA_KEY: None},
+                        expected_generation=record.generation,
+                    )
+                if dirty_during_run or result.pending_document_profiles > 0:
+                    await self.enqueue_refresh(
+                        record.id,
+                        force=False,
+                        reason="chained_refresh",
+                    )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Agent profile post-refresh bookkeeping failed for KB '%s': %s",
@@ -855,6 +936,7 @@ class AgentProfileService:
                 record.id,
                 document.id,
                 metadata_patch={DOC_PROFILE_METADATA_KEY: doc_profile},
+                expected_generation=record.generation,
             )
         if failed_profiles and not profiles_by_doc:
             # Nothing cached and nothing generated: keep the loud failure
@@ -946,9 +1028,15 @@ class AgentProfileService:
             group_profiles_reused=groups_reused,
             failed_profiles=failed_profiles,
         )
-        await self._kb_service.update(
-            record.id, metadata={KB_AUTO_PROFILE_METADATA_KEY: auto_profile}
-        )
+        async with self._kb_metadata_write_guard(
+            record.id,
+            expected_generation=record.generation,
+        ) as current:
+            await self._kb_service.update(
+                current.id,
+                metadata={KB_AUTO_PROFILE_METADATA_KEY: auto_profile},
+                expected_generation=current.generation,
+            )
         return AgentProfileRefreshResult(
             kb_id=record.id,
             status="ready",
@@ -1045,6 +1133,7 @@ class AgentProfileService:
                 record.id,
                 anchor.id,
                 metadata_patch={GROUP_PROFILE_METADATA_KEY: stored},
+                expected_generation=record.generation,
             )
             anchor.metadata[GROUP_PROFILE_METADATA_KEY] = stored
             entries.append(_compact_group_profile_entry(stored))
@@ -1259,22 +1348,33 @@ class AgentProfileService:
                 detail={"error_code": "agent_profile_invalid", "message": str(exc)},
             ) from exc
 
-    async def _mark_profile_failed(self, kb_id: str, *, job_id: str, error: str) -> None:
+    async def _mark_profile_failed(
+        self,
+        kb_id: str,
+        *,
+        job_id: str,
+        error: str,
+        expected_generation: str | None = None,
+    ) -> None:
         try:
-            record = await self._kb_service.get(kb_id)
-            auto = _auto_profile_from_metadata(record.metadata or {})
-            auto.update(
-                {
-                    "schema_version": PROFILE_SCHEMA_VERSION,
-                    "status": "failed",
-                    "last_error": error[:1000],
-                    "failed_at": utc_now_iso(),
-                    "job_id": job_id,
-                }
-            )
-            await self._kb_service.update(
-                kb_id, metadata={KB_AUTO_PROFILE_METADATA_KEY: auto}
-            )
+            async with self._kb_metadata_write_guard(
+                kb_id, expected_generation=expected_generation
+            ) as record:
+                auto = _auto_profile_from_metadata(record.metadata or {})
+                auto.update(
+                    {
+                        "schema_version": PROFILE_SCHEMA_VERSION,
+                        "status": "failed",
+                        "last_error": error[:1000],
+                        "failed_at": utc_now_iso(),
+                        "job_id": job_id,
+                    }
+                )
+                await self._kb_service.update(
+                    record.id,
+                    metadata={KB_AUTO_PROFILE_METADATA_KEY: auto},
+                    expected_generation=record.generation,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Failed to mark Agent profile failure for KB '%s': %s", kb_id, exc

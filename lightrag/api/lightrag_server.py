@@ -73,6 +73,7 @@ from lightrag.api.config_version_service import (
 from lightrag.api.document_lifecycle_service import DocumentLifecycleService
 from lightrag.api.index_build_service import IndexBuildService
 from lightrag.api.job_service import JobService
+from lightrag.api.kb_operation_fence import KBWriteAdmissionMiddleware
 from lightrag.api.kb_deletion_service import KBDeletionService
 from lightrag.api.kb_service import KnowledgeBaseRecord, KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
@@ -982,7 +983,11 @@ def create_app(args):
     # variable at startup time, well after the reassignment.
     enterprise_chat_memory_service = None
     enterprise_api_key_service = (
-        ServiceAPIKeyService(metadata_store, enterprise_audit_service)
+        ServiceAPIKeyService(
+            metadata_store,
+            enterprise_audit_service,
+            kb_service=kb_service,
+        )
         if enterprise_enabled
         else None
     )
@@ -1058,16 +1063,25 @@ def create_app(args):
             # Recover orphan jobs left in queued/running/cancelling/retrying
             # by a previous process. When the durable job worker is enabled,
             # queued jobs of resumable types are LEFT queued for the worker to
-            # consume; everything else (and all mid-flight running jobs) is
-            # failed so the user can retry through the cancel/retry API.
+            # consume. Mid-flight rows are failed only after the recovery grace
+            # and a non-blocking per-job owner-lock attempt prove no live worker
+            # still owns them.
             worker = getattr(app.state, "job_worker", None)
             resumable_types = worker.resumable_job_types if worker else None
+            recovery_grace_seconds = (
+                worker.recovery_grace_seconds
+                if worker is not None
+                else get_env_value(
+                    "LIGHTRAG_KB_JOB_RECOVERY_GRACE_SECONDS", 5.0, float
+                )
+            )
             recovered = await job_service.recover_orphan_jobs(
-                resumable_job_types=resumable_types
+                resumable_job_types=resumable_types,
+                grace_seconds=recovery_grace_seconds,
             )
             if recovered:
                 ASCIIColors.yellow(
-                    f"\nRecovered {len(recovered)} orphan job(s) from previous process; marked as failed.\n"
+                    f"\nRecovered {len(recovered)} orphan job(s) from previous process.\n"
                 )
 
             # Initialize database connections
@@ -1234,6 +1248,17 @@ def create_app(args):
         if origins_str == "*":
             return ["*"]
         return [origin.strip() for origin in origins_str.split(",")]
+
+    # Install the KB write fence before root-path normalization. Starlette's
+    # middleware stack is last-added/first-run, so the normalizer runs outside
+    # the fence and presents it with the canonical prefixed path. The fence also
+    # strips root_path itself for ASGI servers that already provide canonical
+    # scopes.
+    app.add_middleware(
+        KBWriteAdmissionMiddleware,
+        kb_service=kb_service,
+        metadata_store=metadata_store,
+    )
 
     # Normalize scope["path"] for proxy-strip deployments so the WebUI
     # Mount (and any other Mount) routes correctly. Added before CORS so it
@@ -2541,6 +2566,9 @@ def create_app(args):
         agent_profile_executor = build_agent_profile_executor(
             profile_service=agent_profile_service,
         )
+        claim_grace_seconds = get_env_value(
+            "LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS", 5.0, float
+        )
         job_worker = JobWorker(
             job_service,
             executors={
@@ -2556,16 +2584,64 @@ def create_app(args):
             poll_interval_seconds=get_env_value(
                 "LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS", 1.0, float
             ),
-            claim_grace_seconds=get_env_value(
-                "LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS", 5.0, float
+            claim_grace_seconds=claim_grace_seconds,
+            recovery_interval_seconds=get_env_value(
+                "LIGHTRAG_KB_JOB_RECOVERY_INTERVAL_SECONDS", 30.0, float
+            ),
+            recovery_grace_seconds=get_env_value(
+                "LIGHTRAG_KB_JOB_RECOVERY_GRACE_SECONDS",
+                claim_grace_seconds,
+                float,
             ),
         )
     app.state.job_worker = job_worker
     if job_worker is None:
         # No durable worker: agent_profile jobs created by mark_dirty, the
-        # manual refresh route, or post-refresh chaining run in-process.
+        # manual refresh route, or post-refresh chaining run in-process. These
+        # are detached asyncio tasks rather than response BackgroundTasks, so
+        # they must acquire the service-level shared fence themselves.
+        async def _run_in_process_agent_profile_job(job: Any) -> None:
+            generation = (job.payload or {}).get("kb_generation")
+            if not isinstance(generation, str) or not generation.strip():
+                await job_service.transition_job(
+                    job.kb_id,
+                    job.id,
+                    status="failed",
+                    progress=1.0,
+                    failed_items=1,
+                    error_code="job_kb_generation_missing",
+                    error_message="Agent profile job is missing payload.kb_generation",
+                )
+                return
+            try:
+                async with job_service.kb_write_guard(job.kb_id, generation):
+                    await agent_profile_service.run_job(job)
+            except Exception as exc:  # noqa: BLE001 - detached task backstop
+                logger.error(
+                    "Rejected in-process agent profile job '%s' at the KB "
+                    "generation fence: %s",
+                    job.id,
+                    exc,
+                )
+                try:
+                    await job_service.transition_job(
+                        job.kb_id,
+                        job.id,
+                        status="failed",
+                        progress=1.0,
+                        failed_items=1,
+                        error_code="job_kb_generation_conflict",
+                        error_message=str(exc),
+                    )
+                except Exception as transition_exc:  # noqa: BLE001
+                    logger.error(
+                        "Could not fail fenced agent profile job '%s': %s",
+                        job.id,
+                        transition_exc,
+                    )
+
         agent_profile_service.set_job_runner(
-            lambda job: asyncio.create_task(agent_profile_service.run_job(job))
+            lambda job: asyncio.create_task(_run_in_process_agent_profile_job(job))
         )
 
     # Add routes
@@ -2619,7 +2695,9 @@ def create_app(args):
         )
     )
     if enterprise_enabled:
-        app.include_router(create_enterprise_routes(api_key=api_key))
+        app.include_router(
+            create_enterprise_routes(api_key=api_key, kb_service=kb_service)
+        )
         app.include_router(create_chat_routes(api_key=api_key))
     app.include_router(create_document_routes(rag, doc_manager, api_key))
     app.include_router(create_query_routes(rag, api_key, args.top_k))
@@ -2784,6 +2862,8 @@ def create_app(args):
                     "can_create_kb": user.can_create_kb,
                     "can_use_bypass_query": user.can_use_bypass_query,
                     "can_use_agent_query": user.can_use_agent_query,
+                    "can_delete_documents": user.can_delete_documents,
+                    "can_download_files": user.can_download_files,
                     "token_version": user.token_version,
                     "created_at": user.created_at,
                     "updated_at": user.updated_at,

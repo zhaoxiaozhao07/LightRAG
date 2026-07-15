@@ -17,6 +17,7 @@ from uuid import uuid4
 from fastapi import HTTPException, Request, status
 
 from lightrag.api.kb_service import (
+    is_tenant_owned_kb,
     KnowledgeBaseNotFoundError,
     KnowledgeBaseRecord,
     utc_now_iso,
@@ -33,8 +34,13 @@ from lightrag.api.metadata_store import (
     KBACLRecord,
     EnterpriseTenantKBACLRecord,
     EnterpriseTenantMembershipRecord,
+    EnterpriseTenantUserKBOverrideRecord,
     EnterpriseTenantRecord,
+    KBLifecycleConflictError,
+    KBLifecycleRecord,
+    MetadataConflictError,
     MetadataRecordNotFoundError,
+    TenantUserKBOverrideEffect,
 )
 from lightrag.api.passwords import hash_password, verify_password
 
@@ -79,6 +85,7 @@ KB_VISIBILITY_PUBLIC = "public"
 # Sentinel for update calls that need to distinguish "field omitted" from an
 # explicit ``None`` (mirrors the ``_UNSET`` idiom in kb_service updates).
 UNSET: Any = object()
+_ACTOR_TENANT_UNSET: Any = object()
 
 _KB_ROLE_RANK = {
     KB_ROLE_VIEWER: 1,
@@ -130,8 +137,24 @@ class EnterpriseMetadataStore(Protocol):
     async def list_enterprise_users(self) -> list[EnterpriseUserRecord]: ...
 
     async def upsert_enterprise_user(
-        self, user: EnterpriseUserRecord
+        self,
+        user: EnterpriseUserRecord,
+        *,
+        expected_updated_at: str | None = None,
+        expected_token_version: int | None = None,
+        expected_tenant_id: str | None = None,
     ) -> EnterpriseUserRecord: ...
+
+    async def upsert_enterprise_user_with_membership(
+        self,
+        user: EnterpriseUserRecord,
+        membership: EnterpriseTenantMembershipRecord | None,
+        *,
+        expected_updated_at: str | None = None,
+        expected_token_version: int | None = None,
+        expected_tenant_id: str | None = None,
+        expected_membership: Any = UNSET,
+    ) -> tuple[EnterpriseUserRecord, EnterpriseTenantMembershipRecord | None]: ...
 
     async def get_enterprise_user_kb_query_settings(
         self, user_id: str, kb_id: str
@@ -205,12 +228,23 @@ class EnterpriseMetadataStore(Protocol):
         offset: int = 0,
     ) -> tuple[list[ChatMessageRecord], int]: ...
 
+    async def get_chat_message(
+        self,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        message_id: str,
+    ) -> ChatMessageRecord | None: ...
+
     async def delete_chat_message(
         self, user_id: str, project_id: str, session_id: str, message_id: str
     ) -> bool: ...
 
     async def create_enterprise_api_key(
-        self, record: EnterpriseAPIKeyRecord
+        self,
+        record: EnterpriseAPIKeyRecord,
+        *,
+        expected_kb_generations: dict[str, str] | None = None,
     ) -> EnterpriseAPIKeyRecord: ...
 
     async def get_enterprise_api_key_by_hash(
@@ -243,9 +277,45 @@ class EnterpriseMetadataStore(Protocol):
         self, key: str, default: str | None = None
     ) -> str | None: ...
 
-    async def upsert_kb_acl(self, acl: KBACLRecord) -> KBACLRecord: ...
+    async def get_kb_lifecycle(self, kb_id: str) -> KBLifecycleRecord | None: ...
 
-    async def delete_kb_acl(self, kb_id: str, user_id: str) -> bool: ...
+    def kb_write_guard(
+        self, kb_id: str, expected_generation: str | None
+    ) -> Any: ...
+
+    async def register_kb_generation(
+        self,
+        kb_id: str,
+        generation: str,
+        *,
+        activated_at: str | None = None,
+    ) -> KBLifecycleRecord: ...
+
+    async def assert_current_kb_generation(
+        self, kb_id: str, expected_generation: str | None
+    ) -> KBLifecycleRecord | None: ...
+
+    async def upsert_kb_acl(
+        self, acl: KBACLRecord, *, expected_generation: str | None = None
+    ) -> KBACLRecord: ...
+
+    async def delete_kb_acl(
+        self,
+        kb_id: str,
+        user_id: str,
+        *,
+        expected_generation: str | None = None,
+    ) -> bool: ...
+
+    async def delete_enterprise_user(
+        self,
+        user_id: str,
+        *,
+        expected_updated_at: str | None = None,
+        expected_token_version: int | None = None,
+        expected_tenant_id: str | None = None,
+        expected_membership: Any = UNSET,
+    ) -> bool: ...
 
     async def list_kb_acl(self, kb_id: str) -> list[KBACLRecord]: ...
 
@@ -284,10 +354,19 @@ class EnterpriseMetadataStore(Protocol):
     ) -> EnterpriseTenantMembershipRecord | None: ...
 
     async def upsert_tenant_kb_acl(
-        self, acl: EnterpriseTenantKBACLRecord
+        self,
+        acl: EnterpriseTenantKBACLRecord,
+        *,
+        expected_generation: str | None = None,
     ) -> EnterpriseTenantKBACLRecord: ...
 
-    async def delete_tenant_kb_acl(self, tenant_id: str, kb_id: str) -> bool: ...
+    async def delete_tenant_kb_acl(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        *,
+        expected_generation: str | None = None,
+    ) -> bool: ...
 
     async def list_kb_tenant_acl(
         self, kb_id: str
@@ -296,6 +375,43 @@ class EnterpriseMetadataStore(Protocol):
     async def get_tenant_kb_acl_role(self, tenant_id: str, kb_id: str) -> str | None: ...
 
     async def list_kb_ids_for_tenants(self, tenant_ids: list[str]) -> list[str]: ...
+
+    async def get_tenant_user_kb_override(
+        self, tenant_id: str, kb_id: str, user_id: str
+    ) -> EnterpriseTenantUserKBOverrideRecord | None: ...
+
+    async def upsert_tenant_user_kb_override(
+        self,
+        record: EnterpriseTenantUserKBOverrideRecord,
+        *,
+        expected_generation: str | None = None,
+        expected_user: Any = UNSET,
+        expected_membership: Any = UNSET,
+    ) -> EnterpriseTenantUserKBOverrideRecord: ...
+
+    async def delete_tenant_user_kb_override(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        user_id: str,
+        *,
+        granted_by: str | None = None,
+        updated_at: str | None = None,
+        expected_generation: str | None = None,
+        expected_user: Any = UNSET,
+        expected_membership: Any = UNSET,
+    ) -> EnterpriseTenantUserKBOverrideRecord: ...
+
+    async def reset_tenant_user_kb_override(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        user_id: str,
+        *,
+        expected_generation: str | None = None,
+        expected_user: Any = UNSET,
+        expected_membership: Any = UNSET,
+    ) -> bool: ...
 
     async def append_audit_event(
         self, event: AuditEventRecord
@@ -308,6 +424,7 @@ class EnterpriseMetadataStore(Protocol):
         offset: int = 0,
         event_type: str | None = None,
         actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
         target_type: str | None = None,
         target_id: str | None = None,
         created_after: str | None = None,
@@ -333,6 +450,75 @@ class EnterpriseMetadataStore(Protocol):
     ) -> EnterpriseInvitationRecord | None: ...
 
 
+def _user_write_conflict(exc: MetadataConflictError) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="User was modified concurrently; retry the request",
+    )
+
+
+def _kb_lifecycle_write_conflict(exc: KBLifecycleConflictError) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Knowledge base changed concurrently; retry the request",
+    )
+
+
+def _tenant_override_target_write_conflict(
+    exc: MetadataConflictError,
+) -> HTTPException:
+    if (
+        exc.entity_type == "tenant_user_kb_override_target"
+        and exc.current.get("eligible") is False
+    ):
+        return HTTPException(status_code=404, detail="User not found")
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="User was modified concurrently; retry the request",
+    )
+
+
+async def _save_user_cas(
+    metadata_store: EnterpriseMetadataStore,
+    candidate: EnterpriseUserRecord,
+    snapshot: EnterpriseUserRecord,
+) -> EnterpriseUserRecord:
+    try:
+        return await metadata_store.upsert_enterprise_user(
+            candidate,
+            expected_updated_at=snapshot.updated_at,
+            expected_token_version=snapshot.token_version,
+            expected_tenant_id=snapshot.tenant_id,
+        )
+    except MetadataConflictError as exc:
+        raise _user_write_conflict(exc) from exc
+
+
+async def _save_user_with_membership_cas(
+    metadata_store: EnterpriseMetadataStore,
+    candidate: EnterpriseUserRecord,
+    membership: EnterpriseTenantMembershipRecord | None,
+    snapshot: EnterpriseUserRecord,
+    *,
+    expected_membership: Any = UNSET,
+) -> tuple[EnterpriseUserRecord, EnterpriseTenantMembershipRecord | None]:
+    try:
+        kwargs: dict[str, Any] = {
+            "expected_updated_at": snapshot.updated_at,
+            "expected_token_version": snapshot.token_version,
+            "expected_tenant_id": snapshot.tenant_id,
+        }
+        if expected_membership is not UNSET:
+            kwargs["expected_membership"] = expected_membership
+        return await metadata_store.upsert_enterprise_user_with_membership(
+            candidate,
+            membership,
+            **kwargs,
+        )
+    except MetadataConflictError as exc:
+        raise _user_write_conflict(exc) from exc
+
+
 @dataclass(frozen=True, slots=True)
 class Principal:
     user_id: str
@@ -351,10 +537,47 @@ class Principal:
     # Declared last with a default so existing keyword constructions and the
     # frozen-dataclass field ordering stay valid.
     can_delete_documents: bool = False
+    # Interactive users need this capability before source/derived artifacts
+    # can leave the server through a download surface. Service keys retain
+    # their role/scope semantics and super administrators always pass.
+    can_download_files: bool = False
 
     @property
     def is_super_admin(self) -> bool:
         return self.system_role == SYSTEM_ROLE_SUPER_ADMIN
+
+
+@dataclass(frozen=True, slots=True)
+class KBAccessDecision:
+    """Source-aware result of resolving one principal against one KB.
+
+    ``platform_role`` contains only platform-authoritative sources (a direct
+    user grant and visibility). ``tenant_role`` is the contribution from the
+    principal's one canonical tenant after applying its tenant ACL and optional
+    per-user allow/deny override. Keeping those values separate is important:
+    a tenant deny must never hide a direct platform grant or public/internal
+    visibility.
+    """
+
+    kb_id: str
+    generation: str | None
+    effective_role: str | None
+    platform_role: str | None
+    direct_role: str | None
+    visibility_role: str | None
+    tenant_role: str | None
+    tenant_id: str | None
+    tenant_acl_role: str | None
+    tenant_override_effect: str | None
+    tenant_override_role: str | None
+    tenant_owned: bool
+    sources: tuple[str, ...] = ()
+
+    @property
+    def role(self) -> str | None:
+        """Compatibility shorthand for callers that only need the maximum."""
+
+        return self.effective_role
 
 
 _current_principal: contextvars.ContextVar[Principal | None] = contextvars.ContextVar(
@@ -554,6 +777,7 @@ def principal_from_api_key() -> Principal:
         metadata={"auth_mode": "enterprise", "api_key_superadmin": True},
         can_use_agent_query=True,
         can_delete_documents=True,
+        can_download_files=True,
     )
 
 
@@ -566,10 +790,21 @@ class AuditService:
         event_type: str,
         *,
         actor_user_id: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
         target_type: str | None = None,
         target_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> AuditEventRecord:
+        if actor_tenant_id is _ACTOR_TENANT_UNSET:
+            resolved_actor_tenant_id: str | None = None
+            if actor_user_id is not None:
+                actor = await self._metadata_store.get_enterprise_user_by_id(
+                    actor_user_id
+                )
+                if actor is not None:
+                    resolved_actor_tenant_id = actor.tenant_id
+        else:
+            resolved_actor_tenant_id = actor_tenant_id
         event = AuditEventRecord(
             id=f"audit_{uuid4().hex}",
             event_type=event_type,
@@ -578,6 +813,7 @@ class AuditService:
             target_id=target_id,
             metadata=metadata or {},
             created_at=utc_now_iso(),
+            actor_tenant_id=resolved_actor_tenant_id,
         )
         return await self._metadata_store.append_audit_event(event)
 
@@ -588,6 +824,7 @@ class AuditService:
         offset: int = 0,
         event_type: str | None = None,
         actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
         target_type: str | None = None,
         target_id: str | None = None,
         created_after: str | None = None,
@@ -598,6 +835,7 @@ class AuditService:
             offset=offset,
             event_type=event_type,
             actor_user_id=actor_user_id,
+            actor_tenant_id=actor_tenant_id,
             target_type=target_type,
             target_id=target_id,
             created_after=created_after,
@@ -846,9 +1084,11 @@ class ServiceAPIKeyService:
         self,
         metadata_store: EnterpriseMetadataStore,
         audit_service: AuditService | None = None,
+        kb_service: Any = None,
     ):
         self._metadata_store = metadata_store
         self._audit_service = audit_service
+        self._kb_service = kb_service
 
     async def create_key(
         self,
@@ -864,6 +1104,10 @@ class ServiceAPIKeyService:
         if not normalized_name:
             raise HTTPException(status_code=400, detail="Service API key name is required")
         normalized_scopes = _normalize_service_api_key_scopes(scopes or {})
+        # Deliberately make the complete generation snapshot the first await.
+        expected_generations = await self._service_key_kb_generations(
+            normalized_scopes
+        )
         key_id = f"svc_key_{uuid4().hex}"
         raw_key = f"lrsk_{key_id}_{secrets.token_urlsafe(32)}"
         now = utc_now_iso()
@@ -884,7 +1128,13 @@ class ServiceAPIKeyService:
             revoked_by=None,
             expires_at=expires_at,
         )
-        saved = await self._metadata_store.create_enterprise_api_key(record)
+        try:
+            saved = await self._metadata_store.create_enterprise_api_key(
+                record,
+                expected_kb_generations=expected_generations,
+            )
+        except KBLifecycleConflictError as exc:
+            raise _kb_lifecycle_write_conflict(exc) from exc
         if self._audit_service is not None:
             await self._audit_service.append(
                 "service_api_key_created",
@@ -899,6 +1149,38 @@ class ServiceAPIKeyService:
                 },
             )
         return saved, raw_key
+
+    async def _service_key_kb_generations(
+        self, scopes: dict[str, Any]
+    ) -> dict[str, str]:
+        """Snapshot managed KB generations before persisting key scopes.
+
+        The metadata-store write validates these snapshots transactionally. A
+        hard delete/recreate that races this method therefore cannot attach a
+        delayed service-key grant to the replacement KB identity.
+        """
+
+        kb_roles = scopes.get("kb_roles", {})
+        if not isinstance(kb_roles, dict):
+            return {}
+        generations: dict[str, str] = {}
+        for kb_id in sorted(kb_roles):
+            if self._kb_service is not None:
+                try:
+                    record = await self._kb_service.get(kb_id)
+                except (KnowledgeBaseNotFoundError, ValueError):
+                    # A concurrent hard-delete is still rejected below by its
+                    # lifecycle tombstone.  Falling through also preserves
+                    # compatibility for keys created directly against legacy
+                    # metadata stores without a catalog record.
+                    pass
+                else:
+                    generations[kb_id] = record.generation
+                    continue
+            lifecycle = await self._metadata_store.get_kb_lifecycle(kb_id)
+            if lifecycle is not None:
+                generations[kb_id] = lifecycle.generation
+        return generations
 
     async def list_keys(self) -> list[EnterpriseAPIKeyRecord]:
         return await self._metadata_store.list_enterprise_api_keys()
@@ -995,6 +1277,7 @@ class ServiceAPIKeyService:
             },
             can_use_agent_query=bool(scopes.get("can_use_agent_query", False)),
             can_delete_documents=False,
+            can_download_files=False,
         )
 
 
@@ -1022,18 +1305,25 @@ class UserKBQuerySettingsService:
         user_prompt: str,
         actor_user_id: str | None = None,
     ) -> EnterpriseUserKBQuerySettingsRecord:
-        existing = await self.get_settings(user_id, kb_id)
-        now = utc_now_iso()
-        record = EnterpriseUserKBQuerySettingsRecord(
-            user_id=user_id,
-            kb_id=kb_id,
-            user_prompt=user_prompt,
-            created_at=existing.created_at if existing is not None else now,
-            updated_at=now,
-        )
-        saved = await self._metadata_store.upsert_enterprise_user_kb_query_settings(
-            record
-        )
+        lifecycle = await self._metadata_store.get_kb_lifecycle(kb_id)
+        expected_generation = lifecycle.generation if lifecycle is not None else None
+        async with self._metadata_store.kb_write_guard(
+            kb_id, expected_generation
+        ):
+            existing = await self.get_settings(user_id, kb_id)
+            now = utc_now_iso()
+            record = EnterpriseUserKBQuerySettingsRecord(
+                user_id=user_id,
+                kb_id=kb_id,
+                user_prompt=user_prompt,
+                created_at=existing.created_at if existing is not None else now,
+                updated_at=now,
+            )
+            saved = (
+                await self._metadata_store.upsert_enterprise_user_kb_query_settings(
+                    record
+                )
+            )
         if self._audit_service is not None:
             await self._audit_service.append(
                 "user_kb_query_settings_updated",
@@ -1054,9 +1344,16 @@ class UserKBQuerySettingsService:
         kb_id: str,
         actor_user_id: str | None = None,
     ) -> bool:
-        deleted = await self._metadata_store.delete_enterprise_user_kb_query_settings(
-            user_id, kb_id
-        )
+        lifecycle = await self._metadata_store.get_kb_lifecycle(kb_id)
+        expected_generation = lifecycle.generation if lifecycle is not None else None
+        async with self._metadata_store.kb_write_guard(
+            kb_id, expected_generation
+        ):
+            deleted = (
+                await self._metadata_store.delete_enterprise_user_kb_query_settings(
+                    user_id, kb_id
+                )
+            )
         if self._audit_service is not None:
             await self._audit_service.append(
                 "user_kb_query_settings_updated",
@@ -1678,6 +1975,7 @@ class UserService:
                 created_at=now,
                 updated_at=now,
                 can_delete_documents=True,
+                can_download_files=True,
             )
             user = await self._metadata_store.upsert_enterprise_user(created)
             await self._audit("super_admin_bootstrapped", actor_user_id=user.id)
@@ -1693,13 +1991,14 @@ class UserService:
             can_use_bypass_query=True,
             can_use_agent_query=True,
             can_delete_documents=True,
+            can_download_files=True,
             token_version=existing.token_version
             + (1 if new_hash != existing.password_hash else 0),
             updated_at=now,
         )
         if updated == existing:
             return existing
-        user = await self._metadata_store.upsert_enterprise_user(updated)
+        user = await _save_user_cas(self._metadata_store, updated, existing)
         await self._audit("super_admin_synced", actor_user_id=user.id)
         return user
 
@@ -1721,10 +2020,12 @@ class UserService:
         username: str,
         password: str,
         created_by: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
         can_create_kb: bool = False,
         can_use_bypass_query: bool = False,
         can_use_agent_query: bool = False,
         can_delete_documents: bool = False,
+        can_download_files: bool = False,
         tenant_id: str | None = None,
         status: str = USER_STATUS_ACTIVE,
     ) -> EnterpriseUserRecord:
@@ -1747,23 +2048,32 @@ class UserService:
             created_at=now,
             updated_at=now,
             can_delete_documents=can_delete_documents,
+            can_download_files=can_download_files,
         )
-        created = await self._metadata_store.upsert_enterprise_user(user)
-        # Keep user.tenant_id and enterprise_tenant_memberships in sync.
-        if tenant_id:
-            await self._metadata_store.upsert_tenant_membership(
-                EnterpriseTenantMembershipRecord(
-                    tenant_id=tenant_id,
-                    user_id=created.id,
-                    role=TENANT_ROLE_MEMBER,
-                    granted_by=created_by,
-                    created_at=now,
-                    updated_at=now,
+        membership = (
+            EnterpriseTenantMembershipRecord(
+                tenant_id=tenant_id,
+                user_id=user.id,
+                role=TENANT_ROLE_MEMBER,
+                granted_by=created_by,
+                created_at=now,
+                updated_at=now,
+            )
+            if tenant_id is not None
+            else None
+        )
+        try:
+            created, _saved_membership = (
+                await self._metadata_store.upsert_enterprise_user_with_membership(
+                    user, membership
                 )
             )
+        except MetadataConflictError as exc:
+            raise _user_write_conflict(exc) from exc
         await self._audit(
             "user_created",
             actor_user_id=created_by,
+            actor_tenant_id=actor_tenant_id,
             target_type="user",
             target_id=created.id,
         )
@@ -1779,18 +2089,39 @@ class UserService:
         return user
 
     async def delete_user(
-        self, user_id: str, *, actor_user_id: str | None = None
+        self,
+        user_id: str,
+        *,
+        actor_user_id: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
+        expected_user: EnterpriseUserRecord | None = None,
+        expected_membership: Any = UNSET,
     ) -> bool:
-        user = await self.get_user_or_404(user_id)
+        user = expected_user or await self.get_user_or_404(user_id)
+        if user.id != user_id:
+            raise HTTPException(status_code=404, detail="User not found")
         if user.system_role == SYSTEM_ROLE_SUPER_ADMIN:
             raise HTTPException(
                 status_code=400, detail="Cannot delete a super admin"
             )
-        deleted = await self._metadata_store.delete_enterprise_user(user_id)
+        kwargs: dict[str, Any] = {
+            "expected_updated_at": user.updated_at,
+            "expected_token_version": user.token_version,
+            "expected_tenant_id": user.tenant_id,
+        }
+        if expected_membership is not UNSET:
+            kwargs["expected_membership"] = expected_membership
+        try:
+            deleted = await self._metadata_store.delete_enterprise_user(
+                user_id, **kwargs
+            )
+        except MetadataConflictError as exc:
+            raise _user_write_conflict(exc) from exc
         if deleted:
             await self._audit(
                 "user_deleted",
                 actor_user_id=actor_user_id,
+                actor_tenant_id=actor_tenant_id,
                 target_type="user",
                 target_id=user_id,
             )
@@ -1805,10 +2136,16 @@ class UserService:
         can_use_bypass_query: bool | None = None,
         can_use_agent_query: bool | None = None,
         can_delete_documents: bool | None = None,
+        can_download_files: bool | None = None,
         tenant_id: Any = UNSET,
         actor_user_id: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
+        expected_user: EnterpriseUserRecord | None = None,
+        expected_membership: Any = UNSET,
     ) -> EnterpriseUserRecord:
-        user = await self.get_user_or_404(user_id)
+        user = expected_user or await self.get_user_or_404(user_id)
+        if user.id != user_id:
+            raise HTTPException(status_code=404, detail="User not found")
         if status_value is not None and status_value not in USER_STATUS_VALUES:
             raise HTTPException(status_code=400, detail="Invalid user status")
         if user.system_role == SYSTEM_ROLE_SUPER_ADMIN and status_value == USER_STATUS_DISABLED:
@@ -1827,6 +2164,7 @@ class UserService:
                 status_code=400,
                 detail="Tenant id cannot be empty; use null to clear it",
             )
+        now = utc_now_iso()
         updated = replace(
             user,
             status=status_value or user.status,
@@ -1842,57 +2180,97 @@ class UserService:
             can_delete_documents=user.can_delete_documents
             if can_delete_documents is None
             else can_delete_documents,
+            can_download_files=user.can_download_files
+            if can_download_files is None
+            else can_download_files,
             tenant_id=new_tenant_id,
             token_version=user.token_version + 1,
-            updated_at=utc_now_iso(),
+            updated_at=now,
         )
-        saved = await self._metadata_store.upsert_enterprise_user(updated)
-        # Keep user.tenant_id and enterprise_tenant_memberships in sync.
         old_tenant_id = user.tenant_id
         if new_tenant_id != old_tenant_id:
-            if old_tenant_id:
-                await self._metadata_store.delete_tenant_membership(
-                    old_tenant_id, user.id
+            membership = (
+                EnterpriseTenantMembershipRecord(
+                    tenant_id=new_tenant_id,
+                    user_id=user.id,
+                    role=TENANT_ROLE_MEMBER,
+                    granted_by=actor_user_id,
+                    created_at=now,
+                    updated_at=now,
                 )
-            if new_tenant_id:
-                await self._metadata_store.upsert_tenant_membership(
-                    EnterpriseTenantMembershipRecord(
-                        tenant_id=new_tenant_id,
-                        user_id=user.id,
-                        role=TENANT_ROLE_MEMBER,
-                        granted_by=actor_user_id,
-                        created_at=utc_now_iso(),
-                        updated_at=utc_now_iso(),
-                    )
-                )
+                if new_tenant_id is not None
+                else None
+            )
+            saved, _saved_membership = await _save_user_with_membership_cas(
+                self._metadata_store,
+                updated,
+                membership,
+                user,
+                expected_membership=expected_membership,
+            )
+        elif expected_membership is not UNSET:
+            saved, _saved_membership = await _save_user_with_membership_cas(
+                self._metadata_store,
+                updated,
+                None,
+                user,
+                expected_membership=expected_membership,
+            )
+        else:
+            saved = await _save_user_cas(self._metadata_store, updated, user)
         await self._audit(
             "user_updated",
             actor_user_id=actor_user_id,
+            actor_tenant_id=actor_tenant_id,
             target_type="user",
             target_id=saved.id,
         )
         return saved
 
     async def change_password(
-        self, user_id: str, password: str, *, actor_user_id: str | None = None
+        self,
+        user_id: str,
+        password: str,
+        *,
+        actor_user_id: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
+        expected_user: EnterpriseUserRecord | None = None,
+        expected_membership: Any = UNSET,
     ) -> EnterpriseUserRecord:
-        user = await self.get_user_or_404(user_id)
+        user = expected_user or await self.get_user_or_404(user_id)
+        if user.id != user_id:
+            raise HTTPException(status_code=404, detail="User not found")
         updated = replace(
             user,
             password_hash=hash_password(password),
             token_version=user.token_version + 1,
             updated_at=utc_now_iso(),
         )
-        saved = await self._metadata_store.upsert_enterprise_user(updated)
+        if expected_membership is UNSET:
+            saved = await _save_user_cas(self._metadata_store, updated, user)
+        else:
+            saved, _saved_membership = await _save_user_with_membership_cas(
+                self._metadata_store,
+                updated,
+                None,
+                user,
+                expected_membership=expected_membership,
+            )
         await self._audit(
             "user_password_changed",
             actor_user_id=actor_user_id,
+            actor_tenant_id=actor_tenant_id,
             target_type="user",
             target_id=saved.id,
         )
         return saved
 
-    async def logout_all_sessions(self, user_id: str) -> EnterpriseUserRecord:
+    async def logout_all_sessions(
+        self,
+        user_id: str,
+        *,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
+    ) -> EnterpriseUserRecord:
         """Invalidate every outstanding token for the user ("log out all
         devices") by bumping ``token_version``."""
         user = await self.get_user_or_404(user_id)
@@ -1901,10 +2279,11 @@ class UserService:
             token_version=user.token_version + 1,
             updated_at=utc_now_iso(),
         )
-        saved = await self._metadata_store.upsert_enterprise_user(updated)
+        saved = await _save_user_cas(self._metadata_store, updated, user)
         await self._audit(
             "user_logged_out",
             actor_user_id=user_id,
+            actor_tenant_id=actor_tenant_id,
             target_type="user",
             target_id=saved.id,
         )
@@ -1916,6 +2295,7 @@ class UserService:
         *,
         display_name: Any = UNSET,
         email: Any = UNSET,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
     ) -> EnterpriseUserRecord:
         """Update self-service profile fields stored in user metadata.
 
@@ -1952,10 +2332,11 @@ class UserService:
         if metadata == user.metadata:
             return user
         updated = replace(user, metadata=metadata, updated_at=utc_now_iso())
-        saved = await self._metadata_store.upsert_enterprise_user(updated)
+        saved = await _save_user_cas(self._metadata_store, updated, user)
         await self._audit(
             "user_profile_updated",
             actor_user_id=user_id,
+            actor_tenant_id=actor_tenant_id,
             target_type="user",
             target_id=saved.id,
         )
@@ -1991,6 +2372,7 @@ class UserService:
             "can_create_kb": user.can_create_kb,
             "can_use_bypass_query": user.can_use_bypass_query,
             "can_use_agent_query": user.can_use_agent_query,
+            "can_download_files": user.can_download_files,
         }
 
     async def _audit(
@@ -1998,15 +2380,21 @@ class UserService:
         event_type: str,
         *,
         actor_user_id: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
         target_type: str | None = None,
         target_id: str | None = None,
     ) -> None:
         if self._audit_service is not None:
+            kwargs: dict[str, Any] = {
+                "actor_user_id": actor_user_id,
+                "target_type": target_type,
+                "target_id": target_id,
+            }
+            if actor_tenant_id is not _ACTOR_TENANT_UNSET:
+                kwargs["actor_tenant_id"] = actor_tenant_id
             await self._audit_service.append(
                 event_type,
-                actor_user_id=actor_user_id,
-                target_type=target_type,
-                target_id=target_id,
+                **kwargs,
             )
 
 
@@ -2023,6 +2411,28 @@ class AuthorizationService:
         # resolve KB visibility; when absent, visibility implies nothing.
         self._kb_service = kb_service
 
+    async def _append_audit(
+        self,
+        event_type: str,
+        *,
+        actor_user_id: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
+        target_type: str | None = None,
+        target_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if self._audit_service is None:
+            return
+        kwargs: dict[str, Any] = {
+            "actor_user_id": actor_user_id,
+            "target_type": target_type,
+            "target_id": target_id,
+            "metadata": metadata,
+        }
+        if actor_tenant_id is not _ACTOR_TENANT_UNSET:
+            kwargs["actor_tenant_id"] = actor_tenant_id
+        await self._audit_service.append(event_type, **kwargs)
+
     def require_super_admin(self, principal: Principal | None) -> Principal:
         principal = _require_principal(principal)
         if not principal.is_super_admin:
@@ -2031,9 +2441,30 @@ class AuthorizationService:
 
     def require_create_kb(self, principal: Principal | None) -> Principal:
         principal = _require_principal(principal)
+        if principal.is_super_admin:
+            return principal
         if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
             raise HTTPException(status_code=403, detail="Create-KB permission required")
-        if not (principal.is_super_admin or principal.can_create_kb):
+        if principal.tenant_id is None:
+            # A tenant administrator without a canonical primary tenant must
+            # not fall back to user-global create permission.
+            if any(
+                _tenant_role_rank(role)
+                >= _TENANT_ROLE_RANK[TENANT_ROLE_ADMIN]
+                for role in principal.tenant_roles.values()
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Primary tenant is required for tenant KB creation",
+                )
+            if principal.can_create_kb:
+                return principal
+            raise HTTPException(status_code=403, detail="Create-KB permission required")
+        tenant_role = _canonical_primary_tenant_role(principal)
+        tenant_admin = _tenant_role_rank(tenant_role) >= _TENANT_ROLE_RANK[
+            TENANT_ROLE_ADMIN
+        ]
+        if not (principal.can_create_kb or tenant_admin):
             raise HTTPException(status_code=403, detail="Create-KB permission required")
         return principal
 
@@ -2049,17 +2480,77 @@ class AuthorizationService:
             raise HTTPException(status_code=403, detail="Agent-query permission required")
         return principal
 
+    def require_file_download(self, principal: Principal | None) -> Principal:
+        """Require the user-global file export capability.
+
+        Service keys intentionally bypass this user capability and continue to
+        rely on their explicit KB scopes/roles. Super administrators also pass
+        regardless of the stored bit.
+        """
+
+        principal = _require_principal(principal)
+        if (
+            principal.is_super_admin
+            or principal.auth_method == SERVICE_API_KEY_AUTH_METHOD
+            or principal.can_download_files
+        ):
+            return principal
+        raise HTTPException(status_code=403, detail="File download permission required")
+
+    # More grammatical alias for callers introduced after the original API.
+    require_download_files = require_file_download
+
+    async def authorize_kb_lifecycle(
+        self,
+        principal: Principal | None,
+        record: KnowledgeBaseRecord,
+        action: str,
+    ) -> Principal:
+        """Authorize destructive lifecycle operations on a loaded KB record.
+
+        A tenant ACL or direct KB role is deliberately insufficient. Only a
+        super administrator, or an administrator/owner of the KB's canonical
+        owning tenant, may delete, hard-delete, or restore a genuinely
+        tenant-created KB. Callers must load the relevant active/deleted catalog
+        row first and pass that exact record.
+        """
+
+        normalized_action = action.strip().replace("_", "-")
+        if normalized_action not in {"delete", "soft-delete", "hard-delete", "restore"}:
+            raise ValueError(f"Unsupported KB lifecycle action: {action}")
+        principal = _require_principal(principal)
+        if principal.is_super_admin:
+            return principal
+        if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
+            await self._audit_lifecycle_denied(principal, record, normalized_action)
+            raise HTTPException(status_code=403, detail="Knowledge-base lifecycle denied")
+
+        tenant_role = _canonical_primary_tenant_role(principal)
+        if (
+            is_tenant_owned_kb(record, principal.tenant_id)
+            and _tenant_role_rank(tenant_role)
+            >= _TENANT_ROLE_RANK[TENANT_ROLE_ADMIN]
+        ):
+            return principal
+
+        await self._audit_lifecycle_denied(principal, record, normalized_action)
+        raise HTTPException(status_code=403, detail="Knowledge-base lifecycle denied")
+
     async def require_kb_role(
         self, principal: Principal | None, kb_id: str, minimum_role: str
     ) -> Principal:
         principal = _require_principal(principal)
         if principal.is_super_admin:
             return principal
-        if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
-            role = await self._effective_service_api_key_kb_role(principal, kb_id)
-        else:
-            role = await self._effective_user_kb_role(principal, kb_id)
-        if role is None or _KB_ROLE_RANK.get(role, 0) < _KB_ROLE_RANK[minimum_role]:
+        normalized_minimum = _normalize_kb_role(minimum_role)
+        if normalized_minimum is None:
+            raise ValueError(f"Invalid minimum KB role: {minimum_role}")
+        decision = await self.resolve_kb_access(principal, kb_id)
+        role = decision.effective_role
+        if (
+            role is None
+            or _KB_ROLE_RANK.get(role, 0) < _KB_ROLE_RANK[normalized_minimum]
+        ):
             await self._audit_denied(principal, kb_id, minimum_role)
             raise HTTPException(status_code=403, detail="Knowledge-base access denied")
         return principal
@@ -2120,6 +2611,7 @@ class AuthorizationService:
         description: str | None = None,
         tenant_id: str | None = None,
         created_by: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
     ) -> EnterpriseTenantRecord:
         normalized_name = name.strip()
         if not normalized_name:
@@ -2141,14 +2633,14 @@ class AuthorizationService:
             updated_at=now,
         )
         saved = await self._metadata_store.upsert_enterprise_tenant(tenant)
-        if self._audit_service is not None:
-            await self._audit_service.append(
-                "tenant_created",
-                actor_user_id=created_by,
-                target_type="tenant",
-                target_id=saved.id,
-                metadata={"name": saved.name},
-            )
+        await self._append_audit(
+            "tenant_created",
+            actor_user_id=created_by,
+            actor_tenant_id=actor_tenant_id,
+            target_type="tenant",
+            target_id=saved.id,
+            metadata={"name": saved.name},
+        )
         return saved
 
     async def list_tenants(self) -> list[EnterpriseTenantRecord]:
@@ -2170,6 +2662,7 @@ class AuthorizationService:
         description: str | None = None,
         status_value: str | None = None,
         actor_user_id: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
     ) -> EnterpriseTenantRecord:
         tenant = await self.get_tenant_or_404(tenant_id)
         if status_value is not None and status_value not in {
@@ -2187,24 +2680,29 @@ class AuthorizationService:
             updated_at=utc_now_iso(),
         )
         saved = await self._metadata_store.upsert_enterprise_tenant(updated)
-        if self._audit_service is not None:
-            await self._audit_service.append(
-                "tenant_updated",
-                actor_user_id=actor_user_id,
-                target_type="tenant",
-                target_id=saved.id,
-            )
+        await self._append_audit(
+            "tenant_updated",
+            actor_user_id=actor_user_id,
+            actor_tenant_id=actor_tenant_id,
+            target_type="tenant",
+            target_id=saved.id,
+        )
         return saved
 
     async def delete_tenant(
-        self, tenant_id: str, *, actor_user_id: str | None = None
+        self,
+        tenant_id: str,
+        *,
+        actor_user_id: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
     ) -> bool:
         tenant_id = _normalize_required_id(tenant_id, "Tenant id")
         deleted = await self._metadata_store.delete_enterprise_tenant(tenant_id)
-        if deleted and self._audit_service is not None:
-            await self._audit_service.append(
+        if deleted:
+            await self._append_audit(
                 "tenant_deleted",
                 actor_user_id=actor_user_id,
+                actor_tenant_id=actor_tenant_id,
                 target_type="tenant",
                 target_id=tenant_id,
             )
@@ -2238,7 +2736,9 @@ class AuthorizationService:
         if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
             await self._audit_tenant_denied(principal, tenant_id, minimum_role)
             raise HTTPException(status_code=403, detail="Tenant access denied")
-        role = principal.tenant_roles.get(tenant_id)
+        role = _canonical_primary_tenant_role(principal)
+        if principal.tenant_id != tenant_id:
+            role = None
         if _tenant_role_rank(role) < _tenant_role_rank(minimum_role):
             await self._audit_tenant_denied(principal, tenant_id, minimum_role)
             raise HTTPException(status_code=403, detail="Tenant access denied")
@@ -2250,24 +2750,14 @@ class AuthorizationService:
         principal = _require_principal(principal)
         if principal.is_super_admin:
             return records
-        if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
-            allowed_ids = _service_api_key_kb_ids(principal)
-            if _service_api_key_inherits_tenant_kb_acl(principal) and principal.tenant_id:
-                allowed_ids.update(
-                    await self._metadata_store.list_kb_ids_for_tenants(
-                        [principal.tenant_id]
-                    )
-                )
-        else:
-            allowed_ids = set(await self._metadata_store.list_kb_ids_for_user(principal.user_id))
-            tenant_ids = list(principal.tenant_roles)
-            allowed_ids.update(await self._metadata_store.list_kb_ids_for_tenants(tenant_ids))
-        return [
-            record
-            for record in records
-            if record.id in allowed_ids
-            or self._visibility_grants_view(principal, record)
-        ]
+        authorized: list[KnowledgeBaseRecord] = []
+        for record in records:
+            if record.status != "active":
+                continue
+            decision = await self.resolve_kb_access(principal, record)
+            if decision.effective_role is not None:
+                authorized.append(record)
+        return authorized
 
     async def grant_kb_role(
         self,
@@ -2276,10 +2766,15 @@ class AuthorizationService:
         role: str,
         *,
         granted_by: str | None = None,
+        expected_generation: str | None = None,
     ) -> KBACLRecord:
         normalized_role = _normalize_kb_role(role)
         if normalized_role not in _KB_ROLE_RANK:
             raise HTTPException(status_code=400, detail="Invalid KB ACL role")
+        captured_generation = await self._expected_kb_generation(
+            kb_id,
+            expected_generation=expected_generation,
+        )
         user = await self._metadata_store.get_enterprise_user_by_id(user_id)
         if user is None:
             raise HTTPException(status_code=404, detail="User not found")
@@ -2292,7 +2787,13 @@ class AuthorizationService:
             created_at=now,
             updated_at=now,
         )
-        saved = await self._metadata_store.upsert_kb_acl(acl)
+        try:
+            saved = await self._metadata_store.upsert_kb_acl(
+                acl,
+                expected_generation=captured_generation,
+            )
+        except KBLifecycleConflictError as exc:
+            raise _kb_lifecycle_write_conflict(exc) from exc
         if self._audit_service is not None:
             await self._audit_service.append(
                 "kb_acl_granted",
@@ -2304,9 +2805,25 @@ class AuthorizationService:
         return saved
 
     async def revoke_kb_role(
-        self, kb_id: str, user_id: str, *, actor_user_id: str | None = None
+        self,
+        kb_id: str,
+        user_id: str,
+        *,
+        actor_user_id: str | None = None,
+        expected_generation: str | None = None,
     ) -> bool:
-        deleted = await self._metadata_store.delete_kb_acl(kb_id, user_id)
+        captured_generation = await self._expected_kb_generation(
+            kb_id,
+            expected_generation=expected_generation,
+        )
+        try:
+            deleted = await self._metadata_store.delete_kb_acl(
+                kb_id,
+                user_id,
+                expected_generation=captured_generation,
+            )
+        except KBLifecycleConflictError as exc:
+            raise _kb_lifecycle_write_conflict(exc) from exc
         if deleted and self._audit_service is not None:
             await self._audit_service.append(
                 "kb_acl_revoked",
@@ -2327,11 +2844,25 @@ class AuthorizationService:
         role: str,
         *,
         granted_by: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
+        expected_user: EnterpriseUserRecord | None = None,
+        expected_membership: Any = UNSET,
+        allow_tenant_move: bool = True,
     ) -> EnterpriseTenantMembershipRecord:
         tenant_id = _normalize_required_id(tenant_id, "Tenant id")
         normalized_role = _normalize_tenant_role(role)
-        user = await self._metadata_store.get_enterprise_user_by_id(user_id)
+        user = expected_user or await self._metadata_store.get_enterprise_user_by_id(
+            user_id
+        )
         if user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        if user.id != user_id:
+            raise HTTPException(status_code=404, detail="User not found")
+        if not allow_tenant_move and (
+            user.system_role != SYSTEM_ROLE_USER
+            or user.tenant_id is not None
+            or expected_membership is not None
+        ):
             raise HTTPException(status_code=404, detail="User not found")
         now = utc_now_iso()
         membership = EnterpriseTenantMembershipRecord(
@@ -2342,51 +2873,78 @@ class AuthorizationService:
             created_at=now,
             updated_at=now,
         )
-        saved = await self._metadata_store.upsert_tenant_membership(membership)
-        # Keep user.tenant_id in sync: clear old tenant membership if the user
-        # is being moved to a different tenant, then set the new tenant_id.
-        old_tenant_id = user.tenant_id
-        if old_tenant_id and old_tenant_id != tenant_id:
-            await self._metadata_store.delete_tenant_membership(
-                old_tenant_id, user_id
-            )
-        if old_tenant_id != tenant_id:
-            updated_user = replace(
-                user, tenant_id=tenant_id, updated_at=utc_now_iso()
-            )
-            await self._metadata_store.upsert_enterprise_user(updated_user)
-        if self._audit_service is not None:
-            await self._audit_service.append(
-                "tenant_membership_granted",
-                actor_user_id=granted_by,
-                target_type="tenant",
-                target_id=tenant_id,
-                metadata={"user_id": user_id, "role": normalized_role},
-            )
+        updated_user = replace(user, tenant_id=tenant_id, updated_at=now)
+        _saved_user, saved = await _save_user_with_membership_cas(
+            self._metadata_store,
+            updated_user,
+            membership,
+            user,
+            expected_membership=expected_membership,
+        )
+        if saved is None:
+            raise RuntimeError("Canonical tenant membership was not saved")
+        await self._append_audit(
+            "tenant_membership_granted",
+            actor_user_id=granted_by,
+            actor_tenant_id=actor_tenant_id,
+            target_type="tenant",
+            target_id=tenant_id,
+            metadata={"user_id": user_id, "role": normalized_role},
+        )
         return saved
 
     async def revoke_tenant_membership(
-        self, tenant_id: str, user_id: str, *, actor_user_id: str | None = None
+        self,
+        tenant_id: str,
+        user_id: str,
+        *,
+        actor_user_id: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
+        expected_user: EnterpriseUserRecord | None = None,
+        expected_membership: Any = UNSET,
     ) -> bool:
         tenant_id = _normalize_required_id(tenant_id, "Tenant id")
-        deleted = await self._metadata_store.delete_tenant_membership(tenant_id, user_id)
-        if deleted:
-            # Clear user.tenant_id if it matches the revoked tenant.
-            user = await self._metadata_store.get_enterprise_user_by_id(user_id)
-            if user is not None and user.tenant_id == tenant_id:
-                updated_user = replace(
-                    user, tenant_id=None, updated_at=utc_now_iso()
-                )
-                await self._metadata_store.upsert_enterprise_user(updated_user)
-            if self._audit_service is not None:
-                await self._audit_service.append(
-                    "tenant_membership_revoked",
-                    actor_user_id=actor_user_id,
-                    target_type="tenant",
-                    target_id=tenant_id,
-                    metadata={"user_id": user_id},
-                )
-        return deleted
+        membership = (
+            expected_membership
+            if expected_membership is not UNSET
+            else await self._metadata_store.get_tenant_membership(tenant_id, user_id)
+        )
+        if membership is None:
+            return False
+        if not isinstance(membership, EnterpriseTenantMembershipRecord):
+            raise HTTPException(status_code=409, detail="User membership changed")
+        user = expected_user or await self._metadata_store.get_enterprise_user_by_id(
+            user_id
+        )
+        if user is None:
+            return False
+        if (
+            user.id != user_id
+            or membership.user_id != user_id
+            or membership.tenant_id != tenant_id
+            or user.tenant_id != tenant_id
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="User tenant membership is inconsistent",
+            )
+        updated_user = replace(user, tenant_id=None, updated_at=utc_now_iso())
+        await _save_user_with_membership_cas(
+            self._metadata_store,
+            updated_user,
+            None,
+            user,
+            expected_membership=expected_membership,
+        )
+        await self._append_audit(
+            "tenant_membership_revoked",
+            actor_user_id=actor_user_id,
+            actor_tenant_id=actor_tenant_id,
+            target_type="tenant",
+            target_id=tenant_id,
+            metadata={"user_id": user_id},
+        )
+        return True
 
     async def list_tenant_memberships(
         self, tenant_id: str
@@ -2407,11 +2965,16 @@ class AuthorizationService:
         role: str,
         *,
         granted_by: str | None = None,
+        expected_generation: str | None = None,
     ) -> EnterpriseTenantKBACLRecord:
         tenant_id = _normalize_required_id(tenant_id, "Tenant id")
         normalized_role = _normalize_kb_role(role)
         if normalized_role not in _KB_ROLE_RANK:
             raise HTTPException(status_code=400, detail="Invalid KB ACL role")
+        captured_generation = await self._expected_kb_generation(
+            kb_id,
+            expected_generation=expected_generation,
+        )
         now = utc_now_iso()
         acl = EnterpriseTenantKBACLRecord(
             tenant_id=tenant_id,
@@ -2421,7 +2984,13 @@ class AuthorizationService:
             created_at=now,
             updated_at=now,
         )
-        saved = await self._metadata_store.upsert_tenant_kb_acl(acl)
+        try:
+            saved = await self._metadata_store.upsert_tenant_kb_acl(
+                acl,
+                expected_generation=captured_generation,
+            )
+        except KBLifecycleConflictError as exc:
+            raise _kb_lifecycle_write_conflict(exc) from exc
         if self._audit_service is not None:
             await self._audit_service.append(
                 "tenant_kb_acl_granted",
@@ -2433,10 +3002,26 @@ class AuthorizationService:
         return saved
 
     async def revoke_tenant_kb_role(
-        self, kb_id: str, tenant_id: str, *, actor_user_id: str | None = None
+        self,
+        kb_id: str,
+        tenant_id: str,
+        *,
+        actor_user_id: str | None = None,
+        expected_generation: str | None = None,
     ) -> bool:
         tenant_id = _normalize_required_id(tenant_id, "Tenant id")
-        deleted = await self._metadata_store.delete_tenant_kb_acl(tenant_id, kb_id)
+        captured_generation = await self._expected_kb_generation(
+            kb_id,
+            expected_generation=expected_generation,
+        )
+        try:
+            deleted = await self._metadata_store.delete_tenant_kb_acl(
+                tenant_id,
+                kb_id,
+                expected_generation=captured_generation,
+            )
+        except KBLifecycleConflictError as exc:
+            raise _kb_lifecycle_write_conflict(exc) from exc
         if deleted and self._audit_service is not None:
             await self._audit_service.append(
                 "tenant_kb_acl_revoked",
@@ -2450,25 +3035,430 @@ class AuthorizationService:
     async def list_kb_tenant_acl(self, kb_id: str) -> list[EnterpriseTenantKBACLRecord]:
         return await self._metadata_store.list_kb_tenant_acl(kb_id)
 
-    async def _effective_user_kb_role(self, principal: Principal, kb_id: str) -> str | None:
-        roles: list[str] = []
+    async def set_tenant_user_kb_override(
+        self,
+        kb_id: str,
+        tenant_id: str,
+        user_id: str,
+        *,
+        effect: str,
+        role: str | None = None,
+        granted_by: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
+        expected_generation: str | None = None,
+        expected_user: Any = UNSET,
+        expected_membership: Any = UNSET,
+    ) -> EnterpriseTenantUserKBOverrideRecord:
+        tenant_id = _normalize_required_id(tenant_id, "Tenant id")
+        user_id = _normalize_required_id(user_id, "User id")
+        effect_value = effect.strip().lower()
+        if effect_value not in {"allow", "deny"}:
+            raise HTTPException(status_code=400, detail="Invalid tenant KB override effect")
+        normalized_effect: TenantUserKBOverrideEffect = (
+            "allow" if effect_value == "allow" else "deny"
+        )
+        normalized_role = _normalize_kb_role(role)
+        if normalized_effect == "allow" and normalized_role not in _KB_ROLE_RANK:
+            raise HTTPException(status_code=400, detail="Invalid KB ACL role")
+        if normalized_effect == "deny" and role is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Deny override must not include a role",
+            )
+        captured_generation = await self._expected_kb_generation(
+            kb_id,
+            expected_generation=expected_generation,
+        )
+        now = utc_now_iso()
+        override = EnterpriseTenantUserKBOverrideRecord(
+            tenant_id=tenant_id,
+            kb_id=kb_id,
+            user_id=user_id,
+            effect=normalized_effect,
+            role=normalized_role if normalized_effect == "allow" else None,
+            granted_by=granted_by,
+            created_at=now,
+            updated_at=now,
+        )
+        try:
+            target_cas: dict[str, Any] = {}
+            if expected_user is not UNSET:
+                target_cas["expected_user"] = expected_user
+            if expected_membership is not UNSET:
+                target_cas["expected_membership"] = expected_membership
+            saved = await self._metadata_store.upsert_tenant_user_kb_override(
+                override,
+                expected_generation=captured_generation,
+                **target_cas,
+            )
+        except KBLifecycleConflictError as exc:
+            raise _kb_lifecycle_write_conflict(exc) from exc
+        except MetadataConflictError as exc:
+            raise _tenant_override_target_write_conflict(exc) from exc
+        await self._append_audit(
+            "tenant_user_kb_override_set",
+            actor_user_id=granted_by,
+            actor_tenant_id=actor_tenant_id,
+            target_type="kb",
+            target_id=kb_id,
+            metadata={
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "effect": normalized_effect,
+                "role": saved.role,
+            },
+        )
+        return saved
+
+    async def grant_tenant_user_kb_override(
+        self,
+        kb_id: str,
+        tenant_id: str,
+        user_id: str,
+        role: str,
+        *,
+        granted_by: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
+        expected_generation: str | None = None,
+        expected_user: Any = UNSET,
+        expected_membership: Any = UNSET,
+    ) -> EnterpriseTenantUserKBOverrideRecord:
+        return await self.set_tenant_user_kb_override(
+            kb_id,
+            tenant_id,
+            user_id,
+            effect="allow",
+            role=role,
+            granted_by=granted_by,
+            actor_tenant_id=actor_tenant_id,
+            expected_generation=expected_generation,
+            expected_user=expected_user,
+            expected_membership=expected_membership,
+        )
+
+    async def revoke_tenant_user_kb_override(
+        self,
+        kb_id: str,
+        tenant_id: str,
+        user_id: str,
+        *,
+        granted_by: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
+        expected_generation: str | None = None,
+        expected_user: Any = UNSET,
+        expected_membership: Any = UNSET,
+    ) -> EnterpriseTenantUserKBOverrideRecord:
+        return await self.set_tenant_user_kb_override(
+            kb_id,
+            tenant_id,
+            user_id,
+            effect="deny",
+            granted_by=granted_by,
+            actor_tenant_id=actor_tenant_id,
+            expected_generation=expected_generation,
+            expected_user=expected_user,
+            expected_membership=expected_membership,
+        )
+
+    async def reset_tenant_user_kb_override(
+        self,
+        kb_id: str,
+        tenant_id: str,
+        user_id: str,
+        *,
+        actor_user_id: str | None = None,
+        actor_tenant_id: Any = _ACTOR_TENANT_UNSET,
+        expected_generation: str | None = None,
+        expected_user: Any = UNSET,
+        expected_membership: Any = UNSET,
+    ) -> bool:
+        tenant_id = _normalize_required_id(tenant_id, "Tenant id")
+        user_id = _normalize_required_id(user_id, "User id")
+        captured_generation = await self._expected_kb_generation(
+            kb_id,
+            expected_generation=expected_generation,
+        )
+        try:
+            target_cas: dict[str, Any] = {}
+            if expected_user is not UNSET:
+                target_cas["expected_user"] = expected_user
+            if expected_membership is not UNSET:
+                target_cas["expected_membership"] = expected_membership
+            deleted = await self._metadata_store.reset_tenant_user_kb_override(
+                tenant_id,
+                kb_id,
+                user_id,
+                expected_generation=captured_generation,
+                **target_cas,
+            )
+        except KBLifecycleConflictError as exc:
+            raise _kb_lifecycle_write_conflict(exc) from exc
+        except MetadataConflictError as exc:
+            raise _tenant_override_target_write_conflict(exc) from exc
+        if deleted:
+            await self._append_audit(
+                "tenant_user_kb_override_reset",
+                actor_user_id=actor_user_id,
+                actor_tenant_id=actor_tenant_id,
+                target_type="kb",
+                target_id=kb_id,
+                metadata={"tenant_id": tenant_id, "user_id": user_id},
+            )
+        return deleted
+
+    async def resolve_kb_access(
+        self,
+        principal: Principal | None,
+        record_or_kb_id: KnowledgeBaseRecord | str,
+    ) -> KBAccessDecision:
+        """Resolve effective access while preserving each authorization source.
+
+        For interactive users this implements the tenant override formula
+        documented by the governance contract. Direct grants and visibility are
+        platform sources; tenant allow/deny rows can affect only the one
+        canonical tenant contribution. Service keys retain explicit scope plus
+        optional tenant-ACL inheritance semantics.
+        """
+
+        principal = _require_principal(principal)
+        record: KnowledgeBaseRecord | None
+        if isinstance(record_or_kb_id, str):
+            kb_id = record_or_kb_id
+            record = await self._load_kb_record(kb_id)
+        else:
+            record = record_or_kb_id
+            kb_id = record.id
+
+        generation = record.generation if record is not None else None
+        if principal.is_super_admin:
+            return KBAccessDecision(
+                kb_id=kb_id,
+                generation=generation,
+                effective_role=KB_ROLE_OWNER,
+                platform_role=KB_ROLE_OWNER,
+                direct_role=None,
+                visibility_role=None,
+                tenant_role=None,
+                tenant_id=principal.tenant_id,
+                tenant_acl_role=None,
+                tenant_override_effect=None,
+                tenant_override_role=None,
+                tenant_owned=False,
+                sources=("super_admin",),
+            )
+
+        # A missing or non-active catalog row is not an ACL-only KB. Fail closed
+        # instead of exposing a half-created, disabled, or stale identity.
+        if (self._kb_service is not None and record is None) or (
+            record is not None and getattr(record, "status", None) != "active"
+        ):
+            return _empty_kb_access_decision(kb_id, generation, principal.tenant_id)
+
+        if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
+            explicit_role = _service_api_key_kb_role(principal, kb_id)
+            tenant_acl_role: str | None = None
+            if (
+                _service_api_key_inherits_tenant_kb_acl(principal)
+                and principal.tenant_id
+            ):
+                tenant_acl_role = _normalize_kb_role(
+                    await self._metadata_store.get_tenant_kb_acl_role(
+                        principal.tenant_id,
+                        kb_id,
+                    )
+                )
+            effective_role = _max_kb_role(explicit_role, tenant_acl_role)
+            sources = tuple(
+                source
+                for source, role in (
+                    ("service_key", explicit_role),
+                    ("service_key_tenant_acl", tenant_acl_role),
+                )
+                if role is not None
+            )
+            return KBAccessDecision(
+                kb_id=kb_id,
+                generation=generation,
+                effective_role=effective_role,
+                platform_role=explicit_role,
+                direct_role=explicit_role,
+                visibility_role=None,
+                tenant_role=tenant_acl_role,
+                tenant_id=principal.tenant_id,
+                tenant_acl_role=tenant_acl_role,
+                tenant_override_effect=None,
+                tenant_override_role=None,
+                tenant_owned=False,
+                sources=sources,
+            )
+
+        primary_tenant_role = _canonical_primary_tenant_role(principal)
         direct_role = _normalize_kb_role(
             await self._metadata_store.get_kb_acl_role(kb_id, principal.user_id)
         )
-        if direct_role is not None:
-            roles.append(direct_role)
-        for tenant_id in principal.tenant_roles:
-            tenant_role = _normalize_kb_role(
+        visibility_role = (
+            KB_ROLE_VIEWER
+            if record is not None and self._visibility_grants_view(principal, record)
+            else None
+        )
+        platform_role = _max_kb_role(direct_role, visibility_role)
+
+        # AuthorizationService is also used in a few storage-level contexts
+        # without a catalog service. Preserve direct/tenant ACL compatibility
+        # there; source-aware owned/provisioned semantics require a KB record.
+        if record is None:
+            tenant_acl_role: str | None = None
+            if principal.tenant_id is not None and primary_tenant_role is not None:
+                tenant_acl_role = _normalize_kb_role(
+                    await self._metadata_store.get_tenant_kb_acl_role(
+                        principal.tenant_id, kb_id
+                    )
+                )
+            effective_role = _max_kb_role(platform_role, tenant_acl_role)
+            sources = tuple(
+                source
+                for source, role in (
+                    ("direct", direct_role),
+                    ("tenant_acl", tenant_acl_role),
+                )
+                if role is not None
+            )
+            return KBAccessDecision(
+                kb_id=kb_id,
+                generation=None,
+                effective_role=effective_role,
+                platform_role=platform_role,
+                direct_role=direct_role,
+                visibility_role=None,
+                tenant_role=tenant_acl_role,
+                tenant_id=principal.tenant_id,
+                tenant_acl_role=tenant_acl_role,
+                tenant_override_effect=None,
+                tenant_override_role=None,
+                tenant_owned=False,
+                sources=sources,
+            )
+
+        tenant_id = principal.tenant_id
+        tenant_owned = is_tenant_owned_kb(record, tenant_id)
+        tenant_acl_role: str | None = None
+        override: EnterpriseTenantUserKBOverrideRecord | None = None
+        if tenant_id is not None and primary_tenant_role is not None:
+            tenant_acl_role = _normalize_kb_role(
                 await self._metadata_store.get_tenant_kb_acl_role(tenant_id, kb_id)
             )
-            if tenant_role is not None:
-                roles.append(tenant_role)
-        if not roles:
-            # Visibility only ever implies the lowest role, so it can never
-            # raise the max of an explicit grant — consult it only when no
-            # direct/tenant ACL matched.
-            return await self._visibility_implied_role(principal, kb_id)
-        return max(roles, key=lambda item: _KB_ROLE_RANK.get(item, 0))
+            override = await self._metadata_store.get_tenant_user_kb_override(
+                tenant_id,
+                kb_id,
+                principal.user_id,
+            )
+
+        override_effect = override.effect if override is not None else None
+        override_role = (
+            _normalize_kb_role(override.role) if override is not None else None
+        )
+        tenant_role: str | None = None
+        tenant_source: str | None = None
+        if tenant_owned:
+            # Tenant-owned KBs are opt-in per member. The creator's direct owner
+            # ACL remains a platform source and is therefore unaffected.
+            if override_effect == "allow":
+                tenant_role = override_role
+                tenant_source = "tenant_owned_override"
+        elif tenant_acl_role is not None:
+            if override is None:
+                tenant_role = tenant_acl_role
+                tenant_source = "tenant_acl"
+            elif override_effect == "allow" and override_role is not None:
+                tenant_role = _min_kb_role(override_role, tenant_acl_role)
+                tenant_source = "tenant_override_capped"
+            # A deny, malformed override, or override without a current tenant
+            # ACL contributes no tenant access.
+
+        effective_role = _max_kb_role(platform_role, tenant_role)
+        sources = tuple(
+            source
+            for source in (
+                "direct" if direct_role is not None else None,
+                "visibility" if visibility_role is not None else None,
+                tenant_source,
+            )
+            if source is not None
+        )
+        return KBAccessDecision(
+            kb_id=kb_id,
+            generation=generation,
+            effective_role=effective_role,
+            platform_role=platform_role,
+            direct_role=direct_role,
+            visibility_role=visibility_role,
+            tenant_role=tenant_role,
+            tenant_id=tenant_id,
+            tenant_acl_role=tenant_acl_role,
+            tenant_override_effect=override_effect,
+            tenant_override_role=override_role,
+            tenant_owned=tenant_owned,
+            sources=sources,
+        )
+
+    async def _load_kb_record(self, kb_id: str) -> KnowledgeBaseRecord | None:
+        if self._kb_service is None:
+            return None
+        try:
+            return await self._kb_service.get(kb_id)
+        except (KnowledgeBaseNotFoundError, ValueError):
+            return None
+
+    async def _expected_kb_generation(
+        self,
+        kb_id: str,
+        *,
+        expected_generation: str | None = None,
+    ) -> str | None:
+        """Resolve and validate the identity used by an ACL mutation."""
+
+        if expected_generation is not None:
+            try:
+                await self._metadata_store.assert_current_kb_generation(
+                    kb_id,
+                    expected_generation,
+                )
+            except KBLifecycleConflictError as exc:
+                raise _kb_lifecycle_write_conflict(exc) from exc
+            return expected_generation
+
+        captured_generation: str | None = None
+        if self._kb_service is not None:
+            try:
+                record = await self._kb_service.get(kb_id)
+            except KnowledgeBaseNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            captured_generation = record.generation
+            try:
+                await self._metadata_store.register_kb_generation(
+                    kb_id,
+                    record.generation,
+                )
+            except KBLifecycleConflictError as exc:
+                raise _kb_lifecycle_write_conflict(exc) from exc
+        else:
+            lifecycle = await self._metadata_store.get_kb_lifecycle(kb_id)
+            if lifecycle is not None:
+                captured_generation = lifecycle.generation
+
+        try:
+            await self._metadata_store.assert_current_kb_generation(
+                kb_id,
+                captured_generation,
+            )
+        except KBLifecycleConflictError as exc:
+            raise _kb_lifecycle_write_conflict(exc) from exc
+        return captured_generation
+
+    async def _effective_user_kb_role(
+        self, principal: Principal, kb_id: str
+    ) -> str | None:
+        return (await self.resolve_kb_access(principal, kb_id)).effective_role
 
     @staticmethod
     def _visibility_grants_view(principal: Principal, record: Any) -> bool:
@@ -2492,38 +3482,10 @@ class AuthorizationService:
             )
         return False
 
-    async def _visibility_implied_role(
-        self, principal: Principal, kb_id: str
-    ) -> str | None:
-        if self._kb_service is None:
-            return None
-        try:
-            record = await self._kb_service.get(kb_id)
-        except (KnowledgeBaseNotFoundError, ValueError):
-            return None
-        if self._visibility_grants_view(principal, record):
-            return KB_ROLE_VIEWER
-        return None
-
     async def _effective_service_api_key_kb_role(
         self, principal: Principal, kb_id: str
     ) -> str | None:
-        roles: list[str] = []
-        explicit_role = _service_api_key_kb_role(principal, kb_id)
-        if explicit_role is not None:
-            roles.append(explicit_role)
-        if _service_api_key_inherits_tenant_kb_acl(principal) and principal.tenant_id:
-            tenant_role = _normalize_kb_role(
-                await self._metadata_store.get_tenant_kb_acl_role(
-                    principal.tenant_id,
-                    kb_id,
-                )
-            )
-            if tenant_role is not None:
-                roles.append(tenant_role)
-        if not roles:
-            return None
-        return max(roles, key=lambda item: _KB_ROLE_RANK.get(item, 0))
+        return (await self.resolve_kb_access(principal, kb_id)).effective_role
 
     async def _audit_denied(
         self, principal: Principal, kb_id: str, minimum_role: str
@@ -2532,9 +3494,30 @@ class AuthorizationService:
             await self._audit_service.append(
                 "permission_denied",
                 actor_user_id=principal.user_id,
+                actor_tenant_id=principal.tenant_id,
                 target_type="kb",
                 target_id=kb_id,
                 metadata={"minimum_role": minimum_role},
+            )
+
+    async def _audit_lifecycle_denied(
+        self,
+        principal: Principal,
+        record: KnowledgeBaseRecord,
+        action: str,
+    ) -> None:
+        if self._audit_service is not None:
+            await self._audit_service.append(
+                "permission_denied",
+                actor_user_id=principal.user_id,
+                actor_tenant_id=principal.tenant_id,
+                target_type="kb",
+                target_id=record.id,
+                metadata={
+                    "action": action,
+                    "kb_tenant_id": record.tenant_id,
+                    "required_tenant_role": TENANT_ROLE_ADMIN,
+                },
             )
 
     async def _audit_tenant_denied(
@@ -2544,6 +3527,7 @@ class AuthorizationService:
             await self._audit_service.append(
                 "permission_denied",
                 actor_user_id=principal.user_id,
+                actor_tenant_id=principal.tenant_id,
                 target_type="tenant",
                 target_id=tenant_id,
                 metadata={"minimum_role": minimum_role},
@@ -2556,9 +3540,25 @@ def principal_from_user(
     auth_method: str,
     memberships: list[EnterpriseTenantMembershipRecord] | None = None,
 ) -> Principal:
+    canonical_memberships = memberships or []
+    if user.tenant_id is None:
+        consistent = not canonical_memberships
+    else:
+        consistent = (
+            len(canonical_memberships) == 1
+            and canonical_memberships[0].tenant_id == user.tenant_id
+            and canonical_memberships[0].user_id == user.id
+            and _canonical_tenant_role(canonical_memberships[0].role)
+            in _TENANT_ROLE_RANK
+        )
+    if not consistent:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Tenant membership is inconsistent",
+        )
     tenant_roles = {
-        membership.tenant_id: membership.role
-        for membership in memberships or []
+        membership.tenant_id: _canonical_tenant_role(membership.role) or membership.role
+        for membership in canonical_memberships
     }
     return Principal(
         user_id=user.id,
@@ -2574,6 +3574,7 @@ def principal_from_user(
         auth_method=auth_method,
         metadata=dict(user.metadata),
         can_delete_documents=user.can_delete_documents,
+        can_download_files=user.can_download_files,
     )
 
 
@@ -2688,6 +3689,7 @@ async def append_enterprise_audit_event(
     await get_enterprise_audit_service(request).append(
         event_type,
         actor_user_id=principal.user_id if principal is not None else None,
+        actor_tenant_id=principal.tenant_id if principal is not None else None,
         target_type=target_type,
         target_id=target_id,
         metadata=metadata,
@@ -2722,6 +3724,12 @@ async def enforce_enterprise_request_access(
         return
 
     if path.startswith("/admin"):
+        # This one compatibility endpoint is intentionally deferred to its
+        # handler, which re-authorizes a tenant admin against the exact path
+        # tenant.  Do not use prefix matching here: every sibling /admin route
+        # and every subpath remains super-admin-only.
+        if method == "GET" and _exact_admin_tenant_detail_id(path) is not None:
+            return
         authz.require_super_admin(principal)
         return
 
@@ -2732,12 +3740,9 @@ async def enforce_enterprise_request_access(
         return
 
     if method == "DELETE" and path.rstrip("/") == f"/kbs/{kb_id}":
-        authz.require_super_admin(principal)
         return
 
     if method == "POST" and path.rstrip("/") == f"/kbs/{kb_id}:restore":
-        # Restoring a soft-deleted KB is the inverse of DELETE — same tier.
-        authz.require_super_admin(principal)
         return
 
     if method == "PATCH" and path.rstrip("/") == f"/kbs/{kb_id}":
@@ -2782,6 +3787,66 @@ def _require_principal(principal: Principal | None) -> Principal:
     if principal.status != USER_STATUS_ACTIVE:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User is disabled")
     return principal
+
+
+def _canonical_primary_tenant_role(principal: Principal) -> str | None:
+    """Return the sole canonical tenant role or fail closed on divergence."""
+
+    if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
+        return None
+    tenant_id = principal.tenant_id
+    if tenant_id is None:
+        if principal.tenant_roles:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Tenant membership is inconsistent",
+            )
+        return None
+    if set(principal.tenant_roles) != {tenant_id}:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Tenant membership is inconsistent",
+        )
+    role = _canonical_tenant_role(principal.tenant_roles.get(tenant_id))
+    if role not in _TENANT_ROLE_RANK:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Tenant membership is inconsistent",
+        )
+    return role
+
+
+def _max_kb_role(*roles: str | None) -> str | None:
+    normalized = [role for item in roles if (role := _normalize_kb_role(item))]
+    if not normalized:
+        return None
+    return max(normalized, key=lambda item: _KB_ROLE_RANK[item])
+
+
+def _min_kb_role(*roles: str | None) -> str | None:
+    normalized = [role for item in roles if (role := _normalize_kb_role(item))]
+    if not normalized:
+        return None
+    return min(normalized, key=lambda item: _KB_ROLE_RANK[item])
+
+
+def _empty_kb_access_decision(
+    kb_id: str, generation: str | None, tenant_id: str | None
+) -> KBAccessDecision:
+    return KBAccessDecision(
+        kb_id=kb_id,
+        generation=generation,
+        effective_role=None,
+        platform_role=None,
+        direct_role=None,
+        visibility_role=None,
+        tenant_role=None,
+        tenant_id=tenant_id,
+        tenant_acl_role=None,
+        tenant_override_effect=None,
+        tenant_override_role=None,
+        tenant_owned=False,
+    )
 
 
 def _normalize_kb_role(role: str | None) -> str | None:
@@ -3219,6 +4284,19 @@ def _extract_kb_id(path: str) -> str | None:
         # of treating "kb_x:rebuild" as a (non-existent) kb id.
         kb_segment = parts[1].split(":", 1)[0]
         return kb_segment or None
+    return None
+
+
+def _exact_admin_tenant_detail_id(path: str) -> str | None:
+    parts = path.split("/")
+    if (
+        len(parts) == 4
+        and parts[0] == ""
+        and parts[1] == "admin"
+        and parts[2] == "tenants"
+        and parts[3]
+    ):
+        return parts[3]
     return None
 
 

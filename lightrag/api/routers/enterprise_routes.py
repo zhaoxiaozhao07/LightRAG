@@ -4,16 +4,21 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from lightrag.api.auth import auth_handler
 from lightrag.api.enterprise_auth import (
     Principal,
+    KB_ROLE_ADMIN,
+    KB_ROLE_EDITOR,
+    KB_ROLE_OWNER,
     KB_ROLE_VIEWER,
     REGISTRATION_MODE_ADMIN_APPROVAL,
     REGISTRATION_MODE_INVITE_ONLY,
     REGISTRATION_MODE_OPEN,
     SERVICE_API_KEY_AUTH_METHOD,
+    SYSTEM_ROLE_SUPER_ADMIN,
+    SYSTEM_ROLE_USER,
     TENANT_ROLE_ADMIN,
     TENANT_ROLE_MEMBER,
     UNSET,
@@ -33,7 +38,11 @@ from lightrag.api.enterprise_auth import (
     get_request_principal,
 )
 from lightrag.api.chat_memory_service import ChatMemoryUnavailableError
-from lightrag.api.kb_service import KnowledgeBaseNotFoundError, KnowledgeBaseService
+from lightrag.api.kb_service import (
+    is_tenant_owned_kb,
+    KnowledgeBaseNotFoundError,
+    KnowledgeBaseService,
+)
 from lightrag.api.metadata_store import (
     AuditEventRecord,
     EnterpriseAPIKeyRecord,
@@ -59,6 +68,7 @@ class EnterpriseUserResponse(BaseModel):
     can_use_bypass_query: bool
     can_use_agent_query: bool
     can_delete_documents: bool
+    can_download_files: bool
     token_version: int
     created_at: str
     updated_at: str
@@ -105,6 +115,7 @@ class EnterpriseUserCreateRequest(BaseModel):
     can_use_bypass_query: bool = False
     can_use_agent_query: bool = False
     can_delete_documents: bool = False
+    can_download_files: bool = False
     tenant_id: str | None = None
 
 
@@ -114,6 +125,35 @@ class EnterpriseUserUpdateRequest(BaseModel):
     can_use_bypass_query: bool | None = None
     can_use_agent_query: bool | None = None
     can_delete_documents: bool | None = None
+    can_download_files: bool | None = None
+    tenant_id: str | None = None
+    password: str | None = None
+
+
+class EnterpriseTenantUserCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+    can_create_kb: bool = False
+    can_use_bypass_query: bool = False
+    can_use_agent_query: bool = False
+    can_delete_documents: bool = False
+    can_download_files: bool = False
+    tenant_id: str | None = None
+
+
+class EnterpriseTenantUserUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str | None = None
+    can_create_kb: bool | None = None
+    can_use_bypass_query: bool | None = None
+    can_use_agent_query: bool | None = None
+    can_delete_documents: bool | None = None
+    can_download_files: bool | None = None
+    # Declared only so attempts to use the super-admin migration/password
+    # surface receive a deliberate 400 instead of being silently ignored.
     tenant_id: str | None = None
     password: str | None = None
 
@@ -274,8 +314,40 @@ class EnterpriseUserAccessResponse(BaseModel):
     can_use_bypass_query: bool
     can_use_agent_query: bool
     can_delete_documents: bool
+    can_download_files: bool
     tenant_memberships: list[dict[str, str]]
     kb_acls: list[dict[str, str]]
+
+
+class EnterpriseTenantKBMemberRoleRequest(BaseModel):
+    role: Literal["viewer", "editor", "admin"]
+
+
+class EnterpriseTenantKBMemberAccessResponse(BaseModel):
+    tenant_id: str
+    kb_id: str
+    user_id: str
+    username: str
+    status: str
+    override_effect: str | None
+    override_role: str | None
+    effective_role: str | None
+    sources: list[str]
+    platform_role: str | None
+    tenant_acl_role: str | None
+
+
+_TENANT_KB_MEMBER_ROLES = {
+    "viewer": KB_ROLE_VIEWER,
+    "editor": KB_ROLE_EDITOR,
+    "admin": KB_ROLE_ADMIN,
+}
+_KB_ROLE_RANK = {
+    KB_ROLE_VIEWER: 1,
+    KB_ROLE_EDITOR: 2,
+    KB_ROLE_ADMIN: 3,
+    KB_ROLE_OWNER: 4,
+}
 
 
 class EnterpriseServiceAPIKeyCreateRequest(BaseModel):
@@ -357,6 +429,7 @@ class EnterpriseAuditEventResponse(BaseModel):
     id: str
     event_type: str
     actor_user_id: str | None
+    actor_tenant_id: str | None
     actor_username: str | None = None
     target_type: str | None
     target_id: str | None
@@ -430,6 +503,7 @@ def create_enterprise_routes(
             "can_use_bypass_query": principal.can_use_bypass_query,
             "can_use_agent_query": principal.can_use_agent_query,
             "can_delete_documents": principal.can_delete_documents,
+            "can_download_files": principal.can_download_files,
             "token_version": principal.token_version,
             "auth_method": principal.auth_method,
         }
@@ -449,10 +523,14 @@ def create_enterprise_routes(
             )
         return principal
 
-    async def require_kb_exists(request: Request, kb_id: str) -> None:
+    def request_kb_service(request: Request) -> KnowledgeBaseService:
         service = kb_service or getattr(request.app.state, "kb_service", None)
         if not isinstance(service, KnowledgeBaseService):
             raise HTTPException(status_code=500, detail="Knowledge base service unavailable")
+        return service
+
+    async def require_kb_exists(request: Request, kb_id: str) -> None:
+        service = request_kb_service(request)
         try:
             await service.get(kb_id)
         except KnowledgeBaseNotFoundError as exc:
@@ -460,11 +538,13 @@ def create_enterprise_routes(
 
     async def require_tenant_admin(request: Request, tenant_id: str) -> Principal:
         principal = require_principal(request)
-        return await get_enterprise_authorization_service(request).require_tenant_role(
+        authz_service = get_enterprise_authorization_service(request)
+        principal = await authz_service.require_tenant_role(
             principal,
             tenant_id,
             TENANT_ROLE_ADMIN,
         )
+        return principal
 
     async def memberships_with_user_info(
         request: Request,
@@ -490,6 +570,245 @@ def create_enterprise_routes(
             )
             for record in records
         ]
+
+    async def active_tenant_kbs(request: Request, tenant_id: str) -> list[Any]:
+        """Return the active catalog union of owned and tenant-ACL KBs."""
+        authz_service = get_enterprise_authorization_service(request)
+        assigned_ids = set(
+            await authz_service.list_kb_ids_for_tenants([tenant_id])
+        )
+        records = await request_kb_service(request).list(include_deleted=False)
+        return [
+            record
+            for record in records
+            if record.status != "deleted"
+            and (record.tenant_id == tenant_id or record.id in assigned_ids)
+        ]
+
+    async def tenant_user_or_404(
+        request: Request,
+        tenant_id: str,
+        user_id: str,
+    ) -> tuple[EnterpriseUserRecord, EnterpriseTenantMembershipRecord]:
+        """Resolve only canonical, non-super users in the path tenant.
+
+        Missing and cross-tenant targets deliberately share the same response
+        so tenant administrators cannot use this surface for account discovery.
+        """
+        user_service = get_enterprise_user_service(request)
+        user = await user_service.get_user_or_404(user_id)
+        membership = await get_enterprise_authorization_service(
+            request
+        ).get_tenant_membership(tenant_id, user_id)
+        if (
+            user.system_role == SYSTEM_ROLE_SUPER_ADMIN
+            or user.tenant_id != tenant_id
+            or membership is None
+        ):
+            raise HTTPException(status_code=404, detail="User not found")
+        return user, membership
+
+    async def mutable_tenant_member_or_404(
+        request: Request,
+        tenant_id: str,
+        user_id: str,
+        *,
+        actor_user_id: str,
+    ) -> tuple[EnterpriseUserRecord, EnterpriseTenantMembershipRecord]:
+        user, membership = await tenant_user_or_404(request, tenant_id, user_id)
+        if actor_user_id == user.id:
+            raise HTTPException(
+                status_code=409,
+                detail="Tenant administrators cannot mutate themselves",
+            )
+        if membership.role != TENANT_ROLE_MEMBER:
+            raise HTTPException(status_code=404, detail="User not found")
+        return user, membership
+
+    async def unassigned_user_or_404(
+        request: Request,
+        user_id: str,
+        *,
+        actor_user_id: str,
+    ) -> EnterpriseUserRecord:
+        user = await get_enterprise_user_service(request).get_user_or_404(user_id)
+        if actor_user_id == user.id:
+            raise HTTPException(
+                status_code=409,
+                detail="Tenant administrators cannot mutate themselves",
+            )
+        memberships = await get_enterprise_authorization_service(
+            request
+        ).list_user_tenant_memberships(user_id)
+        if (
+            user.system_role != SYSTEM_ROLE_USER
+            or user.tenant_id is not None
+            or memberships
+        ):
+            raise HTTPException(status_code=404, detail="User not found")
+        return user
+
+    async def delete_user_with_chat_memory(
+        request: Request,
+        user_id: str,
+        *,
+        actor_user_id: str,
+        actor_tenant_id: Any = UNSET,
+        expected_user: EnterpriseUserRecord | None = None,
+        expected_membership: Any = UNSET,
+    ) -> bool:
+        """Delete a user while preserving the existing async memory purge."""
+        user_service = get_enterprise_user_service(request)
+        memory_service = get_enterprise_chat_memory_service(request)
+        chat_project_ids: list[str] = []
+        if memory_service is not None:
+            # Enumerate before user deletion cascades the conversation rows.
+            chat_service = getattr(
+                request.app.state, "enterprise_chat_conversation_service", None
+            )
+            if chat_service is not None:
+                offset = 0
+                while True:
+                    projects, total = await chat_service.list_projects(
+                        user_id, limit=200, offset=offset
+                    )
+                    if not projects:
+                        break
+                    chat_project_ids.extend(project.id for project in projects)
+                    offset += len(projects)
+                    if offset >= total:
+                        break
+        delete_kwargs: dict[str, Any] = {
+            "actor_user_id": actor_user_id,
+            "expected_user": expected_user,
+            "expected_membership": expected_membership,
+        }
+        if actor_tenant_id is not UNSET:
+            delete_kwargs["actor_tenant_id"] = actor_tenant_id
+        deleted = await user_service.delete_user(user_id, **delete_kwargs)
+        if deleted and memory_service is not None and chat_project_ids:
+            memory_service.schedule_purge(user_id, chat_project_ids)
+        return deleted
+
+    async def audit_event_responses(
+        request: Request,
+        events: list[AuditEventRecord],
+    ) -> list[EnterpriseAuditEventResponse]:
+        """Attach the same actor/target enrichment to admin and tenant views."""
+        user_ids = {event.actor_user_id for event in events if event.actor_user_id}
+        user_ids.update(
+            event.target_id
+            for event in events
+            if event.target_type == "user" and event.target_id
+        )
+        kb_ids = {
+            event.target_id
+            for event in events
+            if event.target_type == "kb" and event.target_id
+        }
+        user_names: dict[str, str] = {}
+        kb_names: dict[str, str] = {}
+        if user_ids:
+            for user in await get_enterprise_user_service(request).list_users():
+                if user.id in user_ids:
+                    user_names[user.id] = user.username
+        if kb_ids:
+            for record in await request_kb_service(request).list(
+                include_deleted=True
+            ):
+                if record.id in kb_ids:
+                    kb_names[record.id] = record.name
+
+        return [
+            EnterpriseAuditEventResponse.from_record(
+                event,
+                actor_username=user_names.get(event.actor_user_id)
+                if event.actor_user_id
+                else None,
+                target_name=(
+                    user_names.get(event.target_id)
+                    if event.target_type == "user" and event.target_id
+                    else kb_names.get(event.target_id)
+                    if event.target_type == "kb" and event.target_id
+                    else None
+                ),
+            )
+            for event in events
+        ]
+
+    async def manageable_tenant_kb(
+        request: Request,
+        tenant_id: str,
+        kb_id: str,
+    ) -> tuple[Any, str | None, bool]:
+        service = request_kb_service(request)
+        try:
+            record = await service.get(kb_id)
+        except KnowledgeBaseNotFoundError as exc:
+            raise HTTPException(
+                status_code=404, detail="Knowledge base not found"
+            ) from exc
+        if record.status != "active":
+            raise HTTPException(status_code=404, detail="Knowledge base not found")
+
+        tenant_owned = is_tenant_owned_kb(record, tenant_id)
+        authz_service = get_enterprise_authorization_service(request)
+        tenant_acl_role = next(
+            (
+                acl.role
+                for acl in await authz_service.list_kb_tenant_acl(kb_id)
+                if acl.tenant_id == tenant_id
+            ),
+            None,
+        )
+        if not tenant_owned and tenant_acl_role is None:
+            raise HTTPException(
+                status_code=403,
+                detail="Knowledge base is not managed by this tenant",
+            )
+        return record, tenant_acl_role, tenant_owned
+
+    async def tenant_kb_member_access_response(
+        request: Request,
+        tenant_id: str,
+        record: Any,
+        user: EnterpriseUserRecord,
+        membership: EnterpriseTenantMembershipRecord,
+    ) -> EnterpriseTenantKBMemberAccessResponse:
+        # Resolve authorization sources independently of account status; the
+        # status is returned separately and disabled accounts cannot authenticate.
+        target_principal = Principal(
+            user_id=user.id,
+            username=user.username,
+            system_role=user.system_role,
+            status=USER_STATUS_ACTIVE,
+            tenant_id=tenant_id,
+            tenant_roles={tenant_id: membership.role},
+            can_create_kb=user.can_create_kb,
+            can_use_bypass_query=user.can_use_bypass_query,
+            can_use_agent_query=user.can_use_agent_query,
+            can_delete_documents=user.can_delete_documents,
+            can_download_files=user.can_download_files,
+            token_version=user.token_version,
+            auth_method="jwt",
+            metadata=dict(user.metadata),
+        )
+        decision = await get_enterprise_authorization_service(
+            request
+        ).resolve_kb_access(target_principal, record)
+        return EnterpriseTenantKBMemberAccessResponse(
+            tenant_id=tenant_id,
+            kb_id=record.id,
+            user_id=user.id,
+            username=user.username,
+            status=user.status,
+            override_effect=decision.tenant_override_effect,
+            override_role=decision.tenant_override_role,
+            effective_role=decision.effective_role,
+            sources=list(decision.sources),
+            platform_role=decision.platform_role,
+            tenant_acl_role=decision.tenant_acl_role,
+        )
 
     def login_response(user_service, user: EnterpriseUserRecord) -> dict[str, Any]:
         token = auth_handler.create_token(
@@ -633,6 +952,7 @@ def create_enterprise_routes(
             if "display_name" in body.model_fields_set
             else UNSET,
             email=body.email if "email" in body.model_fields_set else UNSET,
+            actor_tenant_id=principal.tenant_id,
         )
         return EnterpriseMeResponse(
             user=EnterpriseUserResponse.from_record(user),
@@ -648,7 +968,10 @@ def create_enterprise_routes(
         outstanding JWT (this one included) stops validating."""
         principal = require_interactive_user_principal(request)
         user_service = get_enterprise_user_service(request)
-        user = await user_service.logout_all_sessions(principal.user_id)
+        user = await user_service.logout_all_sessions(
+            principal.user_id,
+            actor_tenant_id=principal.tenant_id,
+        )
         return {"status": "logged_out", "token_version": user.token_version}
 
     @router.get(
@@ -775,6 +1098,7 @@ def create_enterprise_routes(
             principal.user_id,
             body.new_password,
             actor_user_id=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
         )
         return EnterpriseUserResponse.from_record(user)
 
@@ -820,6 +1144,7 @@ def create_enterprise_routes(
         await audit_service.append(
             "registration_setting_updated",
             actor_user_id=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
             target_type="system_setting",
             target_id="registration_mode",
             metadata={"enabled": mode == "open", "mode": mode},
@@ -868,10 +1193,12 @@ def create_enterprise_routes(
             username=body.username,
             password=body.password,
             created_by=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
             can_create_kb=body.can_create_kb,
             can_use_bypass_query=body.can_use_bypass_query,
             can_use_agent_query=body.can_use_agent_query,
             can_delete_documents=body.can_delete_documents,
+            can_download_files=body.can_download_files,
             tenant_id=body.tenant_id,
         )
         return EnterpriseUserResponse.from_record(user)
@@ -907,6 +1234,7 @@ def create_enterprise_routes(
             can_use_bypass_query=user.can_use_bypass_query,
             can_use_agent_query=user.can_use_agent_query,
             can_delete_documents=user.can_delete_documents,
+            can_download_files=user.can_download_files,
             tenant_memberships=[
                 {"tenant_id": m.tenant_id, "role": m.role} for m in memberships
             ],
@@ -1039,6 +1367,7 @@ def create_enterprise_routes(
             user_id,
             status_value=USER_STATUS_DISABLED,
             actor_user_id=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
         )
         return EnterpriseUserResponse.from_record(user)
 
@@ -1054,6 +1383,7 @@ def create_enterprise_routes(
             user_id,
             status_value=USER_STATUS_ACTIVE,
             actor_user_id=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
         )
         return EnterpriseUserResponse.from_record(user)
 
@@ -1071,6 +1401,7 @@ def create_enterprise_routes(
             user_id,
             body.password,
             actor_user_id=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
         )
         return EnterpriseUserResponse.from_record(user)
 
@@ -1097,6 +1428,7 @@ def create_enterprise_routes(
                     body.can_use_bypass_query,
                     body.can_use_agent_query,
                     body.can_delete_documents,
+                    body.can_download_files,
                 )
             )
             or tenant_provided
@@ -1108,12 +1440,17 @@ def create_enterprise_routes(
                 can_use_bypass_query=body.can_use_bypass_query,
                 can_use_agent_query=body.can_use_agent_query,
                 can_delete_documents=body.can_delete_documents,
+                can_download_files=body.can_download_files,
                 tenant_id=body.tenant_id if tenant_provided else UNSET,
                 actor_user_id=principal.user_id,
+                actor_tenant_id=principal.tenant_id,
             )
         if body.password is not None:
             user = await user_service.change_password(
-                user_id, body.password, actor_user_id=principal.user_id
+                user_id,
+                body.password,
+                actor_user_id=principal.user_id,
+                actor_tenant_id=principal.tenant_id,
             )
         return EnterpriseUserResponse.from_record(user)
 
@@ -1123,33 +1460,12 @@ def create_enterprise_routes(
     )
     async def delete_enterprise_user(user_id: str, request: Request):
         principal = require_principal(request)
-        user_service = get_enterprise_user_service(request)
-        memory_service = get_enterprise_chat_memory_service(request)
-        chat_project_ids: list[str] = []
-        if memory_service is not None:
-            # Enumerate the user's chat projects BEFORE deletion — the user
-            # delete cascades chat rows, after which the project ids (and the
-            # derived memory group ids) are unrecoverable.
-            chat_service = getattr(
-                request.app.state, "enterprise_chat_conversation_service", None
-            )
-            if chat_service is not None:
-                offset = 0
-                while True:
-                    projects, total = await chat_service.list_projects(
-                        user_id, limit=200, offset=offset
-                    )
-                    if not projects:
-                        break
-                    chat_project_ids.extend(project.id for project in projects)
-                    offset += len(projects)
-                    if offset >= total:
-                        break
-        deleted = await user_service.delete_user(
-            user_id, actor_user_id=principal.user_id
+        deleted = await delete_user_with_chat_memory(
+            request,
+            user_id,
+            actor_user_id=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
         )
-        if deleted and memory_service is not None and chat_project_ids:
-            memory_service.schedule_purge(user_id, chat_project_ids)
         return {"deleted": deleted}
 
     @router.post(
@@ -1220,6 +1536,7 @@ def create_enterprise_routes(
             description=body.description,
             tenant_id=body.tenant_id,
             created_by=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
         )
         return EnterpriseTenantResponse.from_record(tenant)
 
@@ -1241,14 +1558,13 @@ def create_enterprise_routes(
         dependencies=[Depends(combined_auth)],
     )
     async def get_tenant(tenant_id: str, request: Request):
+        principal = require_principal(request)
+        if not principal.is_super_admin:
+            await require_tenant_admin(request, tenant_id)
         authz_service = get_enterprise_authorization_service(request)
         tenant = await authz_service.get_tenant_or_404(tenant_id)
         members = await authz_service.list_tenant_memberships(tenant_id)
-        kb_count = 0
-        if kb_service is not None:
-            kb_count = sum(
-                1 for kb in await kb_service.list() if kb.tenant_id == tenant_id
-            )
+        kb_count = len(await active_tenant_kbs(request, tenant_id))
         data = tenant.to_dict()
         data.pop("metadata", None)
         return EnterpriseTenantDetailResponse(
@@ -1271,6 +1587,7 @@ def create_enterprise_routes(
             description=body.description,
             status_value=body.status,
             actor_user_id=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
         )
         return EnterpriseTenantResponse.from_record(tenant)
 
@@ -1285,11 +1602,13 @@ def create_enterprise_routes(
         # No cascade: refuse while anything still references the tenant.
         member_count = len(await authz_service.list_tenant_memberships(tenant_id))
         acl_kb_ids = await authz_service.list_kb_ids_for_tenants([tenant_id])
-        kb_count = 0
-        if kb_service is not None:
-            kb_count = sum(
-                1 for kb in await kb_service.list() if kb.tenant_id == tenant_id
+        kb_count = sum(
+            1
+            for kb in await request_kb_service(request).list(
+                include_deleted=False
             )
+            if kb.tenant_id == tenant_id
+        )
         user_service = get_enterprise_user_service(request)
         user_count = sum(
             1 for user in await user_service.list_users() if user.tenant_id == tenant_id
@@ -1309,7 +1628,9 @@ def create_enterprise_routes(
                 },
             )
         deleted = await authz_service.delete_tenant(
-            tenant_id, actor_user_id=principal.user_id
+            tenant_id,
+            actor_user_id=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
         )
         return {"deleted": deleted}
 
@@ -1321,8 +1642,6 @@ def create_enterprise_routes(
     async def list_tenant_kbs(tenant_id: str, request: Request):
         authz_service = get_enterprise_authorization_service(request)
         await authz_service.get_tenant_or_404(tenant_id)
-        if kb_service is None:
-            return []
         return [
             EnterpriseTenantKBSummaryResponse(
                 id=kb.id,
@@ -1331,8 +1650,7 @@ def create_enterprise_routes(
                 visibility=getattr(kb, "visibility", None),
                 owner_id=getattr(kb, "owner_id", None),
             )
-            for kb in await kb_service.list()
-            if kb.tenant_id == tenant_id
+            for kb in await active_tenant_kbs(request, tenant_id)
         ]
 
     @router.get(
@@ -1364,6 +1682,7 @@ def create_enterprise_routes(
             user_id,
             body.role,
             granted_by=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
         )
         return (await memberships_with_user_info(request, [record]))[0]
 
@@ -1378,6 +1697,276 @@ def create_enterprise_routes(
             tenant_id,
             user_id,
             actor_user_id=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
+        )
+        return {"deleted": deleted}
+
+    @router.get(
+        "/tenants/{tenant_id}",
+        response_model=EnterpriseTenantDetailResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def get_scoped_tenant(tenant_id: str, request: Request):
+        await require_tenant_admin(request, tenant_id)
+        authz_service = get_enterprise_authorization_service(request)
+        tenant = await authz_service.get_tenant_or_404(tenant_id)
+        members = await authz_service.list_tenant_memberships(tenant_id)
+        data = tenant.to_dict()
+        data.pop("metadata", None)
+        return EnterpriseTenantDetailResponse(
+            **data,
+            member_count=len(members),
+            kb_count=len(await active_tenant_kbs(request, tenant_id)),
+        )
+
+    @router.get(
+        "/tenants/{tenant_id}/kbs",
+        response_model=list[EnterpriseTenantKBSummaryResponse],
+        dependencies=[Depends(combined_auth)],
+    )
+    async def list_scoped_tenant_kbs(tenant_id: str, request: Request):
+        await require_tenant_admin(request, tenant_id)
+        return [
+            EnterpriseTenantKBSummaryResponse(
+                id=record.id,
+                name=record.name,
+                status=record.status,
+                visibility=getattr(record, "visibility", None),
+                owner_id=getattr(record, "owner_id", None),
+            )
+            for record in await active_tenant_kbs(request, tenant_id)
+        ]
+
+    @router.get(
+        "/tenants/{tenant_id}/users",
+        response_model=list[EnterpriseUserResponse],
+        dependencies=[Depends(combined_auth)],
+    )
+    async def list_scoped_tenant_users(
+        tenant_id: str,
+        request: Request,
+        status: str | None = None,
+        q: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ):
+        await require_tenant_admin(request, tenant_id)
+        authz_service = get_enterprise_authorization_service(request)
+        member_ids = {
+            membership.user_id
+            for membership in await authz_service.list_tenant_memberships(
+                tenant_id
+            )
+        }
+        users = [
+            user
+            for user in await get_enterprise_user_service(request).list_users()
+            if user.id in member_ids
+            and user.tenant_id == tenant_id
+            and user.system_role != SYSTEM_ROLE_SUPER_ADMIN
+        ]
+        if status:
+            users = [user for user in users if user.status == status]
+        if q:
+            needle = q.strip().lower()
+            users = [user for user in users if needle in user.username.lower()]
+        users = users[max(0, offset) :]
+        if limit is not None and limit > 0:
+            users = users[:limit]
+        return [EnterpriseUserResponse.from_record(user) for user in users]
+
+    @router.post(
+        "/tenants/{tenant_id}/users",
+        response_model=EnterpriseUserResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def create_scoped_tenant_user(
+        tenant_id: str,
+        request: Request,
+        body: EnterpriseTenantUserCreateRequest,
+    ):
+        principal = await require_tenant_admin(request, tenant_id)
+        if "tenant_id" in body.model_fields_set and body.tenant_id != tenant_id:
+            raise HTTPException(
+                status_code=400,
+                detail="User tenant_id must match the path tenant",
+            )
+        user = await get_enterprise_user_service(request).create_user(
+            username=body.username,
+            password=body.password,
+            created_by=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
+            can_create_kb=body.can_create_kb,
+            can_use_bypass_query=body.can_use_bypass_query,
+            can_use_agent_query=body.can_use_agent_query,
+            can_delete_documents=body.can_delete_documents,
+            can_download_files=body.can_download_files,
+            tenant_id=tenant_id,
+        )
+        return EnterpriseUserResponse.from_record(user)
+
+    @router.get(
+        "/tenants/{tenant_id}/users/{user_id}",
+        response_model=EnterpriseUserResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def get_scoped_tenant_user(
+        tenant_id: str, user_id: str, request: Request
+    ):
+        await require_tenant_admin(request, tenant_id)
+        user, _membership = await tenant_user_or_404(
+            request, tenant_id, user_id
+        )
+        return EnterpriseUserResponse.from_record(user)
+
+    @router.patch(
+        "/tenants/{tenant_id}/users/{user_id}",
+        response_model=EnterpriseUserResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def update_scoped_tenant_user(
+        tenant_id: str,
+        user_id: str,
+        request: Request,
+        body: EnterpriseTenantUserUpdateRequest,
+    ):
+        principal = await require_tenant_admin(request, tenant_id)
+        user, membership = await mutable_tenant_member_or_404(
+            request,
+            tenant_id,
+            user_id,
+            actor_user_id=principal.user_id,
+        )
+        if "tenant_id" in body.model_fields_set or "password" in body.model_fields_set:
+            raise HTTPException(
+                status_code=400,
+                detail="Tenant assignment and password cannot be changed here",
+            )
+        if any(
+            value is not None
+            for value in (
+                body.status,
+                body.can_create_kb,
+                body.can_use_bypass_query,
+                body.can_use_agent_query,
+                body.can_delete_documents,
+                body.can_download_files,
+            )
+        ):
+            user = await get_enterprise_user_service(request).update_user(
+                user_id,
+                status_value=body.status,
+                can_create_kb=body.can_create_kb,
+                can_use_bypass_query=body.can_use_bypass_query,
+                can_use_agent_query=body.can_use_agent_query,
+                can_delete_documents=body.can_delete_documents,
+                can_download_files=body.can_download_files,
+                actor_user_id=principal.user_id,
+                actor_tenant_id=principal.tenant_id,
+                expected_user=user,
+                expected_membership=membership,
+            )
+        return EnterpriseUserResponse.from_record(user)
+
+    @router.post(
+        "/tenants/{tenant_id}/users/{user_id}:disable",
+        response_model=EnterpriseUserResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def disable_scoped_tenant_user(
+        tenant_id: str, user_id: str, request: Request
+    ):
+        principal = await require_tenant_admin(request, tenant_id)
+        user, membership = await mutable_tenant_member_or_404(
+            request,
+            tenant_id,
+            user_id,
+            actor_user_id=principal.user_id,
+        )
+        user = await get_enterprise_user_service(request).update_user(
+            user_id,
+            status_value=USER_STATUS_DISABLED,
+            actor_user_id=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
+            expected_user=user,
+            expected_membership=membership,
+        )
+        return EnterpriseUserResponse.from_record(user)
+
+    @router.post(
+        "/tenants/{tenant_id}/users/{user_id}:enable",
+        response_model=EnterpriseUserResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def enable_scoped_tenant_user(
+        tenant_id: str, user_id: str, request: Request
+    ):
+        principal = await require_tenant_admin(request, tenant_id)
+        user, membership = await mutable_tenant_member_or_404(
+            request,
+            tenant_id,
+            user_id,
+            actor_user_id=principal.user_id,
+        )
+        user = await get_enterprise_user_service(request).update_user(
+            user_id,
+            status_value=USER_STATUS_ACTIVE,
+            actor_user_id=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
+            expected_user=user,
+            expected_membership=membership,
+        )
+        return EnterpriseUserResponse.from_record(user)
+
+    @router.post(
+        "/tenants/{tenant_id}/users/{user_id}:reset-password",
+        response_model=EnterpriseUserResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def reset_scoped_tenant_user_password(
+        tenant_id: str,
+        user_id: str,
+        request: Request,
+        body: EnterpriseUserResetPasswordRequest,
+    ):
+        principal = await require_tenant_admin(request, tenant_id)
+        user, membership = await mutable_tenant_member_or_404(
+            request,
+            tenant_id,
+            user_id,
+            actor_user_id=principal.user_id,
+        )
+        user = await get_enterprise_user_service(request).change_password(
+            user_id,
+            body.password,
+            actor_user_id=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
+            expected_user=user,
+            expected_membership=membership,
+        )
+        return EnterpriseUserResponse.from_record(user)
+
+    @router.delete(
+        "/tenants/{tenant_id}/users/{user_id}",
+        dependencies=[Depends(combined_auth)],
+    )
+    async def delete_scoped_tenant_user(
+        tenant_id: str, user_id: str, request: Request
+    ):
+        principal = await require_tenant_admin(request, tenant_id)
+        user, membership = await mutable_tenant_member_or_404(
+            request,
+            tenant_id,
+            user_id,
+            actor_user_id=principal.user_id,
+        )
+        deleted = await delete_user_with_chat_memory(
+            request,
+            user_id,
+            actor_user_id=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
+            expected_user=user,
+            expected_membership=membership,
         )
         return {"deleted": deleted}
 
@@ -1405,7 +1994,12 @@ def create_enterprise_routes(
         body: EnterpriseTenantMembershipGrantRequest,
     ):
         principal = await require_tenant_admin(request, tenant_id)
-        if not principal.is_super_admin and body.role.strip() not in {
+        target_user = await unassigned_user_or_404(
+            request,
+            user_id,
+            actor_user_id=principal.user_id,
+        )
+        if body.role.strip() not in {
             TENANT_ROLE_MEMBER,
             "member",
         }:
@@ -1414,21 +2008,15 @@ def create_enterprise_routes(
                 detail="Tenant admins can only grant tenant_member via self-service",
             )
         authz_service = get_enterprise_authorization_service(request)
-        existing = await authz_service.get_tenant_membership(tenant_id, user_id)
-        if (
-            not principal.is_super_admin
-            and existing is not None
-            and existing.role != TENANT_ROLE_MEMBER
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail="Tenant admins cannot modify tenant admins or tenant owners via self-service",
-            )
         record = await authz_service.grant_tenant_membership(
             tenant_id,
             user_id,
             body.role,
             granted_by=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
+            expected_user=target_user,
+            expected_membership=None,
+            allow_tenant_move=False,
         )
         return (await memberships_with_user_info(request, [record]))[0]
 
@@ -1441,22 +2029,194 @@ def create_enterprise_routes(
     ):
         principal = await require_tenant_admin(request, tenant_id)
         authz_service = get_enterprise_authorization_service(request)
-        existing = await authz_service.get_tenant_membership(tenant_id, user_id)
-        if (
-            not principal.is_super_admin
-            and existing is not None
-            and existing.role != TENANT_ROLE_MEMBER
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail="Tenant admins cannot revoke tenant admins or tenant owners via self-service",
-            )
-        deleted = await authz_service.revoke_tenant_membership(
+        user, existing = await mutable_tenant_member_or_404(
+            request,
             tenant_id,
             user_id,
             actor_user_id=principal.user_id,
         )
+        deleted = await authz_service.revoke_tenant_membership(
+            tenant_id,
+            user_id,
+            actor_user_id=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
+            expected_user=user,
+            expected_membership=existing,
+        )
         return {"deleted": deleted}
+
+    @router.get(
+        "/tenants/{tenant_id}/audit-events",
+        response_model=list[EnterpriseAuditEventResponse],
+        dependencies=[Depends(combined_auth)],
+    )
+    async def list_scoped_tenant_audit_events(
+        tenant_id: str,
+        request: Request,
+        limit: int = 100,
+        offset: int = 0,
+        event_type: str | None = None,
+        actor_user_id: str | None = None,
+        target_type: str | None = None,
+        target_id: str | None = None,
+        created_after: str | None = None,
+        created_before: str | None = None,
+    ):
+        await require_tenant_admin(request, tenant_id)
+        events = await get_enterprise_audit_service(request).list(
+            limit=limit,
+            offset=offset,
+            event_type=event_type,
+            actor_user_id=actor_user_id,
+            actor_tenant_id=tenant_id,
+            target_type=target_type,
+            target_id=target_id,
+            created_after=created_after,
+            created_before=created_before,
+        )
+        return await audit_event_responses(request, events)
+
+    @router.get(
+        "/tenants/{tenant_id}/kbs/{kb_id}/members",
+        response_model=list[EnterpriseTenantKBMemberAccessResponse],
+        dependencies=[Depends(combined_auth)],
+    )
+    async def list_scoped_tenant_kb_members(
+        tenant_id: str, kb_id: str, request: Request
+    ):
+        await require_tenant_admin(request, tenant_id)
+        record, _tenant_acl_role, _tenant_owned = await manageable_tenant_kb(
+            request, tenant_id, kb_id
+        )
+        authz_service = get_enterprise_authorization_service(request)
+        memberships = await authz_service.list_tenant_memberships(tenant_id)
+        users_by_id = {
+            user.id: user
+            for user in await get_enterprise_user_service(request).list_users()
+            if user.tenant_id == tenant_id
+            and user.system_role != SYSTEM_ROLE_SUPER_ADMIN
+        }
+        results: list[EnterpriseTenantKBMemberAccessResponse] = []
+        for membership in memberships:
+            user = users_by_id.get(membership.user_id)
+            if user is None:
+                continue
+            results.append(
+                await tenant_kb_member_access_response(
+                    request,
+                    tenant_id,
+                    record,
+                    user,
+                    membership,
+                )
+            )
+        return results
+
+    @router.put(
+        "/tenants/{tenant_id}/kbs/{kb_id}/members/{user_id}",
+        response_model=EnterpriseTenantKBMemberAccessResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def grant_scoped_tenant_kb_member(
+        tenant_id: str,
+        kb_id: str,
+        user_id: str,
+        request: Request,
+        body: EnterpriseTenantKBMemberRoleRequest,
+    ):
+        principal = await require_tenant_admin(request, tenant_id)
+        record, tenant_acl_role, tenant_owned = await manageable_tenant_kb(
+            request, tenant_id, kb_id
+        )
+        user, membership = await mutable_tenant_member_or_404(
+            request,
+            tenant_id,
+            user_id,
+            actor_user_id=principal.user_id,
+        )
+        requested_role = _TENANT_KB_MEMBER_ROLES[body.role]
+        if (
+            not tenant_owned
+            and _KB_ROLE_RANK[requested_role]
+            > _KB_ROLE_RANK.get(tenant_acl_role or "", 0)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Member role cannot exceed the tenant KB ACL role",
+            )
+        await get_enterprise_authorization_service(
+            request
+        ).grant_tenant_user_kb_override(
+            kb_id,
+            tenant_id,
+            user_id,
+            requested_role,
+            granted_by=principal.user_id,
+            actor_tenant_id=principal.tenant_id,
+            expected_generation=record.generation,
+            expected_user=user,
+            expected_membership=membership,
+        )
+        return await tenant_kb_member_access_response(
+            request,
+            tenant_id,
+            record,
+            user,
+            membership,
+        )
+
+    @router.delete(
+        "/tenants/{tenant_id}/kbs/{kb_id}/members/{user_id}",
+        response_model=EnterpriseTenantKBMemberAccessResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def revoke_scoped_tenant_kb_member(
+        tenant_id: str,
+        kb_id: str,
+        user_id: str,
+        request: Request,
+        reset: bool = False,
+    ):
+        principal = await require_tenant_admin(request, tenant_id)
+        record, _tenant_acl_role, _tenant_owned = await manageable_tenant_kb(
+            request, tenant_id, kb_id
+        )
+        user, membership = await mutable_tenant_member_or_404(
+            request,
+            tenant_id,
+            user_id,
+            actor_user_id=principal.user_id,
+        )
+        authz_service = get_enterprise_authorization_service(request)
+        if reset:
+            await authz_service.reset_tenant_user_kb_override(
+                kb_id,
+                tenant_id,
+                user_id,
+                actor_user_id=principal.user_id,
+                actor_tenant_id=principal.tenant_id,
+                expected_generation=record.generation,
+                expected_user=user,
+                expected_membership=membership,
+            )
+        else:
+            await authz_service.revoke_tenant_user_kb_override(
+                kb_id,
+                tenant_id,
+                user_id,
+                granted_by=principal.user_id,
+                actor_tenant_id=principal.tenant_id,
+                expected_generation=record.generation,
+                expected_user=user,
+                expected_membership=membership,
+            )
+        return await tenant_kb_member_access_response(
+            request,
+            tenant_id,
+            record,
+            user,
+            membership,
+        )
 
     @router.put(
         "/admin/kbs/{kb_id}/acl",
@@ -1733,53 +2493,6 @@ def create_enterprise_routes(
             created_after=created_after,
             created_before=created_before,
         )
-        # Batch-resolve human-readable names for the current page.
-        user_ids = {e.actor_user_id for e in events if e.actor_user_id}
-        kb_ids = {
-            e.target_id
-            for e in events
-            if e.target_type == "kb" and e.target_id
-        }
-        user_names: dict[str, str] = {}
-        kb_names: dict[str, str] = {}
-        if user_ids:
-            user_service = get_enterprise_user_service(request)
-            for u in await user_service.list_users():
-                if u.id in user_ids:
-                    user_names[u.id] = u.username
-        if kb_ids and kb_service is not None:
-            for kb in await kb_service.list(include_deleted=True):
-                if kb.id in kb_ids:
-                    kb_names[kb.id] = kb.name
-
-        results: list[EnterpriseAuditEventResponse] = []
-        for event in events:
-            actor_name = (
-                user_names.get(event.actor_user_id)
-                if event.actor_user_id
-                else None
-            )
-            tgt_name: str | None = None
-            if event.target_type == "user" and event.target_id:
-                tgt_name = user_names.get(event.target_id)
-                # Actor lookup may not have covered target user ids.
-                if tgt_name is None and event.target_id not in user_ids:
-                    store = getattr(request.app.state, "metadata_store", None)
-                    if store is not None:
-                        u = await store.get_enterprise_user_by_id(
-                            event.target_id
-                        )
-                        if u is not None:
-                            tgt_name = u.username
-            elif event.target_type == "kb" and event.target_id:
-                tgt_name = kb_names.get(event.target_id)
-            results.append(
-                EnterpriseAuditEventResponse.from_record(
-                    event,
-                    actor_username=actor_name,
-                    target_name=tgt_name,
-                )
-            )
-        return results
+        return await audit_event_responses(request, events)
 
     return router

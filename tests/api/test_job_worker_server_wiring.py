@@ -24,6 +24,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from lightrag.api.kb_operation_fence import KBWriteAdmissionMiddleware
+
 pytestmark = pytest.mark.offline
 
 # Env that the project's .env may populate at config import time; clear so the
@@ -53,6 +55,8 @@ _ENV_TO_ISOLATE = (
     "LIGHTRAG_KB_JOB_WORKER",
     "LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS",
     "LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS",
+    "LIGHTRAG_KB_JOB_RECOVERY_INTERVAL_SECONDS",
+    "LIGHTRAG_KB_JOB_RECOVERY_GRACE_SECONDS",
 )
 
 # Every resumable job type the server must register an executor for when the
@@ -87,6 +91,8 @@ def _make_app(tmp_path, monkeypatch, *, worker_enabled: bool):
         monkeypatch.setenv("LIGHTRAG_KB_JOB_WORKER", "true")
         monkeypatch.setenv("LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS", "0.05")
         monkeypatch.setenv("LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS", "0")
+        monkeypatch.setenv("LIGHTRAG_KB_JOB_RECOVERY_INTERVAL_SECONDS", "0.25")
+        monkeypatch.setenv("LIGHTRAG_KB_JOB_RECOVERY_GRACE_SECONDS", "0")
 
     from lightrag.api.config import parse_args
 
@@ -125,6 +131,8 @@ def test_job_worker_wired_with_real_executors_when_enabled(tmp_path, monkeypatch
     for job_type in _EXPECTED_EXECUTORS:
         executor = worker._executors[job_type]
         assert callable(executor), f"executor for {job_type} is not callable"
+    assert worker._recovery_interval == 0.25
+    assert worker.recovery_grace_seconds == 0
 
 
 def test_no_job_worker_when_disabled(tmp_path, monkeypatch):
@@ -132,6 +140,19 @@ def test_no_job_worker_when_disabled(tmp_path, monkeypatch):
     identical to the historical in-process-only path."""
     app = _make_app(tmp_path, monkeypatch, worker_enabled=False)
     assert app.state.job_worker is None
+
+
+def test_server_wires_pure_asgi_kb_write_admission_middleware(
+    tmp_path, monkeypatch
+):
+    app = _make_app(tmp_path, monkeypatch, worker_enabled=False)
+    matches = [
+        item for item in app.user_middleware if item.cls is KBWriteAdmissionMiddleware
+    ]
+
+    assert len(matches) == 1
+    assert matches[0].kwargs["kb_service"] is app.state.kb_service
+    assert matches[0].kwargs["metadata_store"] is app.state.metadata_store
 
 
 def test_job_worker_lifespan_consumes_queued_job_and_stops(tmp_path, monkeypatch):
@@ -170,6 +191,8 @@ def test_job_worker_lifespan_consumes_queued_job_and_stops(tmp_path, monkeypatch
         portal = client.portal
         assert worker._task is not None
         assert not worker._task.done()
+        assert worker._recovery_task is not None
+        assert not worker._recovery_task.done()
         job = portal.call(seed_job)
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
@@ -184,3 +207,4 @@ def test_job_worker_lifespan_consumes_queued_job_and_stops(tmp_path, monkeypatch
         assert executed_job_ids == [job.id]
 
     assert worker._task is None
+    assert worker._recovery_task is None

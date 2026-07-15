@@ -22,6 +22,7 @@ class LightRAGLike(Protocol):
 class RegistryEntry:
     kb_id: str
     workspace: str
+    generation: str
     rag: LightRAGLike
     config_version_id: str | None
     last_used: float
@@ -77,43 +78,62 @@ class LightRAGInstanceRegistry:
         return entry.rag
 
     async def get_entry(self, kb_id: str) -> RegistryEntry:
-        record = await self._kb_service.get(kb_id)
-        lock = await self._get_lock(record.id)
+        initial_record = await self._kb_service.get(kb_id)
+        lock = await self._get_lock(initial_record.id)
         async with lock:
-            entry = self._entries.get(record.id)
-            now = time.monotonic()
-            if (
-                entry is not None
-                and entry.workspace == record.workspace
-                and entry.config_version_id == record.active_config_version_id
-                and not self._is_expired(entry, now)
-            ):
-                entry.last_used = now
-                self._entries.move_to_end(record.id)
+            while True:
+                # The catalog may have been purged/recreated while this caller
+                # waited for the single-flight lock. Always use the current
+                # generation for cache validation and construction.
+                record = await self._kb_service.get(initial_record.id)
+                entry = self._entries.get(record.id)
+                now = time.monotonic()
+                if (
+                    entry is not None
+                    and entry.workspace == record.workspace
+                    and entry.generation == record.generation
+                    and entry.config_version_id == record.active_config_version_id
+                    and not self._is_expired(entry, now)
+                ):
+                    entry.last_used = now
+                    self._entries.move_to_end(record.id)
+                    return entry
+
+                if entry is not None:
+                    if record.id in self._destructive_held:
+                        # Refuse to rebuild while destructive job holds the lock —
+                        # the destructive worker is responsible for the existing
+                        # instance's lifecycle.
+                        raise DestructiveLockBusyError(
+                            f"Destructive job in flight for KB '{record.id}'"
+                        )
+                    await self._safe_finalize(entry.rag)
+                    self._entries.pop(record.id, None)
+
+                rag = await self._builder(record)
+                try:
+                    current = await self._kb_service.get(record.id)
+                except BaseException:
+                    await self._safe_finalize(rag)
+                    raise
+                if not self._same_runtime_identity(record, current):
+                    # A generation/config replacement completed while the
+                    # builder was awaiting initialization. Never publish that
+                    # stale instance; finalize it and rebuild from the new row.
+                    await self._safe_finalize(rag)
+                    continue
+
+                entry = RegistryEntry(
+                    kb_id=current.id,
+                    workspace=current.workspace,
+                    generation=current.generation,
+                    rag=rag,
+                    config_version_id=current.active_config_version_id,
+                    last_used=now,
+                )
+                self._entries[current.id] = entry
+                await self._enforce_capacity(protect_kb_id=current.id)
                 return entry
-
-            if entry is not None:
-                if record.id in self._destructive_held:
-                    # Refuse to rebuild while destructive job holds the lock —
-                    # the destructive worker is responsible for the existing
-                    # instance's lifecycle.
-                    raise DestructiveLockBusyError(
-                        f"Destructive job in flight for KB '{record.id}'"
-                    )
-                await self._safe_finalize(entry.rag)
-                self._entries.pop(record.id, None)
-
-            rag = await self._builder(record)
-            entry = RegistryEntry(
-                kb_id=record.id,
-                workspace=record.workspace,
-                rag=rag,
-                config_version_id=record.active_config_version_id,
-                last_used=now,
-            )
-            self._entries[record.id] = entry
-            await self._enforce_capacity(protect_kb_id=record.id)
-            return entry
 
     async def discard(self, kb_id: str) -> bool:
         if kb_id in self._destructive_held:
@@ -187,7 +207,7 @@ class LightRAGInstanceRegistry:
             await self._safe_finalize(entry.rag)
             return True
 
-    async def drop_kb_data(self, kb_id: str) -> dict:
+    async def drop_kb_data(self, record: KnowledgeBaseRecord) -> dict:
         """Drop ALL engine storage data for a KB via a transient instance.
 
         Removing ``working_dir/<workspace>`` only purges file-based backends;
@@ -196,18 +216,21 @@ class LightRAGInstanceRegistry:
         through the registry's builder (so storages are initialized), calls
         :meth:`LightRAGLike.adrop_all_storages`, then finalizes it.
 
-        The caller MUST already hold :meth:`destructive_lock` for ``kb_id`` so the
-        transient instance can't race a concurrent reader/rebuild. The instance is
-        never cached. Returns the drop summary
+        The caller supplies the exact, generation-pinned catalog record already
+        checked under its cross-process deletion fence. This method deliberately
+        does not re-read the live catalog by id, which could otherwise build a
+        transient instance for a replacement generation. The caller MUST already
+        hold :meth:`destructive_lock` for ``record.id`` so the transient instance
+        can't race a concurrent reader/rebuild. The instance is never cached.
+        Returns the drop summary
         (``{"dropped", "failed", "errors"}``); when the instance does not expose
         ``adrop_all_storages`` (e.g. a lightweight test fake) an empty summary is
         returned.
         """
-        if kb_id not in self._destructive_held:
+        if record.id not in self._destructive_held:
             raise DestructiveLockBusyError(
-                f"drop_kb_data requires destructive lock on KB '{kb_id}'"
+                f"drop_kb_data requires destructive lock on KB '{record.id}'"
             )
-        record = await self._kb_service.get(kb_id, include_deleted=True)
         rag = await self._builder(record)
         try:
             dropper = getattr(rag, "adrop_all_storages", None)
@@ -215,7 +238,7 @@ class LightRAGInstanceRegistry:
                 logger.warning(
                     "Instance for KB '%s' has no adrop_all_storages; "
                     "external-backend data may be orphaned",
-                    kb_id,
+                    record.id,
                 )
                 return {"dropped": 0, "failed": 0, "errors": []}
             return await dropper()
@@ -248,6 +271,17 @@ class LightRAGInstanceRegistry:
         if self._idle_ttl_seconds is None:
             return False
         return (now - entry.last_used) >= self._idle_ttl_seconds
+
+    @staticmethod
+    def _same_runtime_identity(
+        first: KnowledgeBaseRecord, second: KnowledgeBaseRecord
+    ) -> bool:
+        return (
+            first.id == second.id
+            and first.workspace == second.workspace
+            and first.generation == second.generation
+            and first.active_config_version_id == second.active_config_version_id
+        )
 
     async def _enforce_capacity(self, *, protect_kb_id: str | None = None) -> None:
         if self._max_entries is None:

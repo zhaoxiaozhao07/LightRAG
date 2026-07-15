@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from lightrag.file_atomic import atomic_write
 
@@ -22,6 +22,10 @@ KB_STATUS_VALUES = {
     "error",
 }
 VISIBILITY_VALUES = {"private", "public", "internal"}
+KB_ORIGIN_VALUES = {"tenant", "platform"}
+LEGACY_PROVENANCE_METADATA_KEYS = frozenset(
+    {"platform_provisioned", "tenant_managed", "tenant_tag"}
+)
 KB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 WORKSPACE_RE = re.compile(r"^[A-Za-z0-9_]+$")
 LOCK_POLL_SECONDS = 0.05
@@ -30,6 +34,7 @@ KnowledgeBaseStatus = Literal[
     "creating", "active", "disabled", "deleting", "deleted", "error"
 ]
 KnowledgeBaseVisibility = Literal["private", "public", "internal"]
+KnowledgeBaseOrigin = Literal["tenant", "platform"]
 
 
 class _UnsetType:
@@ -40,6 +45,59 @@ _UNSET = _UnsetType()
 UpdateField = str | None | _UnsetType
 
 _MAX_KB_METADATA_BYTES = 16 * 1024
+_LEGACY_KB_GENERATION_NAMESPACE = uuid5(
+    NAMESPACE_URL, "https://lightrag.dev/kb-catalog-generation/v1"
+)
+
+
+def _new_kb_generation() -> str:
+    """Return a globally unique identity for one KB catalog incarnation."""
+    return str(uuid4())
+
+
+def _legacy_kb_generation(data: dict[str, Any]) -> str:
+    """Derive a stable generation for catalog rows created before the field."""
+    identity = json.dumps(
+        {
+            "id": str(data["id"]),
+            "workspace": str(data["workspace"]),
+            "created_at": str(data["created_at"]),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return str(uuid5(_LEGACY_KB_GENERATION_NAMESPACE, identity))
+
+
+def _validate_kb_generation(value: object) -> str:
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        raise ValueError(
+            "Knowledge base generation must be a normalized non-empty string"
+        )
+    return value
+
+
+def _validate_kb_origin(value: object) -> KnowledgeBaseOrigin:
+    if value == "tenant":
+        return "tenant"
+    if value == "platform":
+        return "platform"
+    raise ValueError("Invalid knowledge base origin")
+
+
+def _legacy_kb_origin(_data: dict[str, Any]) -> KnowledgeBaseOrigin:
+    """Fail closed for catalog rows written before immutable origin existed.
+
+    Legacy ``tenant_id`` and metadata provenance markers remain available for
+    display, but they are mutable data and therefore never establish tenant
+    ownership. Migrating a verified legacy tenant-owned KB requires an explicit
+    super-admin-controlled rewrite that persists ``origin="tenant"`` after the
+    ownership has been independently verified; loading a row never performs
+    that migration implicitly.
+    """
+
+    return "platform"
 
 
 def _validate_kb_metadata(value: dict[str, Any]) -> dict[str, Any]:
@@ -201,9 +259,26 @@ class KnowledgeBaseRecord:
     updated_at: str
     deleted_at: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    origin: KnowledgeBaseOrigin = "platform"
+    generation: str = field(default_factory=_new_kb_generation)
+
+    def __post_init__(self) -> None:
+        self.origin = _validate_kb_origin(self.origin)
+        _validate_kb_generation(self.generation)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "KnowledgeBaseRecord":
+        raw_generation = data.get("generation")
+        generation = (
+            _legacy_kb_generation(data)
+            if raw_generation is None
+            else _validate_kb_generation(raw_generation)
+        )
+        origin = (
+            _validate_kb_origin(data["origin"])
+            if "origin" in data
+            else _legacy_kb_origin(data)
+        )
         return cls(
             id=str(data["id"]),
             name=str(data["name"]),
@@ -218,6 +293,8 @@ class KnowledgeBaseRecord:
             updated_at=str(data["updated_at"]),
             deleted_at=data.get("deleted_at"),
             metadata=dict(data.get("metadata") or {}),
+            origin=origin,
+            generation=generation,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -238,6 +315,43 @@ class KnowledgeBaseConflictError(KnowledgeBaseServiceError):
 
 class KnowledgeBaseStorageError(KnowledgeBaseServiceError):
     pass
+
+
+def _assert_expected_generation(
+    record: KnowledgeBaseRecord, expected_generation: str | None
+) -> None:
+    if expected_generation is None:
+        return
+    normalized = _validate_kb_generation(expected_generation)
+    if record.generation != normalized:
+        raise KnowledgeBaseConflictError(
+            f"Knowledge base '{record.id}' changed generation"
+        )
+
+
+def _assert_expected_status(
+    record: KnowledgeBaseRecord, expected_status: KnowledgeBaseStatus | None
+) -> None:
+    if expected_status is None:
+        return
+    if expected_status not in KB_STATUS_VALUES:
+        raise ValueError("Invalid expected knowledge base status")
+    if record.status != expected_status:
+        raise KnowledgeBaseConflictError(
+            f"Knowledge base '{record.id}' changed status"
+        )
+
+
+def is_tenant_owned_kb(
+    record: KnowledgeBaseRecord, tenant_id: str | None
+) -> bool:
+    """Return whether ``record`` is owned by this exact tenant identity."""
+
+    return (
+        tenant_id is not None
+        and record.origin == "tenant"
+        and record.tenant_id == tenant_id
+    )
 
 
 class KnowledgeBaseService:
@@ -265,6 +379,8 @@ class KnowledgeBaseService:
         tenant_id: str | None = None,
         visibility: KnowledgeBaseVisibility = "private",
         metadata: dict[str, Any] | None = None,
+        origin: KnowledgeBaseOrigin = "platform",
+        initial_status: KnowledgeBaseStatus = "active",
     ) -> KnowledgeBaseRecord:
         normalized_id = (
             validate_kb_id(kb_id) if kb_id is not None else f"kb_{uuid4().hex[:12]}"
@@ -274,6 +390,9 @@ class KnowledgeBaseService:
             raise ValueError("Knowledge base name cannot be empty")
         if visibility not in VISIBILITY_VALUES:
             raise ValueError("Invalid knowledge base visibility")
+        normalized_origin = _validate_kb_origin(origin)
+        if initial_status not in KB_STATUS_VALUES or initial_status == "deleted":
+            raise ValueError("Invalid initial knowledge base status")
         normalized_metadata = (
             _validate_kb_metadata(dict(metadata)) if metadata else {}
         )
@@ -293,7 +412,7 @@ class KnowledgeBaseService:
                     name=normalized_name,
                     description=description,
                     workspace=sanitize_workspace(normalized_id),
-                    status="active",
+                    status=initial_status,
                     active_config_version_id=None,
                     owner_id=owner_id,
                     tenant_id=tenant_id,
@@ -302,6 +421,8 @@ class KnowledgeBaseService:
                     updated_at=now,
                     deleted_at=None,
                     metadata=normalized_metadata,
+                    origin=normalized_origin,
+                    generation=_new_kb_generation(),
                 )
                 self._records[normalized_id] = record
                 self._write_metadata_locked()
@@ -342,6 +463,7 @@ class KnowledgeBaseService:
         visibility: UpdateField = _UNSET,
         active_config_version_id: UpdateField = _UNSET,
         metadata: Any = _UNSET,
+        expected_generation: str | None = None,
     ) -> KnowledgeBaseRecord:
         normalized_id = validate_kb_id(kb_id)
         async with self._lock:
@@ -352,6 +474,7 @@ class KnowledgeBaseService:
                     raise KnowledgeBaseNotFoundError(
                         f"Knowledge base '{normalized_id}' not found"
                     )
+                _assert_expected_generation(record, expected_generation)
 
                 updated = record.to_dict()
                 if name is not _UNSET:
@@ -388,7 +511,9 @@ class KnowledgeBaseService:
                 self._write_metadata_locked()
                 return next_record
 
-    async def delete(self, kb_id: str) -> KnowledgeBaseRecord:
+    async def delete(
+        self, kb_id: str, *, expected_generation: str | None = None
+    ) -> KnowledgeBaseRecord:
         normalized_id = validate_kb_id(kb_id)
         async with self._lock:
             with _MetadataFileLock(self.lock_path):
@@ -398,6 +523,7 @@ class KnowledgeBaseService:
                     raise KnowledgeBaseNotFoundError(
                         f"Knowledge base '{normalized_id}' not found"
                     )
+                _assert_expected_generation(record, expected_generation)
 
                 now = utc_now_iso()
                 updated = record.to_dict()
@@ -409,7 +535,9 @@ class KnowledgeBaseService:
                 self._write_metadata_locked()
                 return deleted_record
 
-    async def restore(self, kb_id: str) -> KnowledgeBaseRecord:
+    async def restore(
+        self, kb_id: str, *, expected_generation: str | None = None
+    ) -> KnowledgeBaseRecord:
         """Restore a soft-deleted knowledge base back to ``active``.
 
         Raises ``KnowledgeBaseNotFoundError`` for an unknown id and
@@ -425,6 +553,7 @@ class KnowledgeBaseService:
                     raise KnowledgeBaseNotFoundError(
                         f"Knowledge base '{normalized_id}' not found"
                     )
+                _assert_expected_generation(record, expected_generation)
                 if record.status != "deleted":
                     raise ValueError(
                         f"Knowledge base '{normalized_id}' is not deleted"
@@ -438,21 +567,32 @@ class KnowledgeBaseService:
                 self._write_metadata_locked()
                 return restored_record
 
-    async def purge(self, kb_id: str) -> bool:
+    async def purge(
+        self,
+        kb_id: str,
+        *,
+        expected_generation: str | None = None,
+        expected_status: KnowledgeBaseStatus | None = "deleted",
+    ) -> bool:
         """Hard-remove the catalog entry so the kb_id becomes reusable.
 
         Counterpart of :meth:`PostgresKnowledgeBaseService.purge` for the
         file-backed catalog. Idempotent: returns False when the entry is
-        absent. Without this, ``hard=true`` cleanup would leave the file
-        catalog row in ``status='deleted'`` and the next ``POST /kbs``
-        with the same id would 409 on the in-memory uniqueness check.
+        absent. By default the row must still be ``status='deleted'`` so a
+        delayed hard-delete tail cannot purge a restored active generation.
+        Without this, ``hard=true`` cleanup would leave the file catalog row
+        in ``status='deleted'`` and the next ``POST /kbs`` with the same id
+        would 409 on the in-memory uniqueness check.
         """
         normalized_id = validate_kb_id(kb_id)
         async with self._lock:
             with _MetadataFileLock(self.lock_path):
                 self._reload_metadata_locked()
-                if normalized_id not in self._records:
+                record = self._records.get(normalized_id)
+                if record is None:
                     return False
+                _assert_expected_generation(record, expected_generation)
+                _assert_expected_status(record, expected_status)
                 del self._records[normalized_id]
                 self._write_metadata_locked()
                 return True

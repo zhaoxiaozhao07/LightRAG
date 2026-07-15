@@ -2,11 +2,12 @@ import asyncio
 import importlib
 import multiprocessing
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
 from lightrag.api.job_service import JobService
@@ -95,6 +96,7 @@ def _build_hard_delete_client(tmp_path: Path):
             api_key=_API_KEY,
             job_service=job_service,
             deletion_service=deletion_service,
+            metadata_store=metadata_store,
         )
     )
     return TestClient(app), metadata_store, registry, probe
@@ -122,9 +124,18 @@ def _build_durable_hard_delete_client(tmp_path: Path):
             api_key=_API_KEY,
             job_service=job_service,
             deletion_service=deletion_service,
+            metadata_store=metadata_store,
         )
     )
-    return TestClient(app), metadata_store, job_service, registry, probe
+    return (
+        TestClient(app),
+        service,
+        metadata_store,
+        job_service,
+        registry,
+        probe,
+        deletion_service,
+    )
 
 
 def _create_kb_after_start_event(
@@ -150,6 +161,57 @@ async def _list_record_ids(metadata_path: Path) -> list[str]:
     return [record.id for record in records]
 
 
+def _route_endpoint(app: FastAPI, path: str, method: str):
+    for route in app.routes:
+        methods = getattr(route, "methods", None) or set()
+        if getattr(route, "path", None) == path and method in methods:
+            return getattr(route, "endpoint")
+    raise AssertionError(f"Route not found: {method} {path}")
+
+
+def _route_request(app: FastAPI, method: str, path: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "app": app,
+            "method": method,
+            "path": path,
+            "headers": [],
+            "query_string": b"",
+        }
+    )
+
+
+async def _build_restore_race_app(tmp_path: Path, kb_id: str):
+    service = KnowledgeBaseService(tmp_path / "metadata" / "knowledge_bases.json")
+    metadata_store = SQLiteMetadataStore(tmp_path / "metadata" / "metadata.sqlite3")
+    await service.initialize()
+    await metadata_store.initialize()
+    job_service = JobService(service, metadata_store)
+    probe = BuilderProbe()
+    registry = LightRAGInstanceRegistry(service, probe.build, probe.finalize)
+    deletion_service = KBDeletionService(
+        service,
+        metadata_store,
+        registry,
+        input_root=tmp_path / "inputs",
+        working_dir=tmp_path / "working",
+    )
+    app = FastAPI()
+    app.include_router(
+        create_kb_routes(
+            service,
+            registry,
+            job_service=job_service,
+            deletion_service=deletion_service,
+            metadata_store=metadata_store,
+        )
+    )
+    record = await service.create(kb_id=kb_id, name=kb_id)
+    await metadata_store.activate_kb_generation(record.id, record.generation)
+    return app, service, metadata_store, deletion_service, record
+
+
 def test_kb_crud_flow(tmp_path):
     client, _service, _registry, _probe = _build_client(tmp_path)
 
@@ -172,6 +234,7 @@ def test_kb_crud_flow(tmp_path):
     assert created["status"] == "active"
     assert created["tenant_id"] == "tenant-a"
     assert created["visibility"] == "internal"
+    assert created["origin"] == "platform"
 
     duplicate = client.post(
         "/kbs", json={"id": "kb_alpha-1", "name": "Duplicate"}, headers=_HEADERS
@@ -186,7 +249,12 @@ def test_kb_crud_flow(tmp_path):
 
     patch_response = client.patch(
         "/kbs/kb_alpha-1",
-        json={"name": "Renamed", "status": "disabled", "visibility": "private"},
+        json={
+            "name": "Renamed",
+            "status": "disabled",
+            "visibility": "private",
+            "origin": "tenant",
+        },
         headers=_HEADERS,
     )
     assert patch_response.status_code == 200
@@ -194,6 +262,7 @@ def test_kb_crud_flow(tmp_path):
     assert patched["name"] == "Renamed"
     assert patched["status"] == "disabled"
     assert patched["visibility"] == "private"
+    assert patched["origin"] == "platform"
 
     get_response = client.get("/kbs/kb_alpha-1", headers=_HEADERS)
     assert get_response.status_code == 200
@@ -497,9 +566,15 @@ def test_hard_delete_route_purges_control_plane_and_files(tmp_path):
 
 
 def test_hard_delete_route_enqueues_clear_kb_when_worker_enabled(tmp_path):
-    client, metadata_store, job_service, registry, probe = _build_durable_hard_delete_client(
-        tmp_path
-    )
+    (
+        client,
+        _service,
+        metadata_store,
+        job_service,
+        registry,
+        probe,
+        _deletion_service,
+    ) = _build_durable_hard_delete_client(tmp_path)
     create_response = client.post(
         "/kbs", json={"id": "kb_hard_queued", "name": "Queued Hard"}, headers=_HEADERS
     )
@@ -527,8 +602,10 @@ def test_hard_delete_route_enqueues_clear_kb_when_worker_enabled(tmp_path):
     assert payload["hard_delete_job_type"] == "clear_kb"
     assert payload["hard_delete_job_status"] == "queued"
     assert payload["hard_delete_job_id"].startswith("job_clear_kb")
-    assert not registry.is_loaded("kb_hard_queued")
-    assert probe.finalized == [workspace]
+    # Queuing is control-plane only. The worker performs force_evict under the
+    # cross-process deletion guard and local destructive lock.
+    assert registry.is_loaded("kb_hard_queued")
+    assert probe.finalized == []
     assert input_workspace.exists()
     assert working_workspace.exists()
 
@@ -537,12 +614,165 @@ def test_hard_delete_route_enqueues_clear_kb_when_worker_enabled(tmp_path):
     assert jobs[0].id == payload["hard_delete_job_id"]
     assert jobs[0].job_type == "clear_kb"
     assert jobs[0].status == "queued"
+    assert jobs[0].payload["kb_generation"]
+    assert jobs[0].payload["workspace"] == workspace
+    assert jobs[0].idempotency_key == (
+        f"clear_kb:kb_hard_queued:{jobs[0].payload['kb_generation']}"
+    )
     fetched = asyncio.run(
         job_service.get_job(
             "kb_hard_queued", payload["hard_delete_job_id"], include_deleted=True
         )
     )
     assert fetched.id == jobs[0].id
+
+    duplicate = client.delete(
+        "/kbs/kb_hard_queued?hard=true", headers=_HEADERS
+    )
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["hard_delete_job_id"] == payload["hard_delete_job_id"]
+    jobs, total_jobs = asyncio.run(metadata_store.list_jobs("kb_hard_queued"))
+    assert total_jobs == 1
+    assert jobs[0].id == payload["hard_delete_job_id"]
+
+
+def test_worker_hard_delete_route_requeues_same_failed_clear_job(
+    tmp_path, monkeypatch
+):
+    (
+        client,
+        service,
+        metadata_store,
+        _job_service,
+        _registry,
+        _probe,
+        deletion_service,
+    ) = _build_durable_hard_delete_client(tmp_path)
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_hard_requeue", "name": "Hard Requeue"},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 200, created.text
+    generation = asyncio.run(
+        service.get("kb_hard_requeue", include_deleted=True)
+    ).generation
+
+    first_delete = client.delete(
+        "/kbs/kb_hard_requeue?hard=true",
+        headers=_HEADERS,
+    )
+    assert first_delete.status_code == 200, first_delete.text
+    job_id = first_delete.json()["hard_delete_job_id"]
+    queued = asyncio.run(metadata_store.get_job("kb_hard_requeue", job_id))
+    original_key = queued.idempotency_key
+    running = asyncio.run(
+        metadata_store.transition_job(
+            "kb_hard_requeue",
+            job_id,
+            status="running",
+        )
+    )
+
+    async def fail_catalog_purge(*_args, **_kwargs):
+        raise RuntimeError("catalog temporarily unavailable")
+
+    monkeypatch.setattr(service, "purge", fail_catalog_purge)
+    failed = asyncio.run(deletion_service.resume_hard_delete(running))
+    assert failed.job.status == "failed"
+    lifecycle = asyncio.run(metadata_store.get_kb_lifecycle("kb_hard_requeue"))
+    assert lifecycle is not None
+    assert lifecycle.state == "deleted"
+    assert lifecycle.generation == generation
+    assert lifecycle.delete_job_id == job_id
+    assert (
+        asyncio.run(service.get("kb_hard_requeue", include_deleted=True)).status
+        == "deleted"
+    )
+
+    duplicate = client.delete(
+        "/kbs/kb_hard_requeue?hard=true",
+        headers=_HEADERS,
+    )
+
+    assert duplicate.status_code == 200, duplicate.text
+    payload = duplicate.json()
+    assert payload["hard_delete_queued"] is True
+    assert payload["hard_delete_job_id"] == job_id
+    assert payload["hard_delete_job_status"] == "queued"
+    retried = asyncio.run(metadata_store.get_job("kb_hard_requeue", job_id))
+    assert retried.status == "queued"
+    assert retried.retry_count == 1
+    assert retried.idempotency_key == original_key
+    jobs, total = asyncio.run(metadata_store.list_jobs("kb_hard_requeue"))
+    assert total == 1
+    assert [job.id for job in jobs] == [job_id]
+
+
+def test_hard_delete_route_threads_authorized_generation_to_service(
+    tmp_path, monkeypatch
+):
+    original_hard_delete = KBDeletionService.hard_delete
+    original_enqueue = KBDeletionService.enqueue_hard_delete
+    captured: list[tuple[str, str]] = []
+
+    async def hard_delete_with_generation(
+        service, kb_id: str, *, expected_generation: str
+    ):
+        record = await service._kb_service.get(kb_id, include_deleted=True)
+        assert record.generation == expected_generation
+        captured.append(("hard", expected_generation))
+        return await original_hard_delete(
+            service,
+            kb_id,
+            expected_generation=expected_generation,
+        )
+
+    async def enqueue_with_generation(
+        service, kb_id: str, *, expected_generation: str
+    ):
+        record = await service._kb_service.get(kb_id, include_deleted=True)
+        assert record.generation == expected_generation
+        captured.append(("queued", expected_generation))
+        return await original_enqueue(
+            service,
+            kb_id,
+            expected_generation=expected_generation,
+        )
+
+    monkeypatch.setattr(KBDeletionService, "hard_delete", hard_delete_with_generation)
+    monkeypatch.setattr(KBDeletionService, "enqueue_hard_delete", enqueue_with_generation)
+
+    sync_client, _store, _registry, _probe = _build_hard_delete_client(
+        tmp_path / "sync"
+    )
+    sync_created = sync_client.post(
+        "/kbs",
+        json={"id": "kb_generation_sync", "name": "Generation Sync"},
+        headers=_HEADERS,
+    )
+    assert sync_created.status_code == 200, sync_created.text
+    sync_deleted = sync_client.delete(
+        "/kbs/kb_generation_sync?hard=true", headers=_HEADERS
+    )
+    assert sync_deleted.status_code == 200, sync_deleted.text
+
+    queued_client, _service, _store, _jobs, _registry, _probe, _deletion = (
+        _build_durable_hard_delete_client(tmp_path / "queued")
+    )
+    queued_created = queued_client.post(
+        "/kbs",
+        json={"id": "kb_generation_queued", "name": "Generation Queued"},
+        headers=_HEADERS,
+    )
+    assert queued_created.status_code == 200, queued_created.text
+    queued_deleted = queued_client.delete(
+        "/kbs/kb_generation_queued?hard=true", headers=_HEADERS
+    )
+    assert queued_deleted.status_code == 200, queued_deleted.text
+
+    assert [kind for kind, _generation in captured] == ["hard", "queued"]
+    assert all(generation for _kind, generation in captured)
 
 
 def test_missing_kb_returns_404(tmp_path):
@@ -634,8 +864,133 @@ def test_kb_restore_roundtrip(tmp_path):
     assert client.post("/kbs/kb_ghost:restore", headers=_HEADERS).status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_restore_shared_guard_makes_hard_delete_wait_without_destroying(
+    tmp_path, monkeypatch
+):
+    kb_id = "kb_restore_wins"
+    app, service, metadata_store, deletion_service, record = (
+        await _build_restore_race_app(tmp_path, kb_id)
+    )
+    await service.delete(kb_id, expected_generation=record.generation)
+    restore_endpoint = _route_endpoint(app, "/kbs/{kb_id}:restore", "POST")
+    delete_endpoint = _route_endpoint(app, "/kbs/{kb_id}", "DELETE")
+
+    restore_entered = asyncio.Event()
+    release_restore = asyncio.Event()
+    deletion_waiting = asyncio.Event()
+    deletion_entered = asyncio.Event()
+    cleanup_called = asyncio.Event()
+    original_restore = service.restore
+    original_deletion_guard = metadata_store.kb_deletion_guard
+
+    async def blocked_restore(kb_id: str, *, expected_generation: str | None = None):
+        restore_entered.set()
+        await asyncio.wait_for(release_restore.wait(), timeout=5)
+        return await original_restore(
+            kb_id,
+            expected_generation=expected_generation,
+        )
+
+    @asynccontextmanager
+    async def observed_deletion_guard(kb_id):
+        deletion_waiting.set()
+        async with original_deletion_guard(kb_id):
+            deletion_entered.set()
+            yield
+
+    async def forbidden_cleanup(*_args, **_kwargs):
+        cleanup_called.set()
+        raise AssertionError("hard delete reached physical cleanup after restore")
+
+    monkeypatch.setattr(service, "restore", blocked_restore)
+    monkeypatch.setattr(
+        metadata_store,
+        "kb_deletion_guard",
+        observed_deletion_guard,
+    )
+    monkeypatch.setattr(deletion_service, "_run_physical_cleanup", forbidden_cleanup)
+
+    restore_task = asyncio.create_task(
+        restore_endpoint(
+            kb_id,
+            _route_request(app, "POST", f"/kbs/{kb_id}:restore"),
+        )
+    )
+    await asyncio.wait_for(restore_entered.wait(), timeout=5)
+    hard_delete_task = asyncio.create_task(
+        delete_endpoint(
+            kb_id,
+            _route_request(app, "DELETE", f"/kbs/{kb_id}"),
+            hard=True,
+        )
+    )
+    await asyncio.wait_for(deletion_waiting.wait(), timeout=5)
+    await asyncio.sleep(0)
+    assert not deletion_entered.is_set()
+    assert not hard_delete_task.done()
+
+    release_restore.set()
+    restored = await asyncio.wait_for(restore_task, timeout=5)
+    assert restored.status == "active"
+    await asyncio.wait_for(deletion_entered.wait(), timeout=5)
+    with pytest.raises(HTTPException) as hard_delete_error:
+        await asyncio.wait_for(hard_delete_task, timeout=5)
+    assert hard_delete_error.value.status_code == 500
+    assert not cleanup_called.is_set()
+    current = await service.get(kb_id, include_deleted=True)
+    assert current.status == "active"
+    assert current.generation == record.generation
+    lifecycle = await metadata_store.get_kb_lifecycle(kb_id)
+    assert lifecycle is not None
+    assert lifecycle.state == "active"
+    assert lifecycle.delete_job_id is None
+
+
+@pytest.mark.asyncio
+async def test_restore_returns_conflict_after_hard_delete_enters_exclusive_guard(
+    tmp_path, monkeypatch
+):
+    kb_id = "kb_hard_delete_wins"
+    app, service, _metadata_store, deletion_service, _record = (
+        await _build_restore_race_app(tmp_path, kb_id)
+    )
+    restore_endpoint = _route_endpoint(app, "/kbs/{kb_id}:restore", "POST")
+    delete_endpoint = _route_endpoint(app, "/kbs/{kb_id}", "DELETE")
+    hard_delete_entered = asyncio.Event()
+    release_hard_delete = asyncio.Event()
+
+    async def blocked_cleanup(*_args, **_kwargs):
+        hard_delete_entered.set()
+        await asyncio.wait_for(release_hard_delete.wait(), timeout=5)
+
+    monkeypatch.setattr(deletion_service, "_run_physical_cleanup", blocked_cleanup)
+    hard_delete_task = asyncio.create_task(
+        delete_endpoint(
+            kb_id,
+            _route_request(app, "DELETE", f"/kbs/{kb_id}"),
+            hard=True,
+        )
+    )
+    await asyncio.wait_for(hard_delete_entered.wait(), timeout=5)
+
+    with pytest.raises(HTTPException) as restore_error:
+        await restore_endpoint(
+            kb_id,
+            _route_request(app, "POST", f"/kbs/{kb_id}:restore"),
+        )
+    assert restore_error.value.status_code == 409
+    detail: Any = restore_error.value.detail
+    assert isinstance(detail, dict)
+    assert detail["error_code"] == "kb_hard_delete_in_progress"
+
+    release_hard_delete.set()
+    deleted = await asyncio.wait_for(hard_delete_task, timeout=5)
+    assert deleted.status == "deleted"
+
+
 def test_kb_restore_blocked_while_clear_kb_in_flight(tmp_path):
-    client, _metadata_store, _job_service, _registry, _probe = (
+    client, _service, _metadata_store, _job_service, _registry, _probe, _deletion = (
         _build_durable_hard_delete_client(tmp_path)
     )
     created = client.post(
@@ -654,6 +1009,141 @@ def test_kb_restore_blocked_while_clear_kb_in_flight(tmp_path):
     assert detail["job_id"] == delete_response.json()["hard_delete_job_id"]
 
 
+def test_kb_restore_blocked_after_clear_kb_failed_with_deleting_fence(tmp_path):
+    (
+        client,
+        _service,
+        metadata_store,
+        _job_service,
+        _registry,
+        _probe,
+        _deletion,
+    ) = (
+        _build_durable_hard_delete_client(tmp_path)
+    )
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_res_failed", "name": "Hard Failed"},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 200, created.text
+    deleted = client.delete(
+        "/kbs/kb_res_failed?hard=true",
+        headers=_HEADERS,
+    )
+    assert deleted.status_code == 200, deleted.text
+    job_id = deleted.json()["hard_delete_job_id"]
+    jobs, total = asyncio.run(metadata_store.list_jobs("kb_res_failed"))
+    assert total == 1
+    job = jobs[0]
+    generation = job.payload["kb_generation"]
+
+    async def mark_failed_after_guard() -> None:
+        running = await metadata_store.transition_job(
+            "kb_res_failed",
+            job_id,
+            status="running",
+        )
+        assert running.status == "running"
+        async with metadata_store.kb_deletion_guard(
+            "kb_res_failed",
+            generation,
+            job_id,
+        ):
+            pass
+        await metadata_store.transition_job(
+            "kb_res_failed",
+            job_id,
+            status="failed",
+            error_code="physical_cleanup_failed",
+            error_message="retryable",
+        )
+
+    asyncio.run(mark_failed_after_guard())
+    lifecycle = asyncio.run(metadata_store.get_kb_lifecycle("kb_res_failed"))
+    assert lifecycle is not None
+    assert lifecycle.state == "deleting"
+
+    blocked = client.post("/kbs/kb_res_failed:restore", headers=_HEADERS)
+    assert blocked.status_code == 409, blocked.text
+    detail = blocked.json()["detail"]
+    assert detail["error_code"] == "kb_hard_delete_in_progress"
+    assert detail["job_id"] == job_id
+
+
+def test_deleting_fence_blocks_recreate_and_restore_after_metadata_purge(tmp_path):
+    (
+        client,
+        service,
+        metadata_store,
+        _job_service,
+        _registry,
+        _probe,
+        _deletion,
+    ) = _build_durable_hard_delete_client(tmp_path)
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_tail_fence", "name": "Tail Fence"},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 200, created.text
+    deleted = client.delete(
+        "/kbs/kb_tail_fence?hard=true",
+        headers=_HEADERS,
+    )
+    assert deleted.status_code == 200, deleted.text
+    job_id = deleted.json()["hard_delete_job_id"]
+    jobs, total = asyncio.run(metadata_store.list_jobs("kb_tail_fence"))
+    assert total == 1
+    job = jobs[0]
+    generation = job.payload["kb_generation"]
+
+    async def stop_after_metadata_purge() -> None:
+        await metadata_store.transition_job(
+            "kb_tail_fence",
+            job_id,
+            status="running",
+        )
+        async with metadata_store.kb_deletion_guard(
+            "kb_tail_fence",
+            generation,
+            job_id,
+        ):
+            await metadata_store.purge_kb_metadata(
+                "kb_tail_fence",
+                generation=generation,
+                delete_job_id=job_id,
+            )
+        await metadata_store.transition_job(
+            "kb_tail_fence",
+            job_id,
+            status="failed",
+            error_code="complete_failed",
+            error_message="retryable tail",
+        )
+
+    asyncio.run(stop_after_metadata_purge())
+    lifecycle = asyncio.run(metadata_store.get_kb_lifecycle("kb_tail_fence"))
+    assert lifecycle is not None
+    assert lifecycle.state == "deleting"
+
+    recreated = client.post(
+        "/kbs",
+        json={"id": "kb_tail_fence", "name": "Must Be Fenced"},
+        headers=_HEADERS,
+    )
+    assert recreated.status_code == 409, recreated.text
+    retained = asyncio.run(service.get("kb_tail_fence", include_deleted=True))
+    assert retained.status == "deleted"
+    assert retained.generation == generation
+
+    restore = client.post("/kbs/kb_tail_fence:restore", headers=_HEADERS)
+    assert restore.status_code == 409, restore.text
+    detail = restore.json()["detail"]
+    assert detail["error_code"] == "kb_hard_delete_in_progress"
+    assert detail["job_id"] == job_id
+
+
 def test_kb_metadata_create_merge_and_size_cap(tmp_path):
     client, _service, _registry, _probe = _build_client(tmp_path)
 
@@ -662,12 +1152,19 @@ def test_kb_metadata_create_merge_and_size_cap(tmp_path):
         json={
             "id": "kb_meta",
             "name": "Meta",
-            "metadata": {"tags": ["legal", "hr"], "team": "ops"},
+            "metadata": {
+                "tags": ["legal", "hr"],
+                "team": "ops",
+                "platform_provisioned": True,
+                "tenant_managed": True,
+                "tenant_tag": "tenant:spoofed",
+            },
         },
         headers=_HEADERS,
     )
     assert created.status_code == 200, created.text
     assert created.json()["metadata"] == {"tags": ["legal", "hr"], "team": "ops"}
+    assert created.json()["origin"] == "platform"
 
     # Old records / omitted metadata default to an empty dict.
     plain = client.post(
@@ -694,6 +1191,19 @@ def test_kb_metadata_create_merge_and_size_cap(tmp_path):
         "/kbs/kb_meta", json={"metadata": None}, headers=_HEADERS
     )
     assert null_patch.status_code == 400
+
+    for reserved_key in (
+        "platform_provisioned",
+        "tenant_managed",
+        "tenant_tag",
+    ):
+        reserved_patch = client.patch(
+            "/kbs/kb_meta",
+            json={"metadata": {reserved_key: True}},
+            headers=_HEADERS,
+        )
+        assert reserved_patch.status_code == 400
+        assert "reserved" in reserved_patch.json()["detail"]
 
     # Oversized metadata (>16KB serialized) is rejected on create and PATCH.
     oversized = {"blob": "x" * (16 * 1024 + 1)}

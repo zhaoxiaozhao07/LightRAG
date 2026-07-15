@@ -10,14 +10,19 @@ from lightrag.api.kb_service import (
     KB_STATUS_VALUES,
     VISIBILITY_VALUES,
     _UNSET,
+    _assert_expected_generation,
+    _assert_expected_status,
     _merge_kb_metadata,
+    _new_kb_generation,
     _optional_string,
     _require_string,
     _validate_kb_metadata,
     KnowledgeBaseConflictError,
     KnowledgeBaseNotFoundError,
+    KnowledgeBaseOrigin,
     KnowledgeBaseRecord,
     KnowledgeBaseService,
+    KnowledgeBaseStatus,
     KnowledgeBaseVisibility,
     UpdateField,
     sanitize_workspace,
@@ -101,7 +106,7 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
             database=os.getenv("LIGHTRAG_KB_POSTGRES_DATABASE")
             or os.getenv("POSTGRES_DATABASE"),
             min_size=int(os.getenv("LIGHTRAG_KB_POSTGRES_POOL_MIN_SIZE", "1")),
-            max_size=int(os.getenv("LIGHTRAG_KB_POSTGRES_POOL_MAX_SIZE", "5")),
+            max_size=int(os.getenv("LIGHTRAG_KB_POSTGRES_POOL_MAX_SIZE", "10")),
         )
 
     async def initialize(self) -> None:
@@ -140,6 +145,8 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
         tenant_id: str | None = None,
         visibility: KnowledgeBaseVisibility = "private",
         metadata: dict[str, Any] | None = None,
+        origin: KnowledgeBaseOrigin = "platform",
+        initial_status: KnowledgeBaseStatus = "active",
     ) -> KnowledgeBaseRecord:
         await self._ensure_initialized()
         import uuid
@@ -150,6 +157,10 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
             raise ValueError("Knowledge base name cannot be empty")
         if visibility not in VISIBILITY_VALUES:
             raise ValueError("Invalid knowledge base visibility")
+        if origin not in {"tenant", "platform"}:
+            raise ValueError("Invalid knowledge base origin")
+        if initial_status not in KB_STATUS_VALUES or initial_status == "deleted":
+            raise ValueError("Invalid initial knowledge base status")
         normalized_metadata = (
             _validate_kb_metadata(dict(metadata)) if metadata else {}
         )
@@ -159,7 +170,7 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
             name=normalized_name,
             description=description,
             workspace=sanitize_workspace(normalized_id),
-            status="active",
+            status=initial_status,
             active_config_version_id=None,
             owner_id=owner_id,
             tenant_id=tenant_id,
@@ -168,6 +179,8 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
             updated_at=now,
             deleted_at=None,
             metadata=normalized_metadata,
+            origin=origin,
+            generation=_new_kb_generation(),
         )
         async with self._pool_or_raise().acquire() as conn:
             async with conn.transaction():
@@ -222,6 +235,7 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
         visibility: UpdateField = _UNSET,
         active_config_version_id: UpdateField = _UNSET,
         metadata: Any = _UNSET,
+        expected_generation: str | None = None,
     ) -> KnowledgeBaseRecord:
         await self._ensure_initialized()
         normalized_id = validate_kb_id(kb_id)
@@ -240,6 +254,7 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
                     raise KnowledgeBaseNotFoundError(
                         f"Knowledge base '{normalized_id}' not found"
                     )
+                _assert_expected_generation(record, expected_generation)
                 updated = record.to_dict()
                 if name is not _UNSET:
                     normalized_name = _require_string(name, "Knowledge base name").strip()
@@ -275,7 +290,9 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
                 await self._save_record(conn, next_record)
                 return next_record
 
-    async def delete(self, kb_id: str) -> KnowledgeBaseRecord:
+    async def delete(
+        self, kb_id: str, *, expected_generation: str | None = None
+    ) -> KnowledgeBaseRecord:
         await self._ensure_initialized()
         normalized_id = validate_kb_id(kb_id)
         async with self._pool_or_raise().acquire() as conn:
@@ -293,6 +310,7 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
                     raise KnowledgeBaseNotFoundError(
                         f"Knowledge base '{normalized_id}' not found"
                     )
+                _assert_expected_generation(record, expected_generation)
                 now = utc_now_iso()
                 updated = record.to_dict()
                 updated["status"] = "deleted"
@@ -302,7 +320,9 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
                 await self._save_record(conn, deleted_record)
                 return deleted_record
 
-    async def restore(self, kb_id: str) -> KnowledgeBaseRecord:
+    async def restore(
+        self, kb_id: str, *, expected_generation: str | None = None
+    ) -> KnowledgeBaseRecord:
         """Restore a soft-deleted knowledge base back to ``active``.
 
         Raises ``KnowledgeBaseNotFoundError`` for an unknown id and
@@ -322,6 +342,7 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
                         f"Knowledge base '{normalized_id}' not found"
                     )
                 record = _record_from_row(row)
+                _assert_expected_generation(record, expected_generation)
                 if record.status != "deleted":
                     raise ValueError(
                         f"Knowledge base '{normalized_id}' is not deleted"
@@ -334,9 +355,18 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
                 await self._save_record(conn, restored_record)
                 return restored_record
 
-    async def purge(self, kb_id: str) -> bool:
+    async def purge(
+        self,
+        kb_id: str,
+        *,
+        expected_generation: str | None = None,
+        expected_status: KnowledgeBaseStatus | None = "deleted",
+    ) -> bool:
         """Hard-remove the kb_catalog row so the kb_id (and its workspace)
         become reusable. Idempotent: returns False when the row is absent.
+
+        The default status CAS requires ``deleted`` in addition to the pinned
+        generation, preventing a delayed cleanup from purging a restored row.
 
         Called from :meth:`KBDeletionService._execute_clear` at the end of a
         ``hard=true`` flow. The shared catalog row would otherwise keep the
@@ -346,9 +376,19 @@ class PostgresKnowledgeBaseService(KnowledgeBaseService):
         await self._ensure_initialized()
         normalized_id = validate_kb_id(kb_id)
         async with self._pool_or_raise().acquire() as conn:
-            status = await conn.execute(
-                "DELETE FROM kb_catalog WHERE id = $1", normalized_id
-            )
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT data_json FROM kb_catalog WHERE id = $1 FOR UPDATE",
+                    normalized_id,
+                )
+                if row is None:
+                    return False
+                record = _record_from_row(row)
+                _assert_expected_generation(record, expected_generation)
+                _assert_expected_status(record, expected_status)
+                status = await conn.execute(
+                    "DELETE FROM kb_catalog WHERE id = $1", normalized_id
+                )
         try:
             return int(status.rsplit(" ", 1)[-1]) > 0
         except (ValueError, AttributeError):

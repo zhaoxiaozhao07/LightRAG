@@ -16,9 +16,18 @@ from lightrag.api.document_lifecycle_service import (
     DocumentSourceInput,
 )
 from lightrag.api.job_service import JobService
-from lightrag.api.kb_service import KnowledgeBaseService, sanitize_workspace
+from lightrag.api.kb_operation_fence import KBWriteAdmissionMiddleware
+from lightrag.api.kb_service import (
+    KnowledgeBaseConflictError,
+    KnowledgeBaseService,
+    sanitize_workspace,
+)
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
-from lightrag.api.metadata_store import InvalidJobTransitionError, SQLiteMetadataStore
+from lightrag.api.metadata_store import (
+    InvalidJobTransitionError,
+    KBLifecycleConflictError,
+    SQLiteMetadataStore,
+)
 from lightrag.api.object_storage import ObjectStorage
 from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
 
@@ -294,6 +303,11 @@ def _build_client(
     registry = LightRAGInstanceRegistry(kb_service, probe.build, probe.finalize)
     config_service = ConfigVersionService(kb_service, metadata_store, registry)
     app = FastAPI()
+    app.add_middleware(
+        KBWriteAdmissionMiddleware,
+        kb_service=kb_service,
+        metadata_store=metadata_store,
+    )
     app.include_router(
         create_kb_routes(
             kb_service,
@@ -362,7 +376,7 @@ def test_upload_persists_documents_jobs_and_running_status(tmp_path):
     try:
         # No parse worker wired: auto_parse persists metadata + a queued parse
         # job without executing, so the queued/running snapshot is stable.
-        client, _kb_service, _store, _document_service, _job_service = _build_client(
+        client, kb_service, _store, _document_service, _job_service = _build_client(
             tmp_path, wire_document_registry=False
         )
         kb = _create_kb(client, "kb_upload")
@@ -411,6 +425,11 @@ def test_upload_persists_documents_jobs_and_running_status(tmp_path):
         assert jobs["total"] == 1
         assert jobs["jobs"][0]["id"] == payload["job_id"]
         assert jobs["jobs"][0]["job_type"] == "parse"
+        persisted_job = asyncio.run(
+            _job_service.get_job("kb_upload", payload["job_id"])
+        )
+        catalog = asyncio.run(kb_service.get("kb_upload"))
+        assert persisted_job.payload["kb_generation"] == catalog.generation
 
         status_response = client.get("/kbs/kb_upload/status", headers=_HEADERS)
         assert status_response.status_code == 200
@@ -419,6 +438,35 @@ def test_upload_persists_documents_jobs_and_running_status(tmp_path):
         assert [job["id"] for job in status["running_jobs"]] == [payload["job_id"]]
     finally:
         finalize_share_data()
+
+
+def test_upload_is_rejected_before_staging_when_kb_is_deleting(tmp_path):
+    client, kb_service, store, _document_service, _job_service = _build_client(
+        tmp_path
+    )
+    kb = _create_kb(client, "kb_upload_deleting")
+
+    async def mark_deleting() -> None:
+        record = await kb_service.get(kb["id"])
+        async with store.kb_deletion_guard(
+            record.id,
+            record.generation,
+            "job_delete_upload_guard",
+        ):
+            pass
+
+    asyncio.run(mark_deleting())
+    response = client.post(
+        "/kbs/kb_upload_deleting/documents:upload",
+        files=[("files", ("blocked.txt", b"blocked", "text/plain"))],
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 409
+    documents, total = asyncio.run(store.list_documents(kb["id"]))
+    assert documents == []
+    assert total == 0
+    assert not (tmp_path / "inputs" / kb["workspace"]).exists()
 
 
 def test_text_import_is_metadata_only_and_kb_scoped(tmp_path):
@@ -559,6 +607,211 @@ async def test_text_import_idempotency_key_is_atomic_for_concurrent_batches(tmp_
     assert jobs[0].id == first.job.id
     workspace_dir = tmp_path / "inputs" / sanitize_workspace("kb_text_concurrent")
     assert [path.name for path in workspace_dir.iterdir()] == [documents[0].id]
+
+
+@pytest.mark.asyncio
+async def test_create_source_batch_holds_guard_through_staging_and_commit(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "source-batch-fence.sqlite3"
+    writer_store = SQLiteMetadataStore(db_path)
+    delete_store = SQLiteMetadataStore(db_path)
+    await writer_store.initialize()
+    await delete_store.initialize()
+    kb_service = KnowledgeBaseService(tmp_path / "source-batch-kbs.json")
+    await kb_service.initialize()
+    record = await kb_service.create(kb_id="kb_source_batch_fence", name="Fence")
+    await writer_store.activate_kb_generation(record.id, record.generation)
+    document_service = DocumentLifecycleService(
+        kb_service, writer_store, tmp_path / "inputs"
+    )
+
+    first_stage_entered = asyncio.Event()
+    release_first_stage = asyncio.Event()
+    exclusive_entered = asyncio.Event()
+    original_persist_source = document_service._persist_source_file
+
+    async def blocked_persist_source(*args, **kwargs):
+        first_stage_entered.set()
+        await release_first_stage.wait()
+        return await original_persist_source(*args, **kwargs)
+
+    monkeypatch.setattr(
+        document_service, "_persist_source_file", blocked_persist_source
+    )
+
+    async def delete_attempt() -> None:
+        async with delete_store.kb_deletion_guard(
+            record.id,
+            record.generation,
+            "job_delete_source_batch_fence",
+        ):
+            documents, document_total = await delete_store.list_documents(record.id)
+            jobs, job_total = await delete_store.list_jobs(record.id)
+            assert document_total == 1 and len(documents) == 1
+            assert job_total == 1 and len(jobs) == 1
+            exclusive_entered.set()
+
+    source = DocumentSourceInput(
+        source_name="fenced.txt",
+        content=b"fenced content",
+        source_type="upload",
+        content_type="text/plain",
+    )
+    create_task = asyncio.create_task(
+        document_service.create_source_batch(record.id, [source])
+    )
+    await asyncio.wait_for(first_stage_entered.wait(), timeout=2)
+    delete_task = asyncio.create_task(delete_attempt())
+    await asyncio.sleep(0.1)
+    assert not exclusive_entered.is_set()
+
+    release_first_stage.set()
+    result = await asyncio.wait_for(create_task, timeout=2)
+    await asyncio.wait_for(exclusive_entered.wait(), timeout=2)
+    await asyncio.wait_for(delete_task, timeout=2)
+
+    assert result.created is True
+    assert result.job.payload["kb_generation"] == record.generation
+    assert Path(result.documents[0].source_uri).read_bytes() == b"fenced content"
+
+
+@pytest.mark.asyncio
+async def test_create_source_batch_deletion_race_cleans_all_staging(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "source-batch-cleanup.sqlite3"
+    writer_store = SQLiteMetadataStore(db_path)
+    delete_store = SQLiteMetadataStore(db_path)
+    await writer_store.initialize()
+    await delete_store.initialize()
+    kb_service = KnowledgeBaseService(tmp_path / "source-batch-cleanup-kbs.json")
+    await kb_service.initialize()
+    record = await kb_service.create(kb_id="kb_source_batch_cleanup", name="Cleanup")
+    await writer_store.activate_kb_generation(record.id, record.generation)
+    object_storage = FakeObjectStorage()
+    document_service = DocumentLifecycleService(
+        kb_service,
+        writer_store,
+        tmp_path / "inputs",
+        object_storage=object_storage,
+    )
+
+    object_staged = asyncio.Event()
+    release_object_stage = asyncio.Event()
+    exclusive_entered = asyncio.Event()
+    original_upload_file = object_storage.upload_file
+
+    async def blocked_upload_file(*args, **kwargs):
+        uri = await original_upload_file(*args, **kwargs)
+        object_staged.set()
+        await release_object_stage.wait()
+        return uri
+
+    monkeypatch.setattr(object_storage, "upload_file", blocked_upload_file)
+
+    async def delete_attempt() -> None:
+        async with delete_store.kb_deletion_guard(
+            record.id,
+            record.generation,
+            "job_delete_source_batch_cleanup",
+        ):
+            exclusive_entered.set()
+
+    source = DocumentSourceInput(
+        source_name="cleanup.txt",
+        content=b"cleanup content",
+        source_type="upload",
+        content_type="text/plain",
+    )
+    create_task = asyncio.create_task(
+        document_service.create_source_batch(record.id, [source])
+    )
+    await asyncio.wait_for(object_staged.wait(), timeout=2)
+    await kb_service.delete(record.id, expected_generation=record.generation)
+    delete_task = asyncio.create_task(delete_attempt())
+    await asyncio.sleep(0.1)
+    assert not exclusive_entered.is_set()
+
+    release_object_stage.set()
+    with pytest.raises(KnowledgeBaseConflictError) as exc_info:
+        await asyncio.wait_for(create_task, timeout=2)
+    assert "not active" in str(exc_info.value)
+    await asyncio.wait_for(exclusive_entered.wait(), timeout=2)
+    await asyncio.wait_for(delete_task, timeout=2)
+
+    documents, document_total = await writer_store.list_documents(record.id)
+    jobs, job_total = await writer_store.list_jobs(record.id)
+    assert documents == [] and document_total == 0
+    assert jobs == [] and job_total == 0
+    assert object_storage.files == {}
+    assert object_storage.deleted_uris
+    workspace_dir = tmp_path / "inputs" / record.workspace
+    assert not workspace_dir.exists() or not any(workspace_dir.rglob("*"))
+
+    with pytest.raises(KBLifecycleConflictError):
+        await document_service.create_source_batch(record.id, [source])
+
+
+@pytest.mark.asyncio
+async def test_sync_staging_and_job_persist_share_one_composite_guard(tmp_path):
+    db_path = tmp_path / "sync-composite-fence.sqlite3"
+    writer_store = SQLiteMetadataStore(db_path)
+    delete_store = SQLiteMetadataStore(db_path)
+    await writer_store.initialize()
+    await delete_store.initialize()
+    kb_service = KnowledgeBaseService(tmp_path / "sync-composite-kbs.json")
+    await kb_service.initialize()
+    record = await kb_service.create(kb_id="kb_sync_composite", name="Sync")
+    await writer_store.activate_kb_generation(record.id, record.generation)
+    document_service = DocumentLifecycleService(
+        kb_service, writer_store, tmp_path / "inputs"
+    )
+    job_service = JobService(kb_service, writer_store)
+    exclusive_entered = asyncio.Event()
+
+    async def delete_attempt() -> None:
+        async with delete_store.kb_deletion_guard(
+            record.id,
+            record.generation,
+            "job_delete_sync_composite",
+        ):
+            exclusive_entered.set()
+
+    source = DocumentSourceInput(
+        source_name="sync.txt",
+        content=b"sync content",
+        source_type="upload",
+        content_type="text/plain",
+        metadata={"source_key": "manual/sync.txt"},
+    )
+    batch_id = "batch_sync_composite"
+    async with document_service.kb_write_guard(record.id):
+        staged_path = await document_service.stage_sync_source_bytes(
+            record.id,
+            batch_id=batch_id,
+            item_index=0,
+            source=source,
+        )
+        delete_task = asyncio.create_task(delete_attempt())
+        await asyncio.sleep(0.1)
+        assert not exclusive_entered.is_set()
+        job, created = await job_service.create_job_once(
+            record.id,
+            job_type="sync",
+            batch_id=batch_id,
+            stage="syncing",
+            payload={"batch_id": batch_id, "source_keys": ["manual/sync.txt"]},
+        )
+        assert created is True
+        assert Path(staged_path).is_file()
+        assert job.payload["kb_generation"] == record.generation
+        assert not exclusive_entered.is_set()
+
+    await asyncio.wait_for(exclusive_entered.wait(), timeout=2)
+    await asyncio.wait_for(delete_task, timeout=2)
 
 
 def test_list_documents_source_name_filter_and_patch_metadata_flags(tmp_path):

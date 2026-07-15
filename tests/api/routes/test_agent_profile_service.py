@@ -19,9 +19,18 @@ from lightrag.api.agent_profile_service import (
     _stride_sample,
     effective_agent_profile,
 )
-from lightrag.api.kb_service import KnowledgeBaseRecord, utc_now_iso
-from lightrag.api.metadata_store import DocumentRecord
-from lightrag.api.metadata_store import JobRecord
+from lightrag.api.document_lifecycle_service import DocumentLifecycleService
+from lightrag.api.kb_service import (
+    KnowledgeBaseRecord,
+    KnowledgeBaseService,
+    utc_now_iso,
+)
+from lightrag.api.metadata_store import (
+    DocumentRecord,
+    JobRecord,
+    KBLifecycleConflictError,
+    SQLiteMetadataStore,
+)
 
 
 pytestmark = pytest.mark.offline
@@ -493,6 +502,44 @@ async def test_mark_dirty_dedupes_onto_active_refresh_job():
     assert second is None  # coalesced onto the queued job
     assert len(job_service.jobs) == 1
     assert kb_service.record.metadata[KB_AUTO_PROFILE_DIRTY_METADATA_KEY]["document_id"] == "doc2"
+
+
+@pytest.mark.asyncio
+async def test_mark_dirty_direct_call_rejects_deleting_lifecycle(tmp_path):
+    kb_service = KnowledgeBaseService(tmp_path / "agent-direct-kbs.json")
+    metadata_store = SQLiteMetadataStore(tmp_path / "agent-direct.sqlite3")
+    await kb_service.initialize()
+    await metadata_store.initialize()
+    record = await kb_service.create(kb_id="kb1", name="Agent Direct")
+    await metadata_store.activate_kb_generation(record.id, record.generation)
+    document_service = DocumentLifecycleService(
+        kb_service,
+        metadata_store,
+        tmp_path / "inputs",
+    )
+    service = AgentProfileService(
+        kb_service=kb_service,
+        document_service=document_service,
+        registry=_Registry(_FakeRAG()),
+        job_service=None,
+    )
+
+    async with metadata_store.kb_deletion_guard(
+        record.id,
+        record.generation,
+        "job_delete_agent_direct",
+    ):
+        pass
+
+    with pytest.raises(KBLifecycleConflictError):
+        await service.mark_dirty(
+            record.id,
+            reason="document_build_completed",
+            document_id="doc1",
+            enqueue=False,
+        )
+    current = await kb_service.get(record.id)
+    assert KB_AUTO_PROFILE_DIRTY_METADATA_KEY not in current.metadata
 
 
 @pytest.mark.asyncio

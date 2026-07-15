@@ -39,7 +39,7 @@
 | `PATCH` | `/kbs/{kb_id}` | 局部更新知识库（名称、描述、状态等） |
 | `DELETE` | `/kbs/{kb_id}` | 软删除知识库；附加 `?hard=true` 触发硬删除（durable worker 启用时入队 `clear_kb`，否则同步执行） |
 | `GET` | `/kbs/{kb_id}/status` | 知识库状态聚合（含运行中任务、pipeline 状态） |
-| `POST` | `/kbs/{kb_id}:restore` | 恢复软删除的知识库（`deleted`→`active`）；企业模式仅 super admin |
+| `POST` | `/kbs/{kb_id}:restore` | 恢复软删除的知识库（`deleted`→`active`）；企业模式允许 super admin 或该 tenant-created KB 所属租户的 `tenant_admin` / `tenant_owner` |
 | `GET` | `/kbs/{kb_id}/stats` | 控制面统计：文档状态分布、chunks/entity/relation 合计、job 状态分布、dead-letter、artifact 数 |
 
 ### 1.1 创建知识库
@@ -68,21 +68,24 @@ Content-Type: application/json
 - `PATCH /kbs/{kb_id}`：仅更新请求体显式给出的字段；`status` 不允许直接置为 `deleted`；`active_config_version_id` 不能通过 PATCH 修改，若请求体包含该字段返回 `400`，请改用 `POST /kbs/{kb_id}/configs/{version_id}:activate`。`metadata` 为**合并**语义：给出的 key 覆盖现值、value=null 删除该 key、未提及的 key 保留；顶层 `metadata: null` 返回 `400`；合并后序列化超 16KB 返回 `400`。
 - Agent 选库可使用 KB `metadata` 中的 profile 字段。人工覆盖字段为 `agent_description`（字符串，面向 Agent 的知识库说明）、`agent_tags`（字符串数组，或逗号分隔字符串）、`agent_priority`（整数，默认 0）；自动字段为 `agent_auto_profile`，由 `PROFILE` 角色 LLM 基于文档级 `metadata.agent_doc_profile` 聚合生成。人工字段优先于自动字段；这些字段不会改变 RBAC，只会随授权 KB 的 `allowed_kbs` 注入 `/agent/query` 的规划上下文。
 - `DELETE /kbs/{kb_id}`：默认软删除，同步从 `LightRAGInstanceRegistry` 卸载实例。
-- `DELETE /kbs/{kb_id}?hard=true`：触发硬删除。若服务端启用 durable worker 且 `clear_kb` 在 `job_worker.resumable_job_types` 中，路由会先 soft-delete/tombstone KB，再调用 `KBDeletionService.enqueue_hard_delete()` 创建 queued `clear_kb` job，并返回 `KnowledgeBaseDeleteResponse` 中的 `hard_delete_queued=true`、`hard_delete_job_id`、`hard_delete_job_type="clear_kb"`、`hard_delete_job_status="queued"`；后续由 worker 通过 `resume_hard_delete` 幂等执行，且 job 查询/取消/重试端点对 soft-deleted KB 使用 `include_deleted=true`，因此硬删除 job 在 KB tombstone 后仍可观察和控制。若 durable worker 未启用，保持兼容的同步硬删除流程：`KBDeletionService` 在 destructive lock 下依次执行：
+- `DELETE /kbs/{kb_id}?hard=true`：触发硬删除。若服务端启用 durable worker 且 `clear_kb` 在 `job_worker.resumable_job_types` 中，路由会先 soft-delete KB，再创建按 `(kb_id, generation)` 唯一的 queued `clear_kb` job；payload 固定保存 `kb_generation` 与 `workspace`，旧 generation 的 job 不能清理同 ID 重建后的新 KB。响应 `KnowledgeBaseDeleteResponse` 包含 `hard_delete_queued=true`、`hard_delete_job_id`、`hard_delete_job_type="clear_kb"`、`hard_delete_job_status="queued"`；后续由 worker 通过 `resume_hard_delete` 幂等执行。job 查询/取消/重试对 soft-deleted KB 使用 `include_deleted=true`，因此 tombstone 后仍可观察和控制。若 durable worker 未启用，则由同一个 durable clear job 同步执行。
+- 所有普通 KB 写操作在 generation-scoped shared fence 内执行；hard-delete 持 exclusive fence。PostgreSQL 使用 session advisory lock，local 兼容后端使用 KB 文件锁。删除会等待已开始的写入完成；进入 `deleting` 后拒绝新的 mutation/job，不允许恢复或复用该 KB id。
+- `KBDeletionService` 在 exclusive fence 内重新校验 catalog 状态、generation 与 clear job 后，按以下顺序执行：
   1. `force_evict` 在内存中的 LightRAG 实例并调用 `finalize_storages`（关闭存储句柄，不删数据）；
   2. **drop 全部引擎 storage 数据**：用 registry builder 建一个未缓存的瞬时实例并调用 `LightRAG.adrop_all_storages()`，对 full_docs / text_chunks / entities / relations / chunks / vector / graph / doc_status / llm_cache 等全部 storage 调 `drop()`。下一步删 `working_dir` 只能清文件型后端，外部后端（PostgreSQL / Milvus / Neo4j / Qdrant / Redis / Mongo / OpenSearch）数据在远端服务里，必须经此步显式清除，否则会残留并被复用同 workspace 的新 KB 读到；
   3. 删除 `working_dir/<workspace>`（如已配置）；
   4. 删除 `input_dir/<workspace>`（上传文件 + 解析 artifact 的本地 cache）；
   5. 若启用对象存储，删除该 workspace 下的 source/artifact 对象；
-  6. 清空 metadata store 控制面（documents / jobs / artifacts / config_versions；local 模式为 SQLite，PostgreSQL 模式为对应表）。
-  同步分支返回前会创建一条 `clear_kb` 类型的 job 记录最终结果，`result` 包含 `dropped_storages`（成功 drop 的 storage 数）、`cleared_object_storage` 和 `deleted_objects`；任一步失败（含某个 storage `drop()` 失败）HTTP 500 + `clear_kb` job 终态 `failed`，使操作者知道可能有残留并 `:retry`。失败的 `clear_kb` job（`max_retries=3`）可经 `:retry` 重置回 `queued`。
+  6. 严格清空 metadata scope（documents / artifacts / config versions / ACL / tenant override / service-key KB scope 等），但保留当前 clear job；
+  7. 将 lifecycle 从 `deleting` 原子提交为 `deleted`，最后按 generation CAS 删除 catalog 行并把 clear job 置为 `succeeded`。
+  `result` 包含 `dropped_storages`（成功 drop 的 storage 数）、`cleared_object_storage`、`deleted_objects` 与 metadata purge 计数。任一物理清理失败都会把同一 clear job 标为 `failed`，但保留 catalog、metadata 与 `deleting` fence，禁止复用 ID；再次 hard-delete 或 `:retry` 会复用原 job/idempotency key。若进程在 catalog purge 后、job 终态提交前退出，orphan recovery 会把该 `clear_kb` 原行重新排队，由 worker 只完成安全的尾部收敛。
 
 企业模式（`LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true`）下：
 
-- `POST /kbs` 需要 super admin 或 `can_create_kb=true`；服务端忽略请求体中的 `owner_id`/`tenant_id`，改用当前 principal，并自动授予创建者 `kb_owner` ACL。
+- `POST /kbs` 需要 super admin、`tenant_admin` / `tenant_owner`，或 `can_create_kb=true`。非 super admin 的 `owner_id`/`tenant_id` 由当前 principal 派生并自动授予创建者 `kb_owner` ACL；租户用户创建的 KB 固定 `origin="tenant"`、`visibility="private"`，并规范化加入 `tenant:{tenant_id}` 标签。
 - `GET /kbs` 对普通用户返回已授权 KB（direct user ACL / tenant ACL）以及 visibility 命中的 KB（`public` / 同租户 `internal`，见 10.4）；super admin 返回全部；service key 仅按 `kb_roles` scope（可选显式 `inherit_tenant_kb_acl`），不受 visibility 影响。
-- `PATCH /kbs/{kb_id}` 忽略请求体中的 `owner_id`/`tenant_id`，避免客户端伪造所有权或租户。
-- `DELETE /kbs/{kb_id}` 与 `?hard=true` 仅 super admin 可执行，并写入审计事件。
+- `PATCH /kbs/{kb_id}` 忽略非 super admin 请求体中的 `owner_id`/`tenant_id`；非 super admin 不能修改 visibility，租户 KB 的 tenant 标签与不可变 `origin` 不能由 metadata 伪造。
+- `DELETE /kbs/{kb_id}`、`?hard=true` 与 `POST /kbs/{kb_id}:restore`：super admin 可操作任意 KB；目标 KB 必须为 `origin="tenant"` 且 `tenant_id` 等于当前 canonical tenant 时，该租户的 `tenant_admin` / `tenant_owner` 也可操作。tenant ACL、direct KB admin/owner 或可编辑 metadata 都不能获得 platform KB 的生命周期权限。缺失 `origin` 的历史 catalog 行安全地按 `platform` 处理。
 
 ### 1.3 知识库状态
 
@@ -116,7 +119,7 @@ POST /kbs/{kb_id}:restore
 - 仅对 `status="deleted"` 的软删除 KB 生效：恢复为 `active`、清空 `deleted_at`，返回 `KnowledgeBaseResponse`。
 - KB 不存在返回 `404`；KB 当前不是 deleted 状态返回 `409`。
 - 存在在途（queued/running/retrying/cancelling）`clear_kb` 硬删除任务时返回 `409`，`detail.error_code="kb_hard_delete_in_progress"` 并携带 `job_id`——此时数据即将被硬删 worker 清除，恢复无意义；硬删除完成后控制面已 purge，`:restore` 返回 `404`。
-- 企业模式仅 super admin 可调用（与 `DELETE /kbs/{kb_id}` 同级），写入 `kb_restored` 审计事件。
+- 企业模式下由同一 catalog provenance 规则授权：super admin 可恢复任意 KB；所属租户的 `tenant_admin` / `tenant_owner` 仅可恢复真正的 `origin="tenant"` KB。restore 在 shared fence 内完成，若 hard-delete 已进入 `deleting` 或存在未完成的 generation-bound clear job 则返回 `409`；成功写入 `kb_restored` 审计事件。
 
 ### 1.5 知识库控制面统计
 
@@ -687,18 +690,19 @@ Content-Type: application/json
 
 ### 5.5 Durable job worker（可选）
 
-> 通过环境变量 `LIGHTRAG_KB_JOB_WORKER=true` 启用。默认关闭，关闭时行为与历史一致（仅 in-process 背景任务，重启后遗留任务一律标 `failed`）。
+> 通过环境变量 `LIGHTRAG_KB_JOB_WORKER=true` 启用。企业 PostgreSQL 部署建议开启；关闭时仍使用 in-process 背景任务，但不提供 queued job 的自动重驱动。
 
 启用后：
 - 服务启动会拉起一个后台轮询 worker，原子认领（`queued → running` 单赢 CAS）以下可从持久化状态重建的任务类型并执行到终态：单文档 `parse` / `build_kg` / `reindex` / `delete` / `replace`，**聚合** `parse` / `build_kg` / `reindex`（`document_id=null`、payload 携带 `document_ids`，含多文件 `upload` / `texts` 的 auto_parse 聚合 job 与 `batch-parse` / `batch-build-kg` / `batch-reindex` / `:rebuild`），聚合 `sync`（payload 携带 `batch_id` 与 per-item `source_key/source_name/source_hash`，请求字节已落盘到 `.sync-staging/<batch_id>/`），`documents:batch-delete` 聚合 `delete` job，以及 `clear_kb`（KB 硬删除，payload 携带 `kb_id`/`workspace`，幂等清理可重启续跑）。聚合 parse/build 之所以可恢复，是因为其源文件 / 解析产物在 job 运行前已落盘，worker 可凭 `document_ids` 重新规划并逐个 claim 执行；聚合 sync 则凭 staged request bytes 重建 `DocumentSourceInput` 并复用同一 per-item 同步逻辑。
 - **单文档 `replace` 现已可恢复**：replace 创建并 claim 时会把替换源字节落盘到 `INPUT_DIR/<workspace>/<document_id>/.replace-staging-<job_id>.bin`，因此 worker 可在重启/`:retry` 后凭 staged 字节重建 `DocumentReplacementSource`，重新 claim 文档进入 `replacing`，复用与同步路径一致的执行逻辑（删旧索引 → 换 source → 可选 auto_parse/auto_index），终态后清理 staging 文件。若 staged 字节缺失（历史 job 未落盘），或 staged 字节内容 hash 与 payload `source_hash` 不匹配（staging 文件被截断/损坏），worker 以 `replace_not_resumable` 明确失败，不会凭错字节续跑（与批量 `sync` 续跑的 hash 校验对齐）。
 - **批量 `sync` 现已可恢复**：sync route 在创建聚合 job 前为每个 item 落盘请求字节，并在 payload 中持久化 `batch_id`、`source_key`、`source_name`、`source_hash`、`content_type` 与同步选项；worker 重启/`:retry` 后按 staged bytes 重建每个 source，重新执行 created/replaced/skipped 与可选 parse/build。staging 只在终态 job transition 成功后 best-effort 清理；若 staged bytes 缺失或 hash 不匹配，worker 以 `sync_not_resumable` 明确失败。
 - **自动消费 `:retry`**：重试把任务重置回 `queued` 后，worker 在下一轮轮询中认领并重跑，客户端无需再次发起业务请求。
-- **重启续跑**：进程重启时，孤儿恢复会保留这些可恢复类型的 `queued` 任务（不再标 `failed`）交给 worker 继续执行；仍处于 `running` 的中途任务无法安全恢复，照旧标 `failed`，其文档同步重置为 `*_failed`，客户端 `:retry` 后即可被 worker 自动重跑。delete 续跑时若孤儿恢复已把文档从 `deleting` 重置为 `delete_failed`，worker 会重新 claim 回 `deleting` 再执行（`_claim_document_deleting` 接受同一 delete job id 的幂等 reclaim）；replace 续跑同理从 `replace_failed` 重新 claim 回 `replacing`。
+- **跨进程单 owner**：worker claim 后持有 per-job session ownership lock；PostgreSQL 使用独立 operation-lock pool 中的 advisory lock，local 兼容后端使用 job 文件锁。启动恢复与周期恢复只有在 job 超过 grace 且 non-blocking owner-lock 成功时才认定其为 orphan，不会把其他 live worker 正在执行的 job 重置后重复运行。
+- **重启续跑**：可恢复类型的 `queued` job 保持 queued。失去 owner 的普通 mid-flight job按既有失败/重试契约处理；`clear_kb` 会原 job 原 payload 自动 requeue，因为其 generation、workspace 与阶段 checkpoint 足以安全恢复，catalog 已 purge 时也只执行 lifecycle/job 尾部收敛。
 - **不抢占新任务**：worker 只认领 `queued_at` 早于宽限窗口（`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`，默认 5s）的任务；新建任务由其 in-process 背景任务在毫秒级转入 `running`，因此不会被 worker 抢跑，避免重复执行。
 - **需重新发起的类型**：多文件 `upload` 且 `auto_parse=false` 时不产生可重驱动解析工作；其他没有持久化请求上下文的历史/自定义任务仍会在孤儿恢复时标 `failed`，需要重新发起请求。
 - **死信**：`failed` 且 `retry_count >= max_retries` 的任务不会再被 `:retry` 或 worker 重跑，可通过 `GET /kbs/{kb_id}/jobs/dead-letter` 单独列出做人工triage。
-- 可调环境变量：`LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS`（默认 1.0s）、`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`（默认 5.0s）。
+- 可调环境变量：`LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS`（默认 1.0s）、`LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS`（默认 5.0s）、`LIGHTRAG_KB_JOB_RECOVERY_INTERVAL_SECONDS`（默认 30.0s）、`LIGHTRAG_KB_JOB_RECOVERY_GRACE_SECONDS`（默认沿用 worker grace，未启用 worker 时为 5.0s）。PostgreSQL 的 `LIGHTRAG_KB_POSTGRES_OPERATION_LOCK_POOL_MAX_SIZE`（默认 10）是 fence/job-owner 的独立连接池，不占用普通 metadata pool，避免业务池 `max_size=1` 时自锁。
 
 ### 5.5.1 聚合任务的并发执行模型
 
@@ -754,6 +758,7 @@ POST /kbs/{kb_id}/jobs/{job_id}:wait?timeout_seconds=60&poll_interval_seconds=0.
 
 下载约束：
 - 企业模式权限：artifact list/detail 按 `kb_viewer` 或更高角色读取。`:download` 与 `:download-url` 的默认最低角色由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 控制，默认 `kb_viewer` 保持旧行为，可提升为 `kb_editor`、`kb_admin` 或 `kb_owner`；`LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY` 可用 JSON object 按 artifact type 覆盖（如 `{"original":"kb_editor","*":"kb_viewer"}`），并同时作用于显式匹配类型的 `:preview`。更细粒度时可使用 `LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY`，按 action 分别设置 artifact type policy，例如 `{"preview":{"*":"kb_editor"},"download":{"original":"kb_editor"},"download-url":{"original":"kb_admin"}}`。action policy 优先于 download policy；低于要求的角色返回 `403`。
+- 对交互式 JWT 用户，所有 `:download` / `:download-url` 还必须满足用户级 `can_download_files=true`；`original` 的 `:preview` 同样要求该能力，防止把原文件 inline preview 当作下载绕过。`preview_text` / `preview_table_json` 等派生安全预览只按 KB role/action policy，不要求下载能力。super admin 与 service/scoped API key 不受该用户能力位限制，但 service key 仍受自身 KB scope/role 与 artifact policy 约束。新建用户默认 `can_download_files=false`；迁移前已有用户兼容为 `true`，管理员可显式收紧。
 - 文件型产物（`original` / `blocks` / `markdown` / `content_list` / `middle_json` / `model_json` / `image` / `layout_pdf` / `preview_text` / `preview_table_json`）以 `FileResponse` 直接返回。
 - 目录型产物（`sidecar` / `raw_dir`）以流式 zip 返回（`Content-Type: application/zip`），单次下载 zip 内未压缩字节上限 512 MB，超限返回 `413`。
 - 路径必须位于 `inputs/<workspace>/<document_id>` 内；跨 KB、缺失文件、路径逃逸均返回 `404` / `400`。
@@ -1479,6 +1484,20 @@ LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY={"preview":{"*":"kb_editor"},"downloa
 # 企业响应中默认隐藏本地 path / object_uri / object_prefix_uri
 LIGHTRAG_ENTERPRISE_MASK_STORAGE_URIS=true
 
+# 企业 KB 控制面（生产使用 PostgreSQL）
+LIGHTRAG_KB_METADATA_BACKEND=postgres
+LIGHTRAG_KB_POSTGRES_POOL_MIN_SIZE=1
+LIGHTRAG_KB_POSTGRES_POOL_MAX_SIZE=10
+# generation fence / per-job owner advisory lock 的独立连接池
+LIGHTRAG_KB_POSTGRES_OPERATION_LOCK_POOL_MAX_SIZE=10
+
+# durable job worker 与 orphan recovery
+LIGHTRAG_KB_JOB_WORKER=true
+LIGHTRAG_KB_JOB_WORKER_POLL_SECONDS=1.0
+LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS=5.0
+LIGHTRAG_KB_JOB_RECOVERY_INTERVAL_SECONDS=30.0
+LIGHTRAG_KB_JOB_RECOVERY_GRACE_SECONDS=5.0
+
 # 默认关闭的企业请求限流/配额；开启后在认证与 RBAC 通过后计数
 LIGHTRAG_ENTERPRISE_RATE_LIMIT_ENABLED=false
 # user / service key / legacy enterprise API key principal 固定窗口请求限流
@@ -1602,7 +1621,7 @@ username=admin&password=change-me
 
 ### 10.3 管理接口
 
-以下接口均需 super admin：
+以下 `/admin` 接口均需 super admin；唯一兼容例外是精确的 `GET /admin/tenants/{tenant_id}`，目标 tenant 的 `tenant_admin` / `tenant_owner` 也可读取本部门详情。其余 `/admin/*` 不因 tenant role 放宽：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -1610,10 +1629,10 @@ username=admin&password=change-me
 | `GET` | `/admin/overview` | 平台总览 JSON 聚合：KB 状态分布、文档/job/artifact 全局聚合与计数器合计、dead-letter 总数、企业用户/租户/service key/审计事件计数、**项目记忆全局统计**（`chat_memory`：启用/可用、episode 总数、distinct 用户/项目数）；仅查控制面，不加载引擎实例（面向管理台 dashboard，替代解析 `/metrics` 文本） |
 | `PATCH` / `PUT` | `/admin/settings/registration` | 更新实时注册策略，body：`{"enabled": true}` 或 `{"mode":"open"}` |
 | `GET` | `/admin/users` | 列出企业用户；支持 `status`/`tenant_id`/`q`(用户名子串) 过滤与 `limit`/`offset` 分页 |
-| `POST` | `/admin/users` | 创建用户，可设置 `can_create_kb`、`can_use_bypass_query`、`can_use_agent_query`、`can_delete_documents`、`tenant_id` |
+| `POST` | `/admin/users` | 创建用户，可设置 `can_create_kb`、`can_use_bypass_query`、`can_use_agent_query`、`can_delete_documents`、`can_download_files`、`tenant_id` |
 | `GET` | `/admin/users/{user_id}` | 查询用户详情 |
 | `GET` | `/admin/users/{user_id}/access` | 查看用户的访问总览：全局能力 + 租户成员关系(role) + 直接 KB ACL(kb_id/role，不含租户继承的有效角色) |
-| `PATCH` | `/admin/users/{user_id}` | 更新用户状态/能力/tenant/password；请求体包含 `status`、`can_create_kb`、`can_use_bypass_query`、`can_use_agent_query`、`can_delete_documents` 任一非 null 字段、显式给出 `tenant_id` 或修改 `password`，都会增加 `token_version` 并使旧 token 失效。`tenant_id` 区分 omitted 与显式 null：省略=不变，显式 `null`=清空租户归属，空/空白字符串返回 `400` |
+| `PATCH` | `/admin/users/{user_id}` | 更新用户状态/能力/tenant/password；请求体包含 `status`、`can_create_kb`、`can_use_bypass_query`、`can_use_agent_query`、`can_delete_documents`、`can_download_files` 任一非 null 字段、显式给出 `tenant_id` 或修改 `password`，都会增加 `token_version` 并使旧 token 失效。`tenant_id` 区分 omitted 与显式 null：省略=不变，显式 `null`=清空租户归属，空/空白字符串返回 `400` |
 | `POST` | `/admin/users/{user_id}:disable` | 禁用用户并递增 `token_version`，旧 token 失效 |
 | `POST` | `/admin/users/{user_id}:enable` | 启用用户并递增 `token_version` |
 | `POST` | `/admin/users/{user_id}:reset-password` | 重置用户密码并递增 `token_version` |
@@ -1623,7 +1642,7 @@ username=admin&password=change-me
 | `POST` | `/admin/users/{user_id}/kb-access:batch-set` | 按用户维度批量 grant/revoke 多个 KB ACL；与按 KB 维度 `/admin/kbs/{kb_id}/acl:batch-set` 互补 |
 | `POST` | `/admin/tenants` | 创建租户实体（可指定 `tenant_id`，省略则生成 `tenant_<hex>`；重复 `409`） |
 | `GET` | `/admin/tenants` | 列出所有租户 |
-| `GET` | `/admin/tenants/{tenant_id}` | 租户详情 + 总览（含 `member_count` / `kb_count`） |
+| `GET` | `/admin/tenants/{tenant_id}` | 租户详情 + 总览（含 `member_count` / `kb_count`）；`kb_count` 是 active 的 tenant-owned KB 与 super admin 通过 tenant ACL 下发 KB 的去重并集；本 tenant admin/owner 也可读取 |
 | `PATCH` | `/admin/tenants/{tenant_id}` | 更新租户 `name`/`description`/`status`（`active`/`disabled`） |
 | `DELETE` | `/admin/tenants/{tenant_id}` | 删除租户实体；仅当无任何引用（成员/租户内 KB/归属用户/tenant-KB ACL）时允许，否则 `409`（不级联） |
 | `GET` | `/admin/tenants/{tenant_id}/kbs` | 列出该租户下的 KB（`id`/`name`/`status`/`visibility`/`owner_id`） |
@@ -1648,13 +1667,31 @@ username=admin&password=change-me
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/tenants/{tenant_id}/members` | tenant admin 查看本 tenant 成员；每条 membership 附带 `username` / `display_name` / `user_status`（tenant admin 无法访问超管专属的 `/admin/users`，用户名信息直接随成员列表返回） |
-| `PUT` | `/tenants/{tenant_id}/members/{user_id}` | tenant admin 仅可授予/更新普通 `tenant_member`；不能提升为 admin/owner，也不能修改已有 admin/owner |
-| `DELETE` | `/tenants/{tenant_id}/members/{user_id}` | tenant admin 仅可撤销普通 `tenant_member`；不能撤销 tenant admin/owner |
+| `GET` | `/tenants/{tenant_id}` | 本 tenant 详情，含 `member_count` 与 active `kb_count` |
+| `GET` | `/tenants/{tenant_id}/kbs` | 本 tenant 可管理/已下发的 active KB 摘要列表 |
+| `GET` | `/tenants/{tenant_id}/users` | 列出 canonical tenant assignment 与 membership 都属于本 tenant 的非 super 用户；支持 `status`、`q`、`limit`、`offset` |
+| `POST` | `/tenants/{tenant_id}/users` | 创建本部门普通用户；可设置五个能力位：`can_create_kb`、`can_delete_documents`、`can_use_bypass_query`、`can_use_agent_query`、`can_download_files`，默认均为 false |
+| `GET` | `/tenants/{tenant_id}/users/{user_id}` | 查询本部门用户详情 |
+| `PATCH` | `/tenants/{tenant_id}/users/{user_id}` | 更新普通成员状态及五个能力位；不能在此修改 `tenant_id` 或密码 |
+| `POST` | `/tenants/{tenant_id}/users/{user_id}:enable` | 启用本部门普通成员并使旧 JWT 失效 |
+| `POST` | `/tenants/{tenant_id}/users/{user_id}:disable` | 禁用本部门普通成员并使旧 JWT 失效 |
+| `POST` | `/tenants/{tenant_id}/users/{user_id}:reset-password` | 重置本部门普通成员密码并使旧 JWT 失效 |
+| `DELETE` | `/tenants/{tenant_id}/users/{user_id}` | 删除本部门普通成员及其 membership/ACL/个人设置/对话数据等关联记录 |
+| `GET` | `/tenants/{tenant_id}/members` | 查看本 tenant membership；每条记录附带 `username` / `display_name` / `user_status` |
+| `PUT` | `/tenants/{tenant_id}/members/{user_id}` | 仅把当前无租户归属的普通用户授予为 `tenant_member`；不能跨租户搬迁或提升为 admin/owner |
+| `DELETE` | `/tenants/{tenant_id}/members/{user_id}` | 仅撤销普通 `tenant_member`；不能撤销自己、tenant admin/owner 或 super admin |
+| `GET` | `/tenants/{tenant_id}/audit-events` | 查询事件发生时 `actor_tenant_id` 为本 tenant 的审计事件；过滤和分页参数与 `/admin/audit-events` 一致 |
+| `GET` | `/tenants/{tenant_id}/kbs/{kb_id}/members` | 列出本部门普通成员对该 KB 的 override/effective role 与来源 |
+| `PUT` | `/tenants/{tenant_id}/kbs/{kb_id}/members/{user_id}` | 设置成员 `viewer` / `editor` / `admin` allow override；对 platform-provisioned KB 不能超过当前 tenant ACL role |
+| `DELETE` | `/tenants/{tenant_id}/kbs/{kb_id}/members/{user_id}` | 默认写入 deny，仅撤销 tenant-derived access；加 `?reset=true` 删除 override，恢复当前 tenant ACL 继承 |
 
 Tenant membership 响应对象字段：`tenant_id`、`user_id`、`role`、`granted_by`、`created_at`、`updated_at`，以及读取时从用户记录解析出的 `username`（用户名）、`display_name`（用户自助资料中的显示名，未设置时为 `null`）、`user_status`（`active` / `disabled` / `pending`）；对应用户记录已被删除时这三个解析字段为 `null`。适用于 `/admin/tenants/{tenant_id}/members` 与 `/tenants/{tenant_id}/members` 的 GET 列表响应及 PUT 授予响应。
 
-KB ACL 角色使用规范名称：`kb_viewer`、`kb_editor`、`kb_admin`、`kb_owner`。用户 effective KB role 取 direct user ACL 与其 tenant memberships 命中的 tenant-scoped KB ACL 的最高角色；没有 direct/tenant ACL 时跨 tenant 默认拒绝。Service/scoped API key 默认只按自身 `kb_roles` scope 授权；若创建时同时设置 `tenant_id` 与 `inherit_tenant_kb_acl=true`，则显式继承该 tenant 命中的 tenant-scoped KB ACL，并与 `kb_roles` 取最高角色。第一期中 KB ACL 仍由 super admin 统一执行；tenant admin 只具备本 tenant 成员自助管理权限，不具备 KB ACL 管理或删除 KB 的平台权限。
+租户用户管理边界：目标必须在事务提交时仍是本 tenant 的普通 `tenant_member`；tenant admin 不能修改或删除自己、`tenant_admin`、`tenant_owner`、super admin，也不能通过 scoped API 迁移用户到其他 tenant。用户快照、membership、角色与写入采用事务级 CAS；并发迁移/晋升发生时返回 `409`，不会把旧快照写回覆盖新状态。
+
+KB ACL 角色使用规范名称：`kb_viewer`、`kb_editor`、`kb_admin`、`kb_owner`。平台来源角色取 direct user ACL 与 visibility 隐含角色最高值；tenant 来源另按 KB provenance 计算：tenant-owned KB 只有显式 allow override 才给普通成员角色，deny/无 override 均不授予；platform-provisioned KB 无 override 时继承当前 tenant ACL，allow 不能超过当前 tenant ACL，deny 只压制 tenant-derived access，`reset=true` 后恢复当前继承。最终 effective role 是 platform 与 tenant contribution 的最高值，因此 tenant admin 的 revoke 不会删除 super admin 的 direct grant 或 public/internal visibility。Service/scoped API key 默认只按自身 `kb_roles` scope；设置 `tenant_id + inherit_tenant_kb_acl=true` 时才显式继承 tenant ACL。
+
+知识库生命周期权限不等同于 KB role：租户管理员只能软删除、硬删除或恢复 `origin="tenant"` 且 `tenant_id` 为本部门的 KB；super admin 下发的 `origin="platform"` KB 即使 tenant ACL 为 `kb_admin` 也不能由租户管理员删除。`origin` 是不可变 catalog 字段，历史缺失值 fail-safe 为 `platform`。
 
 KB ACL 请求/响应约束：
 
@@ -1663,7 +1700,7 @@ KB ACL 请求/响应约束：
 - ACL 响应对象字段为：`kb_id`、`user_id`、`tenant_id`、`principal_type`（`user` / `tenant`）、`role`、`granted_by`、`created_at`、`updated_at`。
 - `batch-set` 响应中 `granted` 为 ACL 响应对象数组；`revoked` 为本次实际删除成功的 user id 或 tenant id 字符串数组。
 
-`GET /admin/audit-events` 返回审计事件，按 `created_at DESC, id DESC` 排序；`limit` 默认 `100`，服务端会 clamp 到 `1..500`，`offset` 默认 `0` 用于分页。可选过滤参数（精确匹配，组合为 AND）：`event_type`、`actor_user_id`、`target_type`、`target_id`；时间范围 `created_after` / `created_before` 为 ISO-8601 字符串，按字典序与 `created_at` 比较（`>=` / `<=`）。例：`GET /admin/audit-events?event_type=kb_deleted&actor_user_id=usr_x&created_after=2026-06-01T00:00:00Z&limit=50&offset=50`。
+`GET /admin/audit-events` 返回全平台审计事件，按 `created_at DESC, id DESC` 排序；`limit` 默认 `100`，服务端会 clamp 到 `1..500`，`offset` 默认 `0` 用于分页。可选过滤参数（精确匹配，组合为 AND）：`event_type`、`actor_user_id`、`target_type`、`target_id`；时间范围 `created_after` / `created_before` 为 ISO-8601 字符串，按字典序与 `created_at` 比较（`>=` / `<=`）。`GET /tenants/{tenant_id}/audit-events` 使用同一过滤集，但服务端额外强制 `actor_tenant_id=tenant_id`；该字段是事件写入时的 canonical tenant 快照，用户后续调换部门不会改变历史可见性，旧记录若为 null 不会被猜测归属。例：`GET /admin/audit-events?event_type=kb_deleted&actor_user_id=usr_x&created_after=2026-06-01T00:00:00Z&limit=50&offset=50`。
 
 审计事件响应字段：
 
@@ -1672,6 +1709,7 @@ KB ACL 请求/响应约束：
   "id": "audit_...",
   "event_type": "kb_created",
   "actor_user_id": "usr_...",
+  "actor_tenant_id": "tenant-a",
   "actor_username": "张三",
   "target_type": "kb",
   "target_id": "kb_...",
@@ -1681,6 +1719,7 @@ KB ACL 请求/响应约束：
 }
 ```
 
+- `actor_tenant_id`：事件发生时操作者 canonical tenant 的持久化快照；tenant 审计接口按此字段做数据库过滤。
 - `actor_username`：由 `actor_user_id` 在读取时动态解析（对齐 `EnterpriseUserResponse.username`），未找到时为 `null`。
 - `target_name`：根据 `target_type` 动态解析——`kb` 返回知识库名称、`user` 返回用户名、`tenant` 返回租户名称（对齐各实体的 `name` / `username` 字段）；未找到时为 `null`。
 
@@ -1711,10 +1750,10 @@ KB ACL 请求/响应约束：
 // 返回：{"enabled": false, "mode": "invite_only"}
 
 // POST /admin/users
-{"username":"bob","password":"bob-pass","can_create_kb":true,"can_use_bypass_query":false,"can_use_agent_query":true,"can_delete_documents":false,"tenant_id":null}
+{"username":"bob","password":"bob-pass","can_create_kb":true,"can_use_bypass_query":false,"can_use_agent_query":true,"can_delete_documents":false,"can_download_files":false,"tenant_id":null}
 
 // PATCH /admin/users/{user_id}
-{"status":"active","can_create_kb":false,"can_use_bypass_query":true,"can_use_agent_query":true,"can_delete_documents":true,"tenant_id":"tenant-a","password":"new-pass"}
+{"status":"active","can_create_kb":false,"can_use_bypass_query":true,"can_use_agent_query":true,"can_delete_documents":true,"can_download_files":true,"tenant_id":"tenant-a","password":"new-pass"}
 
 // POST /admin/users/{user_id}:reset-password
 {"password":"new-pass"}
@@ -1724,6 +1763,15 @@ KB ACL 请求/响应约束：
 
 // PUT /admin/tenants/{tenant_id}/members/{user_id}
 {"role":"tenant_member"}
+
+// POST /tenants/{tenant_id}/users
+{"username":"alice","password":"change-me","can_create_kb":true,"can_use_bypass_query":false,"can_use_agent_query":true,"can_delete_documents":false,"can_download_files":true}
+
+// PUT /tenants/{tenant_id}/kbs/{kb_id}/members/{user_id}
+{"role":"editor"}
+
+// DELETE /tenants/{tenant_id}/kbs/{kb_id}/members/{user_id}
+// 默认写 deny；加 ?reset=true 删除 override 并恢复 tenant ACL 继承
 
 // PUT /admin/kbs/{kb_id}/acl
 {"tenant_id":"tenant-a","role":"kb_viewer"}
@@ -1822,25 +1870,28 @@ Service API key 行为约束：
 ### 10.4 企业模式权限边界
 
 - `mode="bypass"` 查询需要 KB read ACL 加 `can_use_bypass_query=true` 或 super admin；按最终解析后的查询模式判断，包括 active query config 默认值。
+- `/agent/query` 需要 `can_use_agent_query=true` 或 super admin；Agent 每轮仍只在当前用户 effective `kb_viewer`+ 的候选 KB 中检索。`can_use_bypass_query` 与 `can_use_agent_query` 是两个独立开关，互不蕴含。
 - legacy/global `/documents`、`/query`、`/graph`、Ollama `/api/*` 在 `LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES=true` 时默认拒绝；关闭该开关后仍需 super admin。
 - super admin bootstrap 来自 `.env`，启动后同步为 active super admin；企业模式要求非默认 `TOKEN_SECRET`。
-- Tenant membership 与 tenant-scoped KB ACL 已接入用户 principal hydration；用户请求按 direct user ACL 与 tenant ACL 最高角色授权。Service key 请求默认只按显式 `kb_roles` scope 授权；设置 `tenant_id + inherit_tenant_kb_acl=true` 时显式继承 tenant ACL。
-- **KB 可见性（visibility）语义**：`knowledge_bases.visibility ∈ {private, internal, public}`，默认 `private`。`private` 无隐含权限；`internal` 在 KB `tenant_id` 非空时对该租户用户（`user.tenant_id` 相同或拥有该租户 membership）隐含 `kb_viewer`；`public` 对全部已认证企业交互用户（JWT principal）隐含 `kb_viewer`。隐含角色仅为只读（读 + query），写/配置/删除仍需显式 ACL / super admin；effective role 取 direct ACL、tenant ACL 与 visibility 隐含角色的最高者。service/scoped API key 与 legacy enterprise API key 不受 visibility 影响。`GET /admin/users/{id}/access` 仅列显式授权，不枚举 visibility 隐含项。修改 visibility 走 `PATCH /kbs/{kb_id}`（`kb_admin`+）。
+- Tenant membership、tenant-scoped KB ACL 与 tenant-user override 已接入统一 effective-role resolver；KB 列表、普通 query/retrieve 与 Agent candidate filtering 复用同一结果。Tenant deny 只屏蔽 tenant-derived access，不能覆盖 direct user ACL 或 visibility。Service key 默认只按显式 `kb_roles` scope；设置 `tenant_id + inherit_tenant_kb_acl=true` 时才继承 tenant ACL。
+- **KB 可见性（visibility）语义**：`knowledge_bases.visibility ∈ {private, internal, public}`，默认 `private`。`private` 无隐含权限；`internal` 在 KB `tenant_id` 非空时对该租户用户隐含 `kb_viewer`；`public` 对全部已认证企业交互用户（JWT principal）隐含 `kb_viewer`。隐含角色仅为只读。service/scoped API key 与 legacy enterprise API key 不受 visibility 影响。`GET /admin/users/{id}/access` 仅列显式授权，不枚举 visibility。只有 super admin 可通过 `PATCH /kbs/{kb_id}` 改 visibility；tenant-created KB 固定 private。
 - 文档删除为所有权感知模型：`kb_editor` 仅可删除本人上传（`metadata.created_by`）的文档；删除他人文档需用户级能力 `can_delete_documents`（super admin 通过 `/admin/users` 授予）或 `kb_admin`+/`super_admin`。service/scoped API key 不会获得 `can_delete_documents`：只能按 `kb_admin` scope 删任意，或按 `kb_editor` scope 删除该 key 自身上传的文档；无 `created_by` 的历史文档仅 privileged 主体可删。
+- 文件导出是 KB role 与用户能力的双重门禁：交互式用户访问 artifact `:download` / `:download-url`，以及 original `:preview`，除满足 artifact role policy 外还需 `can_download_files=true`；问答引用文献的下载链接走相同端点，因此不能绕过。派生安全预览不要求该能力。super admin 与 service key 例外，但 service key 仍受显式 KB scope/role。
 
 KB 路由角色矩阵：
 
 | 范围 | 最低角色 / 能力 |
 |---|---|
-| `POST /kbs` | super admin 或 `can_create_kb=true` |
+| `POST /kbs` | super admin、canonical `tenant_admin`/`tenant_owner`，或 `can_create_kb=true`；租户用户创建时强制 tenant provenance/private/tag |
 | `GET /kbs` | super admin 看全部；普通用户看 direct user ACL / tenant ACL 授权 KB + visibility 命中 KB（`public` / 同租户 `internal`）；service key 默认仅看 `kb_roles` scope，显式 `inherit_tenant_kb_acl` 时额外继承 tenant ACL，不受 visibility 影响 |
-| `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、`/stats`、`/documents/{id}/chunks`、graph 读取、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高（可由 visibility 隐含，见上）；artifact `:download` / `:download-url` 可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE` 全局提升最低角色，也可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY` 按 artifact type 覆盖；`:download` / `:download-url` / `:preview` 还可由 `LIGHTRAG_ENTERPRISE_ARTIFACT_ACTION_POLICY` 按 action + artifact type 覆盖 |
+| `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、`/stats`、`/documents/{id}/chunks`、graph 读取、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高（可由 visibility 隐含，见上）；artifact action policy 可提升最低角色；`:download` / `:download-url` 与 original `:preview` 对交互式用户额外要求 `can_download_files=true` |
 | `/kbs/{kb_id}/query`、`/query/stream`、`/query/data`、`/retrieve` | `kb_viewer` 或更高；最终 `mode="bypass"` 额外需要 `can_use_bypass_query=true` |
 | `POST /kbs:query`、`/kbs:query/stream`、`/kbs:retrieve`（跨库合并查询） | `kb_ids` 中每个 KB 均需 `kb_viewer`+（handler 自鉴权，中央中间件不覆盖 collection 级路径）；`bypass` 不支持(400) |
 | 文档上传/解析/构建/替换/sync、批量启停（`:batch-enable`/`:batch-disable`）、`:rebuild`、job wait/cancel/retry 等写操作 | `kb_editor` 或更高 |
 | 文档删除（`DELETE …/documents/{id}`、`:batch-delete`） | `kb_editor` 仅删本人上传(`metadata.created_by`)的文档；删他人需 `can_delete_documents` 能力或 `kb_admin`+/`super_admin` |
-| KB 配置创建/激活/diff、`PATCH /kbs/{kb_id}`、图谱编辑（`/graph` 下全部非 GET 端点） | `kb_admin` 或更高 |
-| `DELETE /kbs/{kb_id}`、`?hard=true`、`POST /kbs/{kb_id}:restore`、`/admin/...` | super admin |
+| KB 配置创建/激活/diff、`PATCH /kbs/{kb_id}`、图谱编辑（`/graph` 下全部非 GET 端点） | `kb_admin` 或更高；非 super admin 不能改 owner/tenant/visibility/provenance |
+| `DELETE /kbs/{kb_id}`、`?hard=true`、`POST /kbs/{kb_id}:restore` | super admin；或该 KB 为 `origin=tenant` 且当前用户是其 canonical tenant 的 `tenant_admin` / `tenant_owner`。direct/tenant ACL 的 `kb_admin`/`kb_owner` 本身不授予生命周期权限 |
+| `/admin/...` | super admin；仅精确 `GET /admin/tenants/{tenant_id}` 允许目标 tenant admin/owner |
 
 ### 10.5 用户对话管理（/chat）
 
