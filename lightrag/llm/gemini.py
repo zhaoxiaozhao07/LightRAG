@@ -29,6 +29,7 @@ from lightrag.utils import (
     safe_unicode_decode,
     wrap_embedding_func_with_attrs,
 )
+from lightrag.sensitive_context import is_sensitive_call
 
 import pipmaster as pm
 
@@ -123,7 +124,13 @@ def _get_gemini_client(
 
             client_kwargs["http_options"] = types.HttpOptions(**http_options_kwargs)
         except Exception as e:
-            logger.error("Failed to apply custom Gemini http_options: %s", e)
+            if is_sensitive_call():
+                logger.error(
+                    "Failed to apply custom Gemini http_options (%s)",
+                    type(e).__name__,
+                )
+            else:
+                logger.error("Failed to apply custom Gemini http_options: %s", e)
             raise e
 
     return genai.Client(**client_kwargs)

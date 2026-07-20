@@ -41,6 +41,8 @@ from .config import (
     get_default_host,
     resolve_asymmetric_embedding_opt_in,
     PREFIX_ASYMMETRIC_EMBEDDING_BINDINGS,
+    normalize_kb_metadata_backend,
+    validate_chat_memory_configuration,
 )
 from lightrag.utils import get_env_value
 from lightrag import LightRAG, ROLES, RoleLLMConfig, __version__ as core_version
@@ -115,6 +117,7 @@ from lightrag.api.enterprise_auth import (
 )
 from lightrag.api.routers.chat_routes import create_chat_routes
 from lightrag.api.chat_memory_service import ChatMemoryConfig, ChatMemoryService
+from lightrag.api.chat_memory_worker import ChatMemoryWorker
 from lightrag.api.routers.enterprise_routes import create_enterprise_routes
 
 # use the .env that is inside the current folder
@@ -128,6 +131,14 @@ webui_description = os.getenv("WEBUI_DESCRIPTION")
 
 # Global authentication configuration
 auth_configured = bool(auth_handler.accounts)
+
+
+def _short_fingerprint(value: str | None) -> str | None:
+    """Return only a short digest suffix; never expose fingerprint inputs."""
+
+    if not value:
+        return None
+    return value.rsplit(":", 1)[-1][:12]
 
 
 def _inject_swagger_theme(html: str, theme: str) -> str:
@@ -867,6 +878,16 @@ def _coerce_binary_string_schemas(node: Any) -> None:
 
 
 def create_app(args):
+    configured_metadata_backend = getattr(args, "kb_metadata_backend", None)
+    if configured_metadata_backend is None:
+        configured_metadata_backend = os.getenv(
+            "LIGHTRAG_KB_METADATA_BACKEND", "local"
+        )
+    kb_metadata_backend = normalize_kb_metadata_backend(configured_metadata_backend)
+    validate_chat_memory_configuration(
+        args, kb_metadata_backend=kb_metadata_backend
+    )
+
     # Check frontend build first and get status
     webui_assets_exist, is_frontend_outdated = check_frontend_build()
 
@@ -913,6 +934,11 @@ def create_app(args):
     if args.embedding_binding_host is None:
         args.embedding_binding_host = get_default_host(args.embedding_binding)
 
+    # Resolve the complete memory configuration only after provider defaults
+    # have been written back to programmatic args. The entry validation above
+    # intentionally remains pure and does not need provider-derived settings.
+    chat_memory_config = ChatMemoryConfig.from_args(args)
+
     # Add SSL validation
     if args.ssl:
         if not args.ssl_certfile or not args.ssl_keyfile:
@@ -929,21 +955,15 @@ def create_app(args):
 
     # Initialize document manager with workspace support for data isolation
     doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
-    kb_metadata_backend = os.getenv("LIGHTRAG_KB_METADATA_BACKEND", "local").strip().lower()
-    if kb_metadata_backend in {"postgres", "postgresql", "pg"}:
+    if kb_metadata_backend == "postgres":
         kb_service = PostgresKnowledgeBaseService.from_env()
         metadata_store = PostgresMetadataStore.from_env()
-    elif kb_metadata_backend in {"", "local", "json", "sqlite"}:
+    else:
         kb_service = KnowledgeBaseService(
             Path(args.working_dir) / "metadata" / "knowledge_bases.json"
         )
         metadata_store = SQLiteMetadataStore(
             Path(args.working_dir) / "metadata" / "metadata.sqlite3"
-        )
-    else:
-        raise ValueError(
-            "Unsupported LIGHTRAG_KB_METADATA_BACKEND: "
-            f"{kb_metadata_backend!r}; expected local or postgres"
         )
     object_storage = create_object_storage_from_env()
     document_lifecycle_service = DocumentLifecycleService(
@@ -952,9 +972,34 @@ def create_app(args):
     job_service = JobService(kb_service, metadata_store)
     index_build_service = IndexBuildService(document_lifecycle_service)
     enterprise_enabled = bool(getattr(args, "enterprise_auth_enabled", False))
+    chat_memory_runtime_configured = bool(
+        enterprise_enabled
+        and kb_metadata_backend == "postgres"
+        and (chat_memory_config.enabled or chat_memory_config.maintenance_enabled)
+    )
+    service_memory_extraction_fingerprint = (
+        chat_memory_config.extraction_fingerprint()
+        if chat_memory_runtime_configured
+        else None
+    )
+    service_memory_graph_store_fingerprint = (
+        chat_memory_config.graph_store_fingerprint()
+        if chat_memory_runtime_configured
+        else None
+    )
     enterprise_audit_service = AuditService(metadata_store) if enterprise_enabled else None
     enterprise_user_service = (
-        UserService(metadata_store, enterprise_audit_service)
+        UserService(
+            metadata_store,
+            enterprise_audit_service,
+            memory_admission_enabled=(
+                chat_memory_config.enabled and chat_memory_runtime_configured
+            ),
+            memory_extraction_fingerprint=service_memory_extraction_fingerprint,
+            memory_graph_store_fingerprint=(
+                service_memory_graph_store_fingerprint
+            ),
+        )
         if enterprise_enabled
         else None
     )
@@ -972,16 +1017,27 @@ def create_app(args):
         else None
     )
     enterprise_chat_conversation_service = (
-        ChatConversationService(metadata_store, enterprise_audit_service)
+        ChatConversationService(
+            metadata_store,
+            enterprise_audit_service,
+            memory_admission_enabled=(
+                chat_memory_config.enabled and chat_memory_runtime_configured
+            ),
+            memory_extraction_fingerprint=service_memory_extraction_fingerprint,
+            memory_graph_store_fingerprint=(
+                service_memory_graph_store_fingerprint
+            ),
+        )
         if enterprise_enabled
         else None
     )
-    # Per-user-per-project chat memory (graphiti); only built when the
-    # feature flag is on so deployments without the memory extra stay clean.
+    # Per-user-per-project chat memory (graphiti). PostgreSQL enterprise
+    # deployments may construct it for read/ingest, maintenance, or both.
     # Constructed further below, after the server rerank function exists (the
     # memory search cross-encoder reuses it); the lifespan closure reads this
     # variable at startup time, well after the reassignment.
-    enterprise_chat_memory_service = None
+    enterprise_chat_memory_service: ChatMemoryService | None = None
+    enterprise_chat_memory_worker: ChatMemoryWorker | None = None
     enterprise_api_key_service = (
         ServiceAPIKeyService(
             metadata_store,
@@ -1035,6 +1091,11 @@ def create_app(args):
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """Lifespan context manager for startup and shutdown events"""
+        # Re-check the captured startup snapshot in case programmatic callers
+        # mutate ``args`` after app construction.
+        validate_chat_memory_configuration(
+            args, kb_metadata_backend=kb_metadata_backend
+        )
         # Store background tasks
         app.state.background_tasks = set()
 
@@ -1055,10 +1116,16 @@ def create_app(args):
             if object_storage is not None:
                 await object_storage.initialize()
 
-            if enterprise_chat_memory_service is not None:
+            if (
+                enterprise_chat_memory_service is not None
+                and chat_memory_config.enabled
+            ):
                 # Fail-soft: an unreachable Neo4j / missing graphiti install
                 # logs an error and the service retries lazily on first use.
                 await enterprise_chat_memory_service.initialize()
+
+            if enterprise_chat_memory_worker is not None:
+                enterprise_chat_memory_worker.start()
 
             # Recover orphan jobs left in queued/running/cancelling/retrying
             # by a previous process. When the durable job worker is enabled,
@@ -1102,30 +1169,60 @@ def create_app(args):
             yield
 
         finally:
-            # Clean up database connections
+            shutdown_cancellation: asyncio.CancelledError | None = None
+
+            async def cleanup_step(name: str, callback) -> None:
+                nonlocal shutdown_cancellation
+                try:
+                    await callback()
+                except asyncio.CancelledError as exc:
+                    if shutdown_cancellation is None:
+                        shutdown_cancellation = exc
+                    logger.warning(
+                        "Shutdown cleanup step %s was cancelled; continuing cleanup",
+                        name,
+                    )
+                except Exception as exc:  # noqa: BLE001 - cleanup must continue
+                    logger.error("Shutdown cleanup step %s failed: %s", name, exc)
+
+            # Each resource gets an independent cleanup boundary so one failure
+            # never prevents later drivers, pools, or shared state from closing.
+            if enterprise_chat_memory_worker is not None:
+                await cleanup_step(
+                    "chat_memory_worker.stop", enterprise_chat_memory_worker.stop
+                )
             worker = getattr(app.state, "job_worker", None)
             if worker is not None:
-                await worker.stop()
+                await cleanup_step("job_worker.stop", worker.stop)
             if enterprise_chat_memory_service is not None:
-                await enterprise_chat_memory_service.finalize()
-            await kb_registry.shutdown()
+                await cleanup_step(
+                    "chat_memory_service.finalize",
+                    enterprise_chat_memory_service.finalize,
+                )
+            await cleanup_step("lightrag_registry.shutdown", kb_registry.shutdown)
             if object_storage is not None:
-                await object_storage.close()
+                await cleanup_step("object_storage.close", object_storage.close)
             if hasattr(metadata_store, "close"):
-                await metadata_store.close()
+                await cleanup_step("metadata_store.close", metadata_store.close)
             if hasattr(kb_service, "close"):
-                await kb_service.close()
-            await rag.finalize_storages()
+                await cleanup_step("kb_service.close", kb_service.close)
+            await cleanup_step("rag.finalize_storages", rag.finalize_storages)
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
-                # Only perform cleanup in Uvicorn single-process mode
+                # Only perform cleanup in Uvicorn single-process mode.
                 logger.debug("Unvicorn Mode: finalizing shared storage...")
-                finalize_share_data()
+                try:
+                    finalize_share_data()
+                except Exception as exc:  # noqa: BLE001 - cleanup must continue
+                    logger.error("Shared storage finalization failed: %s", exc)
             else:
                 # In Gunicorn mode with preload_app=True, cleanup is handled by on_exit hooks
                 logger.debug(
                     "Gunicorn Mode: postpone shared storage finalization to master process"
                 )
+
+            if shutdown_cancellation is not None:
+                raise shutdown_cancellation
 
     base_description = (
         "Providing API for LightRAG core, Web UI and Ollama Model Emulation"
@@ -1181,6 +1278,20 @@ def create_app(args):
     app.openapi = _openapi_with_binary_fields
 
     app.state.enterprise_enabled = enterprise_enabled
+    app.state.enterprise_chat_memory_config = (
+        chat_memory_config if enterprise_enabled else None
+    )
+    app.state.enterprise_chat_memory_runtime_fingerprint = (
+        chat_memory_config.runtime_fingerprint() if enterprise_enabled else None
+    )
+    app.state.enterprise_chat_memory_extraction_fingerprint = (
+        chat_memory_config.extraction_fingerprint() if enterprise_enabled else None
+    )
+    app.state.enterprise_chat_memory_graph_store_fingerprint = (
+        chat_memory_config.graph_store_fingerprint() if enterprise_enabled else None
+    )
+    app.state.enterprise_chat_memory_worker = None
+    app.state.enterprise_chat_memory_maintenance_service = None
     if enterprise_enabled:
         app.state.enterprise_user_service = enterprise_user_service
         app.state.enterprise_settings_service = enterprise_settings_service
@@ -1193,7 +1304,7 @@ def create_app(args):
         app.state.enterprise_chat_conversation_service = (
             enterprise_chat_conversation_service
         )
-        app.state.enterprise_chat_memory_service = enterprise_chat_memory_service
+        app.state.enterprise_chat_memory_service = None
         app.state.enterprise_api_key_service = enterprise_api_key_service
         app.state.enterprise_invitation_service = enterprise_invitation_service
         app.state.enterprise_limit_service = enterprise_limit_service
@@ -2280,17 +2391,49 @@ def create_app(args):
     else:
         logger.info("Reranking is disabled")
 
-    # Build the chat memory service now that the server rerank function exists
-    # (its search cross-encoder recipe reuses it when MEMORY_RERANK_ENABLED).
-    if enterprise_enabled:
-        chat_memory_config = ChatMemoryConfig.from_args(args)
-        if chat_memory_config.enabled:
-            enterprise_chat_memory_service = ChatMemoryService(
-                chat_memory_config,
-                audit_service=enterprise_audit_service,
-                metadata_store=metadata_store,
-                rerank_fn=rerank_model_func,
+    # Build the maintenance-capable Chat Memory runtime only for enterprise
+    # PostgreSQL. Read-disabled maintenance remains lazy until an event is
+    # claimed, so graphiti-core is still optional at server construction.
+    if (
+        enterprise_enabled
+        and kb_metadata_backend == "postgres"
+        and (chat_memory_config.enabled or chat_memory_config.maintenance_enabled)
+    ):
+        enterprise_chat_memory_service = ChatMemoryService(
+            chat_memory_config,
+            audit_service=enterprise_audit_service,
+            metadata_store=metadata_store,
+            rerank_fn=rerank_model_func,
+            legacy_scheduling_enabled=False,
+        )
+        worker_event_types = (
+            ("ingest", "rebuild", "purge")
+            if chat_memory_config.enabled
+            else ("rebuild", "purge")
+        )
+        enterprise_chat_memory_worker = ChatMemoryWorker(
+            metadata_store,
+            enterprise_chat_memory_service,
+            chat_memory_config,
+            event_types=worker_event_types,
+        )
+        if enterprise_chat_conversation_service is not None:
+            enterprise_chat_conversation_service.set_post_commit_nudge_callback(
+                enterprise_chat_memory_worker.nudge
             )
+        if enterprise_user_service is not None:
+            enterprise_user_service.set_post_commit_nudge_callback(
+                enterprise_chat_memory_worker.nudge
+            )
+        enterprise_chat_memory_service.set_post_commit_nudge_callback(
+            enterprise_chat_memory_worker.nudge
+        )
+        app.state.enterprise_chat_memory_maintenance_service = (
+            enterprise_chat_memory_service
+        )
+        app.state.enterprise_chat_memory_worker = enterprise_chat_memory_worker
+        if chat_memory_config.enabled:
+            # Only the read/ingest-facing state is exposed to existing routes.
             app.state.enterprise_chat_memory_service = enterprise_chat_memory_service
 
     # Create ollama_server_infos from command line arguments
@@ -3082,6 +3225,21 @@ def create_app(args):
                         enterprise_chat_memory_service.pending_background_tasks
                         if enterprise_chat_memory_service is not None
                         else 0
+                    ),
+                    "worker_running": (
+                        enterprise_chat_memory_worker.running
+                        if enterprise_chat_memory_worker is not None
+                        else False
+                    ),
+                    "extraction_fingerprint": _short_fingerprint(
+                        enterprise_chat_memory_worker.extraction_fingerprint
+                        if enterprise_chat_memory_worker is not None
+                        else None
+                    ),
+                    "graph_store_fingerprint": _short_fingerprint(
+                        enterprise_chat_memory_worker.graph_store_fingerprint
+                        if enterprise_chat_memory_worker is not None
+                        else None
                     ),
                 },
                 "core_version": core_version,

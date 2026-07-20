@@ -359,10 +359,6 @@ def create_chat_routes(api_key: str | None = None) -> APIRouter:
         )
         if not deleted:
             raise HTTPException(status_code=404, detail="Chat project not found")
-        memory_service = get_enterprise_chat_memory_service(request)
-        if memory_service is not None:
-            # Best-effort background cleanup of the project's memory graph.
-            memory_service.schedule_purge(principal.user_id, [project_id])
         return ChatProjectDeleteResponse(
             id=project_id,
             deleted=True,
@@ -557,14 +553,6 @@ def create_chat_routes(api_key: str | None = None) -> APIRouter:
         )
         if not deleted:
             raise HTTPException(status_code=404, detail="Chat session not found")
-        memory_service = get_enterprise_chat_memory_service(request)
-        if memory_service is not None:
-            # Best-effort: forget the memory episodes distilled from this session.
-            memory_service.schedule_forget_session(
-                user_id=principal.user_id,
-                project_id=project_id,
-                session_id=session_id,
-            )
         return ChatSessionDeleteResponse(
             id=session_id,
             project_id=project_id,
@@ -603,16 +591,6 @@ def create_chat_routes(api_key: str | None = None) -> APIRouter:
         )
         if saved is None:
             raise HTTPException(status_code=404, detail="Chat session not found")
-        memory_service = get_enterprise_chat_memory_service(request)
-        if memory_service is not None:
-            # Fire-and-forget: distill the persisted turn into the project's
-            # memory graph without delaying the request.
-            memory_service.schedule_ingest(
-                user_id=principal.user_id,
-                project_id=project_id,
-                session_id=session_id,
-                messages=saved,
-            )
         return ChatMessagesAppendResponse(
             session_id=session_id,
             project_id=project_id,
@@ -658,15 +636,6 @@ def create_chat_routes(api_key: str | None = None) -> APIRouter:
     ):
         principal = require_interactive_user_principal(request)
         service = get_enterprise_chat_conversation_service(request)
-        memory_service = get_enterprise_chat_memory_service(request)
-        message_seq: int | None = None
-        if memory_service is not None:
-            # Capture the seq before deletion; it locates the memory episode(s)
-            # distilled from this message.
-            record = await service.get_message(
-                principal.user_id, project_id, session_id, message_id
-            )
-            message_seq = record.seq if record is not None else None
         deleted = await service.delete_message(
             user_id=principal.user_id,
             project_id=project_id,
@@ -676,13 +645,6 @@ def create_chat_routes(api_key: str | None = None) -> APIRouter:
         )
         if not deleted:
             raise HTTPException(status_code=404, detail="Chat message not found")
-        if memory_service is not None and message_seq is not None:
-            memory_service.schedule_forget_message(
-                user_id=principal.user_id,
-                project_id=project_id,
-                session_id=session_id,
-                seq=message_seq,
-            )
         return ChatMessageDeleteResponse(
             id=message_id,
             session_id=session_id,

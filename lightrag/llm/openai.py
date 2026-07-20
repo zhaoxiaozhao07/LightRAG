@@ -13,6 +13,7 @@ if not pm.is_installed("openai"):
     pm.install("openai")
 
 from openai import (
+    AsyncOpenAI as StandardAsyncOpenAI,
     APIConnectionError,
     RateLimitError,
     APITimeoutError,
@@ -32,6 +33,7 @@ from lightrag.utils import (
 )
 
 from lightrag.api import __api_version__
+from lightrag.sensitive_context import is_sensitive_call
 
 import numpy as np
 import base64
@@ -43,6 +45,8 @@ from dotenv import load_dotenv
 # Falls back to standard OpenAI client if not available
 # Langfuse requires proper configuration to work correctly
 LANGFUSE_ENABLED = False
+LangfuseAsyncOpenAI = None
+AsyncOpenAI = StandardAsyncOpenAI
 try:
     # Check if required Langfuse environment variables are set
     langfuse_public_key = os.environ.get("LANGFUSE_PUBLIC_KEY")
@@ -50,19 +54,18 @@ try:
 
     # Only enable Langfuse if both keys are configured
     if langfuse_public_key and langfuse_secret_key:
-        from langfuse.openai import AsyncOpenAI  # type: ignore[import-untyped]
+        from langfuse.openai import (  # type: ignore[import-untyped]
+            AsyncOpenAI as LangfuseAsyncOpenAI,
+        )
 
+        AsyncOpenAI = LangfuseAsyncOpenAI
         LANGFUSE_ENABLED = True
         logger.info("Langfuse observability enabled for OpenAI client")
     else:
-        from openai import AsyncOpenAI
-
         logger.debug(
             "Langfuse environment variables not configured, using standard OpenAI client"
         )
 except ImportError:
-    from openai import AsyncOpenAI
-
     logger.debug("Langfuse not available, using standard OpenAI client")
 
 # use the .env that is inside the current folder
@@ -88,6 +91,15 @@ class TransientBadRequestError(Exception):
     """
 
     pass
+
+
+def _log_openai_exception(level: int, message: str, exc: Exception) -> None:
+    """Log no provider-controlled text while a sensitive call is active."""
+
+    if is_sensitive_call():
+        logger.log(level, "%s (%s)", message, type(exc).__name__)
+    else:
+        logger.log(level, "%s: %s", message, exc)
 
 
 def _validate_openai_response_format(response_format: Any | None) -> None:
@@ -142,7 +154,7 @@ def create_openai_async_client(
     api_version: str | None = None,
     timeout: int | None = None,
     client_configs: dict[str, Any] | None = None,
-) -> AsyncOpenAI:
+) -> Any:
     """Create an AsyncOpenAI or AsyncAzureOpenAI client with the given configuration.
 
     Args:
@@ -219,7 +231,8 @@ def create_openai_async_client(
         if timeout is not None:
             merged_configs["timeout"] = timeout
 
-        return AsyncOpenAI(**merged_configs)
+        client_class = StandardAsyncOpenAI if is_sensitive_call() else AsyncOpenAI
+        return client_class(**merged_configs)
 
 
 # TODO LengthFinishReasonError should not persist into LLM cache
@@ -339,7 +352,9 @@ async def openai_complete_if_cache(
         history_messages = []
 
     # Set openai logger level to INFO when VERBOSE_DEBUG is off
-    if not VERBOSE_DEBUG and logger.level == logging.DEBUG:
+    if is_sensitive_call():
+        logging.getLogger("openai").setLevel(logging.INFO)
+    elif not VERBOSE_DEBUG and logger.level == logging.DEBUG:
         logging.getLogger("openai").setLevel(logging.INFO)
 
     # Remove special kwargs that shouldn't be passed to OpenAI
@@ -407,10 +422,11 @@ async def openai_complete_if_cache(
         messages.append({"role": "user", "content": prompt})
 
     logger.debug("===== Entering func of LLM =====")
-    logger.debug(f"Model: {model}   Base URL: {base_url}")
-    logger.debug(f"Client Configs: {client_configs}")
-    logger.debug(f"Additional kwargs: {kwargs}")
-    logger.debug(f"Num of history messages: {len(history_messages)}")
+    if not is_sensitive_call():
+        logger.debug(f"Model: {model}   Base URL: {base_url}")
+        logger.debug(f"Client Configs: {client_configs}")
+        logger.debug(f"Additional kwargs: {kwargs}")
+        logger.debug(f"Num of history messages: {len(history_messages)}")
     verbose_debug(f"System prompt: {system_prompt}")
     verbose_debug(f"Query: {prompt}")
     logger.debug("===== Sending Query to LLM =====")
@@ -437,25 +453,31 @@ async def openai_complete_if_cache(
             model=api_model, messages=messages, **kwargs
         )
     except APITimeoutError as e:
-        logger.error(f"OpenAI API Timeout Error: {e}")
+        _log_openai_exception(logging.ERROR, "OpenAI API timeout", e)
         try:
             await openai_async_client.close()
         except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+            _log_openai_exception(
+                logging.WARNING, "Failed to close OpenAI client", close_error
+            )
         raise
     except APIConnectionError as e:
-        logger.error(f"OpenAI API Connection Error: {e}")
+        _log_openai_exception(logging.ERROR, "OpenAI API connection error", e)
         try:
             await openai_async_client.close()
         except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+            _log_openai_exception(
+                logging.WARNING, "Failed to close OpenAI client", close_error
+            )
         raise
     except RateLimitError as e:
-        logger.error(f"OpenAI API Rate Limit Error: {e}")
+        _log_openai_exception(logging.ERROR, "OpenAI API rate limit error", e)
         try:
             await openai_async_client.close()
         except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+            _log_openai_exception(
+                logging.WARNING, "Failed to close OpenAI client", close_error
+            )
         raise
     except BadRequestError as e:
         # A "could not parse JSON body" 400 is transient (corrupted/truncated
@@ -467,35 +489,44 @@ async def openai_complete_if_cache(
         try:
             await openai_async_client.close()
         except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+            _log_openai_exception(
+                logging.WARNING, "Failed to close OpenAI client", close_error
+            )
         # Heuristic: match on the provider's error wording. It can drift across
         # providers/proxies or localization, and a genuinely malformed request
         # body (e.g. invalid user-supplied JSON) could also surface this text —
         # in that case we simply retry 3x and still fail fast. We accept that
         # "retry too much" trade-off to recover the common transient case.
         if "could not parse" in str(e).lower():
-            logger.warning(f"Transient JSON-parse 400 from OpenAI, will retry: {e}")
+            _log_openai_exception(
+                logging.WARNING, "Transient JSON-parse 400 from OpenAI", e
+            )
             raise TransientBadRequestError(str(e)) from e
         raise
     except Exception as e:
-        body = getattr(e, "body", None)
-        request_id = getattr(e, "request_id", None)
-        req = getattr(e, "request", None)
-        extra_parts = []
-        if body:
-            extra_parts.append(f"Response body: {body}")
-        if request_id:
-            extra_parts.append(f"Request ID: {request_id}")
-        if req is not None:
-            extra_parts.append(f"Request URL: {req.url}")
-        extra = ("\n" + "\n".join(extra_parts)) if extra_parts else ""
-        logger.error(
-            f"OpenAI API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}{extra}"
-        )
+        if is_sensitive_call():
+            logger.error("Sensitive OpenAI API call failed (%s)", type(e).__name__)
+        else:
+            body = getattr(e, "body", None)
+            request_id = getattr(e, "request_id", None)
+            req = getattr(e, "request", None)
+            extra_parts = []
+            if body:
+                extra_parts.append(f"Response body: {body}")
+            if request_id:
+                extra_parts.append(f"Request ID: {request_id}")
+            if req is not None:
+                extra_parts.append(f"Request URL: {req.url}")
+            extra = ("\n" + "\n".join(extra_parts)) if extra_parts else ""
+            logger.error(
+                f"OpenAI API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}{extra}"
+            )
         try:
             await openai_async_client.close()
         except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+            _log_openai_exception(
+                logging.WARNING, "Failed to close OpenAI client", close_error
+            )
         raise
 
     if hasattr(response, "__aiter__"):
@@ -516,16 +547,18 @@ async def openai_complete_if_cache(
                     # Check if this chunk has usage information (final chunk)
                     if hasattr(chunk, "usage") and chunk.usage:
                         final_chunk_usage = chunk.usage
-                        logger.debug(
-                            f"Received usage info in streaming chunk: {chunk.usage}"
-                        )
+                        if not is_sensitive_call():
+                            logger.debug(
+                                f"Received usage info in streaming chunk: {chunk.usage}"
+                            )
 
                     # Check if choices exists and is not empty
                     if not hasattr(chunk, "choices") or not chunk.choices:
                         # Azure OpenAI sends content filter results in first chunk without choices
-                        logger.debug(
-                            f"Received chunk without choices (likely Azure content filter): {chunk}"
-                        )
+                        if not is_sensitive_call():
+                            logger.debug(
+                                f"Received chunk without choices (likely Azure content filter): {chunk}"
+                            )
                         continue
 
                     # Check if delta exists
@@ -611,11 +644,13 @@ async def openai_complete_if_cache(
                         yield "</think>"
                         cot_active = False
                     except Exception as close_error:
-                        logger.warning(
-                            f"Failed to close COT tag during exception handling: {close_error}"
+                        _log_openai_exception(
+                            logging.WARNING,
+                            "Failed to close COT tag during exception handling",
+                            close_error,
                         )
 
-                logger.error(f"Error in stream response: {str(e)}")
+                _log_openai_exception(logging.ERROR, "OpenAI stream failed", e)
                 # Try to clean up resources if possible
                 if (
                     iteration_started
@@ -626,15 +661,19 @@ async def openai_complete_if_cache(
                         await response.aclose()
                         logger.debug("Successfully closed stream response after error")
                     except Exception as close_error:
-                        logger.warning(
-                            f"Failed to close stream response: {close_error}"
+                        _log_openai_exception(
+                            logging.WARNING,
+                            "Failed to close stream response",
+                            close_error,
                         )
                 # Ensure client is closed in case of exception
                 try:
                     await openai_async_client.close()
                 except Exception as client_close_error:
-                    logger.warning(
-                        f"Failed to close OpenAI client after stream error: {client_close_error}"
+                    _log_openai_exception(
+                        logging.WARNING,
+                        "Failed to close OpenAI client after stream error",
+                        client_close_error,
                     )
                 raise
             finally:
@@ -644,8 +683,10 @@ async def openai_complete_if_cache(
                         yield "</think>"
                         cot_active = False
                     except Exception as final_close_error:
-                        logger.warning(
-                            f"Failed to close COT tag in finally block: {final_close_error}"
+                        _log_openai_exception(
+                            logging.WARNING,
+                            "Failed to close COT tag in finally block",
+                            final_close_error,
                         )
 
                 # Ensure resources are released even if no exception occurs
@@ -659,12 +700,16 @@ async def openai_complete_if_cache(
                         except (AttributeError, TypeError) as close_error:
                             # Some wrapper objects may report hasattr(aclose) but fail when called
                             # This is expected behavior for certain client wrappers
-                            logger.debug(
-                                f"Stream response cleanup not supported by client wrapper: {close_error}"
+                            _log_openai_exception(
+                                logging.DEBUG,
+                                "Stream response cleanup not supported by client wrapper",
+                                close_error,
                             )
                         except Exception as close_error:
-                            logger.warning(
-                                f"Unexpected error during stream response cleanup: {close_error}"
+                            _log_openai_exception(
+                                logging.WARNING,
+                                "Unexpected error during stream response cleanup",
+                                close_error,
                             )
 
                 # This prevents resource leaks since the caller doesn't handle closing
@@ -674,8 +719,10 @@ async def openai_complete_if_cache(
                         "Successfully closed OpenAI client for streaming response"
                     )
                 except Exception as client_close_error:
-                    logger.warning(
-                        f"Failed to close OpenAI client in streaming finally block: {client_close_error}"
+                    _log_openai_exception(
+                        logging.WARNING,
+                        "Failed to close OpenAI client in streaming finally block",
+                        client_close_error,
                     )
 
         return inner()
@@ -691,7 +738,9 @@ async def openai_complete_if_cache(
                 try:
                     await openai_async_client.close()
                 except Exception as close_error:
-                    logger.warning(f"Failed to close OpenAI client: {close_error}")
+                    _log_openai_exception(
+                        logging.WARNING, "Failed to close OpenAI client", close_error
+                    )
                 raise InvalidResponseError("Invalid response from OpenAI API")
 
             message = response.choices[0].message
@@ -747,7 +796,11 @@ async def openai_complete_if_cache(
                     try:
                         await openai_async_client.close()
                     except Exception as close_error:
-                        logger.warning(f"Failed to close OpenAI client: {close_error}")
+                        _log_openai_exception(
+                            logging.WARNING,
+                            "Failed to close OpenAI client",
+                            close_error,
+                        )
                     raise InvalidResponseError("Received empty content from OpenAI API")
 
             # Apply Unicode decoding to final content if needed
@@ -765,7 +818,8 @@ async def openai_complete_if_cache(
                 token_tracker.add_usage(token_counts)
 
             logger.debug(f"Response content len: {len(final_content)}")
-            verbose_debug(f"Response: {response}")
+            if not is_sensitive_call():
+                verbose_debug(f"Response: {response}")
 
             return final_content
         finally:
@@ -773,8 +827,10 @@ async def openai_complete_if_cache(
             try:
                 await openai_async_client.close()
             except Exception as close_error:
-                logger.warning(
-                    f"Failed to close OpenAI client in non-streaming finally block: {close_error}"
+                _log_openai_exception(
+                    logging.WARNING,
+                    "Failed to close OpenAI client in non-streaming finally block",
+                    close_error,
                 )
 
 

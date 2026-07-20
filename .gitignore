@@ -82,6 +82,7 @@ ignore_this.txt
 # AI Agent files
 memory-bank
 .claude/
+.slim/deepwork/
 
 # Google Jules
 .jules/

@@ -521,16 +521,28 @@ def test_enterprise_tenant_admin_create_policy_and_generation(monkeypatch, tmp_p
         (alice.id, "kb_owner")
     ]
 
-    non_private = client.post(
+    internal_created = client.post(
         "/kbs",
         json={
             "id": "kb_tenant_internal",
-            "name": "Not Private",
+            "name": "Shared With Tenant",
             "visibility": "internal",
         },
         headers=alice_headers,
     )
-    assert non_private.status_code == 400
+    assert internal_created.status_code == 200, internal_created.text
+    assert internal_created.json()["visibility"] == "internal"
+    assert internal_created.json()["origin"] == "tenant"
+    public_blocked = client.post(
+        "/kbs",
+        json={
+            "id": "kb_tenant_public",
+            "name": "Public Blocked",
+            "visibility": "public",
+        },
+        headers=alice_headers,
+    )
+    assert public_blocked.status_code == 400
     invalid_tags = client.post(
         "/kbs",
         json={
@@ -542,13 +554,32 @@ def test_enterprise_tenant_admin_create_policy_and_generation(monkeypatch, tmp_p
     )
     assert invalid_tags.status_code == 400
 
-    for visibility in ("private", "public", "internal"):
-        blocked_patch = client.patch(
-            "/kbs/kb_tenant_created",
-            json={"visibility": visibility},
-            headers=alice_headers,
-        )
-        assert blocked_patch.status_code == 403
+    public_patch_blocked = client.patch(
+        "/kbs/kb_tenant_created",
+        json={"visibility": "public"},
+        headers=alice_headers,
+    )
+    assert public_patch_blocked.status_code == 400
+    member_patch_blocked = client.patch(
+        "/kbs/kb_tenant_created",
+        json={"visibility": "internal"},
+        headers=bob_headers,
+    )
+    assert member_patch_blocked.status_code == 403
+    shared_patch = client.patch(
+        "/kbs/kb_tenant_created",
+        json={"visibility": "internal"},
+        headers=alice_headers,
+    )
+    assert shared_patch.status_code == 200, shared_patch.text
+    assert shared_patch.json()["visibility"] == "internal"
+    reverted_patch = client.patch(
+        "/kbs/kb_tenant_created",
+        json={"visibility": "private"},
+        headers=alice_headers,
+    )
+    assert reverted_patch.status_code == 200, reverted_patch.text
+    assert reverted_patch.json()["visibility"] == "private"
     safe_patch = client.patch(
         "/kbs/kb_tenant_created",
         json={"name": "Tenant Created Renamed"},
@@ -4269,7 +4300,10 @@ def test_source_aware_kb_decision_lifecycle_and_generation_guard(tmp_path):
         no_owned_inheritance = await authz.resolve_kb_access(principal, owned)
         assert is_tenant_owned_kb(owned, "tenant-a")
         assert no_owned_inheritance.tenant_owned is True
-        assert no_owned_inheritance.effective_role is None
+        # The tenant ACL still does not leak in (no kb_admin); a tenant
+        # administrator only keeps read-level oversight of tenant-owned KBs.
+        assert no_owned_inheritance.effective_role == KB_ROLE_VIEWER
+        assert no_owned_inheritance.sources == ("tenant_admin_oversight",)
         await authz.grant_tenant_user_kb_override(
             owned.id,
             "tenant-a",
@@ -5997,3 +6031,151 @@ def test_service_api_key_create_and_rotate_use_catalog_generation_map(
         {"kb_service_generation": generation},
         {"kb_service_generation": generation},
     ]
+
+
+def test_enterprise_tenant_private_kb_sharing_and_admin_oversight(
+    monkeypatch, tmp_path
+):
+    from lightrag.api.enterprise_auth import Principal
+
+    client, user_service, authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    carol = asyncio.run(
+        user_service.create_user(username="carol", password="carol-pass")
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-a", alice.id, "tenant_admin", granted_by=admin.id
+        )
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-a", bob.id, "tenant_member", granted_by=admin.id
+        )
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-a", carol.id, "tenant_member", granted_by=admin.id
+        )
+    )
+    asyncio.run(
+        user_service.update_user(bob.id, can_create_kb=True, actor_user_id=admin.id)
+    )
+    alice = asyncio.run(user_service.get_user_or_404(alice.id))
+    bob = asyncio.run(user_service.get_user_or_404(bob.id))
+    carol = asyncio.run(user_service.get_user_or_404(carol.id))
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+    carol_headers = {"Authorization": f"Bearer {_token(user_service, carol)}"}
+
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_bob_private", "name": "Bob Private"},
+        headers=bob_headers,
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["visibility"] == "private"
+    assert created.json()["origin"] == "tenant"
+
+    # Owner sees the private KB; a fellow member does not.
+    bob_ids = [
+        kb["id"]
+        for kb in client.get("/kbs", headers=bob_headers).json()["knowledge_bases"]
+    ]
+    assert bob_ids == ["kb_bob_private"]
+    assert client.get("/kbs", headers=carol_headers).json()["knowledge_bases"] == []
+    assert client.get("/kbs/kb_bob_private", headers=carol_headers).status_code == 403
+
+    # The tenant admin always sees member KBs, private or not (read-only).
+    alice_ids = [
+        kb["id"]
+        for kb in client.get("/kbs", headers=alice_headers).json()["knowledge_bases"]
+    ]
+    assert alice_ids == ["kb_bob_private"]
+    assert client.get("/kbs/kb_bob_private", headers=alice_headers).status_code == 200
+    assert (
+        client.patch(
+            "/kbs/kb_bob_private", json={"name": "Renamed"}, headers=alice_headers
+        ).status_code
+        == 403
+    )
+    assert (
+        client.patch(
+            "/kbs/kb_bob_private",
+            json={"visibility": "internal"},
+            headers=alice_headers,
+        ).status_code
+        == 403
+    )
+    alice_principal = Principal(
+        user_id=alice.id,
+        username="alice",
+        system_role="user",
+        status="active",
+        tenant_id="tenant-a",
+        tenant_roles={"tenant-a": "tenant_admin"},
+        can_create_kb=True,
+        can_use_bypass_query=False,
+        token_version=1,
+        auth_method="jwt",
+        metadata={},
+    )
+    decision = asyncio.run(authz.resolve_kb_access(alice_principal, "kb_bob_private"))
+    assert decision.effective_role == "kb_viewer"
+    assert decision.sources == ("tenant_admin_oversight",)
+
+    # The owner may switch the KB to tenant-shared (internal) at any time.
+    shared = client.patch(
+        "/kbs/kb_bob_private", json={"visibility": "internal"}, headers=bob_headers
+    )
+    assert shared.status_code == 200, shared.text
+    assert shared.json()["visibility"] == "internal"
+    carol_ids = [
+        kb["id"]
+        for kb in client.get("/kbs", headers=carol_headers).json()["knowledge_bases"]
+    ]
+    assert carol_ids == ["kb_bob_private"]
+    assert client.get("/kbs/kb_bob_private", headers=carol_headers).status_code == 200
+    # Shared access is read-only for other members.
+    assert (
+        client.patch(
+            "/kbs/kb_bob_private", json={"name": "Hijack"}, headers=carol_headers
+        ).status_code
+        == 403
+    )
+    # Public stays reserved for super administrators.
+    assert (
+        client.patch(
+            "/kbs/kb_bob_private", json={"visibility": "public"}, headers=bob_headers
+        ).status_code
+        == 400
+    )
+
+    # And back to private: fellow members lose access again.
+    reverted = client.patch(
+        "/kbs/kb_bob_private", json={"visibility": "private"}, headers=bob_headers
+    )
+    assert reverted.status_code == 200, reverted.text
+    assert reverted.json()["visibility"] == "private"
+    assert client.get("/kbs", headers=carol_headers).json()["knowledge_bases"] == []
+    assert client.get("/kbs/kb_bob_private", headers=carol_headers).status_code == 403
+
+    # Super admin keeps full sight; visibility flips are audited.
+    admin_ids = [
+        kb["id"]
+        for kb in client.get("/kbs", headers=admin_headers).json()["knowledge_bases"]
+    ]
+    assert admin_ids == ["kb_bob_private"]
+    events = client.get("/admin/audit-events", headers=admin_headers)
+    assert events.status_code == 200
+    visibility_events = [
+        event
+        for event in events.json()
+        if event["event_type"] == "kb_visibility_changed"
+    ]
+    assert [
+        (event["metadata"]["from"], event["metadata"]["to"])
+        for event in visibility_events
+    ] == [("internal", "private"), ("private", "internal")]

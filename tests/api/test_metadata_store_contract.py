@@ -3674,10 +3674,39 @@ async def test_postgres_schema_migrations_are_idempotent_contract():
     class RecordingConnection:
         def __init__(self):
             self.statements: list[str] = []
+            self.schema_versions: set[int] = set()
+            self.chat_memory_v2_complete = False
+            self.chat_memory_v3_complete = False
 
         async def execute(self, statement: str, *_args):
             self.statements.append(statement)
+            if "VALUES (1, clock_timestamp()::text)" in statement:
+                self.schema_versions.add(1)
+            if "VALUES (2, clock_timestamp()::text)" in statement:
+                self.schema_versions.add(2)
+            if "VALUES (3, clock_timestamp()::text)" in statement:
+                self.schema_versions.add(3)
+            if "uq_enterprise_chat_memory_episode_generation_batch" in statement:
+                self.chat_memory_v2_complete = True
+            if "ADD COLUMN IF NOT EXISTS snapshot_digest TEXT" in statement:
+                self.chat_memory_v3_complete = True
             return "OK"
+
+        async def fetch(self, statement: str, *_args):
+            self.statements.append(statement)
+            if "SELECT version FROM kb_metadata_schema" in statement:
+                return [
+                    {"version": version} for version in sorted(self.schema_versions)
+                ]
+            return []
+
+        async def fetchval(self, statement: str, *_args):
+            self.statements.append(statement)
+            if "information_schema.columns" in statement:
+                if "column_name = 'snapshot_digest'" in statement:
+                    return self.chat_memory_v3_complete
+                return self.chat_memory_v2_complete
+            return None
 
     conn = RecordingConnection()
     pg_store = PostgresMetadataStore(dsn="postgresql://unused")
@@ -3696,6 +3725,54 @@ async def test_postgres_schema_migrations_are_idempotent_contract():
     assert "'role', role" in sql
     assert sql.count("ADD COLUMN IF NOT EXISTS actor_tenant_id") == 2
     assert sql.count("ADD COLUMN IF NOT EXISTS delete_job_id") == 2
+    assert sql.count("ADD COLUMN IF NOT EXISTS append_batch_id TEXT") == 2
+    assert sql.count("DROP INDEX IF EXISTS uq_enterprise_chat_memory_episodes_event") == 1
+    assert sql.count("ADD COLUMN IF NOT EXISTS snapshot_digest TEXT") == 2
+    assert "VALUES (3, clock_timestamp()::text)" in sql
+    assert (
+        sql.count("enterprise_chat_messages_admission_v2_check")
+        >= 1
+    )
+
+
+async def test_postgres_chat_memory_claim_sql_contract(monkeypatch):
+    from lightrag.api.postgres_metadata_store import PostgresMetadataStore
+
+    class RecordingClaimConnection:
+        def __init__(self):
+            self.statement = ""
+            self.args: tuple[Any, ...] = ()
+
+        async def fetchrow(self, statement: str, *args):
+            self.statement = statement
+            self.args = args
+            return None
+
+    conn = RecordingClaimConnection()
+    store = PostgresMetadataStore(dsn="postgresql://unused")
+
+    async def ensure_initialized():
+        return None
+
+    async def write(callback):
+        return await callback(conn)
+
+    monkeypatch.setattr(store, "_ensure_initialized", ensure_initialized)
+    monkeypatch.setattr(store, "_write", write)
+    assert (
+        await store.claim_next_chat_memory_event(
+            "chat-memory-config:v1:test", worker_id="worker"
+        )
+        is None
+    )
+    assert "FOR UPDATE SKIP LOCKED" in conn.statement
+    assert "NOT EXISTS" in conn.statement
+    assert "blocker.event_seq < event.event_seq" in conn.statement
+    assert "'pending', 'running', 'retry_wait', 'dead_letter'" in conn.statement
+    assert "event.available_at <= clock_timestamp()" in conn.statement
+    assert "event.config_fingerprint = $1" in conn.statement
+    assert "attempt_no = event.attempt_no + 1" in conn.statement
+    assert "claimed_at = control.control_time" in conn.statement
 
 
 async def test_postgres_lifecycle_uses_advisory_and_row_locks_sql_contract():

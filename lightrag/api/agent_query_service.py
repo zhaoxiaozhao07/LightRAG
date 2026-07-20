@@ -15,7 +15,8 @@ from lightrag.api.bilingual_query_service import (
     bilingual_applies,
     resolve_bilingual_mode,
 )
-from lightrag.api.chat_memory_routing import ChatMemoryScope, resolve_memory_injection
+from lightrag.api.chat_memory_routing import ChatMemoryScope, memory_audit_fields
+from lightrag.api.chat_memory_service import CHAT_MEMORY_AGENT_POLICY_SUFFIX
 from lightrag.api.enterprise_auth import (
     agent_max_rounds,
     agent_query_enabled,
@@ -35,7 +36,19 @@ from lightrag.api.query_tool_service import (
 )
 from lightrag.constants import DEFAULT_QUERY_PRIORITY
 from lightrag.prompt import PROMPTS
-from lightrag.utils import logger, truncate_list_by_token_size
+from lightrag.sensitive_context import (
+    SensitiveContext,
+    SensitiveContextPayload,
+    SensitiveContextPolicyError,
+    bind_sensitive_context_endpoint,
+    mark_sensitive_context_not_used,
+    serialize_sensitive_final_request,
+)
+from lightrag.utils import (
+    get_llm_cache_identity,
+    logger,
+    truncate_list_by_token_size,
+)
 
 AGENT_ALLOWED_MODES: set[str] = {"local", "global", "hybrid", "naive", "mix"}
 
@@ -264,10 +277,53 @@ def _json_event(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False) + "\n"
 
 
+def _sensitive_context_info(
+    sensitive_context: SensitiveContext | None,
+) -> dict[str, Any] | None:
+    """Return the authorized handle's single mutable metadata object."""
+
+    if sensitive_context is None:
+        return None
+    info = getattr(sensitive_context, "info", None)
+    if not isinstance(info, dict):
+        raise TypeError("Authorized sensitive context must expose an info mapping")
+    return info
+
+
+def _done_memory_metadata(
+    sensitive_context: SensitiveContext | None,
+) -> dict[str, Any]:
+    info = _sensitive_context_info(sensitive_context)
+    return {"metadata": {"memory": info}} if info is not None else {}
+
+
+def _has_authoritative_evidence(context_units: list[dict[str, str]]) -> bool:
+    return any(
+        isinstance(content := unit.get("content"), str) and bool(content.strip())
+        for unit in context_units
+    )
+
+
+def _authoritative_chunk_content(chunk: dict[str, Any]) -> str | None:
+    """Return final authoritative text without coercing non-text values."""
+
+    content = chunk.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return None
+    return content
+
+
+def _has_authoritative_chunks(chunks: list[dict[str, Any]]) -> bool:
+    return any(_authoritative_chunk_content(chunk) is not None for chunk in chunks)
+
+
 def _dedup_agent_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[tuple[Any, ...]] = set()
     result: list[dict[str, Any]] = []
     for chunk in chunks:
+        content = _authoritative_chunk_content(chunk)
+        if content is None:
+            continue
         kb_id = chunk.get("kb_id")
         chunk_id = chunk.get("chunk_id")
         if kb_id and chunk_id:
@@ -277,7 +333,7 @@ def _dedup_agent_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "content",
                 kb_id,
                 chunk.get("file_path") or chunk.get("source"),
-                hashlib.sha256(str(chunk.get("content", "")).encode("utf-8")).hexdigest(),
+                hashlib.sha256(content.encode("utf-8")).hexdigest(),
             )
         if key in seen:
             continue
@@ -397,10 +453,14 @@ class AgentQueryService:
         request: Request,
         body: AgentQueryRequest,
         stream: bool = False,
+        sensitive_context: SensitiveContext | None = None,
     ) -> AgentRunResult:
         result: AgentRunResult | None = None
         async for event in self._run_events(
-            request=request, body=body, stream_synthesis=stream
+            request=request,
+            body=body,
+            stream_synthesis=stream,
+            sensitive_context=sensitive_context,
         ):
             candidate = event.get("_result")
             if isinstance(candidate, AgentRunResult):
@@ -414,10 +474,14 @@ class AgentQueryService:
         *,
         request: Request,
         body: AgentQueryRequest,
+        sensitive_context: SensitiveContext | None = None,
     ) -> AsyncIterator[str]:
         try:
             async for event in self._run_events(
-                request=request, body=body, stream_synthesis=True
+                request=request,
+                body=body,
+                stream_synthesis=True,
+                sensitive_context=sensitive_context,
             ):
                 payload = {
                     key: value
@@ -425,19 +489,29 @@ class AgentQueryService:
                     if not key.startswith("_")
                 }
                 yield _json_event(payload)
+        except SensitiveContextPolicyError:
+            raise
         except HTTPException as exc:
+            message = (
+                "Agent query failed" if sensitive_context is not None else exc.detail
+            )
             yield _json_event(
                 {
                     "event": "error",
                     "error_code": "agent_http_error",
                     "status_code": exc.status_code,
-                    "message": exc.detail,
+                    "message": message,
                 }
             )
         except Exception as exc:  # noqa: BLE001
-            logger.error("Agent stream failed: %s", exc, exc_info=True)
+            if sensitive_context is not None:
+                logger.error("Memory-scoped Agent stream failed")
+                message = "Agent query failed"
+            else:
+                logger.error("Agent stream failed: %s", exc, exc_info=True)
+                message = str(exc)
             yield _json_event(
-                {"event": "error", "error_code": "agent_error", "message": str(exc)}
+                {"event": "error", "error_code": "agent_error", "message": message}
             )
 
     async def _run_events(
@@ -446,6 +520,7 @@ class AgentQueryService:
         request: Request,
         body: AgentQueryRequest,
         stream_synthesis: bool,
+        sensitive_context: SensitiveContext | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Drive one Agent session, yielding progress events as they happen.
 
@@ -493,6 +568,7 @@ class AgentQueryService:
                     session_id=session_id,
                     effective_records=effective_records,
                     stream_synthesis=stream_synthesis,
+                    sensitive_context=sensitive_context,
                 ):
                     yield event
                 return
@@ -504,22 +580,34 @@ class AgentQueryService:
                 max_rounds=max_rounds,
             )
             if plan.clarification_required:
+                mark_sensitive_context_not_used(
+                    sensitive_context, "clarification_required"
+                )
+                result_metadata = {
+                    "workflow": body.workflow,
+                    "effective_kb_ids": [record.id for record in effective_records],
+                }
+                memory_info = _sensitive_context_info(sensitive_context)
+                if memory_info is not None:
+                    result_metadata["memory"] = memory_info
                 result = AgentRunResult(
                     status="clarification_required",
                     session_id=session_id,
                     clarification_question=plan.clarification_question
                     or "请补充关键约束。",
-                    metadata={
-                        "workflow": body.workflow,
-                        "effective_kb_ids": [record.id for record in effective_records],
-                    },
+                    metadata=result_metadata,
                 )
                 yield {
                     "event": "clarification_required",
                     "session_id": session_id,
                     "clarification_question": result.clarification_question,
                 }
-                yield {"event": "done", "session_id": session_id, "_result": result}
+                yield {
+                    "event": "done",
+                    "session_id": session_id,
+                    **_done_memory_metadata(sensitive_context),
+                    "_result": result,
+                }
                 return
 
             steps, plan_truncated = self._validate_plan(
@@ -574,8 +662,13 @@ class AgentQueryService:
                 }
                 try:
                     tool_result, retried_mode = await self._retrieve_with_empty_retry(
-                        http_request=request, body=body, step=step
+                        http_request=request,
+                        body=body,
+                        step=step,
+                        sensitive_context=sensitive_context,
                     )
+                except SensitiveContextPolicyError:
+                    raise
                 except Exception as exc:  # noqa: BLE001 — tolerate per-step failure
                     # One failed step must not discard evidence accumulated in
                     # earlier rounds; the gap is reported to the user instead.
@@ -588,10 +681,18 @@ class AgentQueryService:
                         )
                     else:
                         error_code = "agent_step_failed"
-                        logger.error(
-                            "Agent step %d failed: %s", step.step_index, exc,
-                            exc_info=True,
-                        )
+                        if sensitive_context is not None:
+                            logger.error(
+                                "Memory-scoped Agent step %d failed",
+                                step.step_index,
+                            )
+                        else:
+                            logger.error(
+                                "Agent step %d failed: %s",
+                                step.step_index,
+                                exc,
+                                exc_info=True,
+                            )
                     summary["status"] = "failed"
                     summary["error_code"] = error_code
                     steps_summary.append(summary)
@@ -636,11 +737,16 @@ class AgentQueryService:
                         "mode": used_mode,
                     }
                     for chunk in tool_result.chunks
+                    if _authoritative_chunk_content(chunk) is not None
+                )
+                authoritative_chunk_count = sum(
+                    _authoritative_chunk_content(chunk) is not None
+                    for chunk in tool_result.chunks
                 )
                 summary.update(
                     {
                         "kb_ids": tool_result.queried_kb_ids,
-                        "chunk_count": len(tool_result.chunks),
+                        "chunk_count": authoritative_chunk_count,
                         "per_kb_chunk_counts": tool_result.per_kb_chunk_counts,
                         "skipped_kbs": tool_result.skipped_kbs,
                     }
@@ -654,7 +760,7 @@ class AgentQueryService:
                     "query_hash": hashlib.sha256(
                         step.query.encode("utf-8")
                     ).hexdigest(),
-                    "chunk_count": len(tool_result.chunks),
+                    "chunk_count": authoritative_chunk_count,
                     "skipped_kbs": tool_result.skipped_kbs,
                 }
                 if retried_mode:
@@ -670,6 +776,7 @@ class AgentQueryService:
 
             failed_rounds = [s for s in steps_summary if s.get("status") == "failed"]
             if synth_result is None:
+                mark_sensitive_context_not_used(sensitive_context, "no_kb_evidence")
                 raise HTTPException(
                     status_code=502,
                     detail={
@@ -695,7 +802,8 @@ class AgentQueryService:
                 }
 
             answer_parts: list[str] = []
-            if not context_units:
+            if not _has_authoritative_evidence(context_units):
+                mark_sensitive_context_not_used(sensitive_context, "no_kb_evidence")
                 answer = "未检索到可用于回答的证据。"
                 yield {"event": "response", "session_id": session_id, "delta": answer}
             else:
@@ -707,6 +815,7 @@ class AgentQueryService:
                     context_units=context_units,
                     steps_summary=steps_summary,
                     stream=stream_synthesis,
+                    sensitive_context=sensitive_context,
                 ):
                     if delta:
                         answer_parts.append(delta)
@@ -717,53 +826,84 @@ class AgentQueryService:
                         }
                 answer = "".join(answer_parts)
 
+            completion_audit_metadata = {
+                "round_count": len(steps_summary),
+                "failed_round_count": len(failed_rounds),
+                "reference_count": len(references),
+                "effective_kb_ids": [record.id for record in effective_records],
+            }
+            memory_info = _sensitive_context_info(sensitive_context)
+            if memory_info is not None:
+                completion_audit_metadata.update(memory_audit_fields(memory_info))
             await append_enterprise_audit_event(
                 request,
                 "agent_query_completed",
                 target_type="agent_session",
                 target_id=session_id,
-                metadata={
-                    "round_count": len(steps_summary),
-                    "failed_round_count": len(failed_rounds),
-                    "reference_count": len(references),
-                    "effective_kb_ids": [record.id for record in effective_records],
-                },
+                metadata=completion_audit_metadata,
             )
+            result_metadata = {
+                "workflow": body.workflow,
+                "effective_kb_ids": [record.id for record in effective_records],
+                "round_count": len(steps_summary),
+                "failed_round_count": len(failed_rounds),
+                "plan_truncated": plan_truncated,
+                "bilingual_retrieval": agent_bilingual_enabled(body),
+                "notes_for_user": plan.notes_for_user,
+            }
+            if memory_info is not None:
+                result_metadata["memory"] = memory_info
             result = AgentRunResult(
                 status="success",
                 session_id=session_id,
                 answer=answer,
                 references=references if body.include_references else [],
                 steps_summary=steps_summary,
-                metadata={
-                    "workflow": body.workflow,
-                    "effective_kb_ids": [record.id for record in effective_records],
-                    "round_count": len(steps_summary),
-                    "failed_round_count": len(failed_rounds),
-                    "plan_truncated": plan_truncated,
-                    "bilingual_retrieval": agent_bilingual_enabled(body),
-                    "notes_for_user": plan.notes_for_user,
-                },
+                metadata=result_metadata,
             )
-            yield {"event": "done", "session_id": session_id, "_result": result}
+            yield {
+                "event": "done",
+                "session_id": session_id,
+                **_done_memory_metadata(sensitive_context),
+                "_result": result,
+            }
+        except SensitiveContextPolicyError:
+            raise
         except Exception as exc:
+            if sensitive_context is not None:
+                failure_metadata = {
+                    "error": "Agent query failed",
+                    "error_code": (
+                        "agent_http_error"
+                        if isinstance(exc, HTTPException)
+                        else "agent_error"
+                    ),
+                    "status_code": (
+                        exc.status_code if isinstance(exc, HTTPException) else None
+                    ),
+                }
+            else:
+                failure_metadata = {
+                    "error": str(
+                        exc.detail if isinstance(exc, HTTPException) else exc
+                    )[:500],
+                    "status_code": (
+                        exc.status_code if isinstance(exc, HTTPException) else None
+                    ),
+                }
             try:
                 await append_enterprise_audit_event(
                     request,
                     "agent_session_failed",
                     target_type="agent_session",
                     target_id=session_id,
-                    metadata={
-                        "error": str(
-                            exc.detail if isinstance(exc, HTTPException) else exc
-                        )[:500],
-                        "status_code": exc.status_code
-                        if isinstance(exc, HTTPException)
-                        else None,
-                    },
+                    metadata=failure_metadata,
                 )
             except Exception as audit_exc:  # noqa: BLE001
-                logger.warning("Agent session-failed audit failed: %s", audit_exc)
+                if sensitive_context is not None:
+                    logger.warning("Memory-scoped Agent session-failed audit failed")
+                else:
+                    logger.warning("Agent session-failed audit failed: %s", audit_exc)
             raise
 
     def _require_agent_access(self, request: Request):
@@ -846,6 +986,7 @@ class AgentQueryService:
         http_request: Request,
         body: AgentQueryRequest,
         step: AgentPlanStep,
+        sensitive_context: SensitiveContext | None = None,
     ) -> tuple[QueryToolResult, str | None]:
         """Execute one retrieval step, retrying once on an empty result.
 
@@ -856,7 +997,7 @@ class AgentQueryService:
         tool_result = await self._retrieve_for_step(
             http_request=http_request, body=body, step=step, mode=step.mode
         )
-        if tool_result.chunks:
+        if _has_authoritative_chunks(tool_result.chunks):
             return tool_result, None
         fallback = EMPTY_RETRY_MODE_FALLBACK.get(step.mode)
         if not fallback:
@@ -865,12 +1006,20 @@ class AgentQueryService:
             retry_result = await self._retrieve_for_step(
                 http_request=http_request, body=body, step=step, mode=fallback
             )
+        except SensitiveContextPolicyError:
+            raise
         except Exception as exc:  # noqa: BLE001 — retry must not fail the step
-            logger.warning(
-                "Agent empty-result retry (mode=%s) failed: %s", fallback, exc
-            )
+            if sensitive_context is not None:
+                logger.warning(
+                    "Memory-scoped Agent empty-result retry (mode=%s) failed",
+                    fallback,
+                )
+            else:
+                logger.warning(
+                    "Agent empty-result retry (mode=%s) failed: %s", fallback, exc
+                )
             return tool_result, None
-        if retry_result.chunks:
+        if _has_authoritative_chunks(retry_result.chunks):
             return retry_result, fallback
         return tool_result, None
 
@@ -1072,7 +1221,12 @@ class AgentQueryService:
         umbrella question systematically drops evidence for sub-questions
         phrased differently (e.g. P0 regulation lookups).
         """
-        deduped = _dedup_agent_chunks(evidence_chunks)
+        authoritative = [
+            chunk
+            for chunk in evidence_chunks
+            if _authoritative_chunk_content(chunk) is not None
+        ]
+        deduped = _dedup_agent_chunks(authoritative)
         interleaved = _interleave_rounds(deduped)
         rag = synth_result.rag
         param = synth_result.param
@@ -1083,11 +1237,14 @@ class AgentQueryService:
             getattr(param, "max_total_tokens", None) if param is not None else None
         )
         if tokenizer is not None and budget:
-            interleaved = truncate_list_by_token_size(
-                interleaved,
-                key=lambda chunk: str(chunk.get("content", "")),
-                max_token_size=int(budget),
-                tokenizer=tokenizer,
+            interleaved = cast(
+                list[dict[str, Any]],
+                truncate_list_by_token_size(
+                    interleaved,
+                    key=lambda chunk: _authoritative_chunk_content(chunk) or "",
+                    max_token_size=int(budget),
+                    tokenizer=tokenizer,
+                ),
             )
         return interleaved
 
@@ -1099,9 +1256,11 @@ class AgentQueryService:
     ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
         references: list[dict[str, Any]] = []
         context_units: list[dict[str, str]] = []
-        for index, chunk in enumerate(processed, start=1):
-            reference_id = f"A{index}"
-            content = str(chunk.get("content", ""))
+        for chunk in processed:
+            content = _authoritative_chunk_content(chunk)
+            if content is None:
+                continue
+            reference_id = f"A{len(references) + 1}"
             file_path = str(chunk.get("file_path") or chunk.get("source") or "unknown")
             ref = {
                 "reference_id": reference_id,
@@ -1130,9 +1289,16 @@ class AgentQueryService:
         steps_summary: list[dict[str, Any]],
         stream: bool,
         extra_rules: str = "",
+        sensitive_context: SensitiveContext | None = None,
     ) -> AsyncIterator[str]:
-        global_config = synth_result.rag._build_global_config()
+        rag = synth_result.rag
         param = synth_result.param
+        if rag is None or param is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Agent synthesis runtime is unavailable",
+            )
+        global_config = rag._build_global_config()
         if body.response_type:
             param.response_type = body.response_type
         if body.max_total_tokens:
@@ -1147,15 +1313,6 @@ class AgentQueryService:
             reference_list_str=reference_list_str,
         )
         user_prompt = body.user_prompt or "n/a"
-        # Server-side project memory: prepend distilled facts to the answer
-        # prompt (fail-open — an unavailable backend just skips injection).
-        memory_block, _memory_info = await resolve_memory_injection(
-            request, body.memory, body.query
-        )
-        if memory_block:
-            user_prompt = (
-                memory_block if user_prompt == "n/a" else f"{memory_block}\n\n{user_prompt}"
-            )
         agent_rules = (
             "你只能基于给定证据回答。引用必须使用 [A1]、[A2] 这样的 Agent 级引用编号。"
             "如果证据不足或存在冲突，必须明确说明缺口或冲突；不要编造未在证据中的事实。"
@@ -1167,21 +1324,68 @@ class AgentQueryService:
             agent_rules = (
                 f"{agent_rules}\n已知检索缺口（必须在回答中明确说明对应内容未覆盖）：{gap_notes}"
             )
-        sys_prompt = PROMPTS["naive_rag_response"].format(
-            response_type=param.response_type or "Multiple Paragraphs",
-            user_prompt=f"{agent_rules}\n\n{user_prompt}",
-            content_data=content_data,
-        )
+
+        def build_system_prompt(payload: SensitiveContextPayload | None) -> str:
+            effective_instructions = f"{agent_rules}\n\n{user_prompt}"
+            effective_content_data = content_data
+            if payload is not None:
+                effective_instructions = (
+                    f"{effective_instructions}\n\n{payload.trusted_policy}"
+                )
+                effective_content_data = (
+                    f"{effective_content_data}\n\n{payload.context_data}"
+                )
+            return PROMPTS["naive_rag_response"].format(
+                response_type=param.response_type or "Multiple Paragraphs",
+                user_prompt=effective_instructions,
+                content_data=effective_content_data,
+            )
+
+        sys_prompt = build_system_prompt(None)
         query_func = partial(
             global_config["role_llm_funcs"]["query"], _priority=DEFAULT_QUERY_PRIORITY
         )
-        response = await query_func(
-            body.query,
-            system_prompt=sys_prompt,
-            history_messages=body.conversation_history or [],
-            stream=stream,
-            enable_cot=True,
-        )
+        if sensitive_context is not None:
+            llm_identity = get_llm_cache_identity(global_config, "query")
+            bind_sensitive_context_endpoint(
+                sensitive_context,
+                llm_identity.get("host")
+                if isinstance(llm_identity, dict)
+                else None,
+            )
+
+            def build_final_request(
+                payload: SensitiveContextPayload | None,
+            ) -> str:
+                return serialize_sensitive_final_request(
+                    build_system_prompt(payload),
+                    body.query,
+                    body.conversation_history or [],
+                )
+
+            max_total_tokens = (
+                body.max_total_tokens
+                or getattr(param, "max_total_tokens", None)
+                or global_config.get("max_total_tokens")
+                or 0
+            )
+            payload = await sensitive_context.resolve_for_final_request(
+                global_config.get("tokenizer"),
+                max_total_tokens,
+                build_final_request,
+                policy_suffix=CHAT_MEMORY_AGENT_POLICY_SUFFIX,
+            )
+            sys_prompt = build_system_prompt(payload)
+
+        llm_kwargs: dict[str, Any] = {
+            "system_prompt": sys_prompt,
+            "history_messages": body.conversation_history or [],
+            "stream": stream,
+            "enable_cot": True,
+        }
+        if sensitive_context is not None:
+            llm_kwargs["_sensitive"] = True
+        response = await query_func(body.query, **llm_kwargs)
         if hasattr(response, "__aiter__"):
             async for chunk in response:
                 if chunk:

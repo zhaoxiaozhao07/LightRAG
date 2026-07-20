@@ -1,10 +1,9 @@
-"""Server-side chat-memory injection shared by query and agent endpoints.
+"""Chat-memory authorization shared by query and Agent endpoints.
 
-Endpoints opt in per request with ``memory: {"project_id": "...", "limit": n}``.
-The server validates that the caller is an interactive user who owns the chat
-project, searches the project's graphiti memory partition with the request
-query, and prepends the formatted fact block to the effective ``user_prompt``.
-See docs/ChatMemory-zh.md §6.
+``authorize_memory_context`` validates request ownership without searching and
+returns a process-local handle that Phase 4B call sites resolve only at final
+synthesis. ``resolve_memory_injection`` remains as a compatibility wrapper for
+the existing pre-Phase-4B routes.
 
 Failure semantics:
 
@@ -18,15 +17,37 @@ Failure semantics:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field
 
-from lightrag.api.chat_memory_service import MEMORY_SEARCH_MAX_LIMIT
+from lightrag.api.chat_memory_service import (
+    MEMORY_QUERY_MAX_LENGTH,
+    MEMORY_SEARCH_MAX_LIMIT,
+    AuthorizedChatMemoryHandle,
+)
 from lightrag.api.enterprise_auth import (
     get_enterprise_chat_memory_service,
     get_request_principal,
+)
+
+
+_MEMORY_AUDIT_ALLOWED_KEYS = frozenset(
+    {
+        "memory_enabled",
+        "memory_fact_count",
+        "memory_injected_count",
+        "memory_status",
+        "memory_truncated",
+        "memory_reason",
+    }
+)
+_MEMORY_AUDIT_STATUS_VALUES = frozenset(
+    {"injected", "empty", "budget_exhausted", "unavailable", "not_used"}
+)
+_MEMORY_AUDIT_REASON_VALUES = frozenset(
+    {"unavailable", "clarification_required", "no_kb_evidence"}
 )
 
 
@@ -36,6 +57,74 @@ class ChatMemoryScope(BaseModel):
     project_id: str = Field(min_length=1, max_length=128)
     # Omitted limit falls back to the deployment default (MEMORY_SEARCH_LIMIT).
     limit: int | None = Field(default=None, ge=1, le=MEMORY_SEARCH_MAX_LIMIT)
+
+
+async def authorize_memory_context(
+    request: Request,
+    scope: ChatMemoryScope | None,
+    query: str,
+    *,
+    query_llm_endpoint: str | None = None,
+) -> AuthorizedChatMemoryHandle | None:
+    """Authorize a fact-free handle without searching Chat Memory.
+
+    Phase 4B call sites bind (or pass) the exact final-synthesis endpoint and
+    invoke the handle only after authoritative KB/Agent evidence is complete.
+    """
+
+    if scope is None:
+        return None
+    if len(query) > MEMORY_QUERY_MAX_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chat memory query exceeds {MEMORY_QUERY_MAX_LENGTH} characters",
+        )
+    service = get_enterprise_chat_memory_service(request)
+    if service is None:
+        raise HTTPException(status_code=503, detail="Chat memory is not enabled")
+    principal = get_request_principal(request)
+    if principal is None:
+        raise HTTPException(status_code=401, detail="Login required")
+    if principal.auth_method != "jwt":
+        raise HTTPException(
+            status_code=403,
+            detail="Chat memory requires an interactive user",
+        )
+    conversation = getattr(
+        request.app.state, "enterprise_chat_conversation_service", None
+    )
+    if conversation is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Enterprise chat conversation service unavailable",
+        )
+    project = await conversation.get_project(principal.user_id, scope.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Chat project not found")
+    create_handle = getattr(service, "create_authorized_handle", None)
+    if callable(create_handle):
+        return cast(
+            AuthorizedChatMemoryHandle,
+            create_handle(
+                user_id=principal.user_id,
+                project_id=scope.project_id,
+                query=query,
+                limit=scope.limit,
+                query_llm_endpoint=query_llm_endpoint,
+            ),
+        )
+    return AuthorizedChatMemoryHandle(
+        service,
+        user_id=principal.user_id,
+        project_id=scope.project_id,
+        query=query,
+        limit=scope.limit,
+        query_llm_endpoint=query_llm_endpoint,
+    )
+
+
+# Explicit alias for Phase 4B integration lanes.
+authorize_chat_memory_context = authorize_memory_context
 
 
 async def resolve_memory_injection(
@@ -94,10 +183,20 @@ def memory_audit_fields(info: dict[str, Any] | None) -> dict[str, Any]:
     if info is None:
         return {}
     fields: dict[str, Any] = {"memory_enabled": bool(info.get("enabled"))}
-    if "project_id" in info:
-        fields["memory_project_id"] = info["project_id"]
     if "fact_count" in info:
         fields["memory_fact_count"] = info["fact_count"]
-    if "reason" in info:
-        fields["memory_reason"] = info["reason"]
-    return fields
+    if "injected_count" in info:
+        fields["memory_injected_count"] = info["injected_count"]
+    status = info.get("status")
+    if status.__class__ is str and status in _MEMORY_AUDIT_STATUS_VALUES:
+        fields["memory_status"] = status
+    if "truncated" in info:
+        fields["memory_truncated"] = bool(info["truncated"])
+    reason = info.get("reason")
+    if reason.__class__ is str and reason in _MEMORY_AUDIT_REASON_VALUES:
+        fields["memory_reason"] = reason
+    return {
+        key: value
+        for key, value in fields.items()
+        if key in _MEMORY_AUDIT_ALLOWED_KEYS
+    }

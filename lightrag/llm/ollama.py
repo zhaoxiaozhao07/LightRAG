@@ -23,6 +23,7 @@ from lightrag.exceptions import (
     APITimeoutError,
 )
 from lightrag.api import __api_version__
+from lightrag.sensitive_context import is_sensitive_call
 
 import numpy as np
 from typing import Any, Optional, Union
@@ -33,6 +34,24 @@ from lightrag.utils import (
 
 
 _OLLAMA_CLOUD_HOST = "https://ollama.com"
+
+
+def _log_ollama_error(message: str, exc: Exception) -> None:
+    if is_sensitive_call():
+        logger.error("%s (%s)", message, type(exc).__name__)
+    else:
+        logger.error("%s: %s", message, exc)
+
+
+def _log_ollama_cleanup_error(message: str, exc: Exception) -> None:
+    """Log cleanup failures without sensitive provider-controlled text."""
+
+    if is_sensitive_call():
+        logger.warning("%s (%s)", message, type(exc).__name__)
+    else:
+        logger.warning("%s: %s", message, exc)
+
+
 _CLOUD_MODEL_SUFFIX_PATTERN = re.compile(r"(?:-cloud|:cloud)$")
 
 
@@ -178,14 +197,16 @@ async def _ollama_model_if_cache(
                     async for chunk in response:
                         yield chunk["message"]["content"]
                 except Exception as e:
-                    logger.error(f"Error in stream response: {str(e)}")
+                    _log_ollama_error("Ollama stream failed", e)
                     raise
                 finally:
                     try:
                         await ollama_client._client.aclose()
                         logger.debug("Successfully closed Ollama client for streaming")
                     except Exception as close_error:
-                        logger.warning(f"Failed to close Ollama client: {close_error}")
+                        _log_ollama_cleanup_error(
+                            "Failed to close Ollama client", close_error
+                        )
 
             return inner()
         else:
@@ -198,15 +219,15 @@ async def _ollama_model_if_cache(
             """
 
             return model_response
-    except Exception as e:
+    except Exception:
         try:
             await ollama_client._client.aclose()
             logger.debug("Successfully closed Ollama client after exception")
         except Exception as close_error:
-            logger.warning(
-                f"Failed to close Ollama client after exception: {close_error}"
+            _log_ollama_cleanup_error(
+                "Failed to close Ollama client after exception", close_error
             )
-        raise e
+        raise
     finally:
         if not stream:
             try:
@@ -215,8 +236,8 @@ async def _ollama_model_if_cache(
                     "Successfully closed Ollama client for non-streaming response"
                 )
             except Exception as close_error:
-                logger.warning(
-                    f"Failed to close Ollama client in finally block: {close_error}"
+                _log_ollama_cleanup_error(
+                    "Failed to close Ollama client in finally block", close_error
                 )
 
 

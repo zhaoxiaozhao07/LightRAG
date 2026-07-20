@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import threading
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -47,7 +48,7 @@ DocumentStatus = Literal[
     "deleted",
 ]
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 11
 _T = TypeVar("_T")
 _EXPECTATION_UNSET: Any = object()
 _KB_OPERATION_LOCK_POLL_SECONDS = 0.05
@@ -61,6 +62,176 @@ _ORPHANED_DOCUMENT_STATUS_TARGETS = {
     "deleting": "delete_failed",
     "replacing": "replace_failed",
 }
+
+CHAT_MEMORY_RECORD_VERSION = 1
+CHAT_MEMORY_SNAPSHOT_DIGEST_VERSION = 1
+CHAT_MEMORY_DEFAULT_INGEST_MAX_CHARS = 6000
+_CHAT_MEMORY_ADMISSION_POLICY_VERSION = 1
+_CHAT_MEMORY_TRUNCATION_MARKER = "…[truncated]"
+_CHAT_MEMORY_GRAPH_STORE_MIGRATION_REQUIRED = "graph_store_migration_required"
+ChatMemoryGroupState = Literal[
+    "active", "rebuilding", "deleting", "failed", "deleted"
+]
+ChatMemoryGenerationState = Literal[
+    "building", "active", "retired", "abandoned", "purge_pending", "purged"
+]
+ChatMemoryEventType = Literal["ingest", "rebuild", "purge"]
+ChatMemoryEventStatus = Literal[
+    "pending", "running", "retry_wait", "succeeded", "superseded", "dead_letter"
+]
+_CHAT_MEMORY_BLOCKING_EVENT_STATUSES = (
+    "pending",
+    "running",
+    "retry_wait",
+    "dead_letter",
+)
+
+
+def chat_memory_logical_group_id(user_id: str, project_id: str) -> str:
+    """Return the stable logical Chat Memory group id for one project."""
+
+    digest = hashlib.sha256(f"{user_id}\0{project_id}".encode("utf-8")).hexdigest()
+    return f"cm_{digest[:24]}"
+
+
+def chat_memory_graph_group_id(
+    user_id: str, project_id: str, generation: int
+) -> str:
+    """Return the generation-fenced physical Graphiti group id."""
+
+    if int(generation) < 1:
+        raise ValueError("Chat Memory generation must be at least 1")
+    return f"{chat_memory_logical_group_id(user_id, project_id)}_g{int(generation)}"
+
+
+def chat_memory_legacy_graph_group_id(user_id: str, project_id: str) -> str:
+    """Return the pre-generation Graphiti group id used by legacy workers."""
+
+    return f"{user_id}--{project_id}"
+
+
+def _validate_chat_memory_fingerprint(config_fingerprint: str) -> str:
+    if (
+        not isinstance(config_fingerprint, str)
+        or not config_fingerprint.strip()
+        or config_fingerprint != config_fingerprint.strip()
+    ):
+        raise ValueError(
+            "Chat Memory config_fingerprint must be a normalized non-empty string"
+        )
+    return config_fingerprint
+
+
+def _resolve_chat_memory_graph_store_fingerprint(
+    config_fingerprint: str,
+    graph_store_fingerprint: str | None,
+) -> str:
+    """Resolve the graph-store identity for legacy-compatible store calls.
+
+    Falling back to the extraction/runtime fingerprint is compatibility-only
+    for existing tests and callers. Production callers must pass the graph
+    store fingerprint explicitly so extraction changes cannot alias a physical
+    graph store identity.
+    """
+
+    return _validate_chat_memory_fingerprint(
+        config_fingerprint
+        if graph_store_fingerprint is None
+        else graph_store_fingerprint
+    )
+
+
+def _new_chat_memory_claim_token() -> str:
+    return f"cmc_{secrets.token_urlsafe(24)}"
+
+
+def _validate_chat_memory_worker_id(worker_id: str | None) -> str | None:
+    if worker_id is None:
+        return None
+    if not isinstance(worker_id, str) or not worker_id.strip():
+        raise ValueError("Chat Memory worker_id must be a non-empty string")
+    return worker_id.strip()
+
+
+def _normalize_chat_memory_event_types(
+    event_types: Sequence[ChatMemoryEventType] | None,
+) -> tuple[ChatMemoryEventType, ...]:
+    if event_types is None:
+        return ("ingest", "rebuild", "purge")
+    normalized: list[ChatMemoryEventType] = []
+    for event_type in event_types:
+        if event_type not in {"ingest", "rebuild", "purge"}:
+            raise ValueError(f"Unsupported Chat Memory event type: {event_type}")
+        if event_type not in normalized:
+            normalized.append(event_type)
+    return tuple(normalized)
+
+
+def _chat_memory_event_identity(
+    *,
+    event_type: ChatMemoryEventType,
+    user_id: str,
+    project_id: str,
+    event_seq: int,
+    generation: int,
+    append_batch_id: str | None = None,
+    target_session_id: str | None = None,
+    target_message_id: str | None = None,
+) -> tuple[str, str]:
+    """Build a deterministic SQL event id and stable versioned key."""
+
+    canonical = json.dumps(
+        {
+            "append_batch_id": append_batch_id,
+            "event_seq": int(event_seq),
+            "event_type": event_type,
+            "generation": int(generation),
+            "project_id": project_id,
+            "record_version": CHAT_MEMORY_RECORD_VERSION,
+            "target_message_id": target_message_id,
+            "target_session_id": target_session_id,
+            "user_id": user_id,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"cme_{digest[:32]}", f"chat-memory-event:v1:{digest}"
+
+
+def _chat_memory_append_batch_id(
+    *,
+    user_id: str,
+    project_id: str,
+    session_id: str,
+    event_seq: int,
+    message_ids: Sequence[str],
+) -> str:
+    canonical = json.dumps(
+        {
+            "event_seq": int(event_seq),
+            "message_ids": list(message_ids),
+            "project_id": project_id,
+            "record_version": CHAT_MEMORY_RECORD_VERSION,
+            "session_id": session_id,
+            "user_id": user_id,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return f"cmb_{hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:32]}"
+
+
+def _next_sqlite_chat_memory_reference_time(last_value: str | None) -> str:
+    now = datetime.now(timezone.utc)
+    if last_value:
+        last = datetime.fromisoformat(last_value)
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        now = max(now, last + timedelta(microseconds=1))
+    return now.isoformat()
 
 
 class _AsyncKBOperationLock:
@@ -246,6 +417,31 @@ class _SQLiteKBWriteGuardTaskState:
     owner_task: asyncio.Task[Any] | None
     depths: dict[tuple[str, str | None], int]
     idle_events: dict[tuple[str, str | None], asyncio.Event]
+
+
+@dataclass(slots=True)
+class _SQLiteChatMemoryGuardTaskState:
+    owner_task: asyncio.Task[Any] | None
+    depths: dict[str, int]
+
+
+_PROCESS_CHAT_MEMORY_GROUP_LOCKS: dict[
+    tuple[asyncio.AbstractEventLoop, str], _AsyncJobExecutionLock
+] = {}
+_PROCESS_CHAT_MEMORY_GROUP_LOCKS_GUARD = threading.Lock()
+
+
+def _process_chat_memory_group_lock(
+    db_path: Path, logical_group_id: str
+) -> _AsyncJobExecutionLock:
+    lock_name = f"{db_path.resolve()}:{logical_group_id}"
+    key = (asyncio.get_running_loop(), lock_name)
+    with _PROCESS_CHAT_MEMORY_GROUP_LOCKS_GUARD:
+        lock = _PROCESS_CHAT_MEMORY_GROUP_LOCKS.get(key)
+        if lock is None:
+            lock = _AsyncJobExecutionLock()
+            _PROCESS_CHAT_MEMORY_GROUP_LOCKS[key] = lock
+        return lock
 
 
 async def _wait_for_kb_guard_borrowers(event: asyncio.Event) -> None:
@@ -921,9 +1117,15 @@ class ChatMessageRecord:
     metadata: dict[str, Any]
     seq: int
     created_at: str
+    # Admission fields are nullable by design. Legacy and feature-off messages
+    # remain source data but are not silently imported into memory rebuilds.
+    append_batch_id: str | None = None
+    project_event_seq: int | None = None
+    memory_reference_time: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "ChatMessageRecord":
+        columns = set(row.keys())
         return cls(
             id=str(row["id"]),
             session_id=str(row["session_id"]),
@@ -934,6 +1136,20 @@ class ChatMessageRecord:
             metadata=_loads_json_object(row["metadata_json"]),
             seq=int(row["seq"]),
             created_at=str(row["created_at"]),
+            append_batch_id=(
+                row["append_batch_id"] if "append_batch_id" in columns else None
+            ),
+            project_event_seq=(
+                int(row["project_event_seq"])
+                if "project_event_seq" in columns
+                and row["project_event_seq"] is not None
+                else None
+            ),
+            memory_reference_time=(
+                row["memory_reference_time"]
+                if "memory_reference_time" in columns
+                else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -945,11 +1161,11 @@ class ChatMemoryEpisodeRecord:
     """Mapping between a graphiti memory episode and the chat messages it
     distilled (docs/ChatMemory-zh.md).
 
-    ``first_seq``/``last_seq`` bound the per-session message range covered by
-    the episode; ``MAX(last_seq)`` per session is the ingestion watermark used
-    for idempotent ingestion and restart compensation. ``noop_*`` uuids mark
-    ranges that produced no graphiti episode (e.g. blank content) but still
-    advance the watermark.
+    ``first_seq``/``last_seq`` retain compatibility with the legacy session
+    watermark. Generation-aware producers also persist the admitted append
+    identity. The same producer event/batch may be replayed into multiple
+    generations, while each generation admits at most one logical mapping for
+    that append batch. ``noop_*`` uuids remain valid legacy mappings.
     """
 
     episode_uuid: str
@@ -959,9 +1175,15 @@ class ChatMemoryEpisodeRecord:
     first_seq: int
     last_seq: int
     created_at: str
+    event_id: str | None = None
+    generation: int | None = None
+    graph_group_id: str | None = None
+    append_batch_id: str | None = None
+    project_event_seq: int | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "ChatMemoryEpisodeRecord":
+        columns = set(row.keys())
         return cls(
             episode_uuid=str(row["episode_uuid"]),
             session_id=str(row["session_id"]),
@@ -970,10 +1192,716 @@ class ChatMemoryEpisodeRecord:
             first_seq=int(row["first_seq"]),
             last_seq=int(row["last_seq"]),
             created_at=str(row["created_at"]),
+            event_id=row["event_id"] if "event_id" in columns else None,
+            generation=(
+                int(row["generation"])
+                if "generation" in columns and row["generation"] is not None
+                else None
+            ),
+            graph_group_id=(
+                row["graph_group_id"] if "graph_group_id" in columns else None
+            ),
+            append_batch_id=(
+                row["append_batch_id"] if "append_batch_id" in columns else None
+            ),
+            project_event_seq=(
+                int(row["project_event_seq"])
+                if "project_event_seq" in columns
+                and row["project_event_seq"] is not None
+                else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(slots=True)
+class ChatMemoryGroupRecord:
+    """Durable logical Chat Memory group state for one user/project."""
+
+    user_id: str
+    project_id: str
+    logical_group_id: str
+    active_generation: int | None
+    desired_generation: int
+    next_event_seq: int
+    last_reference_time: str | None
+    state: ChatMemoryGroupState
+    state_version: int
+    active_config_fingerprint: str | None
+    desired_config_fingerprint: str
+    active_rebuild_event_id: str | None
+    last_success_at: str | None
+    last_error_code: str | None
+    last_error_message: str | None
+    last_error_at: str | None
+    created_at: str
+    updated_at: str
+    deleted_at: str | None
+    record_version: int = CHAT_MEMORY_RECORD_VERSION
+    active_graph_store_fingerprint: str | None = None
+    desired_graph_store_fingerprint: str | None = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "ChatMemoryGroupRecord":
+        columns = set(row.keys())
+        return cls(
+            user_id=str(row["user_id"]),
+            project_id=str(row["project_id"]),
+            logical_group_id=str(row["logical_group_id"]),
+            active_generation=(
+                int(row["active_generation"])
+                if row["active_generation"] is not None
+                else None
+            ),
+            desired_generation=int(row["desired_generation"]),
+            next_event_seq=int(row["next_event_seq"]),
+            last_reference_time=row["last_reference_time"],
+            state=str(row["state"]),  # type: ignore[arg-type]
+            state_version=int(row["state_version"]),
+            active_config_fingerprint=row["active_config_fingerprint"],
+            desired_config_fingerprint=str(row["desired_config_fingerprint"]),
+            active_rebuild_event_id=row["active_rebuild_event_id"],
+            last_success_at=row["last_success_at"],
+            last_error_code=row["last_error_code"],
+            last_error_message=row["last_error_message"],
+            last_error_at=row["last_error_at"],
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+            deleted_at=row["deleted_at"],
+            record_version=int(row["record_version"]),
+            active_graph_store_fingerprint=(
+                row["active_graph_store_fingerprint"]
+                if "active_graph_store_fingerprint" in columns
+                else row["active_config_fingerprint"]
+            ),
+            desired_graph_store_fingerprint=(
+                str(row["desired_graph_store_fingerprint"])
+                if "desired_graph_store_fingerprint" in columns
+                else str(row["desired_config_fingerprint"])
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _chat_memory_existing_graph_store_fingerprint(
+    group: ChatMemoryGroupRecord,
+    fallback_graph_store_fingerprint: str,
+) -> str:
+    """Bind destructive work to an existing logical group's graph store."""
+
+    return _validate_chat_memory_fingerprint(
+        group.desired_graph_store_fingerprint
+        or group.active_graph_store_fingerprint
+        or fallback_graph_store_fingerprint
+    )
+
+
+def _chat_memory_graph_store_migration_conflict(
+    logical_group_id: str,
+    required_graph_store_fingerprint: str,
+    observed_graph_store_fingerprints: Sequence[str],
+) -> MetadataConflictError:
+    """Report that changing or reconciling graph stores needs explicit migration."""
+
+    return MetadataConflictError(
+        "chat_memory_graph_store",
+        logical_group_id,
+        expected={
+            "graph_store_fingerprints": (required_graph_store_fingerprint,),
+        },
+        current={
+            "error_code": _CHAT_MEMORY_GRAPH_STORE_MIGRATION_REQUIRED,
+            "graph_store_fingerprints": tuple(
+                sorted(set(observed_graph_store_fingerprints))
+            ),
+        },
+    )
+
+
+@dataclass(slots=True)
+class ChatMemoryGenerationRecord:
+    """Inventory row for one physical generation of a logical group."""
+
+    user_id: str
+    project_id: str
+    generation: int
+    graph_group_id: str
+    config_fingerprint: str
+    state: ChatMemoryGenerationState
+    snapshot_cutoff: int | None
+    replay_batch_count: int | None
+    replay_message_count: int | None
+    replay_byte_count: int | None
+    clear_attempt_no: int
+    clear_started_at: str | None
+    created_at: str
+    updated_at: str
+    activated_at: str | None
+    cleared_at: str | None
+    last_error_code: str | None
+    last_error_message: str | None
+    last_error_at: str | None
+    snapshot_digest: str | None = None
+    record_version: int = CHAT_MEMORY_RECORD_VERSION
+    graph_store_fingerprint: str | None = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "ChatMemoryGenerationRecord":
+        columns = set(row.keys())
+        return cls(
+            user_id=str(row["user_id"]),
+            project_id=str(row["project_id"]),
+            generation=int(row["generation"]),
+            graph_group_id=str(row["graph_group_id"]),
+            config_fingerprint=str(row["config_fingerprint"]),
+            state=str(row["state"]),  # type: ignore[arg-type]
+            snapshot_cutoff=(
+                int(row["snapshot_cutoff"])
+                if row["snapshot_cutoff"] is not None
+                else None
+            ),
+            replay_batch_count=(
+                int(row["replay_batch_count"])
+                if row["replay_batch_count"] is not None
+                else None
+            ),
+            replay_message_count=(
+                int(row["replay_message_count"])
+                if row["replay_message_count"] is not None
+                else None
+            ),
+            replay_byte_count=(
+                int(row["replay_byte_count"])
+                if row["replay_byte_count"] is not None
+                else None
+            ),
+            clear_attempt_no=int(row["clear_attempt_no"]),
+            clear_started_at=row["clear_started_at"],
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+            activated_at=row["activated_at"],
+            cleared_at=row["cleared_at"],
+            last_error_code=row["last_error_code"],
+            last_error_message=row["last_error_message"],
+            last_error_at=row["last_error_at"],
+            snapshot_digest=(
+                row["snapshot_digest"] if "snapshot_digest" in columns else None
+            ),
+            record_version=int(row["record_version"]),
+            graph_store_fingerprint=(
+                str(row["graph_store_fingerprint"])
+                if "graph_store_fingerprint" in columns
+                else str(row["config_fingerprint"])
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class ChatMemoryOutboxEventRecord:
+    """Durable, generation-fenced Chat Memory mutation event."""
+
+    event_id: str
+    deterministic_key: str
+    user_id: str
+    project_id: str
+    event_seq: int
+    generation: int
+    graph_group_id: str
+    config_fingerprint: str
+    event_type: ChatMemoryEventType
+    status: ChatMemoryEventStatus
+    available_at: str
+    attempt_no: int
+    created_at: str
+    updated_at: str
+    source_session_id: str | None = None
+    append_batch_id: str | None = None
+    first_seq: int | None = None
+    last_seq: int | None = None
+    snapshot_cutoff: int | None = None
+    snapshot_batch_count: int | None = None
+    snapshot_message_count: int | None = None
+    snapshot_byte_count: int | None = None
+    snapshot_digest: str | None = None
+    claim_token: str | None = None
+    claimed_by: str | None = None
+    claimed_at: str | None = None
+    side_effect_started_at: str | None = None
+    side_effect_state_version: int | None = None
+    completed_at: str | None = None
+    superseded_by_event_id: str | None = None
+    last_error_code: str | None = None
+    last_error_message: str | None = None
+    last_error_at: str | None = None
+    actor_user_id: str | None = None
+    actor_tenant_id: str | None = None
+    target_user_id: str | None = None
+    target_project_id: str | None = None
+    target_session_id: str | None = None
+    target_message_id: str | None = None
+    record_version: int = CHAT_MEMORY_RECORD_VERSION
+    graph_store_fingerprint: str | None = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "ChatMemoryOutboxEventRecord":
+        columns = set(row.keys())
+        return cls(
+            event_id=str(row["event_id"]),
+            deterministic_key=str(row["deterministic_key"]),
+            user_id=str(row["user_id"]),
+            project_id=str(row["project_id"]),
+            event_seq=int(row["event_seq"]),
+            generation=int(row["generation"]),
+            graph_group_id=str(row["graph_group_id"]),
+            config_fingerprint=str(row["config_fingerprint"]),
+            event_type=str(row["event_type"]),  # type: ignore[arg-type]
+            status=str(row["status"]),  # type: ignore[arg-type]
+            available_at=str(row["available_at"]),
+            attempt_no=int(row["attempt_no"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+            source_session_id=row["source_session_id"],
+            append_batch_id=row["append_batch_id"],
+            first_seq=(int(row["first_seq"]) if row["first_seq"] is not None else None),
+            last_seq=(int(row["last_seq"]) if row["last_seq"] is not None else None),
+            snapshot_cutoff=(
+                int(row["snapshot_cutoff"])
+                if row["snapshot_cutoff"] is not None
+                else None
+            ),
+            snapshot_batch_count=(
+                int(row["snapshot_batch_count"])
+                if row["snapshot_batch_count"] is not None
+                else None
+            ),
+            snapshot_message_count=(
+                int(row["snapshot_message_count"])
+                if row["snapshot_message_count"] is not None
+                else None
+            ),
+            snapshot_byte_count=(
+                int(row["snapshot_byte_count"])
+                if row["snapshot_byte_count"] is not None
+                else None
+            ),
+            snapshot_digest=(
+                row["snapshot_digest"] if "snapshot_digest" in columns else None
+            ),
+            claim_token=row["claim_token"],
+            claimed_by=row["claimed_by"],
+            claimed_at=row["claimed_at"],
+            side_effect_started_at=row["side_effect_started_at"],
+            side_effect_state_version=(
+                int(row["side_effect_state_version"])
+                if row["side_effect_state_version"] is not None
+                else None
+            ),
+            completed_at=row["completed_at"],
+            superseded_by_event_id=row["superseded_by_event_id"],
+            last_error_code=row["last_error_code"],
+            last_error_message=row["last_error_message"],
+            last_error_at=row["last_error_at"],
+            actor_user_id=row["actor_user_id"],
+            actor_tenant_id=row["actor_tenant_id"],
+            target_user_id=row["target_user_id"],
+            target_project_id=row["target_project_id"],
+            target_session_id=row["target_session_id"],
+            target_message_id=row["target_message_id"],
+            record_version=int(row["record_version"]),
+            graph_store_fingerprint=(
+                str(row["graph_store_fingerprint"])
+                if "graph_store_fingerprint" in columns
+                else str(row["config_fingerprint"])
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class ChatMemoryExecutionState:
+    group: ChatMemoryGroupRecord
+    event: ChatMemoryOutboxEventRecord
+    generation: ChatMemoryGenerationRecord
+
+
+@dataclass(slots=True, frozen=True)
+class ChatMemoryReadToken:
+    """Atomic logical/physical identity used to fence Chat Memory reads."""
+
+    user_id: str
+    project_id: str
+    state: ChatMemoryGroupState
+    state_version: int
+    active_generation: int | None
+    active_config_fingerprint: str | None
+    active_graph_store_fingerprint: str | None
+    graph_group_id: str | None
+    generation_state: ChatMemoryGenerationState | None
+
+
+@dataclass(slots=True)
+class ChatMemoryOutboxStats:
+    pending: int
+    running: int
+    retry_wait: int
+    dead_letter: int
+    oldest_available_at: str | None
+    oldest_lag_seconds: float
+
+
+@dataclass(slots=True)
+class ChatMemoryRebuildSnapshot:
+    event_id: str
+    user_id: str
+    project_id: str
+    generation: int
+    graph_group_id: str
+    config_fingerprint: str
+    group_state_version: int
+    snapshot_cutoff: int
+    replay_batches: list[ChatMemoryReplayBatch]
+    batch_count: int
+    message_count: int
+    byte_count: int
+    snapshot_digest: str | None = None
+    ingest_max_chars: int = CHAT_MEMORY_DEFAULT_INGEST_MAX_CHARS
+    graph_store_fingerprint: str | None = None
+
+    @property
+    def state_version(self) -> int:
+        """Compatibility alias for the captured logical-group state version."""
+
+        return self.group_state_version
+
+
+@dataclass(slots=True)
+class ChatMemoryReplayMappingInput:
+    append_batch_id: str
+    project_event_seq: int
+    session_id: str
+    first_seq: int
+    last_seq: int
+    episode_uuid: str
+
+
+@dataclass(slots=True)
+class ChatMemoryRebuildTargetSet:
+    event_id: str
+    user_id: str
+    project_id: str
+    logical_group_id: str
+    group_ids: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class ChatMemoryPurgeTargetSet:
+    event_id: str
+    user_id: str
+    project_id: str
+    logical_group_id: str
+    group_ids: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class ChatMemoryReplayBatch:
+    """One admitted append boundary returned for generation replay."""
+
+    append_batch_id: str
+    project_event_seq: int
+    memory_reference_time: str
+    session_id: str
+    messages: list[ChatMessageRecord]
+
+
+def _validate_chat_memory_ingest_max_chars(value: int) -> int:
+    if isinstance(value, bool):
+        raise ValueError("Chat Memory ingest_max_chars must be a non-negative integer")
+    normalized = int(value)
+    if normalized < 0:
+        raise ValueError("Chat Memory ingest_max_chars must be non-negative")
+    return normalized
+
+
+def _chat_memory_admitted_message_content(
+    message: ChatMessageRecord,
+) -> str | None:
+    """Apply the fixed, shared Chat Memory admission policy.
+
+    Non-empty user messages are admitted. Assistant messages are admitted only
+    when their JSON metadata contains the literal boolean
+    ``memory_eligible=true``. Other roles and blank content are not admitted.
+    """
+
+    content = message.content.strip()
+    if not content:
+        return None
+    if message.role == "user":
+        return content
+    if (
+        message.role == "assistant"
+        and message.metadata.get("memory_eligible") is True
+    ):
+        return content
+    return None
+
+
+def _chat_memory_canonical_episode_payload(
+    messages: Sequence[ChatMessageRecord],
+    *,
+    ingest_max_chars: int,
+) -> dict[str, Any]:
+    """Return the normalized final episode payload for one admitted batch."""
+
+    max_chars = _validate_chat_memory_ingest_max_chars(ingest_max_chars)
+    admitted: list[dict[str, Any]] = []
+    lines: list[str] = []
+    for message in messages:
+        content = _chat_memory_admitted_message_content(message)
+        if content is None:
+            continue
+        normalized_content = content
+        if len(normalized_content) > max_chars:
+            normalized_content = (
+                normalized_content[:max_chars] + _CHAT_MEMORY_TRUNCATION_MARKER
+            )
+        admitted.append(
+            {
+                "id": message.id,
+                "seq": int(message.seq),
+                "role": message.role,
+                "content": normalized_content,
+            }
+        )
+        lines.append(f"{message.role}: {normalized_content}")
+    return {
+        "admission_policy_version": _CHAT_MEMORY_ADMISSION_POLICY_VERSION,
+        "ingest_max_chars": max_chars,
+        "messages": admitted,
+        "episode_body": "\n".join(lines),
+    }
+
+
+def _chat_memory_canonical_snapshot_manifest(
+    replay_batches: Sequence[ChatMemoryReplayBatch],
+    *,
+    ingest_max_chars: int,
+) -> dict[str, Any]:
+    """Build the ordered, versioned manifest attested by rebuild snapshots."""
+
+    max_chars = _validate_chat_memory_ingest_max_chars(ingest_max_chars)
+    batches: list[dict[str, Any]] = []
+    for batch in replay_batches:
+        message_manifest: list[dict[str, Any]] = []
+        for message in batch.messages:
+            metadata = message.metadata
+            if not isinstance(metadata, dict):
+                raise MetadataStoreError("Chat Memory message metadata must be an object")
+            message_manifest.append(
+                {
+                    "id": message.id,
+                    "seq": int(message.seq),
+                    "role": message.role,
+                    "content": message.content,
+                    "admission_metadata": {
+                        "memory_eligible_present": "memory_eligible" in metadata,
+                        "memory_eligible": metadata.get("memory_eligible"),
+                    },
+                }
+            )
+        batches.append(
+            {
+                "project_event_seq": int(batch.project_event_seq),
+                "append_batch_id": batch.append_batch_id,
+                "session_id": batch.session_id,
+                "memory_reference_time": batch.memory_reference_time,
+                "messages": message_manifest,
+                "episode_payload": _chat_memory_canonical_episode_payload(
+                    batch.messages,
+                    ingest_max_chars=max_chars,
+                ),
+            }
+        )
+    return {
+        "snapshot_manifest_version": CHAT_MEMORY_SNAPSHOT_DIGEST_VERSION,
+        "ingest_max_chars": max_chars,
+        "batches": batches,
+    }
+
+
+def _chat_memory_snapshot_digest(
+    replay_batches: Sequence[ChatMemoryReplayBatch],
+    *,
+    ingest_max_chars: int,
+) -> str:
+    """Return a versioned SHA-256 digest for an ordered replay manifest."""
+
+    manifest = _chat_memory_canonical_snapshot_manifest(
+        replay_batches,
+        ingest_max_chars=ingest_max_chars,
+    )
+    try:
+        canonical = json.dumps(
+            manifest,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise MetadataStoreError(
+            "Chat Memory rebuild snapshot manifest is not JSON-canonicalizable"
+        ) from exc
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"chat-memory-snapshot:v{CHAT_MEMORY_SNAPSHOT_DIGEST_VERSION}:sha256:{digest}"
+
+
+def _chat_memory_replay_batches_from_messages(
+    messages: Sequence[ChatMessageRecord],
+) -> list[ChatMemoryReplayBatch]:
+    """Materialize validated replay batches from database-ordered messages."""
+
+    grouped: dict[tuple[int, str], list[ChatMessageRecord]] = {}
+    event_batch_ids: dict[int, str] = {}
+    for message in messages:
+        if message.project_event_seq is None or message.append_batch_id is None:
+            raise MetadataStoreError(
+                "Chat Memory replay message is missing admission identity"
+            )
+        previous_batch_id = event_batch_ids.setdefault(
+            message.project_event_seq, message.append_batch_id
+        )
+        if previous_batch_id != message.append_batch_id:
+            raise MetadataStoreError(
+                "One Chat Memory project event sequence maps to multiple batches"
+            )
+        grouped.setdefault(
+            (message.project_event_seq, message.append_batch_id), []
+        ).append(message)
+
+    replay_batches: list[ChatMemoryReplayBatch] = []
+    for (project_event_seq, append_batch_id), batch_messages in grouped.items():
+        session_ids = {message.session_id for message in batch_messages}
+        reference_times = {
+            message.memory_reference_time for message in batch_messages
+        }
+        if (
+            len(session_ids) != 1
+            or len(reference_times) != 1
+            or None in reference_times
+        ):
+            raise MetadataStoreError(
+                "Chat Memory replay batch identity is internally inconsistent"
+            )
+        replay_batches.append(
+            ChatMemoryReplayBatch(
+                append_batch_id=append_batch_id,
+                project_event_seq=project_event_seq,
+                memory_reference_time=str(next(iter(reference_times))),
+                session_id=next(iter(session_ids)),
+                messages=list(batch_messages),
+            )
+        )
+    return replay_batches
+
+
+def _validate_chat_memory_ingest_source_batch(
+    event: ChatMemoryOutboxEventRecord,
+    messages: Sequence[ChatMessageRecord],
+) -> None:
+    """Fail closed unless rows still exactly represent the ingest event batch."""
+
+    if (
+        event.append_batch_id is None
+        or event.source_session_id is None
+        or event.first_seq is None
+        or event.last_seq is None
+    ):
+        raise MetadataStoreError("Ingest event is missing source batch identity")
+    expected_seqs = list(range(event.first_seq, event.last_seq + 1))
+    current_seqs = [message.seq for message in messages]
+    reference_times = {
+        message.memory_reference_time for message in messages
+    }
+    recomputed_batch_id = _chat_memory_append_batch_id(
+        user_id=event.user_id,
+        project_id=event.project_id,
+        session_id=event.source_session_id,
+        event_seq=event.event_seq,
+        message_ids=[message.id for message in messages],
+    )
+    identity_matches = all(
+        message.user_id == event.user_id
+        and message.project_id == event.project_id
+        and message.session_id == event.source_session_id
+        and message.append_batch_id == event.append_batch_id
+        and message.project_event_seq == event.event_seq
+        and message.memory_reference_time is not None
+        for message in messages
+    ) and len(reference_times) == 1
+    identity_matches = (
+        identity_matches and recomputed_batch_id == event.append_batch_id
+    )
+    if current_seqs != expected_seqs or not identity_matches:
+        raise MetadataConflictError(
+            "chat_memory_ingest_source_batch",
+            event.event_id,
+            expected={
+                "session_id": event.source_session_id,
+                "append_batch_id": event.append_batch_id,
+                "project_event_seq": event.event_seq,
+                "seqs": expected_seqs,
+            },
+            current={
+                "message_count": len(messages),
+                "seqs": current_seqs,
+                "identity_matches": identity_matches,
+                "recomputed_append_batch_id": recomputed_batch_id,
+            },
+        )
+
+
+def _chat_memory_replay_snapshot_metrics(
+    replay_batches: Sequence[ChatMemoryReplayBatch],
+) -> tuple[int, int, int]:
+    """Return batch/message/content UTF-8 byte counts for a complete replay."""
+
+    message_count = sum(len(batch.messages) for batch in replay_batches)
+    byte_count = sum(
+        len(message.content.encode("utf-8"))
+        for batch in replay_batches
+        for message in batch.messages
+    )
+    return len(replay_batches), message_count, byte_count
+
+
+def _chat_memory_noop_episode_uuid(
+    *, event_id: str, generation: int, append_batch_id: str
+) -> str:
+    """Build a deterministic generation-aware mapping id for a no-op ingest."""
+
+    digest = hashlib.sha256(
+        f"{event_id}\0{int(generation)}\0{append_batch_id}".encode("utf-8")
+    ).hexdigest()
+    return f"noop_{digest[:32]}"
+
+
+def _normalize_chat_memory_group_ids(group_ids: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(group_ids, str):
+        raise ValueError("Chat Memory graph group ids must be a sequence")
+    normalized: set[str] = set()
+    for group_id in group_ids:
+        if not isinstance(group_id, str) or not group_id.strip():
+            raise ValueError("Chat Memory graph group ids must be non-empty strings")
+        normalized.add(group_id.strip())
+    return tuple(sorted(normalized))
 
 
 @dataclass(slots=True)
@@ -1485,6 +2413,9 @@ class SQLiteMetadataStore:
         self._kb_write_guard_state: ContextVar[
             _SQLiteKBWriteGuardTaskState | None
         ] = ContextVar(f"sqlite_kb_write_guard_state_{id(self)}", default=None)
+        self._chat_memory_guard_state: ContextVar[
+            _SQLiteChatMemoryGuardTaskState | None
+        ] = ContextVar(f"sqlite_chat_memory_guard_state_{id(self)}", default=None)
         self._initialized = False
 
     async def initialize(self) -> None:
@@ -3604,12 +4535,16 @@ class SQLiteMetadataStore:
             )
             for index, record in enumerate(records):
                 record.seq = next_seq + index
+                record.append_batch_id = None
+                record.project_event_seq = None
+                record.memory_reference_time = None
                 conn.execute(
                     """
                     INSERT INTO enterprise_chat_messages (
                         id, session_id, project_id, user_id, role, content,
-                        metadata_json, seq, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        metadata_json, seq, created_at, append_batch_id,
+                        project_event_seq, memory_reference_time
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.id,
@@ -3621,6 +4556,9 @@ class SQLiteMetadataStore:
                         _dumps_json(record.metadata),
                         record.seq,
                         record.created_at,
+                        None,
+                        None,
+                        None,
                     ),
                 )
             conn.execute(
@@ -3733,10 +4671,23 @@ class SQLiteMetadataStore:
         def write(conn: sqlite3.Connection) -> None:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO enterprise_chat_memory_episodes (
+                INSERT INTO enterprise_chat_memory_episodes (
                     episode_uuid, session_id, project_id, user_id,
-                    first_seq, last_seq, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    first_seq, last_seq, created_at, event_id, generation,
+                    graph_group_id, append_batch_id, project_event_seq
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(episode_uuid) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    project_id = excluded.project_id,
+                    user_id = excluded.user_id,
+                    first_seq = excluded.first_seq,
+                    last_seq = excluded.last_seq,
+                    created_at = excluded.created_at,
+                    event_id = excluded.event_id,
+                    generation = excluded.generation,
+                    graph_group_id = excluded.graph_group_id,
+                    append_batch_id = excluded.append_batch_id,
+                    project_event_seq = excluded.project_event_seq
                 """,
                 (
                     record.episode_uuid,
@@ -3746,6 +4697,11 @@ class SQLiteMetadataStore:
                     record.first_seq,
                     record.last_seq,
                     record.created_at,
+                    record.event_id,
+                    record.generation,
+                    record.graph_group_id,
+                    record.append_batch_id,
+                    record.project_event_seq,
                 ),
             )
 
@@ -3919,6 +4875,4549 @@ class SQLiteMetadataStore:
         if row is None:
             return 0, 0, 0
         return int(row["c"] or 0), int(row["u"] or 0), int(row["p"] or 0)
+
+    async def append_chat_messages_with_memory(
+        self,
+        records: Sequence[ChatMessageRecord],
+        *,
+        config_fingerprint: str,
+        graph_store_fingerprint: str | None = None,
+        actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
+    ) -> list[ChatMessageRecord]:
+        """Atomically admit one append batch and enqueue its ingest event."""
+
+        if not records:
+            return []
+        fingerprint = _validate_chat_memory_fingerprint(config_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, graph_store_fingerprint
+        )
+        head = records[0]
+        if any(
+            record.session_id != head.session_id
+            or record.project_id != head.project_id
+            or record.user_id != head.user_id
+            for record in records
+        ):
+            raise ValueError("All appended messages must target the same session")
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> list[ChatMessageRecord]:
+            # Stable source lock order: user -> project -> session -> group.
+            if (
+                conn.execute(
+                    "SELECT id FROM enterprise_users WHERE id = ?", (head.user_id,)
+                ).fetchone()
+                is None
+            ):
+                raise MetadataRecordNotFoundError(
+                    f"Chat session '{head.session_id}' not found"
+                )
+            if (
+                conn.execute(
+                    """
+                    SELECT id FROM enterprise_chat_projects
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (head.project_id, head.user_id),
+                ).fetchone()
+                is None
+            ):
+                raise MetadataRecordNotFoundError(
+                    f"Chat session '{head.session_id}' not found"
+                )
+            session_row = conn.execute(
+                """
+                SELECT * FROM enterprise_chat_sessions
+                WHERE id = ? AND project_id = ? AND user_id = ?
+                """,
+                (head.session_id, head.project_id, head.user_id),
+            ).fetchone()
+            if session_row is None:
+                raise MetadataRecordNotFoundError(
+                    f"Chat session '{head.session_id}' not found"
+                )
+
+            group, _created = self._ensure_sqlite_chat_memory_group(
+                conn,
+                head.user_id,
+                head.project_id,
+                fingerprint,
+                graph_fingerprint,
+                generation_state="building",
+            )
+            self._assert_sqlite_chat_memory_graph_store_invariant(
+                conn, group, graph_fingerprint
+            )
+            if group.state in {"deleting", "deleted"}:
+                raise MetadataConflictError(
+                    "chat_memory_group",
+                    f"{head.user_id}:{head.project_id}",
+                    expected={"state": "writable"},
+                    current={"state": group.state},
+                )
+            if group.desired_config_fingerprint != fingerprint:
+                self._enqueue_sqlite_chat_memory_rebuild(
+                    conn,
+                    group,
+                    fingerprint,
+                    graph_fingerprint,
+                    actor_user_id=actor_user_id or head.user_id,
+                    actor_tenant_id=actor_tenant_id,
+                    target_session_id=head.session_id,
+                    target_message_id=None,
+                )
+                group = self._get_sqlite_chat_memory_group(
+                    conn, head.user_id, head.project_id
+                )
+                assert group is not None
+
+            event_seq, reference_time = self._allocate_sqlite_chat_memory_event_seq(
+                conn,
+                head.user_id,
+                head.project_id,
+                allocate_reference_time=True,
+            )
+            assert reference_time is not None
+            append_batch_id = _chat_memory_append_batch_id(
+                user_id=head.user_id,
+                project_id=head.project_id,
+                session_id=head.session_id,
+                event_seq=event_seq,
+                message_ids=[record.id for record in records],
+            )
+            next_seq = (
+                int(
+                    conn.execute(
+                        """
+                        SELECT COALESCE(MAX(seq), 0)
+                        FROM enterprise_chat_messages WHERE session_id = ?
+                        """,
+                        (head.session_id,),
+                    ).fetchone()[0]
+                )
+                + 1
+            )
+            for index, record in enumerate(records):
+                record.seq = next_seq + index
+                record.append_batch_id = append_batch_id
+                record.project_event_seq = event_seq
+                record.memory_reference_time = reference_time
+                conn.execute(
+                    """
+                    INSERT INTO enterprise_chat_messages (
+                        id, session_id, project_id, user_id, role, content,
+                        metadata_json, seq, created_at, append_batch_id,
+                        project_event_seq, memory_reference_time
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.id,
+                        record.session_id,
+                        record.project_id,
+                        record.user_id,
+                        record.role,
+                        record.content,
+                        _dumps_json(record.metadata),
+                        record.seq,
+                        record.created_at,
+                        append_batch_id,
+                        event_seq,
+                        reference_time,
+                    ),
+                )
+
+            now = utc_now_iso()
+            conn.execute(
+                "UPDATE enterprise_chat_sessions SET updated_at = ? WHERE id = ?",
+                (now, head.session_id),
+            )
+            event_id, deterministic_key = _chat_memory_event_identity(
+                event_type="ingest",
+                user_id=head.user_id,
+                project_id=head.project_id,
+                event_seq=event_seq,
+                generation=group.desired_generation,
+                append_batch_id=append_batch_id,
+                target_session_id=head.session_id,
+            )
+            self._insert_sqlite_chat_memory_event(
+                conn,
+                ChatMemoryOutboxEventRecord(
+                    event_id=event_id,
+                    deterministic_key=deterministic_key,
+                    user_id=head.user_id,
+                    project_id=head.project_id,
+                    event_seq=event_seq,
+                    generation=group.desired_generation,
+                    graph_group_id=chat_memory_graph_group_id(
+                        head.user_id, head.project_id, group.desired_generation
+                    ),
+                    config_fingerprint=group.desired_config_fingerprint,
+                    graph_store_fingerprint=group.desired_graph_store_fingerprint,
+                    event_type="ingest",
+                    status="pending",
+                    available_at=now,
+                    attempt_no=0,
+                    created_at=now,
+                    updated_at=now,
+                    source_session_id=head.session_id,
+                    append_batch_id=append_batch_id,
+                    first_seq=next_seq,
+                    last_seq=next_seq + len(records) - 1,
+                    actor_user_id=actor_user_id or head.user_id,
+                    actor_tenant_id=actor_tenant_id,
+                    target_user_id=head.user_id,
+                    target_project_id=head.project_id,
+                    target_session_id=head.session_id,
+                ),
+            )
+            rows = conn.execute(
+                """
+                SELECT * FROM enterprise_chat_messages
+                WHERE append_batch_id = ?
+                ORDER BY seq ASC, id ASC
+                """,
+                (append_batch_id,),
+            ).fetchall()
+            return [ChatMessageRecord.from_row(row) for row in rows]
+
+        return await self._write(write)
+
+    async def delete_chat_message_with_memory(
+        self,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        message_id: str,
+        *,
+        config_fingerprint: str,
+        graph_store_fingerprint: str | None = None,
+        actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
+    ) -> bool:
+        """Delete one source message and enqueue a fenced rebuild if admitted."""
+
+        fingerprint = _validate_chat_memory_fingerprint(config_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, graph_store_fingerprint
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> bool:
+            # Source order mirrors PostgreSQL even though SQLite serializes writes.
+            if conn.execute(
+                "SELECT id FROM enterprise_users WHERE id = ?", (user_id,)
+            ).fetchone() is None:
+                return False
+            if conn.execute(
+                """
+                SELECT id FROM enterprise_chat_projects
+                WHERE id = ? AND user_id = ?
+                """,
+                (project_id, user_id),
+            ).fetchone() is None:
+                return False
+            if conn.execute(
+                """
+                SELECT id FROM enterprise_chat_sessions
+                WHERE id = ? AND project_id = ? AND user_id = ?
+                """,
+                (session_id, project_id, user_id),
+            ).fetchone() is None:
+                return False
+            message_row = conn.execute(
+                """
+                SELECT * FROM enterprise_chat_messages
+                WHERE id = ? AND session_id = ? AND project_id = ? AND user_id = ?
+                """,
+                (message_id, session_id, project_id, user_id),
+            ).fetchone()
+            if message_row is None:
+                return False
+            memory_affected = message_row["project_event_seq"] is not None
+            if not memory_affected:
+                memory_affected = (
+                    conn.execute(
+                        """
+                        SELECT 1 FROM enterprise_chat_memory_episodes
+                        WHERE session_id = ? AND project_id = ? AND user_id = ?
+                          AND first_seq <= ? AND last_seq >= ?
+                        LIMIT 1
+                        """,
+                        (
+                            session_id,
+                            project_id,
+                            user_id,
+                            int(message_row["seq"]),
+                            int(message_row["seq"]),
+                        ),
+                    ).fetchone()
+                    is not None
+                )
+            conn.execute(
+                "DELETE FROM enterprise_chat_messages WHERE id = ?", (message_id,)
+            )
+            if memory_affected:
+                group, _ = self._ensure_sqlite_chat_memory_group(
+                    conn,
+                    user_id,
+                    project_id,
+                    fingerprint,
+                    graph_fingerprint,
+                    generation_state="building",
+                )
+                bound_graph_fingerprint = (
+                    _chat_memory_existing_graph_store_fingerprint(
+                        group, graph_fingerprint
+                    )
+                )
+                self._enqueue_sqlite_chat_memory_rebuild(
+                    conn,
+                    group,
+                    fingerprint,
+                    bound_graph_fingerprint,
+                    actor_user_id=actor_user_id or user_id,
+                    actor_tenant_id=actor_tenant_id,
+                    target_session_id=session_id,
+                    target_message_id=message_id,
+                )
+            return True
+
+        return await self._write(write)
+
+    async def delete_chat_session_with_memory(
+        self,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        *,
+        config_fingerprint: str,
+        graph_store_fingerprint: str | None = None,
+        actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
+    ) -> tuple[bool, int]:
+        """Delete an owned session and atomically enqueue any required rebuild."""
+
+        fingerprint = _validate_chat_memory_fingerprint(config_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, graph_store_fingerprint
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> tuple[bool, int]:
+            if conn.execute(
+                "SELECT id FROM enterprise_users WHERE id = ?", (user_id,)
+            ).fetchone() is None:
+                return False, 0
+            if conn.execute(
+                """
+                SELECT id FROM enterprise_chat_projects
+                WHERE id = ? AND user_id = ?
+                """,
+                (project_id, user_id),
+            ).fetchone() is None:
+                return False, 0
+            session_row = conn.execute(
+                """
+                SELECT id FROM enterprise_chat_sessions
+                WHERE id = ? AND project_id = ? AND user_id = ?
+                """,
+                (session_id, project_id, user_id),
+            ).fetchone()
+            if session_row is None:
+                return False, 0
+            admitted = conn.execute(
+                """
+                SELECT 1 FROM enterprise_chat_messages
+                WHERE session_id = ? AND project_event_seq IS NOT NULL LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            mapped = conn.execute(
+                """
+                SELECT 1 FROM enterprise_chat_memory_episodes
+                WHERE session_id = ? AND project_id = ? AND user_id = ? LIMIT 1
+                """,
+                (session_id, project_id, user_id),
+            ).fetchone()
+            messages_cursor = conn.execute(
+                "DELETE FROM enterprise_chat_messages WHERE session_id = ?",
+                (session_id,),
+            )
+            conn.execute(
+                "DELETE FROM enterprise_chat_sessions WHERE id = ?", (session_id,)
+            )
+            if admitted is not None or mapped is not None:
+                group, _ = self._ensure_sqlite_chat_memory_group(
+                    conn,
+                    user_id,
+                    project_id,
+                    fingerprint,
+                    graph_fingerprint,
+                    generation_state="building",
+                )
+                bound_graph_fingerprint = (
+                    _chat_memory_existing_graph_store_fingerprint(
+                        group, graph_fingerprint
+                    )
+                )
+                self._enqueue_sqlite_chat_memory_rebuild(
+                    conn,
+                    group,
+                    fingerprint,
+                    bound_graph_fingerprint,
+                    actor_user_id=actor_user_id or user_id,
+                    actor_tenant_id=actor_tenant_id,
+                    target_session_id=session_id,
+                    target_message_id=None,
+                )
+            return True, int(messages_cursor.rowcount)
+
+        return await self._write(write)
+
+    async def delete_chat_project_with_memory(
+        self,
+        user_id: str,
+        project_id: str,
+        *,
+        config_fingerprint: str,
+        graph_store_fingerprint: str | None = None,
+        actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
+    ) -> tuple[bool, int, int]:
+        """Persist a purge tombstone before deleting an owned source project."""
+
+        fingerprint = _validate_chat_memory_fingerprint(config_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, graph_store_fingerprint
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> tuple[bool, int, int]:
+            if conn.execute(
+                "SELECT id FROM enterprise_users WHERE id = ?", (user_id,)
+            ).fetchone() is None:
+                return False, 0, 0
+            project_row = conn.execute(
+                """
+                SELECT id FROM enterprise_chat_projects
+                WHERE id = ? AND user_id = ?
+                """,
+                (project_id, user_id),
+            ).fetchone()
+            if project_row is None:
+                return False, 0, 0
+            # Materialize child rows before the durable group/outbox rows.
+            conn.execute(
+                """
+                SELECT id FROM enterprise_chat_sessions
+                WHERE project_id = ? AND user_id = ? ORDER BY id
+                """,
+                (project_id, user_id),
+            ).fetchall()
+            conn.execute(
+                """
+                SELECT id FROM enterprise_chat_messages
+                WHERE project_id = ? AND user_id = ? ORDER BY session_id, seq, id
+                """,
+                (project_id, user_id),
+            ).fetchall()
+            self._enqueue_sqlite_chat_memory_purge(
+                conn,
+                user_id,
+                project_id,
+                fingerprint,
+                graph_fingerprint,
+                actor_user_id=actor_user_id or user_id,
+                actor_tenant_id=actor_tenant_id,
+            )
+            messages_cursor = conn.execute(
+                "DELETE FROM enterprise_chat_messages WHERE project_id = ?",
+                (project_id,),
+            )
+            sessions_cursor = conn.execute(
+                "DELETE FROM enterprise_chat_sessions WHERE project_id = ?",
+                (project_id,),
+            )
+            conn.execute(
+                "DELETE FROM enterprise_chat_projects WHERE id = ?", (project_id,)
+            )
+            return True, int(sessions_cursor.rowcount), int(messages_cursor.rowcount)
+
+        return await self._write(write)
+
+    async def delete_enterprise_user_with_memory(
+        self,
+        user_id: str,
+        *,
+        config_fingerprint: str,
+        graph_store_fingerprint: str | None = None,
+        actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
+        expected_updated_at: Any = _EXPECTATION_UNSET,
+        expected_token_version: Any = _EXPECTATION_UNSET,
+        expected_tenant_id: Any = _EXPECTATION_UNSET,
+        expected_membership: Any = _EXPECTATION_UNSET,
+    ) -> bool:
+        """Create sorted per-project purge work before deleting a user."""
+
+        fingerprint = _validate_chat_memory_fingerprint(config_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, graph_store_fingerprint
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> bool:
+            current_row = conn.execute(
+                "SELECT * FROM enterprise_users WHERE id = ?", (user_id,)
+            ).fetchone()
+            conditional = any(
+                value is not _EXPECTATION_UNSET
+                for value in (
+                    expected_updated_at,
+                    expected_token_version,
+                    expected_tenant_id,
+                    expected_membership,
+                )
+            )
+            if current_row is None:
+                if conditional:
+                    raise MetadataConflictError(
+                        "enterprise_user",
+                        user_id,
+                        expected={"exists": True},
+                        current={"exists": False},
+                    )
+                return False
+            current_user = EnterpriseUserRecord.from_row(current_row)
+            if any(
+                value is not _EXPECTATION_UNSET
+                for value in (
+                    expected_updated_at,
+                    expected_token_version,
+                    expected_tenant_id,
+                )
+            ):
+                _assert_enterprise_user_write_preconditions(
+                    current_user,
+                    current_user,
+                    expected_updated_at=expected_updated_at,
+                    expected_token_version=expected_token_version,
+                    expected_tenant_id=expected_tenant_id,
+                    allow_tenant_change=False,
+                )
+            if expected_membership is not _EXPECTATION_UNSET:
+                membership_rows = conn.execute(
+                    """
+                    SELECT * FROM enterprise_tenant_memberships
+                    WHERE user_id = ? ORDER BY tenant_id ASC
+                    """,
+                    (user_id,),
+                ).fetchall()
+                _assert_enterprise_user_membership_precondition(
+                    user_id,
+                    [
+                        EnterpriseTenantMembershipRecord.from_row(row)
+                        for row in membership_rows
+                    ],
+                    expected_membership=expected_membership,
+                )
+
+            project_rows = conn.execute(
+                """
+                SELECT project_id FROM (
+                    SELECT id AS project_id FROM enterprise_chat_projects
+                    WHERE user_id = ?
+                    UNION
+                    SELECT project_id FROM enterprise_chat_memory_groups
+                    WHERE user_id = ?
+                    UNION
+                    SELECT project_id FROM enterprise_chat_memory_generations
+                    WHERE user_id = ?
+                    UNION
+                    SELECT project_id FROM enterprise_chat_memory_episodes
+                    WHERE user_id = ?
+                    UNION
+                    SELECT project_id FROM enterprise_chat_memory_outbox
+                    WHERE user_id = ?
+                ) ORDER BY project_id ASC
+                """,
+                (user_id, user_id, user_id, user_id, user_id),
+            ).fetchall()
+            for project_row in project_rows:
+                project_id = str(project_row["project_id"])
+                conn.execute(
+                    """
+                    SELECT id FROM enterprise_chat_sessions
+                    WHERE project_id = ? AND user_id = ? ORDER BY id
+                    """,
+                    (project_id, user_id),
+                ).fetchall()
+                conn.execute(
+                    """
+                    SELECT id FROM enterprise_chat_messages
+                    WHERE project_id = ? AND user_id = ?
+                    ORDER BY session_id, seq, id
+                    """,
+                    (project_id, user_id),
+                ).fetchall()
+                self._enqueue_sqlite_chat_memory_purge(
+                    conn,
+                    user_id,
+                    project_id,
+                    fingerprint,
+                    graph_fingerprint,
+                    actor_user_id=actor_user_id or user_id,
+                    actor_tenant_id=actor_tenant_id,
+                )
+
+            conn.execute(
+                "DELETE FROM enterprise_tenant_memberships WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.execute(
+                "DELETE FROM enterprise_tenant_user_kb_overrides WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.execute(
+                "DELETE FROM enterprise_kb_acl WHERE user_id = ?", (user_id,)
+            )
+            conn.execute(
+                "DELETE FROM enterprise_user_kb_query_settings WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.execute(
+                "DELETE FROM enterprise_chat_messages WHERE user_id = ?", (user_id,)
+            )
+            conn.execute(
+                "DELETE FROM enterprise_chat_sessions WHERE user_id = ?", (user_id,)
+            )
+            conn.execute(
+                "DELETE FROM enterprise_chat_projects WHERE user_id = ?", (user_id,)
+            )
+            cursor = conn.execute(
+                "DELETE FROM enterprise_users WHERE id = ?", (user_id,)
+            )
+            return bool(cursor.rowcount)
+
+        return await self._write(write)
+
+    async def get_chat_memory_group(
+        self, user_id: str, project_id: str
+    ) -> ChatMemoryGroupRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            return self._get_sqlite_chat_memory_group(conn, user_id, project_id)
+
+    async def get_chat_memory_read_token(
+        self, user_id: str, project_id: str
+    ) -> ChatMemoryReadToken | None:
+        """Read one complete logical/active-generation identity atomically."""
+
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT groups.state, groups.state_version,
+                       groups.active_generation,
+                       groups.active_config_fingerprint,
+                       groups.active_graph_store_fingerprint,
+                       generation.graph_group_id,
+                       generation.state AS generation_state
+                FROM enterprise_chat_memory_groups AS groups
+                LEFT JOIN enterprise_chat_memory_generations AS generation
+                  ON generation.user_id = groups.user_id
+                 AND generation.project_id = groups.project_id
+                 AND generation.generation = groups.active_generation
+                WHERE groups.user_id = ? AND groups.project_id = ?
+                """,
+                (user_id, project_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return ChatMemoryReadToken(
+            user_id=user_id,
+            project_id=project_id,
+            state=str(row["state"]),  # type: ignore[arg-type]
+            state_version=int(row["state_version"]),
+            active_generation=(
+                int(row["active_generation"])
+                if row["active_generation"] is not None
+                else None
+            ),
+            active_config_fingerprint=row["active_config_fingerprint"],
+            active_graph_store_fingerprint=row[
+                "active_graph_store_fingerprint"
+            ],
+            graph_group_id=row["graph_group_id"],
+            generation_state=(
+                str(row["generation_state"])  # type: ignore[arg-type]
+                if row["generation_state"] is not None
+                else None
+            ),
+        )
+
+    async def get_chat_memory_generation(
+        self, user_id: str, project_id: str, generation: int
+    ) -> ChatMemoryGenerationRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM enterprise_chat_memory_generations
+                WHERE user_id = ? AND project_id = ? AND generation = ?
+                """,
+                (user_id, project_id, int(generation)),
+            ).fetchone()
+        return ChatMemoryGenerationRecord.from_row(row) if row is not None else None
+
+    async def list_chat_memory_generations(
+        self, user_id: str, project_id: str
+    ) -> list[ChatMemoryGenerationRecord]:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM enterprise_chat_memory_generations
+                WHERE user_id = ? AND project_id = ?
+                ORDER BY generation ASC
+                """,
+                (user_id, project_id),
+            ).fetchall()
+        return [ChatMemoryGenerationRecord.from_row(row) for row in rows]
+
+    async def get_chat_memory_event(
+        self, event_id: str
+    ) -> ChatMemoryOutboxEventRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_chat_memory_outbox WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+        return ChatMemoryOutboxEventRecord.from_row(row) if row is not None else None
+
+    async def get_chat_memory_event_by_sequence(
+        self, user_id: str, project_id: str, event_seq: int
+    ) -> ChatMemoryOutboxEventRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM enterprise_chat_memory_outbox
+                WHERE user_id = ? AND project_id = ? AND event_seq = ?
+                """,
+                (user_id, project_id, int(event_seq)),
+            ).fetchone()
+        return ChatMemoryOutboxEventRecord.from_row(row) if row is not None else None
+
+    async def list_chat_memory_events(
+        self,
+        *,
+        user_id: str | None = None,
+        project_id: str | None = None,
+        status: ChatMemoryEventStatus | None = None,
+        event_type: ChatMemoryEventType | None = None,
+        limit: int = 100,
+    ) -> list[ChatMemoryOutboxEventRecord]:
+        await self._ensure_initialized()
+        limit = max(1, min(int(limit), 1000))
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("user_id", user_id),
+            ("project_id", project_id),
+            ("status", status),
+            ("event_type", event_type),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM enterprise_chat_memory_outbox
+                {where}
+                ORDER BY user_id, project_id, event_seq
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [ChatMemoryOutboxEventRecord.from_row(row) for row in rows]
+
+    async def count_chat_memory_events(
+        self,
+        *,
+        status: ChatMemoryEventStatus | None = None,
+        event_type: ChatMemoryEventType | None = None,
+    ) -> int:
+        await self._ensure_initialized()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if event_type is not None:
+            clauses.append("event_type = ?")
+            params.append(event_type)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            value = conn.execute(
+                f"SELECT COUNT(*) FROM enterprise_chat_memory_outbox {where}",
+                params,
+            ).fetchone()[0]
+        return int(value)
+
+    async def list_admitted_chat_memory_replay_batches(
+        self,
+        user_id: str,
+        project_id: str,
+        *,
+        through_event_seq: int,
+        after_event_seq: int = 0,
+        limit: int = 100,
+    ) -> list[ChatMemoryReplayBatch]:
+        """Page complete surviving admitted batches through a fixed cutoff."""
+
+        await self._ensure_initialized()
+        cutoff = max(0, int(through_event_seq))
+        after = max(0, int(after_event_seq))
+        limit = max(1, min(int(limit), 1000))
+        with self._connect() as conn:
+            batch_rows = conn.execute(
+                """
+                SELECT project_event_seq, append_batch_id
+                FROM enterprise_chat_messages
+                WHERE user_id = ? AND project_id = ?
+                  AND project_event_seq IS NOT NULL
+                  AND append_batch_id IS NOT NULL
+                  AND project_event_seq > ? AND project_event_seq <= ?
+                GROUP BY project_event_seq, append_batch_id
+                ORDER BY project_event_seq ASC
+                LIMIT ?
+                """,
+                (user_id, project_id, after, cutoff, limit),
+            ).fetchall()
+            if not batch_rows:
+                return []
+            event_seqs = [int(row["project_event_seq"]) for row in batch_rows]
+            placeholders = ",".join("?" for _ in event_seqs)
+            message_rows = conn.execute(
+                f"""
+                SELECT * FROM enterprise_chat_messages
+                WHERE user_id = ? AND project_id = ?
+                  AND project_event_seq IN ({placeholders})
+                ORDER BY project_event_seq ASC, session_id ASC, seq ASC, id ASC
+                """,
+                (user_id, project_id, *event_seqs),
+            ).fetchall()
+        by_event: dict[int, list[ChatMessageRecord]] = {
+            event_seq: [] for event_seq in event_seqs
+        }
+        for row in message_rows:
+            record = ChatMessageRecord.from_row(row)
+            assert record.project_event_seq is not None
+            by_event[record.project_event_seq].append(record)
+        batches: list[ChatMemoryReplayBatch] = []
+        for batch_row in batch_rows:
+            event_seq = int(batch_row["project_event_seq"])
+            messages = by_event[event_seq]
+            if not messages:
+                continue
+            first = messages[0]
+            assert first.append_batch_id is not None
+            assert first.memory_reference_time is not None
+            batches.append(
+                ChatMemoryReplayBatch(
+                    append_batch_id=first.append_batch_id,
+                    project_event_seq=event_seq,
+                    memory_reference_time=first.memory_reference_time,
+                    session_id=first.session_id,
+                    messages=messages,
+                )
+            )
+        return batches
+
+    async def enqueue_chat_memory_rebuild(
+        self,
+        user_id: str,
+        project_id: str,
+        config_fingerprint: str,
+        *,
+        graph_store_fingerprint: str | None = None,
+        actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
+    ) -> ChatMemoryOutboxEventRecord | None:
+        """Durably enqueue an administrative rebuild, coalescing current work."""
+
+        fingerprint = _validate_chat_memory_fingerprint(config_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, graph_store_fingerprint
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryOutboxEventRecord | None:
+            group = self._get_sqlite_chat_memory_group(conn, user_id, project_id)
+            if group is not None:
+                self._assert_sqlite_chat_memory_graph_store_invariant(
+                    conn, group, graph_fingerprint
+                )
+                if group.state in {"deleting", "deleted"}:
+                    return None
+            else:
+                group, _ = self._ensure_sqlite_chat_memory_group(
+                    conn,
+                    user_id,
+                    project_id,
+                    fingerprint,
+                    graph_fingerprint,
+                    generation_state="building",
+                )
+            existing = conn.execute(
+                """
+                SELECT * FROM enterprise_chat_memory_outbox
+                WHERE user_id = ? AND project_id = ? AND event_type = 'rebuild'
+                  AND generation = ? AND config_fingerprint = ?
+                  AND graph_store_fingerprint = ?
+                  AND status IN ('pending', 'running', 'retry_wait')
+                ORDER BY event_seq DESC LIMIT 1
+                """,
+                (
+                    user_id,
+                    project_id,
+                    group.desired_generation,
+                    fingerprint,
+                    graph_fingerprint,
+                ),
+            ).fetchone()
+            if existing is not None:
+                return ChatMemoryOutboxEventRecord.from_row(existing)
+            return self._enqueue_sqlite_chat_memory_rebuild(
+                conn,
+                group,
+                fingerprint,
+                graph_fingerprint,
+                actor_user_id=actor_user_id,
+                actor_tenant_id=actor_tenant_id,
+                target_session_id=None,
+                target_message_id=None,
+            )
+
+        return await self._write(write)
+
+    async def enqueue_chat_memory_purge(
+        self,
+        user_id: str,
+        project_id: str,
+        config_fingerprint: str,
+        *,
+        graph_store_fingerprint: str | None = None,
+        actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
+    ) -> ChatMemoryOutboxEventRecord | None:
+        """Durably enqueue an administrative purge without reviving terminal work."""
+
+        fingerprint = _validate_chat_memory_fingerprint(config_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, graph_store_fingerprint
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryOutboxEventRecord | None:
+            group = self._get_sqlite_chat_memory_group(conn, user_id, project_id)
+            if group is not None and group.state == "deleted":
+                return None
+            existing = conn.execute(
+                """
+                SELECT * FROM enterprise_chat_memory_outbox
+                WHERE user_id = ? AND project_id = ? AND event_type = 'purge'
+                  AND status IN ('pending', 'running', 'retry_wait')
+                ORDER BY event_seq DESC LIMIT 1
+                """,
+                (user_id, project_id),
+            ).fetchone()
+            if existing is not None:
+                return ChatMemoryOutboxEventRecord.from_row(existing)
+            return self._enqueue_sqlite_chat_memory_purge(
+                conn,
+                user_id,
+                project_id,
+                fingerprint,
+                graph_fingerprint,
+                actor_user_id=actor_user_id,
+                actor_tenant_id=actor_tenant_id,
+            )
+
+        return await self._write(write)
+
+    def _materialize_sqlite_chat_memory_rebuild_batches(
+        self,
+        conn: sqlite3.Connection,
+        user_id: str,
+        project_id: str,
+        cutoff: int,
+    ) -> list[ChatMemoryReplayBatch]:
+        """Fetch full replay rows only after the aggregate cap preflight passes."""
+
+        rows = conn.execute(
+            """
+            SELECT * FROM enterprise_chat_messages
+            WHERE user_id = ? AND project_id = ?
+              AND project_event_seq IS NOT NULL
+              AND append_batch_id IS NOT NULL
+              AND project_event_seq <= ?
+            ORDER BY project_event_seq ASC, session_id ASC, seq ASC, id ASC
+            """,
+            (user_id, project_id, int(cutoff)),
+        ).fetchall()
+        return _chat_memory_replay_batches_from_messages(
+            [ChatMessageRecord.from_row(row) for row in rows]
+        )
+
+    async def prepare_chat_memory_rebuild_snapshot(
+        self,
+        event_id: str,
+        claim_token: str,
+        runtime_fingerprint: str,
+        max_messages: int,
+        max_bytes: int,
+        ingest_max_chars: int = CHAT_MEMORY_DEFAULT_INGEST_MAX_CHARS,
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+    ) -> ChatMemoryRebuildSnapshot | None:
+        """Capture and persist one complete fixed-cutoff rebuild snapshot."""
+
+        fingerprint = _validate_chat_memory_fingerprint(runtime_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, runtime_graph_store_fingerprint
+        )
+        message_cap = int(max_messages)
+        byte_cap = int(max_bytes)
+        episode_max_chars = _validate_chat_memory_ingest_max_chars(ingest_max_chars)
+        if message_cap < 0 or byte_cap < 0:
+            raise ValueError("Chat Memory rebuild caps must be non-negative")
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryRebuildSnapshot | None:
+            state = self._require_sqlite_chat_memory_running_claim(
+                conn, event_id, claim_token
+            )
+            stale = self._resolve_sqlite_stale_chat_memory_execution(
+                conn, state, claim_token
+            )
+            if stale is not None:
+                return None
+            if not self._chat_memory_runtime_identity_matches(
+                state.event, fingerprint, graph_fingerprint
+            ):
+                self._retry_sqlite_chat_memory_runtime_mismatch(
+                    conn,
+                    state,
+                    claim_token,
+                    fingerprint,
+                    graph_fingerprint,
+                    retry_delay_seconds=1.0,
+                )
+                return None
+            self._validate_chat_memory_execution_fence(
+                state, fingerprint, graph_fingerprint
+            )
+            event = state.event
+            if event.event_type != "rebuild":
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"event_type": "rebuild"},
+                    current={"event_type": event.event_type},
+                )
+            if state.group.state != "rebuilding" or state.generation.state != "building":
+                raise MetadataConflictError(
+                    "chat_memory_rebuild",
+                    event_id,
+                    expected={
+                        "group_state": "rebuilding",
+                        "generation_state": "building",
+                    },
+                    current={
+                        "group_state": state.group.state,
+                        "generation_state": state.generation.state,
+                    },
+                )
+            if state.group.active_rebuild_event_id != event_id:
+                raise MetadataConflictError(
+                    "chat_memory_rebuild",
+                    event_id,
+                    expected={"active_rebuild_event_id": event_id},
+                    current={
+                        "active_rebuild_event_id": state.group.active_rebuild_event_id
+                    },
+                )
+            if event.side_effect_started_at is not None:
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"side_effect_started_at": None},
+                    current={
+                        "side_effect_started_at": event.side_effect_started_at
+                    },
+                )
+
+            cutoff = (
+                event.snapshot_cutoff
+                if event.snapshot_cutoff is not None
+                else state.group.next_event_seq - 1
+            )
+            metrics = conn.execute(
+                """
+                WITH source AS (
+                    SELECT project_event_seq, append_batch_id, content
+                    FROM enterprise_chat_messages
+                    WHERE user_id = ? AND project_id = ?
+                      AND project_event_seq IS NOT NULL
+                      AND append_batch_id IS NOT NULL
+                      AND project_event_seq <= ?
+                ), batch_metrics AS (
+                    SELECT COUNT(*) AS batch_count FROM (
+                        SELECT project_event_seq, append_batch_id
+                        FROM source
+                        GROUP BY project_event_seq, append_batch_id
+                    )
+                )
+                SELECT COUNT(*) AS message_count,
+                       COALESCE(SUM(length(CAST(content AS BLOB))), 0) AS byte_count,
+                       (SELECT batch_count FROM batch_metrics) AS batch_count
+                FROM source
+                """,
+                (event.user_id, event.project_id, cutoff),
+            ).fetchone()
+            assert metrics is not None
+            batch_count = int(metrics["batch_count"] or 0)
+            message_count = int(metrics["message_count"] or 0)
+            byte_count = int(metrics["byte_count"] or 0)
+            now = utc_now_iso()
+            if message_count > message_cap or byte_count > byte_cap:
+                error_message = (
+                    "Rebuild snapshot exceeds hard cap: "
+                    f"messages={message_count}/{message_cap}, "
+                    f"bytes={byte_count}/{byte_cap}"
+                )
+                conn.execute(
+                    """
+                    UPDATE enterprise_chat_memory_generations
+                    SET snapshot_cutoff = ?, replay_batch_count = ?,
+                        replay_message_count = ?, replay_byte_count = ?,
+                        snapshot_digest = NULL,
+                        last_error_code = 'rebuild_snapshot_hard_cap_exceeded',
+                        last_error_message = ?, last_error_at = ?, updated_at = ?
+                    WHERE user_id = ? AND project_id = ? AND generation = ?
+                      AND state = 'building'
+                    """,
+                    (
+                        cutoff,
+                        batch_count,
+                        message_count,
+                        byte_count,
+                        error_message,
+                        now,
+                        now,
+                        event.user_id,
+                        event.project_id,
+                        event.generation,
+                    ),
+                )
+                cursor = conn.execute(
+                    """
+                    UPDATE enterprise_chat_memory_outbox
+                    SET status = 'dead_letter', snapshot_cutoff = ?,
+                        snapshot_batch_count = ?, snapshot_message_count = ?,
+                        snapshot_byte_count = ?, snapshot_digest = NULL,
+                        claim_token = NULL,
+                        claimed_by = NULL, claimed_at = NULL,
+                        side_effect_started_at = NULL,
+                        side_effect_state_version = NULL, completed_at = ?,
+                        last_error_code = 'rebuild_snapshot_hard_cap_exceeded',
+                        last_error_message = ?, last_error_at = ?, updated_at = ?
+                    WHERE event_id = ? AND status = 'running' AND claim_token = ?
+                      AND side_effect_started_at IS NULL
+                    """,
+                    (
+                        cutoff,
+                        batch_count,
+                        message_count,
+                        byte_count,
+                        now,
+                        error_message,
+                        now,
+                        now,
+                        event_id,
+                        claim_token,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise MetadataConflictError(
+                        "chat_memory_event",
+                        event_id,
+                        expected={"status": "running", "claim_token": claim_token},
+                        current={"status": event.status, "claim_token": event.claim_token},
+                    )
+                conn.execute(
+                    """
+                    UPDATE enterprise_chat_memory_groups
+                    SET state = 'failed', state_version = state_version + 1,
+                        last_error_code = 'rebuild_snapshot_hard_cap_exceeded',
+                        last_error_message = ?, last_error_at = ?, updated_at = ?
+                    WHERE user_id = ? AND project_id = ?
+                    """,
+                    (
+                        error_message,
+                        now,
+                        now,
+                        event.user_id,
+                        event.project_id,
+                    ),
+                )
+                return None
+
+            replay_batches = self._materialize_sqlite_chat_memory_rebuild_batches(
+                conn,
+                event.user_id,
+                event.project_id,
+                cutoff,
+            )
+            materialized_metrics = _chat_memory_replay_snapshot_metrics(replay_batches)
+            if materialized_metrics != (batch_count, message_count, byte_count):
+                raise MetadataConflictError(
+                    "chat_memory_rebuild_snapshot",
+                    event_id,
+                    expected={
+                        "aggregate_metrics": (batch_count, message_count, byte_count)
+                    },
+                    current={"materialized_metrics": materialized_metrics},
+                )
+            snapshot_digest = _chat_memory_snapshot_digest(
+                replay_batches,
+                ingest_max_chars=episode_max_chars,
+            )
+            persisted_digests = (
+                event.snapshot_digest,
+                state.generation.snapshot_digest,
+            )
+            if persisted_digests not in {
+                (None, None),
+                (snapshot_digest, snapshot_digest),
+            }:
+                raise MetadataConflictError(
+                    "chat_memory_rebuild_snapshot",
+                    event_id,
+                    expected={"snapshot_digest": persisted_digests},
+                    current={"snapshot_digest": snapshot_digest},
+                )
+
+            generation_cursor = conn.execute(
+                """
+                UPDATE enterprise_chat_memory_generations
+                SET snapshot_cutoff = ?, replay_batch_count = ?,
+                    replay_message_count = ?, replay_byte_count = ?,
+                    snapshot_digest = ?,
+                    last_error_code = NULL, last_error_message = NULL,
+                    last_error_at = NULL, updated_at = ?
+                WHERE user_id = ? AND project_id = ? AND generation = ?
+                  AND state = 'building' AND config_fingerprint = ?
+                  AND graph_store_fingerprint = ?
+                  AND graph_group_id = ?
+                """,
+                (
+                    cutoff,
+                    batch_count,
+                    message_count,
+                    byte_count,
+                    snapshot_digest,
+                    now,
+                    event.user_id,
+                    event.project_id,
+                    event.generation,
+                    fingerprint,
+                    graph_fingerprint,
+                    event.graph_group_id,
+                ),
+            )
+            event_cursor = conn.execute(
+                """
+                UPDATE enterprise_chat_memory_outbox
+                SET snapshot_cutoff = ?, snapshot_batch_count = ?,
+                    snapshot_message_count = ?, snapshot_byte_count = ?,
+                    snapshot_digest = ?,
+                    updated_at = ?
+                WHERE event_id = ? AND status = 'running' AND claim_token = ?
+                  AND side_effect_started_at IS NULL
+                """,
+                (
+                    cutoff,
+                    batch_count,
+                    message_count,
+                    byte_count,
+                    snapshot_digest,
+                    now,
+                    event_id,
+                    claim_token,
+                ),
+            )
+            if generation_cursor.rowcount != 1 or event_cursor.rowcount != 1:
+                raise MetadataConflictError(
+                    "chat_memory_rebuild_snapshot",
+                    event_id,
+                    expected={
+                        "event_status": "running",
+                        "claim_token": claim_token,
+                        "generation_state": "building",
+                    },
+                    current={
+                        "event_status": event.status,
+                        "claim_token": event.claim_token,
+                        "generation_state": state.generation.state,
+                    },
+                )
+            return ChatMemoryRebuildSnapshot(
+                event_id=event.event_id,
+                user_id=event.user_id,
+                project_id=event.project_id,
+                generation=event.generation,
+                graph_group_id=event.graph_group_id,
+                config_fingerprint=fingerprint,
+                graph_store_fingerprint=graph_fingerprint,
+                group_state_version=state.group.state_version,
+                snapshot_cutoff=cutoff,
+                replay_batches=replay_batches,
+                batch_count=batch_count,
+                message_count=message_count,
+                byte_count=byte_count,
+                snapshot_digest=snapshot_digest,
+                ingest_max_chars=episode_max_chars,
+            )
+
+        return await self._write(write)
+
+    async def prepare_chat_memory_rebuild_targets(
+        self,
+        event_id: str,
+        claim_token: str,
+        runtime_fingerprint: str,
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+    ) -> ChatMemoryRebuildTargetSet | None:
+        """Capture the complete graph-group universe a rebuild must clear."""
+
+        fingerprint = _validate_chat_memory_fingerprint(runtime_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, runtime_graph_store_fingerprint
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryRebuildTargetSet | None:
+            state = self._require_sqlite_chat_memory_running_claim(
+                conn, event_id, claim_token
+            )
+            stale = self._resolve_sqlite_stale_chat_memory_execution(
+                conn, state, claim_token
+            )
+            if stale is not None:
+                return None
+            if not self._chat_memory_runtime_identity_matches(
+                state.event, fingerprint, graph_fingerprint
+            ):
+                self._retry_sqlite_chat_memory_runtime_mismatch(
+                    conn,
+                    state,
+                    claim_token,
+                    fingerprint,
+                    graph_fingerprint,
+                    retry_delay_seconds=1.0,
+                )
+                return None
+            self._validate_chat_memory_execution_fence(
+                state, fingerprint, graph_fingerprint
+            )
+            event = state.event
+            if (
+                event.event_type != "rebuild"
+                or state.group.state != "rebuilding"
+                or state.generation.state != "building"
+                or state.group.active_rebuild_event_id != event_id
+            ):
+                raise MetadataConflictError(
+                    "chat_memory_rebuild",
+                    event_id,
+                    expected={
+                        "event_type": "rebuild",
+                        "group_state": "rebuilding",
+                        "generation_state": "building",
+                        "active_rebuild_event_id": event_id,
+                    },
+                    current={
+                        "event_type": event.event_type,
+                        "group_state": state.group.state,
+                        "generation_state": state.generation.state,
+                        "active_rebuild_event_id": (
+                            state.group.active_rebuild_event_id
+                        ),
+                    },
+                )
+            if event.side_effect_started_at is not None:
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"side_effect_started_at": None},
+                    current={
+                        "side_effect_started_at": event.side_effect_started_at
+                    },
+                )
+            self._assert_sqlite_chat_memory_graph_store_invariant(
+                conn, state.group, graph_fingerprint
+            )
+            return ChatMemoryRebuildTargetSet(
+                event_id=event.event_id,
+                user_id=event.user_id,
+                project_id=event.project_id,
+                logical_group_id=state.group.logical_group_id,
+                group_ids=self._sqlite_chat_memory_rebuild_group_ids(conn, event),
+            )
+
+        return await self._write(write)
+
+    async def claim_next_chat_memory_event(
+        self,
+        runtime_fingerprint: str,
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+        worker_id: str | None = None,
+        event_types: Sequence[ChatMemoryEventType] | None = None,
+    ) -> ChatMemoryOutboxEventRecord | None:
+        """Claim one eligible FIFO head event for SQLite test parity."""
+
+        fingerprint = _validate_chat_memory_fingerprint(runtime_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, runtime_graph_store_fingerprint
+        )
+        claimed_by = _validate_chat_memory_worker_id(worker_id)
+        claimable_types = _normalize_chat_memory_event_types(event_types)
+        if not claimable_types:
+            return None
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryOutboxEventRecord | None:
+            now = utc_now_iso()
+            type_placeholders = ",".join("?" for _ in claimable_types)
+            row = conn.execute(
+                f"""
+                SELECT candidate.*
+                FROM enterprise_chat_memory_outbox AS candidate
+                WHERE candidate.status IN ('pending', 'retry_wait')
+                  AND candidate.available_at <= ?
+                  AND (
+                      (candidate.event_type = 'purge'
+                       AND candidate.graph_store_fingerprint = ?)
+                      OR
+                      (candidate.event_type IN ('ingest', 'rebuild')
+                       AND candidate.config_fingerprint = ?
+                       AND candidate.graph_store_fingerprint = ?)
+                  )
+                  AND candidate.event_type IN ({type_placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM enterprise_chat_memory_outbox AS blocker
+                      WHERE blocker.user_id = candidate.user_id
+                        AND blocker.project_id = candidate.project_id
+                        AND blocker.event_seq < candidate.event_seq
+                        AND blocker.status IN (
+                            'pending', 'running', 'retry_wait', 'dead_letter'
+                        )
+                  )
+                ORDER BY candidate.available_at ASC,
+                         candidate.event_seq ASC,
+                         candidate.user_id ASC,
+                         candidate.project_id ASC,
+                         candidate.event_id ASC
+                LIMIT 1
+                """,
+                (
+                    now,
+                    graph_fingerprint,
+                    fingerprint,
+                    graph_fingerprint,
+                    *claimable_types,
+                ),
+            ).fetchone()
+            if row is None:
+                return None
+            claim_token = _new_chat_memory_claim_token()
+            cursor = conn.execute(
+                """
+                UPDATE enterprise_chat_memory_outbox
+                SET status = 'running', attempt_no = attempt_no + 1,
+                    claim_token = ?, claimed_by = ?, claimed_at = ?,
+                    side_effect_started_at = NULL,
+                    side_effect_state_version = NULL, completed_at = NULL,
+                    last_error_code = NULL, last_error_message = NULL,
+                    last_error_at = NULL, updated_at = ?
+                WHERE event_id = ? AND status IN ('pending', 'retry_wait')
+                  AND available_at <= ?
+                  AND (
+                      (event_type = 'purge' AND graph_store_fingerprint = ?)
+                      OR
+                      (event_type IN ('ingest', 'rebuild')
+                       AND config_fingerprint = ?
+                       AND graph_store_fingerprint = ?)
+                  )
+                """,
+                (
+                    claim_token,
+                    claimed_by,
+                    now,
+                    now,
+                    row["event_id"],
+                    now,
+                    graph_fingerprint,
+                    fingerprint,
+                    graph_fingerprint,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claimed = conn.execute(
+                "SELECT * FROM enterprise_chat_memory_outbox WHERE event_id = ?",
+                (row["event_id"],),
+            ).fetchone()
+            assert claimed is not None
+            return ChatMemoryOutboxEventRecord.from_row(claimed)
+
+        return await self._write(write)
+
+    @asynccontextmanager
+    async def chat_memory_group_execution_guard(
+        self, logical_group_id: str, *, wait: bool = True
+    ) -> AsyncIterator[bool]:
+        """Process-local SQLite parity guard for one logical memory group."""
+
+        if not isinstance(logical_group_id, str) or not logical_group_id.strip():
+            raise ValueError("Chat Memory logical_group_id must be non-empty")
+        logical_group_id = logical_group_id.strip()
+        await self._ensure_initialized()
+        task = asyncio.current_task()
+        state = self._chat_memory_guard_state.get()
+        token: Any | None = None
+        if state is None or state.owner_task is not task:
+            state = _SQLiteChatMemoryGuardTaskState(owner_task=task, depths={})
+            token = self._chat_memory_guard_state.set(state)
+        depth = state.depths.get(logical_group_id, 0)
+        if depth:
+            state.depths[logical_group_id] = depth + 1
+            try:
+                yield True
+            finally:
+                remaining = state.depths[logical_group_id] - 1
+                if remaining:
+                    state.depths[logical_group_id] = remaining
+                else:
+                    state.depths.pop(logical_group_id, None)
+                if token is not None:
+                    self._chat_memory_guard_state.reset(token)
+            return
+
+        lock = _process_chat_memory_group_lock(self.db_path, logical_group_id)
+        acquired = False
+        try:
+            acquired = await lock.acquire(wait=wait)
+            if not acquired:
+                yield False
+                return
+            state.depths[logical_group_id] = 1
+            try:
+                yield True
+            finally:
+                state.depths.pop(logical_group_id, None)
+        finally:
+            if acquired:
+                await lock.release()
+            if token is not None:
+                self._chat_memory_guard_state.reset(token)
+
+    async def get_chat_memory_execution_state(
+        self, event_id: str
+    ) -> ChatMemoryExecutionState | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            return self._get_sqlite_chat_memory_execution_state(conn, event_id)
+
+    async def mark_chat_memory_event_side_effect_started(
+        self,
+        event_id: str,
+        claim_token: str,
+        runtime_fingerprint: str,
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+        fingerprint_retry_delay_seconds: float = 1.0,
+    ) -> ChatMemoryOutboxEventRecord:
+        """Begin a side effect only while the claimed execution fence is current.
+
+        A stale execution is atomically superseded. A worker running the wrong
+        runtime fingerprint releases the claim to retry_wait without setting a
+        side-effect marker.
+        """
+
+        fingerprint = _validate_chat_memory_fingerprint(runtime_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, runtime_graph_store_fingerprint
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryOutboxEventRecord:
+            state = self._require_sqlite_chat_memory_running_claim(
+                conn, event_id, claim_token
+            )
+            stale = self._resolve_sqlite_stale_chat_memory_execution(
+                conn, state, claim_token
+            )
+            if stale is not None:
+                return stale
+            if not self._chat_memory_runtime_identity_matches(
+                state.event, fingerprint, graph_fingerprint
+            ):
+                return self._retry_sqlite_chat_memory_runtime_mismatch(
+                    conn,
+                    state,
+                    claim_token,
+                    fingerprint,
+                    graph_fingerprint,
+                    retry_delay_seconds=fingerprint_retry_delay_seconds,
+                )
+            if state.event.side_effect_started_at is None:
+                now = utc_now_iso()
+                conn.execute(
+                    """
+                    UPDATE enterprise_chat_memory_outbox
+                    SET side_effect_started_at = ?,
+                        side_effect_state_version = ?, updated_at = ?
+                    WHERE event_id = ? AND status = 'running'
+                      AND claim_token = ?
+                    """,
+                    (
+                        now,
+                        state.group.state_version,
+                        now,
+                        event_id,
+                        claim_token,
+                    ),
+                )
+            row = conn.execute(
+                "SELECT * FROM enterprise_chat_memory_outbox WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            assert row is not None
+            return ChatMemoryOutboxEventRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def finalize_chat_memory_ingest(
+        self,
+        event_id: str,
+        claim_token: str,
+        runtime_fingerprint: str,
+        *,
+        episode_uuid: str,
+        runtime_graph_store_fingerprint: str | None = None,
+    ) -> ChatMemoryExecutionState | None:
+        """Commit an ingest atomically; return None after stale supersession."""
+
+        fingerprint = _validate_chat_memory_fingerprint(runtime_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, runtime_graph_store_fingerprint
+        )
+        if not episode_uuid:
+            raise ValueError("episode_uuid must be non-empty")
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryExecutionState | None:
+            state = self._require_sqlite_chat_memory_running_claim(
+                conn, event_id, claim_token
+            )
+            stale = self._resolve_sqlite_stale_chat_memory_execution(
+                conn, state, claim_token
+            )
+            if stale is not None:
+                return None
+            self._validate_chat_memory_ingest_execution(
+                state, fingerprint, graph_fingerprint
+            )
+            event = state.event
+            if event.side_effect_started_at is None:
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"side_effect_started_at": "set"},
+                    current={"side_effect_started_at": None},
+                )
+            if (
+                event.append_batch_id is None
+                or event.source_session_id is None
+                or event.first_seq is None
+                or event.last_seq is None
+            ):
+                raise MetadataStoreError("Ingest event is missing source batch identity")
+            now = utc_now_iso()
+            expected_mapping = ChatMemoryEpisodeRecord(
+                episode_uuid=episode_uuid,
+                session_id=event.source_session_id,
+                project_id=event.project_id,
+                user_id=event.user_id,
+                first_seq=event.first_seq,
+                last_seq=event.last_seq,
+                created_at=now,
+                event_id=event.event_id,
+                generation=event.generation,
+                graph_group_id=event.graph_group_id,
+                append_batch_id=event.append_batch_id,
+                project_event_seq=event.event_seq,
+            )
+            self._insert_sqlite_chat_memory_historical_mapping(
+                conn, expected_mapping
+            )
+
+            activate_first = (
+                state.group.active_generation is None
+                and state.group.state == "rebuilding"
+                and state.generation.state == "building"
+            )
+            if activate_first:
+                conn.execute(
+                    """
+                    UPDATE enterprise_chat_memory_generations
+                    SET state = 'active', activated_at = ?, updated_at = ?,
+                        last_error_code = NULL, last_error_message = NULL,
+                        last_error_at = NULL
+                    WHERE user_id = ? AND project_id = ? AND generation = ?
+                    """,
+                    (
+                        now,
+                        now,
+                        event.user_id,
+                        event.project_id,
+                        event.generation,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE enterprise_chat_memory_groups
+                    SET active_generation = ?, active_config_fingerprint = ?,
+                        active_graph_store_fingerprint = ?,
+                        state = 'active', state_version = state_version + 1,
+                        active_rebuild_event_id = NULL, last_success_at = ?,
+                        last_error_code = NULL, last_error_message = NULL,
+                        last_error_at = NULL, updated_at = ?
+                    WHERE user_id = ? AND project_id = ?
+                    """,
+                    (
+                        event.generation,
+                        fingerprint,
+                        graph_fingerprint,
+                        now,
+                        now,
+                        event.user_id,
+                        event.project_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE enterprise_chat_memory_groups
+                    SET last_success_at = ?, last_error_code = NULL,
+                        last_error_message = NULL, last_error_at = NULL,
+                        updated_at = ?
+                    WHERE user_id = ? AND project_id = ?
+                    """,
+                    (now, now, event.user_id, event.project_id),
+                )
+            cursor = conn.execute(
+                """
+                UPDATE enterprise_chat_memory_outbox
+                SET status = 'succeeded', completed_at = ?, updated_at = ?,
+                    last_error_code = NULL, last_error_message = NULL,
+                    last_error_at = NULL
+                WHERE event_id = ? AND status = 'running' AND claim_token = ?
+                """,
+                (now, now, event_id, claim_token),
+            )
+            if cursor.rowcount != 1:
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"status": "running", "claim_token": claim_token},
+                    current={"status": event.status, "claim_token": event.claim_token},
+                )
+            final = self._get_sqlite_chat_memory_execution_state(conn, event_id)
+            assert final is not None
+            return final
+
+        return await self._write(write)
+
+    async def finalize_chat_memory_ingest_noop(
+        self,
+        event_id: str,
+        claim_token: str,
+        runtime_fingerprint: str,
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+    ) -> ChatMemoryExecutionState | None:
+        """Atomically complete an ingest that required no Graphiti side effect."""
+
+        fingerprint = _validate_chat_memory_fingerprint(runtime_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, runtime_graph_store_fingerprint
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryExecutionState | None:
+            state = self._require_sqlite_chat_memory_running_claim(
+                conn, event_id, claim_token
+            )
+            stale = self._resolve_sqlite_stale_chat_memory_execution(
+                conn, state, claim_token
+            )
+            if stale is not None:
+                return None
+            self._validate_chat_memory_ingest_execution(
+                state, fingerprint, graph_fingerprint
+            )
+            event = state.event
+            if (
+                event.side_effect_started_at is not None
+                or event.side_effect_state_version is not None
+            ):
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={
+                        "side_effect_started_at": None,
+                        "side_effect_state_version": None,
+                    },
+                    current={
+                        "side_effect_started_at": event.side_effect_started_at,
+                        "side_effect_state_version": event.side_effect_state_version,
+                    },
+                )
+            if (
+                event.append_batch_id is None
+                or event.source_session_id is None
+                or event.first_seq is None
+                or event.last_seq is None
+            ):
+                raise MetadataStoreError("Ingest event is missing source batch identity")
+
+            source_rows = conn.execute(
+                """
+                SELECT * FROM enterprise_chat_messages
+                WHERE user_id = ? AND project_id = ? AND project_event_seq = ?
+                ORDER BY seq ASC, id ASC
+                """,
+                (
+                    event.user_id,
+                    event.project_id,
+                    event.event_seq,
+                ),
+            ).fetchall()
+            source_messages = [
+                ChatMessageRecord.from_row(row) for row in source_rows
+            ]
+            _validate_chat_memory_ingest_source_batch(event, source_messages)
+            eligible_payload = _chat_memory_canonical_episode_payload(
+                source_messages,
+                ingest_max_chars=CHAT_MEMORY_DEFAULT_INGEST_MAX_CHARS,
+            )
+            if eligible_payload["messages"]:
+                raise MetadataConflictError(
+                    "chat_memory_ingest_noop",
+                    event_id,
+                    expected={"eligible_payload": "empty"},
+                    current={
+                        "eligible_message_ids": tuple(
+                            item["id"] for item in eligible_payload["messages"]
+                        )
+                    },
+                )
+
+            now = utc_now_iso()
+            episode_uuid = _chat_memory_noop_episode_uuid(
+                event_id=event.event_id,
+                generation=event.generation,
+                append_batch_id=event.append_batch_id,
+            )
+            self._insert_sqlite_chat_memory_historical_mapping(
+                conn,
+                ChatMemoryEpisodeRecord(
+                    episode_uuid=episode_uuid,
+                    session_id=event.source_session_id,
+                    project_id=event.project_id,
+                    user_id=event.user_id,
+                    first_seq=event.first_seq,
+                    last_seq=event.last_seq,
+                    created_at=now,
+                    event_id=event.event_id,
+                    generation=event.generation,
+                    graph_group_id=event.graph_group_id,
+                    append_batch_id=event.append_batch_id,
+                    project_event_seq=event.event_seq,
+                ),
+            )
+
+            activate_first = (
+                state.group.active_generation is None
+                and state.group.state == "rebuilding"
+                and state.generation.state == "building"
+            )
+            if activate_first:
+                generation_cursor = conn.execute(
+                    """
+                    UPDATE enterprise_chat_memory_generations
+                    SET state = 'active', activated_at = ?, updated_at = ?,
+                        last_error_code = NULL, last_error_message = NULL,
+                        last_error_at = NULL
+                    WHERE user_id = ? AND project_id = ? AND generation = ?
+                      AND state = 'building'
+                    """,
+                    (
+                        now,
+                        now,
+                        event.user_id,
+                        event.project_id,
+                        event.generation,
+                    ),
+                )
+                group_cursor = conn.execute(
+                    """
+                    UPDATE enterprise_chat_memory_groups
+                    SET active_generation = ?, active_config_fingerprint = ?,
+                        active_graph_store_fingerprint = ?,
+                        state = 'active', state_version = state_version + 1,
+                        active_rebuild_event_id = NULL, last_success_at = ?,
+                        last_error_code = NULL, last_error_message = NULL,
+                        last_error_at = NULL, updated_at = ?
+                    WHERE user_id = ? AND project_id = ?
+                      AND desired_generation = ? AND state_version = ?
+                      AND state = 'rebuilding'
+                    """,
+                    (
+                        event.generation,
+                        fingerprint,
+                        graph_fingerprint,
+                        now,
+                        now,
+                        event.user_id,
+                        event.project_id,
+                        event.generation,
+                        state.group.state_version,
+                    ),
+                )
+                if generation_cursor.rowcount != 1 or group_cursor.rowcount != 1:
+                    raise MetadataConflictError(
+                        "chat_memory_ingest_noop",
+                        event_id,
+                        expected={"generation_state": "building", "group": "current"},
+                        current={
+                            "generation_state": state.generation.state,
+                            "group_state": state.group.state,
+                        },
+                    )
+            else:
+                conn.execute(
+                    """
+                    UPDATE enterprise_chat_memory_groups
+                    SET last_success_at = ?, last_error_code = NULL,
+                        last_error_message = NULL, last_error_at = NULL,
+                        updated_at = ?
+                    WHERE user_id = ? AND project_id = ?
+                    """,
+                    (now, now, event.user_id, event.project_id),
+                )
+
+            cursor = conn.execute(
+                """
+                UPDATE enterprise_chat_memory_outbox
+                SET status = 'succeeded', completed_at = ?, updated_at = ?,
+                    last_error_code = NULL, last_error_message = NULL,
+                    last_error_at = NULL
+                WHERE event_id = ? AND status = 'running' AND claim_token = ?
+                  AND side_effect_started_at IS NULL
+                  AND side_effect_state_version IS NULL
+                """,
+                (now, now, event_id, claim_token),
+            )
+            if cursor.rowcount != 1:
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"status": "running", "claim_token": claim_token},
+                    current={"status": event.status, "claim_token": event.claim_token},
+                )
+            final = self._get_sqlite_chat_memory_execution_state(conn, event_id)
+            assert final is not None
+            return final
+
+        return await self._write(write)
+
+    async def finalize_chat_memory_rebuild(
+        self,
+        event_id: str,
+        claim_token: str,
+        runtime_fingerprint: str,
+        snapshot: ChatMemoryRebuildSnapshot,
+        mappings: Sequence[ChatMemoryReplayMappingInput],
+        targets: ChatMemoryRebuildTargetSet,
+        definitely_cleared_group_ids: Sequence[str],
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+    ) -> ChatMemoryExecutionState | None:
+        """Atomically install a complete replay and activate its generation."""
+
+        fingerprint = _validate_chat_memory_fingerprint(runtime_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, runtime_graph_store_fingerprint
+        )
+        if not isinstance(targets, ChatMemoryRebuildTargetSet):
+            raise TypeError("targets must be a ChatMemoryRebuildTargetSet")
+        replay_mappings = list(mappings)
+        normalized_targets = _normalize_chat_memory_group_ids(targets.group_ids)
+        normalized_cleared = _normalize_chat_memory_group_ids(
+            definitely_cleared_group_ids
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryExecutionState | None:
+            state = self._require_sqlite_chat_memory_running_claim(
+                conn, event_id, claim_token
+            )
+            stale = self._resolve_sqlite_stale_chat_memory_execution(
+                conn, state, claim_token
+            )
+            if stale is not None:
+                return None
+            self._validate_chat_memory_execution_fence(
+                state, fingerprint, graph_fingerprint
+            )
+            event = state.event
+            if event.event_type != "rebuild":
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"event_type": "rebuild"},
+                    current={"event_type": event.event_type},
+                )
+            if state.group.active_rebuild_event_id != event_id:
+                raise MetadataConflictError(
+                    "chat_memory_rebuild",
+                    event_id,
+                    expected={"active_rebuild_event_id": event_id},
+                    current={
+                        "active_rebuild_event_id": state.group.active_rebuild_event_id
+                    },
+                )
+            if event.side_effect_started_at is None:
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"side_effect_started_at": "set"},
+                    current={"side_effect_started_at": None},
+                )
+
+            self._assert_sqlite_chat_memory_graph_store_invariant(
+                conn, state.group, graph_fingerprint
+            )
+            expected_target_identity = (
+                event.event_id,
+                event.user_id,
+                event.project_id,
+                state.group.logical_group_id,
+            )
+            current_target_identity = (
+                targets.event_id,
+                targets.user_id,
+                targets.project_id,
+                targets.logical_group_id,
+            )
+            if current_target_identity != expected_target_identity:
+                raise MetadataConflictError(
+                    "chat_memory_rebuild_targets",
+                    event_id,
+                    expected={"identity": expected_target_identity},
+                    current={"identity": current_target_identity},
+                )
+            authoritative_targets = self._sqlite_chat_memory_rebuild_group_ids(
+                conn, event
+            )
+            if normalized_targets != authoritative_targets:
+                raise MetadataConflictError(
+                    "chat_memory_rebuild_targets",
+                    event_id,
+                    expected={"group_ids": authoritative_targets},
+                    current={"group_ids": normalized_targets},
+                )
+            missing_clears = tuple(
+                sorted(set(authoritative_targets).difference(normalized_cleared))
+            )
+            if missing_clears:
+                raise MetadataConflictError(
+                    "chat_memory_rebuild_clear",
+                    event_id,
+                    expected={"definitely_cleared": authoritative_targets},
+                    current={
+                        "definitely_cleared": normalized_cleared,
+                        "missing": missing_clears,
+                    },
+                )
+
+            identity_expected = {
+                "event_id": event.event_id,
+                "user_id": event.user_id,
+                "project_id": event.project_id,
+                "generation": event.generation,
+                "graph_group_id": event.graph_group_id,
+                "config_fingerprint": fingerprint,
+                "graph_store_fingerprint": graph_fingerprint,
+                "group_state_version": state.group.state_version,
+            }
+            identity_current = {
+                "event_id": snapshot.event_id,
+                "user_id": snapshot.user_id,
+                "project_id": snapshot.project_id,
+                "generation": snapshot.generation,
+                "graph_group_id": snapshot.graph_group_id,
+                "config_fingerprint": snapshot.config_fingerprint,
+                "graph_store_fingerprint": snapshot.graph_store_fingerprint,
+                "group_state_version": snapshot.group_state_version,
+            }
+            if identity_current != identity_expected:
+                raise MetadataConflictError(
+                    "chat_memory_rebuild_snapshot",
+                    event_id,
+                    expected=identity_expected,
+                    current=identity_current,
+                )
+            if event.side_effect_state_version != snapshot.group_state_version:
+                raise MetadataConflictError(
+                    "chat_memory_rebuild_snapshot",
+                    event_id,
+                    expected={
+                        "side_effect_state_version": snapshot.group_state_version
+                    },
+                    current={
+                        "side_effect_state_version": event.side_effect_state_version
+                    },
+                )
+
+            invocation_digest = _chat_memory_snapshot_digest(
+                snapshot.replay_batches,
+                ingest_max_chars=snapshot.ingest_max_chars,
+            )
+            persisted_digests = (
+                event.snapshot_digest,
+                state.generation.snapshot_digest,
+            )
+            if (
+                snapshot.snapshot_digest != invocation_digest
+                or persisted_digests != (invocation_digest, invocation_digest)
+            ):
+                raise MetadataConflictError(
+                    "chat_memory_rebuild_snapshot",
+                    event_id,
+                    expected={"snapshot_digest": persisted_digests},
+                    current={
+                        "snapshot_digest": snapshot.snapshot_digest,
+                        "recomputed_snapshot_digest": invocation_digest,
+                    },
+                )
+
+            batch_count, message_count, byte_count = (
+                _chat_memory_replay_snapshot_metrics(snapshot.replay_batches)
+            )
+            event_seqs = [
+                batch.project_event_seq for batch in snapshot.replay_batches
+            ]
+            if event_seqs != sorted(set(event_seqs)) or any(
+                event_seq > snapshot.snapshot_cutoff for event_seq in event_seqs
+            ):
+                raise MetadataStoreError(
+                    "Chat Memory rebuild snapshot batches must be unique and ordered"
+                )
+            if (
+                snapshot.batch_count,
+                snapshot.message_count,
+                snapshot.byte_count,
+            ) != (batch_count, message_count, byte_count):
+                raise MetadataStoreError(
+                    "Chat Memory rebuild snapshot counts do not match its replay batches"
+                )
+            persisted_counts = (
+                event.snapshot_cutoff,
+                event.snapshot_batch_count,
+                event.snapshot_message_count,
+                event.snapshot_byte_count,
+                state.generation.snapshot_cutoff,
+                state.generation.replay_batch_count,
+                state.generation.replay_message_count,
+                state.generation.replay_byte_count,
+            )
+            expected_counts = (
+                snapshot.snapshot_cutoff,
+                batch_count,
+                message_count,
+                byte_count,
+                snapshot.snapshot_cutoff,
+                batch_count,
+                message_count,
+                byte_count,
+            )
+            if persisted_counts != expected_counts:
+                raise MetadataConflictError(
+                    "chat_memory_rebuild_snapshot",
+                    event_id,
+                    expected={"persisted_counts": expected_counts},
+                    current={"persisted_counts": persisted_counts},
+                )
+            batches_by_key: dict[tuple[str, int], ChatMemoryReplayBatch] = {}
+            for batch in snapshot.replay_batches:
+                if not batch.messages:
+                    raise MetadataStoreError("Chat Memory replay batches cannot be empty")
+                key = (batch.append_batch_id, batch.project_event_seq)
+                if key in batches_by_key:
+                    raise MetadataStoreError("Duplicate Chat Memory replay batch identity")
+                batches_by_key[key] = batch
+            mappings_by_key: dict[
+                tuple[str, int], ChatMemoryReplayMappingInput
+            ] = {}
+            episode_uuids: set[str] = set()
+            for mapping in replay_mappings:
+                key = (mapping.append_batch_id, int(mapping.project_event_seq))
+                if key in mappings_by_key or not mapping.episode_uuid:
+                    raise MetadataStoreError(
+                        "Chat Memory rebuild mappings must have unique identities"
+                    )
+                if mapping.episode_uuid in episode_uuids:
+                    raise MetadataStoreError(
+                        "Chat Memory rebuild episode UUIDs must be unique"
+                    )
+                mappings_by_key[key] = mapping
+                episode_uuids.add(mapping.episode_uuid)
+            if set(mappings_by_key) != set(batches_by_key):
+                raise MetadataStoreError(
+                    "Chat Memory rebuild mappings must cover every replay batch exactly once"
+                )
+
+            now = utc_now_iso()
+            for batch in snapshot.replay_batches:
+                key = (batch.append_batch_id, batch.project_event_seq)
+                mapping = mappings_by_key[key]
+                session_ids = {message.session_id for message in batch.messages}
+                first_seq = min(message.seq for message in batch.messages)
+                last_seq = max(message.seq for message in batch.messages)
+                if (
+                    session_ids != {batch.session_id}
+                    or mapping.session_id != batch.session_id
+                    or mapping.first_seq != first_seq
+                    or mapping.last_seq != last_seq
+                ):
+                    raise MetadataStoreError(
+                        "Chat Memory rebuild mapping does not match its replay batch"
+                    )
+                self._insert_sqlite_chat_memory_historical_mapping(
+                    conn,
+                    ChatMemoryEpisodeRecord(
+                        episode_uuid=mapping.episode_uuid,
+                        session_id=mapping.session_id,
+                        project_id=event.project_id,
+                        user_id=event.user_id,
+                        first_seq=mapping.first_seq,
+                        last_seq=mapping.last_seq,
+                        created_at=now,
+                        event_id=event.event_id,
+                        generation=event.generation,
+                        graph_group_id=event.graph_group_id,
+                        append_batch_id=mapping.append_batch_id,
+                        project_event_seq=mapping.project_event_seq,
+                    ),
+                )
+
+            conn.execute(
+                """
+                UPDATE enterprise_chat_memory_generations
+                SET state = 'purged', cleared_at = COALESCE(cleared_at, ?),
+                    updated_at = ?, last_error_code = NULL,
+                    last_error_message = NULL, last_error_at = NULL
+                WHERE user_id = ? AND project_id = ? AND generation <> ?
+                """,
+                (
+                    now,
+                    now,
+                    event.user_id,
+                    event.project_id,
+                    event.generation,
+                ),
+            )
+
+            activated = conn.execute(
+                """
+                UPDATE enterprise_chat_memory_generations
+                SET state = 'active', activated_at = ?, updated_at = ?,
+                    last_error_code = NULL, last_error_message = NULL,
+                    last_error_at = NULL
+                WHERE user_id = ? AND project_id = ? AND generation = ?
+                  AND state = 'building' AND snapshot_cutoff = ?
+                  AND replay_batch_count = ? AND replay_message_count = ?
+                  AND replay_byte_count = ? AND snapshot_digest = ?
+                """,
+                (
+                    now,
+                    now,
+                    event.user_id,
+                    event.project_id,
+                    event.generation,
+                    snapshot.snapshot_cutoff,
+                    batch_count,
+                    message_count,
+                    byte_count,
+                    invocation_digest,
+                ),
+            )
+            if activated.rowcount != 1:
+                raise MetadataConflictError(
+                    "chat_memory_generation",
+                    event.graph_group_id,
+                    expected={"state": "building", "snapshot": expected_counts[4:]},
+                    current={
+                        "state": state.generation.state,
+                        "snapshot": persisted_counts[4:],
+                    },
+                )
+
+            for batch in snapshot.replay_batches:
+                conn.execute(
+                    """
+                    UPDATE enterprise_chat_memory_outbox
+                    SET status = 'superseded', superseded_by_event_id = ?,
+                        completed_at = ?, updated_at = ?
+                    WHERE user_id = ? AND project_id = ?
+                      AND event_type = 'ingest'
+                      AND status IN ('pending', 'retry_wait', 'dead_letter')
+                      AND event_seq = ? AND event_seq <= ?
+                      AND append_batch_id = ?
+                    """,
+                    (
+                        event.event_id,
+                        now,
+                        now,
+                        event.user_id,
+                        event.project_id,
+                        batch.project_event_seq,
+                        snapshot.snapshot_cutoff,
+                        batch.append_batch_id,
+                    ),
+                )
+
+            group_cursor = conn.execute(
+                """
+                UPDATE enterprise_chat_memory_groups
+                SET active_generation = ?, active_config_fingerprint = ?,
+                    active_graph_store_fingerprint = ?,
+                    state = 'active', state_version = state_version + 1,
+                    active_rebuild_event_id = NULL, last_success_at = ?,
+                    last_error_code = NULL, last_error_message = NULL,
+                    last_error_at = NULL, updated_at = ?
+                WHERE user_id = ? AND project_id = ?
+                  AND desired_generation = ? AND desired_config_fingerprint = ?
+                  AND desired_graph_store_fingerprint = ?
+                  AND state = 'rebuilding' AND state_version = ?
+                  AND active_rebuild_event_id = ?
+                """,
+                (
+                    event.generation,
+                    fingerprint,
+                    graph_fingerprint,
+                    now,
+                    now,
+                    event.user_id,
+                    event.project_id,
+                    event.generation,
+                    fingerprint,
+                    graph_fingerprint,
+                    snapshot.group_state_version,
+                    event.event_id,
+                ),
+            )
+            event_cursor = conn.execute(
+                """
+                UPDATE enterprise_chat_memory_outbox
+                SET status = 'succeeded', completed_at = ?, updated_at = ?,
+                    last_error_code = NULL, last_error_message = NULL,
+                    last_error_at = NULL
+                WHERE event_id = ? AND status = 'running' AND claim_token = ?
+                  AND side_effect_started_at IS NOT NULL
+                  AND side_effect_state_version = ? AND snapshot_cutoff = ?
+                  AND snapshot_batch_count = ? AND snapshot_message_count = ?
+                  AND snapshot_byte_count = ? AND snapshot_digest = ?
+                """,
+                (
+                    now,
+                    now,
+                    event_id,
+                    claim_token,
+                    snapshot.group_state_version,
+                    snapshot.snapshot_cutoff,
+                    batch_count,
+                    message_count,
+                    byte_count,
+                    invocation_digest,
+                ),
+            )
+            if group_cursor.rowcount != 1 or event_cursor.rowcount != 1:
+                raise MetadataConflictError(
+                    "chat_memory_rebuild_finalize",
+                    event_id,
+                    expected={"group": "current", "event": "running/current"},
+                    current={
+                        "group_state": state.group.state,
+                        "event_status": event.status,
+                    },
+                )
+            final = self._get_sqlite_chat_memory_execution_state(conn, event_id)
+            assert final is not None
+            return final
+
+        return await self._write(write)
+
+    async def get_chat_memory_purge_targets(
+        self,
+        event_id: str,
+        claim_token: str,
+        runtime_fingerprint: str,
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+    ) -> ChatMemoryPurgeTargetSet | None:
+        """Return every durable physical target plus the legacy graph group."""
+
+        fingerprint = _validate_chat_memory_fingerprint(runtime_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, runtime_graph_store_fingerprint
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryPurgeTargetSet | None:
+            state = self._require_sqlite_chat_memory_running_claim(
+                conn, event_id, claim_token
+            )
+            self._assert_sqlite_chat_memory_graph_store_invariant(
+                conn,
+                state.group,
+                _resolve_chat_memory_graph_store_fingerprint(
+                    state.event.config_fingerprint,
+                    state.event.graph_store_fingerprint,
+                ),
+            )
+            stale = self._resolve_sqlite_stale_chat_memory_execution(
+                conn, state, claim_token
+            )
+            if stale is not None:
+                return None
+            if not self._chat_memory_runtime_identity_matches(
+                state.event, fingerprint, graph_fingerprint
+            ):
+                self._retry_sqlite_chat_memory_runtime_mismatch(
+                    conn,
+                    state,
+                    claim_token,
+                    fingerprint,
+                    graph_fingerprint,
+                    retry_delay_seconds=1.0,
+                )
+                return None
+            self._validate_chat_memory_execution_fence(
+                state, fingerprint, graph_fingerprint
+            )
+            event = state.event
+            if (
+                event.event_type != "purge"
+                or state.group.state != "deleting"
+                or state.generation.state != "purge_pending"
+            ):
+                raise MetadataConflictError(
+                    "chat_memory_purge",
+                    event_id,
+                    expected={
+                        "event_type": "purge",
+                        "group_state": "deleting",
+                        "generation_state": "purge_pending",
+                    },
+                    current={
+                        "event_type": event.event_type,
+                        "group_state": state.group.state,
+                        "generation_state": state.generation.state,
+                    },
+                )
+            group_ids = self._sqlite_chat_memory_purge_group_ids(
+                conn,
+                event.user_id,
+                event.project_id,
+            )
+            return ChatMemoryPurgeTargetSet(
+                event_id=event.event_id,
+                user_id=event.user_id,
+                project_id=event.project_id,
+                logical_group_id=state.group.logical_group_id,
+                group_ids=group_ids,
+            )
+
+        return await self._write(write)
+
+    async def prepare_chat_memory_purge_targets(
+        self,
+        event_id: str,
+        claim_token: str,
+        runtime_fingerprint: str,
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+    ) -> ChatMemoryPurgeTargetSet | None:
+        """Alias emphasizing that target enumeration precedes clear side effects."""
+
+        return await self.get_chat_memory_purge_targets(
+            event_id,
+            claim_token,
+            runtime_fingerprint,
+            runtime_graph_store_fingerprint=runtime_graph_store_fingerprint,
+        )
+
+    async def finalize_chat_memory_purge(
+        self,
+        event_id: str,
+        claim_token: str,
+        runtime_fingerprint: str,
+        targets: ChatMemoryPurgeTargetSet | Sequence[str] | None = None,
+        definitely_cleared_group_ids: Sequence[str] | None = None,
+        *,
+        expected_group_ids: Sequence[str] | None = None,
+        cleared_group_ids: Sequence[str] | None = None,
+        runtime_graph_store_fingerprint: str | None = None,
+    ) -> ChatMemoryExecutionState | None:
+        """Terminalize a purge only after every expected target definitely cleared."""
+
+        fingerprint = _validate_chat_memory_fingerprint(runtime_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, runtime_graph_store_fingerprint
+        )
+        target_record = targets if isinstance(targets, ChatMemoryPurgeTargetSet) else None
+        positional_expected: Sequence[str] | None = (
+            targets
+            if targets is not None
+            and not isinstance(targets, ChatMemoryPurgeTargetSet)
+            else None
+        )
+        if positional_expected is not None and expected_group_ids is not None:
+            raise ValueError("Specify purge expected group ids only once")
+        if (
+            definitely_cleared_group_ids is not None
+            and cleared_group_ids is not None
+        ):
+            raise ValueError("Specify definitely cleared group ids only once")
+        caller_expected = (
+            target_record.group_ids
+            if target_record is not None
+            else (
+                positional_expected
+                if positional_expected is not None
+                else expected_group_ids
+            )
+        )
+        normalized_expected = (
+            _normalize_chat_memory_group_ids(caller_expected)
+            if caller_expected is not None
+            else None
+        )
+        normalized_cleared = _normalize_chat_memory_group_ids(
+            definitely_cleared_group_ids
+            if definitely_cleared_group_ids is not None
+            else (cleared_group_ids or ())
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryExecutionState | None:
+            state = self._require_sqlite_chat_memory_running_claim(
+                conn, event_id, claim_token
+            )
+            self._assert_sqlite_chat_memory_graph_store_invariant(
+                conn,
+                state.group,
+                _resolve_chat_memory_graph_store_fingerprint(
+                    state.event.config_fingerprint,
+                    state.event.graph_store_fingerprint,
+                ),
+            )
+            stale = self._resolve_sqlite_stale_chat_memory_execution(
+                conn, state, claim_token
+            )
+            if stale is not None:
+                return None
+            self._validate_chat_memory_execution_fence(
+                state, fingerprint, graph_fingerprint
+            )
+            event = state.event
+            if (
+                event.event_type != "purge"
+                or state.group.state != "deleting"
+                or state.generation.state != "purge_pending"
+            ):
+                raise MetadataConflictError(
+                    "chat_memory_purge",
+                    event_id,
+                    expected={
+                        "event_type": "purge",
+                        "group_state": "deleting",
+                        "generation_state": "purge_pending",
+                    },
+                    current={
+                        "event_type": event.event_type,
+                        "group_state": state.group.state,
+                        "generation_state": state.generation.state,
+                    },
+                )
+            if (
+                event.side_effect_started_at is None
+                or event.side_effect_state_version != state.group.state_version
+            ):
+                raise MetadataConflictError(
+                    "chat_memory_purge",
+                    event_id,
+                    expected={
+                        "side_effect_started_at": "set",
+                        "side_effect_state_version": state.group.state_version,
+                    },
+                    current={
+                        "side_effect_started_at": event.side_effect_started_at,
+                        "side_effect_state_version": event.side_effect_state_version,
+                    },
+                )
+            if target_record is not None:
+                expected_identity = (
+                    event.event_id,
+                    event.user_id,
+                    event.project_id,
+                    state.group.logical_group_id,
+                )
+                current_identity = (
+                    target_record.event_id,
+                    target_record.user_id,
+                    target_record.project_id,
+                    target_record.logical_group_id,
+                )
+                if current_identity != expected_identity:
+                    raise MetadataConflictError(
+                        "chat_memory_purge_targets",
+                        event_id,
+                        expected={"identity": expected_identity},
+                        current={"identity": current_identity},
+                    )
+
+            authoritative_expected = self._sqlite_chat_memory_purge_group_ids(
+                conn,
+                event.user_id,
+                event.project_id,
+            )
+            if (
+                normalized_expected is not None
+                and normalized_expected != authoritative_expected
+            ):
+                raise MetadataConflictError(
+                    "chat_memory_purge_targets",
+                    event_id,
+                    expected={"group_ids": authoritative_expected},
+                    current={"group_ids": normalized_expected},
+                )
+            missing = sorted(
+                set(authoritative_expected).difference(normalized_cleared)
+            )
+            if missing:
+                raise MetadataConflictError(
+                    "chat_memory_purge_clear",
+                    event_id,
+                    expected={"definitely_cleared": authoritative_expected},
+                    current={
+                        "definitely_cleared": normalized_cleared,
+                        "missing": tuple(missing),
+                    },
+                )
+
+            now = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE enterprise_chat_memory_generations
+                SET state = 'purged', cleared_at = COALESCE(cleared_at, ?),
+                    updated_at = ?, last_error_code = NULL,
+                    last_error_message = NULL, last_error_at = NULL
+                WHERE user_id = ? AND project_id = ?
+                """,
+                (now, now, event.user_id, event.project_id),
+            )
+            conn.execute(
+                """
+                DELETE FROM enterprise_chat_memory_episodes
+                WHERE user_id = ? AND project_id = ?
+                """,
+                (event.user_id, event.project_id),
+            )
+            group_cursor = conn.execute(
+                """
+                UPDATE enterprise_chat_memory_groups
+                SET state = 'deleted', active_generation = NULL,
+                    active_config_fingerprint = NULL,
+                    active_graph_store_fingerprint = NULL,
+                    active_rebuild_event_id = NULL,
+                    state_version = state_version + 1, deleted_at = ?,
+                    last_success_at = ?, last_error_code = NULL,
+                    last_error_message = NULL, last_error_at = NULL,
+                    updated_at = ?
+                WHERE user_id = ? AND project_id = ? AND state = 'deleting'
+                  AND desired_generation = ?
+                  AND desired_graph_store_fingerprint = ? AND state_version = ?
+                """,
+                (
+                    now,
+                    now,
+                    now,
+                    event.user_id,
+                    event.project_id,
+                    event.generation,
+                    graph_fingerprint,
+                    event.side_effect_state_version,
+                ),
+            )
+            event_cursor = conn.execute(
+                """
+                UPDATE enterprise_chat_memory_outbox
+                SET status = 'succeeded', completed_at = ?, updated_at = ?,
+                    last_error_code = NULL, last_error_message = NULL,
+                    last_error_at = NULL
+                WHERE event_id = ? AND status = 'running' AND claim_token = ?
+                  AND side_effect_started_at IS NOT NULL
+                  AND side_effect_state_version = ?
+                """,
+                (
+                    now,
+                    now,
+                    event_id,
+                    claim_token,
+                    event.side_effect_state_version,
+                ),
+            )
+            if group_cursor.rowcount != 1 or event_cursor.rowcount != 1:
+                raise MetadataConflictError(
+                    "chat_memory_purge_finalize",
+                    event_id,
+                    expected={"group": "current", "event": "running/current"},
+                    current={
+                        "group_state": state.group.state,
+                        "event_status": event.status,
+                    },
+                )
+            final = self._get_sqlite_chat_memory_execution_state(conn, event_id)
+            assert final is not None
+            return final
+
+        return await self._write(write)
+
+    async def fail_chat_memory_event_before_side_effect(
+        self,
+        event_id: str,
+        claim_token: str,
+        runtime_fingerprint: str,
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+        error_code: str,
+        error_message: str,
+        retry_delay_seconds: float | None = 1.0,
+        max_attempts: int = 3,
+    ) -> ChatMemoryOutboxEventRecord:
+        """CAS a known pre-side-effect failure to retry_wait or dead_letter."""
+
+        fingerprint = _validate_chat_memory_fingerprint(runtime_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, runtime_graph_store_fingerprint
+        )
+        await self._ensure_initialized()
+        max_attempts = max(1, int(max_attempts))
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryOutboxEventRecord:
+            state = self._require_sqlite_chat_memory_running_claim(
+                conn, event_id, claim_token
+            )
+            stale = self._resolve_sqlite_stale_chat_memory_execution(
+                conn, state, claim_token
+            )
+            if stale is not None:
+                return stale
+            if not self._chat_memory_runtime_identity_matches(
+                state.event, fingerprint, graph_fingerprint
+            ):
+                return self._retry_sqlite_chat_memory_runtime_mismatch(
+                    conn,
+                    state,
+                    claim_token,
+                    fingerprint,
+                    graph_fingerprint,
+                    retry_delay_seconds=float(retry_delay_seconds or 1.0),
+                )
+            if state.event.event_type == "purge":
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"event_type": "ingest/rebuild"},
+                    current={"event_type": "purge"},
+                )
+            if state.event.side_effect_started_at is not None:
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"side_effect_started_at": None},
+                    current={
+                        "side_effect_started_at": state.event.side_effect_started_at
+                    },
+                )
+            now_dt = datetime.now(timezone.utc)
+            now = now_dt.isoformat()
+            dead_letter = (
+                retry_delay_seconds is None
+                or state.event.attempt_no >= max_attempts
+            )
+            status: ChatMemoryEventStatus = (
+                "dead_letter" if dead_letter else "retry_wait"
+            )
+            available_at = (
+                now
+                if dead_letter
+                else (
+                    now_dt
+                    + timedelta(seconds=max(0.0, float(retry_delay_seconds or 0)))
+                ).isoformat()
+            )
+            conn.execute(
+                """
+                UPDATE enterprise_chat_memory_outbox
+                SET status = ?, available_at = ?, claim_token = NULL,
+                    claimed_by = NULL, claimed_at = NULL,
+                    side_effect_state_version = NULL,
+                    completed_at = CASE WHEN ? = 'dead_letter' THEN ? ELSE NULL END,
+                    last_error_code = ?, last_error_message = ?,
+                    last_error_at = ?, updated_at = ?
+                WHERE event_id = ? AND status = 'running' AND claim_token = ?
+                """,
+                (
+                    status,
+                    available_at,
+                    status,
+                    now,
+                    error_code,
+                    error_message,
+                    now,
+                    now,
+                    event_id,
+                    claim_token,
+                ),
+            )
+            if dead_letter:
+                conn.execute(
+                    """
+                    UPDATE enterprise_chat_memory_groups
+                    SET state = 'failed', state_version = state_version + 1,
+                        last_error_code = ?, last_error_message = ?,
+                        last_error_at = ?, updated_at = ?
+                    WHERE user_id = ? AND project_id = ?
+                    """,
+                    (
+                        error_code,
+                        error_message,
+                        now,
+                        now,
+                        state.event.user_id,
+                        state.event.project_id,
+                    ),
+                )
+            row = conn.execute(
+                "SELECT * FROM enterprise_chat_memory_outbox WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            assert row is not None
+            return ChatMemoryOutboxEventRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def supersede_chat_memory_dead_letter_with_rebuild(
+        self,
+        event_id: str,
+        runtime_fingerprint: str,
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+        actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
+    ) -> ChatMemoryOutboxEventRecord:
+        fingerprint = _validate_chat_memory_fingerprint(runtime_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, runtime_graph_store_fingerprint
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryOutboxEventRecord:
+            state = self._get_sqlite_chat_memory_execution_state(conn, event_id)
+            if state is None:
+                raise MetadataRecordNotFoundError(
+                    f"Chat Memory event '{event_id}' not found"
+                )
+            if state.event.status != "dead_letter" or state.event.event_type == "purge":
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"status": "dead_letter", "event_type": "ingest/rebuild"},
+                    current={
+                        "status": state.event.status,
+                        "event_type": state.event.event_type,
+                    },
+                )
+            return self._enqueue_sqlite_chat_memory_rebuild(
+                conn,
+                state.group,
+                fingerprint,
+                graph_fingerprint,
+                actor_user_id=actor_user_id,
+                actor_tenant_id=actor_tenant_id,
+                target_session_id=state.event.target_session_id,
+                target_message_id=state.event.target_message_id,
+            )
+
+        return await self._write(write)
+
+    async def fail_chat_memory_purge_before_side_effect(
+        self,
+        event_id: str,
+        claim_token: str,
+        runtime_fingerprint: str,
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+        error_code: str,
+        error_message: str,
+        retry_delay_seconds: float | None = 5.0,
+        max_attempts: int = 3,
+    ) -> ChatMemoryOutboxEventRecord:
+        """Retry or dead-letter a purge failure known to precede any clear."""
+
+        fingerprint = _validate_chat_memory_fingerprint(runtime_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, runtime_graph_store_fingerprint
+        )
+        max_attempts = max(1, int(max_attempts))
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryOutboxEventRecord:
+            state = self._require_sqlite_chat_memory_running_claim(
+                conn, event_id, claim_token
+            )
+            stale = self._resolve_sqlite_stale_chat_memory_execution(
+                conn, state, claim_token
+            )
+            if stale is not None:
+                return stale
+            if state.event.event_type != "purge":
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"event_type": "purge"},
+                    current={"event_type": state.event.event_type},
+                )
+            if not self._chat_memory_runtime_identity_matches(
+                state.event, fingerprint, graph_fingerprint
+            ):
+                return self._retry_sqlite_chat_memory_runtime_mismatch(
+                    conn,
+                    state,
+                    claim_token,
+                    fingerprint,
+                    graph_fingerprint,
+                    retry_delay_seconds=float(retry_delay_seconds or 5.0),
+                )
+            if state.event.side_effect_started_at is not None:
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"side_effect_started_at": None},
+                    current={
+                        "side_effect_started_at": state.event.side_effect_started_at
+                    },
+                )
+            now_dt = datetime.now(timezone.utc)
+            now = now_dt.isoformat()
+            dead_letter = (
+                retry_delay_seconds is None
+                or state.event.attempt_no >= max_attempts
+            )
+            status: ChatMemoryEventStatus = (
+                "dead_letter" if dead_letter else "retry_wait"
+            )
+            available = (
+                now
+                if dead_letter
+                else (
+                    now_dt
+                    + timedelta(seconds=max(0.0, float(retry_delay_seconds or 0)))
+                ).isoformat()
+            )
+            conn.execute(
+                """
+                UPDATE enterprise_chat_memory_outbox
+                SET status = ?, available_at = ?, claim_token = NULL,
+                    claimed_by = NULL, claimed_at = NULL,
+                    side_effect_started_at = NULL,
+                    side_effect_state_version = NULL,
+                    completed_at = CASE WHEN ? = 'dead_letter' THEN ? ELSE NULL END,
+                    last_error_code = ?, last_error_message = ?,
+                    last_error_at = ?, updated_at = ?
+                WHERE event_id = ? AND status = 'running' AND claim_token = ?
+                """,
+                (
+                    status,
+                    available,
+                    status,
+                    now,
+                    error_code,
+                    error_message,
+                    now,
+                    now,
+                    event_id,
+                    claim_token,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE enterprise_chat_memory_groups
+                SET last_error_code = ?, last_error_message = ?,
+                    last_error_at = ?, updated_at = ?
+                WHERE user_id = ? AND project_id = ? AND state = 'deleting'
+                """,
+                (
+                    error_code,
+                    error_message,
+                    now,
+                    now,
+                    state.event.user_id,
+                    state.event.project_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_chat_memory_outbox WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            assert row is not None
+            return ChatMemoryOutboxEventRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def retry_chat_memory_purge_after_unknown_clear(
+        self,
+        event_id: str,
+        claim_token: str,
+        runtime_fingerprint: str,
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+        retry_delay_seconds: float = 5.0,
+        error_code: str = "purge_clear_outcome_unknown",
+        error_message: str = "Purge clear outcome is unknown; final sweep required",
+    ) -> ChatMemoryOutboxEventRecord:
+        """Schedule a same-generation purge final sweep after an unknown clear."""
+
+        fingerprint = _validate_chat_memory_fingerprint(runtime_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, runtime_graph_store_fingerprint
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryOutboxEventRecord:
+            state = self._require_sqlite_chat_memory_running_claim(
+                conn, event_id, claim_token
+            )
+            stale = self._resolve_sqlite_stale_chat_memory_execution(
+                conn, state, claim_token
+            )
+            if stale is not None:
+                return stale
+            event = state.event
+            if event.event_type != "purge":
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"event_type": "purge"},
+                    current={"event_type": event.event_type},
+                )
+            if not self._chat_memory_runtime_identity_matches(
+                event, fingerprint, graph_fingerprint
+            ):
+                raise MetadataConflictError(
+                    "chat_memory_runtime_fingerprint",
+                    event_id,
+                    expected={
+                        "runtime_graph_store_fingerprint": (
+                            event.graph_store_fingerprint
+                        )
+                    },
+                    current={
+                        "runtime_graph_store_fingerprint": graph_fingerprint
+                    },
+                )
+            if event.side_effect_started_at is None:
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"side_effect_started_at": "set"},
+                    current={"side_effect_started_at": None},
+                )
+            now_dt = datetime.now(timezone.utc)
+            now = now_dt.isoformat()
+            available = (
+                now_dt + timedelta(seconds=max(0.0, float(retry_delay_seconds)))
+            ).isoformat()
+            conn.execute(
+                """
+                UPDATE enterprise_chat_memory_generations
+                SET state = 'purge_pending', cleared_at = NULL, updated_at = ?,
+                    last_error_code = ?, last_error_message = ?,
+                    last_error_at = ?
+                WHERE user_id = ? AND project_id = ? AND generation = ?
+                """,
+                (
+                    now,
+                    error_code,
+                    error_message,
+                    now,
+                    event.user_id,
+                    event.project_id,
+                    event.generation,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE enterprise_chat_memory_outbox
+                SET status = 'retry_wait', available_at = ?,
+                    claim_token = NULL, claimed_by = NULL, claimed_at = NULL,
+                    side_effect_started_at = NULL,
+                    side_effect_state_version = NULL, completed_at = NULL,
+                    last_error_code = ?, last_error_message = ?,
+                    last_error_at = ?, updated_at = ?
+                WHERE event_id = ? AND status = 'running' AND claim_token = ?
+                """,
+                (
+                    available,
+                    error_code,
+                    error_message,
+                    now,
+                    now,
+                    event_id,
+                    claim_token,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE enterprise_chat_memory_groups
+                SET last_error_code = ?, last_error_message = ?,
+                    last_error_at = ?, updated_at = ?
+                WHERE user_id = ? AND project_id = ? AND state = 'deleting'
+                """,
+                (
+                    error_code,
+                    error_message,
+                    now,
+                    now,
+                    event.user_id,
+                    event.project_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_chat_memory_outbox WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            assert row is not None
+            return ChatMemoryOutboxEventRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def requeue_chat_memory_purge(
+        self,
+        event_id: str,
+        runtime_fingerprint: str,
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+        retry_delay_seconds: float = 5.0,
+    ) -> ChatMemoryOutboxEventRecord:
+        """Explicitly requeue the same dead-letter purge without generation churn."""
+
+        fingerprint = _validate_chat_memory_fingerprint(runtime_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, runtime_graph_store_fingerprint
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryOutboxEventRecord:
+            state = self._get_sqlite_chat_memory_execution_state(conn, event_id)
+            if state is None:
+                raise MetadataRecordNotFoundError(
+                    f"Chat Memory event '{event_id}' not found"
+                )
+            event = state.event
+            if (
+                event.event_type != "purge"
+                or event.status != "dead_letter"
+                or state.group.state != "deleting"
+                or state.generation.state != "purge_pending"
+                or state.group.desired_generation != event.generation
+                or state.group.desired_graph_store_fingerprint != graph_fingerprint
+                or state.generation.graph_store_fingerprint != graph_fingerprint
+                or event.graph_store_fingerprint != graph_fingerprint
+            ):
+                raise MetadataConflictError(
+                    "chat_memory_purge_requeue",
+                    event_id,
+                    expected={
+                        "event_type": "purge",
+                        "status": "dead_letter",
+                        "group_state": "deleting",
+                        "generation_state": "purge_pending",
+                        "runtime_graph_store_fingerprint": graph_fingerprint,
+                    },
+                    current={
+                        "event_type": event.event_type,
+                        "status": event.status,
+                        "group_state": state.group.state,
+                        "generation_state": state.generation.state,
+                        "event_graph_store_fingerprint": (
+                            event.graph_store_fingerprint
+                        ),
+                    },
+                )
+            now_dt = datetime.now(timezone.utc)
+            now = now_dt.isoformat()
+            available = (
+                now_dt + timedelta(seconds=max(0.0, float(retry_delay_seconds)))
+            ).isoformat()
+            conn.execute(
+                """
+                UPDATE enterprise_chat_memory_outbox
+                SET status = 'retry_wait', available_at = ?,
+                    claim_token = NULL, claimed_by = NULL, claimed_at = NULL,
+                    side_effect_started_at = NULL,
+                    side_effect_state_version = NULL, completed_at = NULL,
+                    last_error_code = NULL, last_error_message = NULL,
+                    last_error_at = NULL, updated_at = ?
+                WHERE event_id = ? AND status = 'dead_letter'
+                """,
+                (available, now, event_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_chat_memory_outbox WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            assert row is not None
+            return ChatMemoryOutboxEventRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def escalate_chat_memory_event_unknown(
+        self,
+        event_id: str,
+        claim_token: str,
+        runtime_fingerprint: str,
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+        error_code: str = "side_effect_outcome_unknown",
+        error_message: str = "Graph side-effect outcome is unknown",
+        actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
+    ) -> ChatMemoryOutboxEventRecord:
+        """Fence an uncertain generation and enqueue a fresh rebuild atomically."""
+
+        fingerprint = _validate_chat_memory_fingerprint(runtime_fingerprint)
+        graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            fingerprint, runtime_graph_store_fingerprint
+        )
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> ChatMemoryOutboxEventRecord:
+            state = self._require_sqlite_chat_memory_running_claim(
+                conn, event_id, claim_token
+            )
+            stale = self._resolve_sqlite_stale_chat_memory_execution(
+                conn, state, claim_token
+            )
+            if stale is not None:
+                return stale
+            event = state.event
+            if event.side_effect_started_at is None:
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"side_effect_started_at": "set"},
+                    current={"side_effect_started_at": None},
+                )
+            if event.event_type == "purge":
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"event_type": "ingest/rebuild"},
+                    current={"event_type": event.event_type},
+                )
+            self._validate_chat_memory_execution_fence(
+                state, fingerprint, graph_fingerprint
+            )
+            now = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE enterprise_chat_memory_generations
+                SET state = 'abandoned', updated_at = ?,
+                    last_error_code = ?, last_error_message = ?,
+                    last_error_at = ?
+                WHERE user_id = ? AND project_id = ? AND generation = ?
+                """,
+                (
+                    now,
+                    error_code,
+                    error_message,
+                    now,
+                    event.user_id,
+                    event.project_id,
+                    event.generation,
+                ),
+            )
+            if state.group.active_generation == event.generation:
+                conn.execute(
+                    """
+                    UPDATE enterprise_chat_memory_groups
+                    SET active_generation = NULL,
+                        active_config_fingerprint = NULL
+                        , active_graph_store_fingerprint = NULL
+                    WHERE user_id = ? AND project_id = ?
+                    """,
+                    (event.user_id, event.project_id),
+                )
+            rebuild = self._enqueue_sqlite_chat_memory_rebuild(
+                conn,
+                state.group,
+                fingerprint,
+                graph_fingerprint,
+                actor_user_id=actor_user_id,
+                actor_tenant_id=actor_tenant_id,
+                target_session_id=event.target_session_id,
+                target_message_id=event.target_message_id,
+            )
+            cursor = conn.execute(
+                """
+                UPDATE enterprise_chat_memory_outbox
+                SET status = 'superseded', superseded_by_event_id = ?,
+                    completed_at = ?, last_error_code = ?,
+                    last_error_message = ?, last_error_at = ?, updated_at = ?
+                WHERE event_id = ? AND status = 'running' AND claim_token = ?
+                """,
+                (
+                    rebuild.event_id,
+                    now,
+                    error_code,
+                    error_message,
+                    now,
+                    now,
+                    event_id,
+                    claim_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise MetadataConflictError(
+                    "chat_memory_event",
+                    event_id,
+                    expected={"status": "running", "claim_token": claim_token},
+                    current={"status": event.status, "claim_token": event.claim_token},
+                )
+            return rebuild
+
+        return await self._write(write)
+
+    async def list_stale_chat_memory_running_events(
+        self, *, stale_after_seconds: float, limit: int = 100
+    ) -> list[ChatMemoryOutboxEventRecord]:
+        await self._ensure_initialized()
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=max(0.0, float(stale_after_seconds)))
+        ).isoformat()
+        limit = max(1, min(int(limit), 1000))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM enterprise_chat_memory_outbox
+                WHERE status = 'running' AND claimed_at IS NOT NULL
+                  AND claimed_at <= ?
+                ORDER BY claimed_at, user_id, project_id, event_seq
+                LIMIT ?
+                """,
+                (cutoff, limit),
+            ).fetchall()
+        return [ChatMemoryOutboxEventRecord.from_row(row) for row in rows]
+
+    async def recover_stale_chat_memory_event(
+        self,
+        event_id: str,
+        claim_token: str,
+        runtime_fingerprint: str,
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+        retry_delay_seconds: float = 1.0,
+        max_attempts: int = 3,
+        error_code: str = "stale_worker_claim",
+        error_message: str = "Worker ownership ended before finalization",
+    ) -> ChatMemoryOutboxEventRecord | None:
+        """Try group ownership once; return None without mutation if unavailable."""
+
+        event = await self.get_chat_memory_event(event_id)
+        if event is None:
+            raise MetadataRecordNotFoundError(
+                f"Chat Memory event '{event_id}' not found"
+            )
+        logical_group_id = chat_memory_logical_group_id(
+            event.user_id, event.project_id
+        )
+        async with self.chat_memory_group_execution_guard(
+            logical_group_id, wait=False
+        ) as acquired:
+            if not acquired:
+                return None
+            event = await self.get_chat_memory_event(event_id)
+            if event is None:
+                raise MetadataRecordNotFoundError(
+                    f"Chat Memory event '{event_id}' not found"
+                )
+            if event.event_type == "purge":
+                if event.side_effect_started_at is None:
+                    return await self.fail_chat_memory_purge_before_side_effect(
+                        event_id,
+                        claim_token,
+                        runtime_fingerprint,
+                        runtime_graph_store_fingerprint=(
+                            runtime_graph_store_fingerprint
+                        ),
+                        error_code=error_code,
+                        error_message=error_message,
+                        retry_delay_seconds=retry_delay_seconds,
+                        max_attempts=max_attempts,
+                    )
+                return await self.retry_chat_memory_purge_after_unknown_clear(
+                    event_id,
+                    claim_token,
+                    runtime_fingerprint,
+                    runtime_graph_store_fingerprint=(
+                        runtime_graph_store_fingerprint
+                    ),
+                    retry_delay_seconds=retry_delay_seconds,
+                    error_code=error_code,
+                    error_message=error_message,
+                )
+            if event.side_effect_started_at is None:
+                return await self.fail_chat_memory_event_before_side_effect(
+                    event_id,
+                    claim_token,
+                    runtime_fingerprint,
+                    runtime_graph_store_fingerprint=(
+                        runtime_graph_store_fingerprint
+                    ),
+                    error_code=error_code,
+                    error_message=error_message,
+                    retry_delay_seconds=retry_delay_seconds,
+                    max_attempts=max_attempts,
+                )
+            return await self.escalate_chat_memory_event_unknown(
+                event_id,
+                claim_token,
+                runtime_fingerprint,
+                runtime_graph_store_fingerprint=runtime_graph_store_fingerprint,
+                error_code=error_code,
+                error_message=error_message,
+            )
+
+    async def get_chat_memory_outbox_stats(self) -> ChatMemoryOutboxStats:
+        await self._ensure_initialized()
+        now = datetime.now(timezone.utc)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                    SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
+                    SUM(CASE WHEN status = 'retry_wait' THEN 1 ELSE 0 END) AS retry_wait,
+                    SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END) AS dead_letter,
+                    MIN(CASE WHEN status IN (
+                        'pending', 'running', 'retry_wait', 'dead_letter'
+                    ) THEN available_at END) AS oldest_available_at
+                FROM enterprise_chat_memory_outbox
+                """
+            ).fetchone()
+        oldest = row["oldest_available_at"] if row is not None else None
+        lag = 0.0
+        if oldest:
+            oldest_dt = datetime.fromisoformat(str(oldest))
+            if oldest_dt.tzinfo is None:
+                oldest_dt = oldest_dt.replace(tzinfo=timezone.utc)
+            lag = max(0.0, (now - oldest_dt).total_seconds())
+        return ChatMemoryOutboxStats(
+            pending=int(row["pending"] or 0) if row is not None else 0,
+            running=int(row["running"] or 0) if row is not None else 0,
+            retry_wait=int(row["retry_wait"] or 0) if row is not None else 0,
+            dead_letter=int(row["dead_letter"] or 0) if row is not None else 0,
+            oldest_available_at=str(oldest) if oldest else None,
+            oldest_lag_seconds=lag,
+        )
+
+    def _get_sqlite_chat_memory_execution_state(
+        self, conn: sqlite3.Connection, event_id: str
+    ) -> ChatMemoryExecutionState | None:
+        event_row = conn.execute(
+            "SELECT * FROM enterprise_chat_memory_outbox WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if event_row is None:
+            return None
+        event = ChatMemoryOutboxEventRecord.from_row(event_row)
+        group = self._get_sqlite_chat_memory_group(
+            conn, event.user_id, event.project_id
+        )
+        generation_row = conn.execute(
+            """
+            SELECT * FROM enterprise_chat_memory_generations
+            WHERE user_id = ? AND project_id = ? AND generation = ?
+            """,
+            (event.user_id, event.project_id, event.generation),
+        ).fetchone()
+        if group is None or generation_row is None:
+            raise MetadataStoreError(
+                f"Chat Memory execution inventory missing for event '{event_id}'"
+            )
+        return ChatMemoryExecutionState(
+            group=group,
+            event=event,
+            generation=ChatMemoryGenerationRecord.from_row(generation_row),
+        )
+
+    def _require_sqlite_chat_memory_running_claim(
+        self, conn: sqlite3.Connection, event_id: str, claim_token: str
+    ) -> ChatMemoryExecutionState:
+        state = self._get_sqlite_chat_memory_execution_state(conn, event_id)
+        if state is None:
+            raise MetadataRecordNotFoundError(
+                f"Chat Memory event '{event_id}' not found"
+            )
+        if state.event.status != "running" or state.event.claim_token != claim_token:
+            raise MetadataConflictError(
+                "chat_memory_event",
+                event_id,
+                expected={"status": "running", "claim_token": claim_token},
+                current={
+                    "status": state.event.status,
+                    "claim_token": state.event.claim_token,
+                },
+            )
+        return state
+
+    def _chat_memory_stale_execution_reason(
+        self, state: ChatMemoryExecutionState
+    ) -> str | None:
+        event = state.event
+        group = state.group
+        generation = state.generation
+        if group.desired_generation != event.generation:
+            return "desired_generation_advanced"
+        if generation.graph_group_id != event.graph_group_id:
+            return "physical_generation_changed"
+        if event.graph_store_fingerprint != group.desired_graph_store_fingerprint:
+            return "desired_graph_store_fingerprint_changed"
+        if event.graph_store_fingerprint != generation.graph_store_fingerprint:
+            return "generation_graph_store_fingerprint_changed"
+        if (
+            event.event_type != "purge"
+            and event.config_fingerprint != group.desired_config_fingerprint
+        ):
+            return "desired_fingerprint_changed"
+        if (
+            event.event_type != "purge"
+            and event.config_fingerprint != generation.config_fingerprint
+        ):
+            return "generation_fingerprint_changed"
+        allowed = {
+            "ingest": (
+                {"active", "rebuilding"},
+                {"active", "building"},
+            ),
+            "rebuild": ({"rebuilding"}, {"building"}),
+            "purge": ({"deleting"}, {"purge_pending"}),
+        }
+        group_states, generation_states = allowed[event.event_type]
+        if group.state not in group_states:
+            return f"group_state_{group.state}"
+        if generation.state not in generation_states:
+            return f"generation_state_{generation.state}"
+        if event.side_effect_started_at is not None and (
+            event.side_effect_state_version is None
+            or event.side_effect_state_version != group.state_version
+        ):
+            return "side_effect_state_version_changed"
+        return None
+
+    @staticmethod
+    def _chat_memory_runtime_identity_matches(
+        event: ChatMemoryOutboxEventRecord,
+        runtime_fingerprint: str,
+        runtime_graph_store_fingerprint: str,
+    ) -> bool:
+        return (
+            event.graph_store_fingerprint == runtime_graph_store_fingerprint
+            and (
+                event.event_type == "purge"
+                or event.config_fingerprint == runtime_fingerprint
+            )
+        )
+
+    def _resolve_sqlite_stale_chat_memory_execution(
+        self,
+        conn: sqlite3.Connection,
+        state: ChatMemoryExecutionState,
+        claim_token: str,
+    ) -> ChatMemoryOutboxEventRecord | None:
+        reason = self._chat_memory_stale_execution_reason(state)
+        if reason is None:
+            return None
+        takeover = conn.execute(
+            """
+            SELECT event_id FROM enterprise_chat_memory_outbox
+            WHERE user_id = ? AND project_id = ? AND event_seq > ?
+              AND event_type IN ('rebuild', 'purge')
+              AND status <> 'superseded'
+            ORDER BY event_seq ASC LIMIT 1
+            """,
+            (state.event.user_id, state.event.project_id, state.event.event_seq),
+        ).fetchone()
+        superseded_by = takeover["event_id"] if takeover is not None else None
+        now = utc_now_iso()
+        cursor = conn.execute(
+            """
+            UPDATE enterprise_chat_memory_outbox
+            SET status = 'superseded', superseded_by_event_id = ?,
+                completed_at = ?, last_error_code = 'stale_execution_fence',
+                last_error_message = ?, last_error_at = ?, updated_at = ?
+            WHERE event_id = ? AND status = 'running' AND claim_token = ?
+            """,
+            (
+                superseded_by,
+                now,
+                reason,
+                now,
+                now,
+                state.event.event_id,
+                claim_token,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise MetadataConflictError(
+                "chat_memory_event",
+                state.event.event_id,
+                expected={"status": "running", "claim_token": claim_token},
+                current={
+                    "status": state.event.status,
+                    "claim_token": state.event.claim_token,
+                },
+            )
+        row = conn.execute(
+            "SELECT * FROM enterprise_chat_memory_outbox WHERE event_id = ?",
+            (state.event.event_id,),
+        ).fetchone()
+        assert row is not None
+        return ChatMemoryOutboxEventRecord.from_row(row)
+
+    def _retry_sqlite_chat_memory_runtime_mismatch(
+        self,
+        conn: sqlite3.Connection,
+        state: ChatMemoryExecutionState,
+        claim_token: str,
+        runtime_fingerprint: str,
+        runtime_graph_store_fingerprint: str,
+        *,
+        retry_delay_seconds: float,
+    ) -> ChatMemoryOutboxEventRecord:
+        if state.event.side_effect_started_at is not None:
+            raise MetadataConflictError(
+                "chat_memory_runtime_fingerprint",
+                state.event.event_id,
+                expected={
+                    "runtime_fingerprint": state.event.config_fingerprint,
+                    "runtime_graph_store_fingerprint": (
+                        state.event.graph_store_fingerprint
+                    ),
+                },
+                current={
+                    "runtime_fingerprint": runtime_fingerprint,
+                    "runtime_graph_store_fingerprint": (
+                        runtime_graph_store_fingerprint
+                    ),
+                },
+            )
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        available = (
+            now_dt + timedelta(seconds=max(0.0, float(retry_delay_seconds)))
+        ).isoformat()
+        conn.execute(
+            """
+            UPDATE enterprise_chat_memory_outbox
+            SET status = 'retry_wait', available_at = ?, claim_token = NULL,
+                claimed_by = NULL, claimed_at = NULL,
+                side_effect_started_at = NULL,
+                side_effect_state_version = NULL,
+                last_error_code = 'runtime_fingerprint_mismatch',
+                last_error_message = ?, last_error_at = ?, updated_at = ?
+            WHERE event_id = ? AND status = 'running' AND claim_token = ?
+            """,
+            (
+                available,
+                (
+                    "expected runtime identity "
+                    f"({state.event.config_fingerprint}, "
+                    f"{state.event.graph_store_fingerprint}), got "
+                    f"({runtime_fingerprint}, {runtime_graph_store_fingerprint})"
+                ),
+                now,
+                now,
+                state.event.event_id,
+                claim_token,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM enterprise_chat_memory_outbox WHERE event_id = ?",
+            (state.event.event_id,),
+        ).fetchone()
+        assert row is not None
+        return ChatMemoryOutboxEventRecord.from_row(row)
+
+    def _validate_chat_memory_execution_fence(
+        self,
+        state: ChatMemoryExecutionState,
+        runtime_fingerprint: str,
+        runtime_graph_store_fingerprint: str,
+    ) -> None:
+        event = state.event
+        group = state.group
+        generation = state.generation
+        expected = {
+            "desired_generation": event.generation,
+            "event_fingerprint": runtime_fingerprint,
+            "generation_fingerprint": runtime_fingerprint,
+            "desired_fingerprint": runtime_fingerprint,
+            "event_graph_store_fingerprint": runtime_graph_store_fingerprint,
+            "generation_graph_store_fingerprint": (
+                runtime_graph_store_fingerprint
+            ),
+            "desired_graph_store_fingerprint": runtime_graph_store_fingerprint,
+            "graph_group_id": event.graph_group_id,
+        }
+        current = {
+            "desired_generation": group.desired_generation,
+            "event_fingerprint": event.config_fingerprint,
+            "generation_fingerprint": generation.config_fingerprint,
+            "desired_fingerprint": group.desired_config_fingerprint,
+            "event_graph_store_fingerprint": event.graph_store_fingerprint,
+            "generation_graph_store_fingerprint": (
+                generation.graph_store_fingerprint
+            ),
+            "desired_graph_store_fingerprint": (
+                group.desired_graph_store_fingerprint
+            ),
+            "graph_group_id": generation.graph_group_id,
+        }
+        extraction_fingerprints_match = (
+            event.event_type == "purge"
+            or (
+                event.config_fingerprint == runtime_fingerprint
+                and generation.config_fingerprint == runtime_fingerprint
+                and group.desired_config_fingerprint == runtime_fingerprint
+            )
+        )
+        if (
+            group.desired_generation != event.generation
+            or not extraction_fingerprints_match
+            or event.graph_store_fingerprint != runtime_graph_store_fingerprint
+            or generation.graph_store_fingerprint
+            != runtime_graph_store_fingerprint
+            or group.desired_graph_store_fingerprint
+            != runtime_graph_store_fingerprint
+            or generation.graph_group_id != event.graph_group_id
+        ):
+            raise MetadataConflictError(
+                "chat_memory_execution_fence",
+                event.event_id,
+                expected=expected,
+                current=current,
+            )
+
+    def _validate_chat_memory_ingest_execution(
+        self,
+        state: ChatMemoryExecutionState,
+        runtime_fingerprint: str,
+        runtime_graph_store_fingerprint: str,
+    ) -> None:
+        self._validate_chat_memory_execution_fence(
+            state, runtime_fingerprint, runtime_graph_store_fingerprint
+        )
+        if state.event.event_type != "ingest":
+            raise MetadataConflictError(
+                "chat_memory_event",
+                state.event.event_id,
+                expected={"event_type": "ingest"},
+                current={"event_type": state.event.event_type},
+            )
+        if state.group.state in {"deleting", "deleted", "failed"}:
+            raise MetadataConflictError(
+                "chat_memory_group",
+                state.group.logical_group_id,
+                expected={"state": "active/rebuilding"},
+                current={"state": state.group.state},
+            )
+        if state.generation.state not in {"building", "active"}:
+            raise MetadataConflictError(
+                "chat_memory_generation",
+                state.generation.graph_group_id,
+                expected={"state": "building/active"},
+                current={"state": state.generation.state},
+            )
+
+    def _insert_sqlite_chat_memory_historical_mapping(
+        self, conn: sqlite3.Connection, expected: ChatMemoryEpisodeRecord
+    ) -> None:
+        def same_payload(row: sqlite3.Row) -> bool:
+            current = ChatMemoryEpisodeRecord.from_row(row)
+            return all(
+                getattr(current, field) == getattr(expected, field)
+                for field in (
+                    "episode_uuid",
+                    "session_id",
+                    "project_id",
+                    "user_id",
+                    "first_seq",
+                    "last_seq",
+                    "event_id",
+                    "generation",
+                    "graph_group_id",
+                    "append_batch_id",
+                    "project_event_seq",
+                )
+            )
+
+        by_uuid = conn.execute(
+            """
+            SELECT * FROM enterprise_chat_memory_episodes
+            WHERE episode_uuid = ?
+            """,
+            (expected.episode_uuid,),
+        ).fetchone()
+        by_identity = conn.execute(
+            """
+            SELECT * FROM enterprise_chat_memory_episodes
+            WHERE user_id = ? AND project_id = ? AND generation = ?
+              AND append_batch_id = ?
+            """,
+            (
+                expected.user_id,
+                expected.project_id,
+                expected.generation,
+                expected.append_batch_id,
+            ),
+        ).fetchone()
+        for row in (by_uuid, by_identity):
+            if row is not None and not same_payload(row):
+                raise MetadataConflictError(
+                    "chat_memory_episode_mapping",
+                    expected.episode_uuid,
+                    expected=expected.to_dict(),
+                    current=ChatMemoryEpisodeRecord.from_row(row).to_dict(),
+                )
+        if by_uuid is not None or by_identity is not None:
+            return
+        conn.execute(
+            """
+            INSERT INTO enterprise_chat_memory_episodes (
+                episode_uuid, session_id, project_id, user_id, first_seq,
+                last_seq, created_at, event_id, generation, graph_group_id,
+                append_batch_id, project_event_seq
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                expected.episode_uuid,
+                expected.session_id,
+                expected.project_id,
+                expected.user_id,
+                expected.first_seq,
+                expected.last_seq,
+                expected.created_at,
+                expected.event_id,
+                expected.generation,
+                expected.graph_group_id,
+                expected.append_batch_id,
+                expected.project_event_seq,
+            ),
+        )
+
+    def _sqlite_chat_memory_graph_store_fingerprints(
+        self,
+        conn: sqlite3.Connection,
+        user_id: str,
+        project_id: str,
+    ) -> tuple[str, ...]:
+        """Return every non-empty graph-store identity attached to a group."""
+
+        rows = conn.execute(
+            """
+            SELECT graph_store_fingerprint FROM (
+                SELECT active_graph_store_fingerprint AS graph_store_fingerprint
+                FROM enterprise_chat_memory_groups
+                WHERE user_id = ? AND project_id = ?
+                UNION ALL
+                SELECT desired_graph_store_fingerprint
+                FROM enterprise_chat_memory_groups
+                WHERE user_id = ? AND project_id = ?
+                UNION ALL
+                SELECT graph_store_fingerprint
+                FROM enterprise_chat_memory_generations
+                WHERE user_id = ? AND project_id = ?
+                UNION ALL
+                SELECT graph_store_fingerprint
+                FROM enterprise_chat_memory_outbox
+                WHERE user_id = ? AND project_id = ?
+                UNION ALL
+                SELECT generation.graph_store_fingerprint
+                FROM enterprise_chat_memory_episodes AS mapping
+                JOIN enterprise_chat_memory_generations AS generation
+                  ON generation.user_id = mapping.user_id
+                 AND generation.project_id = mapping.project_id
+                 AND generation.generation = mapping.generation
+                WHERE mapping.user_id = ? AND mapping.project_id = ?
+                UNION ALL
+                SELECT event.graph_store_fingerprint
+                FROM enterprise_chat_memory_episodes AS mapping
+                JOIN enterprise_chat_memory_outbox AS event
+                  ON event.event_id = mapping.event_id
+                WHERE mapping.user_id = ? AND mapping.project_id = ?
+            )
+            WHERE graph_store_fingerprint IS NOT NULL
+              AND trim(graph_store_fingerprint) <> ''
+            """,
+            (
+                user_id,
+                project_id,
+                user_id,
+                project_id,
+                user_id,
+                project_id,
+                user_id,
+                project_id,
+                user_id,
+                project_id,
+                user_id,
+                project_id,
+            ),
+        ).fetchall()
+        return tuple(
+            sorted({str(row["graph_store_fingerprint"]) for row in rows})
+        )
+
+    def _assert_sqlite_chat_memory_graph_store_invariant(
+        self,
+        conn: sqlite3.Connection,
+        group: ChatMemoryGroupRecord,
+        required_graph_store_fingerprint: str,
+    ) -> None:
+        required = _validate_chat_memory_fingerprint(
+            required_graph_store_fingerprint
+        )
+        observed = self._sqlite_chat_memory_graph_store_fingerprints(
+            conn, group.user_id, group.project_id
+        )
+        if observed != (required,):
+            raise _chat_memory_graph_store_migration_conflict(
+                group.logical_group_id,
+                required,
+                observed,
+            )
+
+    def _get_sqlite_chat_memory_group(
+        self, conn: sqlite3.Connection, user_id: str, project_id: str
+    ) -> ChatMemoryGroupRecord | None:
+        row = conn.execute(
+            """
+            SELECT * FROM enterprise_chat_memory_groups
+            WHERE user_id = ? AND project_id = ?
+            """,
+            (user_id, project_id),
+        ).fetchone()
+        return ChatMemoryGroupRecord.from_row(row) if row is not None else None
+
+    def _ensure_sqlite_chat_memory_group(
+        self,
+        conn: sqlite3.Connection,
+        user_id: str,
+        project_id: str,
+        config_fingerprint: str,
+        graph_store_fingerprint: str,
+        *,
+        generation_state: ChatMemoryGenerationState,
+    ) -> tuple[ChatMemoryGroupRecord, bool]:
+        group = self._get_sqlite_chat_memory_group(conn, user_id, project_id)
+        if group is not None:
+            return group, False
+        now = utc_now_iso()
+        logical_group_id = chat_memory_logical_group_id(user_id, project_id)
+        conn.execute(
+            """
+            INSERT INTO enterprise_chat_memory_groups (
+                user_id, project_id, logical_group_id, active_generation,
+                desired_generation, next_event_seq, last_reference_time, state,
+                state_version, active_config_fingerprint,
+                desired_config_fingerprint, active_graph_store_fingerprint,
+                desired_graph_store_fingerprint, active_rebuild_event_id,
+                last_success_at, last_error_code, last_error_message,
+                last_error_at, created_at, updated_at, deleted_at, record_version
+            ) VALUES (?, ?, ?, NULL, 1, 1, NULL, ?, 1, NULL, ?, NULL, ?, NULL,
+                      NULL, NULL, NULL, NULL, ?, ?, NULL, ?)
+            """,
+            (
+                user_id,
+                project_id,
+                logical_group_id,
+                "deleting" if generation_state == "purge_pending" else "rebuilding",
+                config_fingerprint,
+                graph_store_fingerprint,
+                now,
+                now,
+                CHAT_MEMORY_RECORD_VERSION,
+            ),
+        )
+        self._insert_sqlite_chat_memory_generation(
+            conn,
+            user_id=user_id,
+            project_id=project_id,
+            generation=1,
+            config_fingerprint=config_fingerprint,
+            graph_store_fingerprint=graph_store_fingerprint,
+            state=generation_state,
+            now=now,
+        )
+        group = self._get_sqlite_chat_memory_group(conn, user_id, project_id)
+        assert group is not None
+        return group, True
+
+    def _insert_sqlite_chat_memory_generation(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        user_id: str,
+        project_id: str,
+        generation: int,
+        config_fingerprint: str,
+        graph_store_fingerprint: str,
+        state: ChatMemoryGenerationState,
+        now: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO enterprise_chat_memory_generations (
+                user_id, project_id, generation, graph_group_id,
+                config_fingerprint, graph_store_fingerprint, state, snapshot_cutoff,
+                replay_batch_count, replay_message_count, replay_byte_count,
+                snapshot_digest, clear_attempt_no, clear_started_at, created_at,
+                updated_at, activated_at, cleared_at, last_error_code,
+                last_error_message, last_error_at, record_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, NULL,
+                      ?, ?, NULL, NULL, NULL, NULL, NULL, ?)
+            """,
+            (
+                user_id,
+                project_id,
+                int(generation),
+                chat_memory_graph_group_id(user_id, project_id, generation),
+                config_fingerprint,
+                graph_store_fingerprint,
+                state,
+                now,
+                now,
+                CHAT_MEMORY_RECORD_VERSION,
+            ),
+        )
+
+    def _allocate_sqlite_chat_memory_event_seq(
+        self,
+        conn: sqlite3.Connection,
+        user_id: str,
+        project_id: str,
+        *,
+        allocate_reference_time: bool,
+    ) -> tuple[int, str | None]:
+        row = conn.execute(
+            """
+            SELECT next_event_seq, last_reference_time
+            FROM enterprise_chat_memory_groups
+            WHERE user_id = ? AND project_id = ?
+            """,
+            (user_id, project_id),
+        ).fetchone()
+        if row is None:
+            raise MetadataRecordNotFoundError("Chat Memory group not found")
+        event_seq = int(row["next_event_seq"])
+        reference_time = (
+            _next_sqlite_chat_memory_reference_time(row["last_reference_time"])
+            if allocate_reference_time
+            else None
+        )
+        now = utc_now_iso()
+        conn.execute(
+            """
+            UPDATE enterprise_chat_memory_groups
+            SET next_event_seq = ?,
+                last_reference_time = CASE WHEN ? IS NULL
+                    THEN last_reference_time ELSE ? END,
+                updated_at = ?
+            WHERE user_id = ? AND project_id = ?
+            """,
+            (
+                event_seq + 1,
+                reference_time,
+                reference_time,
+                now,
+                user_id,
+                project_id,
+            ),
+        )
+        return event_seq, reference_time
+
+    def _insert_sqlite_chat_memory_event(
+        self, conn: sqlite3.Connection, event: ChatMemoryOutboxEventRecord
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO enterprise_chat_memory_outbox (
+                event_id, deterministic_key, user_id, project_id, event_seq,
+                generation, graph_group_id, config_fingerprint,
+                graph_store_fingerprint, event_type,
+                status, available_at, attempt_no, source_session_id,
+                append_batch_id, first_seq, last_seq, snapshot_cutoff,
+                snapshot_batch_count, snapshot_message_count,
+                snapshot_byte_count, snapshot_digest, claim_token, claimed_by,
+                claimed_at, side_effect_started_at, side_effect_state_version, completed_at,
+                superseded_by_event_id, last_error_code, last_error_message,
+                last_error_at, actor_user_id, actor_tenant_id, target_user_id,
+                target_project_id, target_session_id, target_message_id,
+                created_at, updated_at, record_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.event_id,
+                event.deterministic_key,
+                event.user_id,
+                event.project_id,
+                event.event_seq,
+                event.generation,
+                event.graph_group_id,
+                event.config_fingerprint,
+                event.graph_store_fingerprint,
+                event.event_type,
+                event.status,
+                event.available_at,
+                event.attempt_no,
+                event.source_session_id,
+                event.append_batch_id,
+                event.first_seq,
+                event.last_seq,
+                event.snapshot_cutoff,
+                event.snapshot_batch_count,
+                event.snapshot_message_count,
+                event.snapshot_byte_count,
+                event.snapshot_digest,
+                event.claim_token,
+                event.claimed_by,
+                event.claimed_at,
+                event.side_effect_started_at,
+                event.side_effect_state_version,
+                event.completed_at,
+                event.superseded_by_event_id,
+                event.last_error_code,
+                event.last_error_message,
+                event.last_error_at,
+                event.actor_user_id,
+                event.actor_tenant_id,
+                event.target_user_id,
+                event.target_project_id,
+                event.target_session_id,
+                event.target_message_id,
+                event.created_at,
+                event.updated_at,
+                event.record_version,
+            ),
+        )
+
+    def _enqueue_sqlite_chat_memory_rebuild(
+        self,
+        conn: sqlite3.Connection,
+        group: ChatMemoryGroupRecord,
+        config_fingerprint: str,
+        graph_store_fingerprint: str | None = None,
+        *,
+        actor_user_id: str | None,
+        actor_tenant_id: str | None,
+        target_session_id: str | None,
+        target_message_id: str | None,
+    ) -> ChatMemoryOutboxEventRecord:
+        graph_store_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            config_fingerprint, graph_store_fingerprint
+        )
+        self._assert_sqlite_chat_memory_graph_store_invariant(
+            conn, group, graph_store_fingerprint
+        )
+        existing_generation = conn.execute(
+            """
+            SELECT 1 FROM enterprise_chat_memory_generations
+            WHERE user_id = ? AND project_id = ? AND generation = ?
+            """,
+            (group.user_id, group.project_id, group.desired_generation),
+        ).fetchone()
+        is_new_group = group.next_event_seq == 1 and existing_generation is not None
+        if is_new_group and group.active_generation is None:
+            generation = group.desired_generation
+        else:
+            generation = group.desired_generation + 1
+            now = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE enterprise_chat_memory_generations
+                SET state = 'abandoned', updated_at = ?,
+                    last_error_code = 'source_changed',
+                    last_error_message = 'Superseded by a newer source snapshot',
+                    last_error_at = ?
+                WHERE user_id = ? AND project_id = ? AND state = 'building'
+                """,
+                (now, now, group.user_id, group.project_id),
+            )
+            self._insert_sqlite_chat_memory_generation(
+                conn,
+                user_id=group.user_id,
+                project_id=group.project_id,
+                generation=generation,
+                config_fingerprint=config_fingerprint,
+                graph_store_fingerprint=graph_store_fingerprint,
+                state="building",
+                now=now,
+            )
+            conn.execute(
+                """
+                UPDATE enterprise_chat_memory_groups
+                SET desired_generation = ?, desired_config_fingerprint = ?,
+                    desired_graph_store_fingerprint = ?,
+                    state = 'rebuilding', state_version = state_version + 1,
+                    active_rebuild_event_id = NULL, last_error_code = NULL,
+                    last_error_message = NULL, last_error_at = NULL,
+                    updated_at = ?, deleted_at = NULL
+                WHERE user_id = ? AND project_id = ?
+                """,
+                (
+                    generation,
+                    config_fingerprint,
+                    graph_store_fingerprint,
+                    now,
+                    group.user_id,
+                    group.project_id,
+                ),
+            )
+
+        event_seq, _ = self._allocate_sqlite_chat_memory_event_seq(
+            conn,
+            group.user_id,
+            group.project_id,
+            allocate_reference_time=False,
+        )
+        event_id, deterministic_key = _chat_memory_event_identity(
+            event_type="rebuild",
+            user_id=group.user_id,
+            project_id=group.project_id,
+            event_seq=event_seq,
+            generation=generation,
+            target_session_id=target_session_id,
+            target_message_id=target_message_id,
+        )
+        now = utc_now_iso()
+        conn.execute(
+            """
+            UPDATE enterprise_chat_memory_outbox
+            SET status = 'superseded', superseded_by_event_id = ?,
+                completed_at = ?, updated_at = ?
+            WHERE user_id = ? AND project_id = ? AND event_seq < ?
+              AND event_type IN ('ingest', 'rebuild')
+              AND status IN ('pending', 'retry_wait', 'dead_letter')
+            """,
+            (
+                event_id,
+                now,
+                now,
+                group.user_id,
+                group.project_id,
+                event_seq,
+            ),
+        )
+        event = ChatMemoryOutboxEventRecord(
+            event_id=event_id,
+            deterministic_key=deterministic_key,
+            user_id=group.user_id,
+            project_id=group.project_id,
+            event_seq=event_seq,
+            generation=generation,
+            graph_group_id=chat_memory_graph_group_id(
+                group.user_id, group.project_id, generation
+            ),
+            config_fingerprint=config_fingerprint,
+            graph_store_fingerprint=graph_store_fingerprint,
+            event_type="rebuild",
+            status="pending",
+            available_at=now,
+            attempt_no=0,
+            created_at=now,
+            updated_at=now,
+            actor_user_id=actor_user_id,
+            actor_tenant_id=actor_tenant_id,
+            target_user_id=group.user_id,
+            target_project_id=group.project_id,
+            target_session_id=target_session_id,
+            target_message_id=target_message_id,
+        )
+        self._insert_sqlite_chat_memory_event(conn, event)
+        conn.execute(
+            """
+            UPDATE enterprise_chat_memory_groups
+            SET state = 'rebuilding', desired_config_fingerprint = ?,
+                desired_graph_store_fingerprint = ?,
+                active_rebuild_event_id = ?, updated_at = ?
+            WHERE user_id = ? AND project_id = ?
+            """,
+            (
+                config_fingerprint,
+                graph_store_fingerprint,
+                event_id,
+                now,
+                group.user_id,
+                group.project_id,
+            ),
+        )
+        return event
+
+    def _sqlite_chat_memory_purge_group_ids(
+        self,
+        conn: sqlite3.Connection,
+        user_id: str,
+        project_id: str,
+    ) -> tuple[str, ...]:
+        """Return the complete defensive graph-group universe for a purge."""
+
+        rows = conn.execute(
+            """
+            SELECT graph_group_id FROM (
+                SELECT graph_group_id
+                FROM enterprise_chat_memory_generations
+                WHERE user_id = ? AND project_id = ?
+                UNION
+                SELECT graph_group_id
+                FROM enterprise_chat_memory_episodes
+                WHERE user_id = ? AND project_id = ?
+                UNION
+                SELECT graph_group_id
+                FROM enterprise_chat_memory_outbox
+                WHERE user_id = ? AND project_id = ?
+            )
+            WHERE graph_group_id IS NOT NULL AND trim(graph_group_id) <> ''
+            ORDER BY graph_group_id ASC
+            """,
+            (
+                user_id,
+                project_id,
+                user_id,
+                project_id,
+                user_id,
+                project_id,
+            ),
+        ).fetchall()
+        return _normalize_chat_memory_group_ids(
+            [
+                *(str(row["graph_group_id"]) for row in rows),
+                chat_memory_legacy_graph_group_id(user_id, project_id),
+            ]
+        )
+
+    def _sqlite_chat_memory_rebuild_group_ids(
+        self,
+        conn: sqlite3.Connection,
+        event: ChatMemoryOutboxEventRecord,
+    ) -> tuple[str, ...]:
+        """Return every old, orphan, legacy, and target rebuild group id."""
+
+        return _normalize_chat_memory_group_ids(
+            [
+                *self._sqlite_chat_memory_purge_group_ids(
+                    conn, event.user_id, event.project_id
+                ),
+                event.graph_group_id,
+            ]
+        )
+
+    def _enqueue_sqlite_chat_memory_purge(
+        self,
+        conn: sqlite3.Connection,
+        user_id: str,
+        project_id: str,
+        config_fingerprint: str,
+        graph_store_fingerprint: str | None = None,
+        *,
+        actor_user_id: str | None,
+        actor_tenant_id: str | None,
+    ) -> ChatMemoryOutboxEventRecord | None:
+        graph_store_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
+            config_fingerprint, graph_store_fingerprint
+        )
+        group = self._get_sqlite_chat_memory_group(conn, user_id, project_id)
+        if group is not None and group.state == "deleted":
+            return None
+        existing = conn.execute(
+            """
+            SELECT * FROM enterprise_chat_memory_outbox
+            WHERE user_id = ? AND project_id = ? AND event_type = 'purge'
+              AND status IN ('pending', 'running', 'retry_wait')
+            ORDER BY event_seq DESC LIMIT 1
+            """,
+            (user_id, project_id),
+        ).fetchone()
+        if existing is not None:
+            return ChatMemoryOutboxEventRecord.from_row(existing)
+        if group is None:
+            group, _ = self._ensure_sqlite_chat_memory_group(
+                conn,
+                user_id,
+                project_id,
+                config_fingerprint,
+                graph_store_fingerprint,
+                generation_state="purge_pending",
+            )
+        else:
+            graph_store_fingerprint = (
+                _chat_memory_existing_graph_store_fingerprint(
+                    group, graph_store_fingerprint
+                )
+            )
+        generation_row = conn.execute(
+            """
+            SELECT graph_group_id FROM enterprise_chat_memory_generations
+            WHERE user_id = ? AND project_id = ? AND generation = ?
+            """,
+            (user_id, project_id, group.desired_generation),
+        ).fetchone()
+        if generation_row is None:
+            self._insert_sqlite_chat_memory_generation(
+                conn,
+                user_id=user_id,
+                project_id=project_id,
+                generation=group.desired_generation,
+                config_fingerprint=group.desired_config_fingerprint,
+                graph_store_fingerprint=(
+                    group.desired_graph_store_fingerprint
+                    or group.desired_config_fingerprint
+                ),
+                state="purge_pending",
+                now=utc_now_iso(),
+            )
+        now = utc_now_iso()
+        conn.execute(
+            """
+            UPDATE enterprise_chat_memory_generations
+            SET state = 'purge_pending', updated_at = ?, cleared_at = NULL
+            WHERE user_id = ? AND project_id = ? AND state <> 'purged'
+            """,
+            (now, user_id, project_id),
+        )
+        conn.execute(
+            """
+            UPDATE enterprise_chat_memory_groups
+            SET state = 'deleting', state_version = state_version + 1,
+                desired_config_fingerprint = ?, active_rebuild_event_id = NULL,
+                active_generation = NULL, active_config_fingerprint = NULL,
+                active_graph_store_fingerprint = NULL,
+                last_error_code = NULL, last_error_message = NULL,
+                last_error_at = NULL, updated_at = ?, deleted_at = NULL
+            WHERE user_id = ? AND project_id = ?
+            """,
+            (config_fingerprint, now, user_id, project_id),
+        )
+        event_seq, _ = self._allocate_sqlite_chat_memory_event_seq(
+            conn,
+            user_id,
+            project_id,
+            allocate_reference_time=False,
+        )
+        event_id, deterministic_key = _chat_memory_event_identity(
+            event_type="purge",
+            user_id=user_id,
+            project_id=project_id,
+            event_seq=event_seq,
+            generation=group.desired_generation,
+        )
+        conn.execute(
+            """
+            UPDATE enterprise_chat_memory_outbox
+            SET status = 'superseded', superseded_by_event_id = ?,
+                completed_at = ?, updated_at = ?
+            WHERE user_id = ? AND project_id = ? AND event_seq < ?
+              AND status IN ('pending', 'retry_wait', 'dead_letter')
+            """,
+            (event_id, now, now, user_id, project_id, event_seq),
+        )
+        event = ChatMemoryOutboxEventRecord(
+            event_id=event_id,
+            deterministic_key=deterministic_key,
+            user_id=user_id,
+            project_id=project_id,
+            event_seq=event_seq,
+            generation=group.desired_generation,
+            graph_group_id=chat_memory_graph_group_id(
+                user_id, project_id, group.desired_generation
+            ),
+            config_fingerprint=config_fingerprint,
+            graph_store_fingerprint=graph_store_fingerprint,
+            event_type="purge",
+            status="pending",
+            available_at=now,
+            attempt_no=0,
+            created_at=now,
+            updated_at=now,
+            actor_user_id=actor_user_id,
+            actor_tenant_id=actor_tenant_id,
+            target_user_id=user_id,
+            target_project_id=project_id,
+        )
+        self._insert_sqlite_chat_memory_event(conn, event)
+        return event
 
     async def set_enterprise_system_setting(
         self, key: str, value: str, *, updated_by: str | None = None
@@ -6460,8 +11959,18 @@ class SQLiteMetadataStore:
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 seq INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
+                append_batch_id TEXT,
+                project_event_seq INTEGER,
+                memory_reference_time TEXT,
                 FOREIGN KEY (session_id) REFERENCES enterprise_chat_sessions(id),
-                FOREIGN KEY (user_id) REFERENCES enterprise_users(id)
+                FOREIGN KEY (user_id) REFERENCES enterprise_users(id),
+                CHECK (
+                    (append_batch_id IS NULL AND project_event_seq IS NULL
+                     AND memory_reference_time IS NULL)
+                    OR
+                    (append_batch_id IS NOT NULL AND project_event_seq > 0
+                     AND memory_reference_time IS NOT NULL)
+                )
             );
 
             CREATE INDEX IF NOT EXISTS idx_enterprise_chat_messages_session
@@ -6480,7 +11989,29 @@ class SQLiteMetadataStore:
                 user_id TEXT NOT NULL,
                 first_seq INTEGER NOT NULL,
                 last_seq INTEGER NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                event_id TEXT,
+                generation INTEGER,
+                graph_group_id TEXT,
+                append_batch_id TEXT,
+                project_event_seq INTEGER,
+                CONSTRAINT enterprise_chat_memory_episode_generation_v2_check
+                    CHECK (generation IS NULL OR generation > 0),
+                CONSTRAINT enterprise_chat_memory_episode_identity_v2_check CHECK ((
+                    (event_id IS NULL AND generation IS NULL
+                     AND graph_group_id IS NULL AND append_batch_id IS NULL
+                     AND project_event_seq IS NULL)
+                    OR
+                    (event_id IS NOT NULL AND generation > 0
+                     AND graph_group_id IS NOT NULL
+                     AND append_batch_id IS NULL
+                     AND project_event_seq IS NULL)
+                    OR
+                    (event_id IS NOT NULL AND generation > 0
+                     AND graph_group_id IS NOT NULL
+                     AND append_batch_id IS NOT NULL
+                     AND project_event_seq > 0)
+                ) IS TRUE)
             );
 
             CREATE INDEX IF NOT EXISTS idx_enterprise_chat_memory_episodes_session
@@ -6491,6 +12022,206 @@ class SQLiteMetadataStore:
 
             CREATE INDEX IF NOT EXISTS idx_enterprise_chat_memory_episodes_user
                 ON enterprise_chat_memory_episodes (user_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_chat_memory_groups (
+                user_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                logical_group_id TEXT NOT NULL UNIQUE,
+                active_generation INTEGER,
+                desired_generation INTEGER NOT NULL,
+                next_event_seq INTEGER NOT NULL DEFAULT 1,
+                last_reference_time TEXT,
+                state TEXT NOT NULL CHECK (
+                    state IN ('active', 'rebuilding', 'deleting', 'failed', 'deleted')
+                ),
+                state_version INTEGER NOT NULL DEFAULT 1,
+                active_config_fingerprint TEXT,
+                desired_config_fingerprint TEXT NOT NULL,
+                active_graph_store_fingerprint TEXT,
+                desired_graph_store_fingerprint TEXT NOT NULL,
+                active_rebuild_event_id TEXT,
+                last_success_at TEXT,
+                last_error_code TEXT,
+                last_error_message TEXT,
+                last_error_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT,
+                record_version INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (user_id, project_id),
+                CHECK (desired_generation >= 1),
+                CHECK (next_event_seq >= 1),
+                CHECK (state_version >= 1),
+                CHECK (
+                    active_generation IS NULL OR (
+                        active_generation >= 1
+                        AND active_generation <= desired_generation
+                    )
+                ),
+                CONSTRAINT enterprise_chat_memory_group_active_identity_v4_check CHECK (
+                    (active_generation IS NULL
+                     AND active_config_fingerprint IS NULL
+                     AND active_graph_store_fingerprint IS NULL)
+                    OR
+                    (active_generation IS NOT NULL
+                     AND active_config_fingerprint IS NOT NULL
+                     AND active_graph_store_fingerprint IS NOT NULL)
+                ),
+                CONSTRAINT enterprise_chat_memory_group_desired_graph_v4_check CHECK (
+                    desired_graph_store_fingerprint <> ''
+                    AND desired_graph_store_fingerprint =
+                        trim(desired_graph_store_fingerprint)
+                    AND (
+                        active_graph_store_fingerprint IS NULL
+                        OR (
+                            active_graph_store_fingerprint <> ''
+                            AND active_graph_store_fingerprint =
+                                trim(active_graph_store_fingerprint)
+                        )
+                    )
+                ),
+                CHECK (state <> 'active' OR active_generation IS NOT NULL),
+                CHECK (record_version = 1)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_memory_groups_state
+                ON enterprise_chat_memory_groups (state, updated_at, project_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_chat_memory_generations (
+                user_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                graph_group_id TEXT NOT NULL UNIQUE,
+                config_fingerprint TEXT NOT NULL,
+                graph_store_fingerprint TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (
+                    state IN (
+                        'building', 'active', 'retired', 'abandoned',
+                        'purge_pending', 'purged'
+                    )
+                ),
+                snapshot_cutoff INTEGER,
+                replay_batch_count INTEGER,
+                replay_message_count INTEGER,
+                replay_byte_count INTEGER,
+                snapshot_digest TEXT,
+                clear_attempt_no INTEGER NOT NULL DEFAULT 0,
+                clear_started_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                activated_at TEXT,
+                cleared_at TEXT,
+                last_error_code TEXT,
+                last_error_message TEXT,
+                last_error_at TEXT,
+                record_version INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (user_id, project_id, generation),
+                CHECK (generation >= 1),
+                CHECK (snapshot_cutoff IS NULL OR snapshot_cutoff >= 0),
+                CHECK (replay_batch_count IS NULL OR replay_batch_count >= 0),
+                CHECK (replay_message_count IS NULL OR replay_message_count >= 0),
+                CHECK (replay_byte_count IS NULL OR replay_byte_count >= 0),
+                CHECK (clear_attempt_no >= 0),
+                CONSTRAINT enterprise_chat_memory_generation_graph_v4_check CHECK (
+                    graph_store_fingerprint <> ''
+                    AND graph_store_fingerprint = trim(graph_store_fingerprint)
+                ),
+                CHECK (record_version = 1)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_memory_generations_group
+                ON enterprise_chat_memory_generations (
+                    user_id, project_id, generation, state
+                );
+
+            CREATE TABLE IF NOT EXISTS enterprise_chat_memory_outbox (
+                event_id TEXT PRIMARY KEY,
+                deterministic_key TEXT NOT NULL UNIQUE,
+                user_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                event_seq INTEGER NOT NULL,
+                generation INTEGER NOT NULL,
+                graph_group_id TEXT NOT NULL,
+                config_fingerprint TEXT NOT NULL,
+                graph_store_fingerprint TEXT NOT NULL,
+                event_type TEXT NOT NULL CHECK (
+                    event_type IN ('ingest', 'rebuild', 'purge')
+                ),
+                status TEXT NOT NULL CHECK (
+                    status IN (
+                        'pending', 'running', 'retry_wait', 'succeeded',
+                        'superseded', 'dead_letter'
+                    )
+                ),
+                available_at TEXT NOT NULL,
+                attempt_no INTEGER NOT NULL DEFAULT 0,
+                source_session_id TEXT,
+                append_batch_id TEXT,
+                first_seq INTEGER,
+                last_seq INTEGER,
+                snapshot_cutoff INTEGER,
+                snapshot_batch_count INTEGER,
+                snapshot_message_count INTEGER,
+                snapshot_byte_count INTEGER,
+                snapshot_digest TEXT,
+                claim_token TEXT,
+                claimed_by TEXT,
+                claimed_at TEXT,
+                side_effect_started_at TEXT,
+                side_effect_state_version INTEGER,
+                completed_at TEXT,
+                superseded_by_event_id TEXT,
+                last_error_code TEXT,
+                last_error_message TEXT,
+                last_error_at TEXT,
+                actor_user_id TEXT,
+                actor_tenant_id TEXT,
+                target_user_id TEXT,
+                target_project_id TEXT,
+                target_session_id TEXT,
+                target_message_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                record_version INTEGER NOT NULL DEFAULT 1,
+                UNIQUE (user_id, project_id, event_seq),
+                CHECK (event_seq >= 1),
+                CHECK (generation >= 1),
+                CHECK (attempt_no >= 0),
+                CHECK (snapshot_cutoff IS NULL OR snapshot_cutoff >= 0),
+                CHECK (snapshot_batch_count IS NULL OR snapshot_batch_count >= 0),
+                CHECK (snapshot_message_count IS NULL OR snapshot_message_count >= 0),
+                CHECK (snapshot_byte_count IS NULL OR snapshot_byte_count >= 0),
+                CHECK (
+                    (first_seq IS NULL AND last_seq IS NULL)
+                    OR (first_seq >= 1 AND last_seq >= first_seq)
+                ),
+                CONSTRAINT enterprise_chat_memory_outbox_graph_v4_check CHECK (
+                    graph_store_fingerprint <> ''
+                    AND graph_store_fingerprint = trim(graph_store_fingerprint)
+                ),
+                CHECK (record_version = 1)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_memory_outbox_claim
+                ON enterprise_chat_memory_outbox (
+                    status, available_at, user_id, project_id, event_seq
+                );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_memory_outbox_head
+                ON enterprise_chat_memory_outbox (
+                    user_id, project_id, event_seq, status
+                )
+                WHERE status IN ('pending', 'running', 'retry_wait', 'dead_letter');
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_memory_outbox_generation
+                ON enterprise_chat_memory_outbox (
+                    user_id, project_id, generation, event_seq
+                );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_enterprise_chat_memory_rebuild_target
+                ON enterprise_chat_memory_outbox (user_id, project_id, generation)
+                WHERE event_type = 'rebuild'
+                  AND status IN ('pending', 'running', 'retry_wait', 'dead_letter');
 
             CREATE TABLE IF NOT EXISTS enterprise_api_keys (
                 id TEXT PRIMARY KEY,
@@ -6667,6 +12398,39 @@ class SQLiteMetadataStore:
             "enterprise_chat_sessions": {
                 "context_rounds": "INTEGER NOT NULL DEFAULT 1",
             },
+            "enterprise_chat_messages": {
+                "append_batch_id": "TEXT",
+                "project_event_seq": "INTEGER",
+                "memory_reference_time": "TEXT",
+            },
+            "enterprise_chat_memory_episodes": {
+                "event_id": "TEXT",
+                "generation": "INTEGER",
+                "graph_group_id": "TEXT",
+                "append_batch_id": "TEXT",
+                "project_event_seq": "INTEGER",
+            },
+            "enterprise_chat_memory_groups": {
+                "last_error_at": "TEXT",
+                "active_graph_store_fingerprint": "TEXT",
+                "desired_graph_store_fingerprint": "TEXT",
+            },
+            "enterprise_chat_memory_generations": {
+                "last_error_at": "TEXT",
+                "replay_byte_count": "INTEGER",
+                "snapshot_digest": "TEXT",
+                "graph_store_fingerprint": "TEXT",
+            },
+            "enterprise_chat_memory_outbox": {
+                "last_error_at": "TEXT",
+                "claimed_by": "TEXT",
+                "side_effect_state_version": "INTEGER",
+                "snapshot_batch_count": "INTEGER",
+                "snapshot_message_count": "INTEGER",
+                "snapshot_byte_count": "INTEGER",
+                "snapshot_digest": "TEXT",
+                "graph_store_fingerprint": "TEXT",
+            },
         }
         for table, columns in additions.items():
             existing = {
@@ -6676,6 +12440,59 @@ class SQLiteMetadataStore:
             for column, ddl in columns.items():
                 if column not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+        # Legacy rows used config_fingerprint for both extraction/runtime and
+        # physical graph-store identity. Preserve that recoverability while new
+        # production writes persist the two identities independently.
+        conn.execute(
+            """
+            UPDATE enterprise_chat_memory_groups
+            SET active_graph_store_fingerprint = active_config_fingerprint
+            WHERE active_graph_store_fingerprint IS NULL
+              AND active_config_fingerprint IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            UPDATE enterprise_chat_memory_groups
+            SET desired_graph_store_fingerprint = desired_config_fingerprint
+            WHERE desired_graph_store_fingerprint IS NULL
+            """
+        )
+        conn.execute(
+            """
+            UPDATE enterprise_chat_memory_generations
+            SET graph_store_fingerprint = config_fingerprint
+            WHERE graph_store_fingerprint IS NULL
+            """
+        )
+        conn.execute(
+            """
+            UPDATE enterprise_chat_memory_outbox
+            SET graph_store_fingerprint = config_fingerprint
+            WHERE graph_store_fingerprint IS NULL
+            """
+        )
+        incomplete_graph_identity = conn.execute(
+            """
+            SELECT 1
+            FROM enterprise_chat_memory_groups
+            WHERE desired_graph_store_fingerprint IS NULL
+               OR (active_generation IS NULL) <>
+                  (active_graph_store_fingerprint IS NULL)
+            UNION ALL
+            SELECT 1 FROM enterprise_chat_memory_generations
+            WHERE graph_store_fingerprint IS NULL
+            UNION ALL
+            SELECT 1 FROM enterprise_chat_memory_outbox
+            WHERE graph_store_fingerprint IS NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        if incomplete_graph_identity is not None:
+            raise RuntimeError(
+                "Chat Memory graph-store fingerprint migration incomplete"
+            )
 
         self._repair_enterprise_tenant_memberships(conn)
         conn.execute(
@@ -6688,6 +12505,199 @@ class SQLiteMetadataStore:
             """
             CREATE INDEX IF NOT EXISTS idx_enterprise_audit_events_actor_tenant
             ON enterprise_audit_events (actor_tenant_id, created_at DESC, id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_messages_memory_replay
+            ON enterprise_chat_messages (
+                user_id, project_id, project_event_seq, session_id, seq
+            )
+            WHERE project_event_seq IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            UPDATE enterprise_chat_memory_episodes AS episode
+            SET append_batch_id = (
+                    SELECT outbox.append_batch_id
+                    FROM enterprise_chat_memory_outbox AS outbox
+                    WHERE outbox.event_id = episode.event_id
+                ),
+                project_event_seq = (
+                    SELECT outbox.event_seq
+                    FROM enterprise_chat_memory_outbox AS outbox
+                    WHERE outbox.event_id = episode.event_id
+                )
+            WHERE episode.append_batch_id IS NULL
+              AND episode.project_event_seq IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM enterprise_chat_memory_outbox AS outbox
+                  WHERE outbox.event_id = episode.event_id
+                    AND outbox.append_batch_id IS NOT NULL
+              )
+            """
+        )
+        conn.execute(
+            """
+            UPDATE enterprise_chat_memory_episodes
+            SET event_id = NULL,
+                generation = NULL,
+                graph_group_id = NULL,
+                append_batch_id = NULL,
+                project_event_seq = NULL
+            WHERE (
+                (event_id IS NULL AND generation IS NULL
+                 AND graph_group_id IS NULL AND append_batch_id IS NULL
+                 AND project_event_seq IS NULL)
+                OR
+                (event_id IS NOT NULL AND generation > 0
+                 AND graph_group_id IS NOT NULL AND append_batch_id IS NULL
+                 AND project_event_seq IS NULL)
+                OR
+                (event_id IS NOT NULL AND generation > 0
+                 AND graph_group_id IS NOT NULL
+                 AND append_batch_id IS NOT NULL
+                 AND project_event_seq > 0)
+            ) IS NOT TRUE
+            """
+        )
+        conn.execute(
+            """
+            WITH ranked AS (
+                SELECT episode_uuid,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY user_id, project_id, generation,
+                                        append_batch_id
+                           ORDER BY created_at, episode_uuid
+                       ) AS duplicate_rank
+                FROM enterprise_chat_memory_episodes
+                WHERE generation IS NOT NULL AND append_batch_id IS NOT NULL
+            )
+            UPDATE enterprise_chat_memory_episodes
+            SET event_id = NULL,
+                generation = NULL,
+                graph_group_id = NULL,
+                append_batch_id = NULL,
+                project_event_seq = NULL
+            WHERE episode_uuid IN (
+                SELECT episode_uuid FROM ranked WHERE duplicate_rank > 1
+            )
+            """
+        )
+        self._migrate_chat_memory_episode_identity_schema(conn)
+        conn.execute("DROP INDEX IF EXISTS uq_enterprise_chat_memory_episodes_event")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_memory_episodes_session
+            ON enterprise_chat_memory_episodes (session_id, last_seq)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_memory_episodes_project
+            ON enterprise_chat_memory_episodes (project_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_memory_episodes_user
+            ON enterprise_chat_memory_episodes (user_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                uq_enterprise_chat_memory_episode_generation_batch
+            ON enterprise_chat_memory_episodes (
+                user_id, project_id, generation, append_batch_id
+            )
+            WHERE generation IS NOT NULL AND append_batch_id IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_enterprise_chat_memory_episodes_generation
+            ON enterprise_chat_memory_episodes (
+                user_id, project_id, generation, graph_group_id
+            )
+            """
+        )
+
+    def _migrate_chat_memory_episode_identity_schema(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        table_row = conn.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'table' AND name = 'enterprise_chat_memory_episodes'
+            """
+        ).fetchone()
+        if table_row is None:
+            return
+        table_sql = str(table_row["sql"] or "").lower()
+        if (
+            "enterprise_chat_memory_episode_identity_v2_check" in table_sql
+            and "is true" in table_sql
+        ):
+            return
+
+        conn.execute(
+            "DROP TABLE IF EXISTS enterprise_chat_memory_episodes_identity_migrated"
+        )
+        conn.execute(
+            """
+            CREATE TABLE enterprise_chat_memory_episodes_identity_migrated (
+                episode_uuid TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                first_seq INTEGER NOT NULL,
+                last_seq INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                event_id TEXT,
+                generation INTEGER,
+                graph_group_id TEXT,
+                append_batch_id TEXT,
+                project_event_seq INTEGER,
+                CONSTRAINT enterprise_chat_memory_episode_generation_v2_check
+                    CHECK (generation IS NULL OR generation > 0),
+                CONSTRAINT enterprise_chat_memory_episode_identity_v2_check CHECK ((
+                    (event_id IS NULL AND generation IS NULL
+                     AND graph_group_id IS NULL AND append_batch_id IS NULL
+                     AND project_event_seq IS NULL)
+                    OR
+                    (event_id IS NOT NULL AND generation > 0
+                     AND graph_group_id IS NOT NULL
+                     AND append_batch_id IS NULL
+                     AND project_event_seq IS NULL)
+                    OR
+                    (event_id IS NOT NULL AND generation > 0
+                     AND graph_group_id IS NOT NULL
+                     AND append_batch_id IS NOT NULL
+                     AND project_event_seq > 0)
+                ) IS TRUE)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO enterprise_chat_memory_episodes_identity_migrated (
+                episode_uuid, session_id, project_id, user_id, first_seq,
+                last_seq, created_at, event_id, generation, graph_group_id,
+                append_batch_id, project_event_seq
+            )
+            SELECT episode_uuid, session_id, project_id, user_id, first_seq,
+                   last_seq, created_at, event_id, generation, graph_group_id,
+                   append_batch_id, project_event_seq
+            FROM enterprise_chat_memory_episodes
+            """
+        )
+        conn.execute("DROP TABLE enterprise_chat_memory_episodes")
+        conn.execute(
+            """
+            ALTER TABLE enterprise_chat_memory_episodes_identity_migrated
+            RENAME TO enterprise_chat_memory_episodes
             """
         )
 

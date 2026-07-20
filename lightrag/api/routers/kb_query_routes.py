@@ -52,9 +52,13 @@ from lightrag.api.enterprise_auth import (
 )
 from lightrag.api.chat_memory_routing import (
     ChatMemoryScope,
+    authorize_memory_context,
     memory_audit_fields,
-    merge_memory_block,
-    resolve_memory_injection,
+)
+from lightrag.api.chat_memory_service import (
+    CHAT_MEMORY_FINAL_REQUEST_BUILDER_INVALID,
+    MEMORY_QUERY_MAX_LENGTH,
+    AuthorizedChatMemoryHandle,
 )
 from lightrag.api.kb_service import KnowledgeBaseNotFoundError
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry
@@ -62,13 +66,114 @@ from lightrag.api.metadata_store import DocumentRecord
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.base import QueryParam
 from lightrag.prompt import PROMPTS
+from lightrag.sensitive_context import (
+    CHAT_MEMORY_QUERY_LLM_EGRESS_NOT_ALLOWED,
+    SensitiveContextPayload,
+    SensitiveContextPolicyError,
+    bind_sensitive_context_endpoint,
+    mark_sensitive_context_not_used,
+    serialize_sensitive_final_request,
+)
 from lightrag.utils import (
     generate_reference_list_from_chunks,
+    get_llm_cache_identity,
     logger,
     process_chunks_unified,
 )
 
 QueryMode = Literal["local", "global", "hybrid", "naive", "mix", "bypass"]
+
+_CHAT_MEMORY_REQUIRES_FINAL_SYNTHESIS = "chat_memory_requires_final_synthesis"
+_CHAT_MEMORY_QUERY_TOO_LONG = "chat_memory_query_too_long"
+_CHAT_MEMORY_INTERNAL_ERROR = "chat_memory_sensitive_context_failed"
+
+
+def _chat_memory_http_error(status_code: int, error_code: str) -> HTTPException:
+    """Build a stable, content-free Chat Memory API error."""
+
+    return HTTPException(
+        status_code=status_code,
+        detail={"error_code": error_code, "message": error_code},
+    )
+
+
+def _reject_memory_without_final_synthesis(
+    scope: ChatMemoryScope | None,
+    param: QueryParam | None = None,
+    *,
+    final_synthesis: bool = True,
+) -> None:
+    """Reject memory whenever the request cannot execute a final query LLM."""
+
+    if scope is None:
+        return
+    if (
+        not final_synthesis
+        or param is None
+        or param.mode == "bypass"
+        or bool(param.only_need_context)
+        or bool(param.only_need_prompt)
+    ):
+        raise _chat_memory_http_error(
+            400,
+            _CHAT_MEMORY_REQUIRES_FINAL_SYNTHESIS,
+        )
+
+
+async def _authorize_memory_handle(
+    http_request: Request,
+    scope: ChatMemoryScope | None,
+    query: str,
+) -> AuthorizedChatMemoryHandle | None:
+    """Authorize before KB work while keeping fact search lazy."""
+
+    if scope is None:
+        return None
+    if len(query) > MEMORY_QUERY_MAX_LENGTH:
+        raise _chat_memory_http_error(400, _CHAT_MEMORY_QUERY_TOO_LONG)
+    return await authorize_memory_context(http_request, scope, query)
+
+
+def _map_sensitive_context_policy_error(
+    exc: SensitiveContextPolicyError,
+) -> HTTPException:
+    """Map stable sensitive-context policy errors without exposing internals."""
+
+    if exc.error_code == CHAT_MEMORY_QUERY_LLM_EGRESS_NOT_ALLOWED:
+        return _chat_memory_http_error(403, exc.error_code)
+    if exc.error_code in {
+        _CHAT_MEMORY_REQUIRES_FINAL_SYNTHESIS,
+        _CHAT_MEMORY_QUERY_TOO_LONG,
+    }:
+        return _chat_memory_http_error(400, exc.error_code)
+    if exc.error_code == CHAT_MEMORY_FINAL_REQUEST_BUILDER_INVALID:
+        return _chat_memory_http_error(500, exc.error_code)
+    return _chat_memory_http_error(500, _CHAT_MEMORY_INTERNAL_ERROR)
+
+
+async def _reject_explicit_memory_without_final_synthesis(
+    request: Request,
+) -> None:
+    """Reject memory-scoped bypass before enterprise bypass gating.
+
+    Enterprise request authorization checks explicit ``mode=bypass`` before the
+    route handler runs. This lightweight body dependency must therefore run
+    first so a memory-scoped bypass request receives the stable memory contract
+    error instead of the unrelated bypass-capability response. The body remains
+    cached on ``Request`` for normal FastAPI model validation.
+    """
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - normal validation owns malformed JSON
+        return
+    if not isinstance(body, dict) or body.get("memory") is None:
+        return
+    if body.get("mode") == "bypass":
+        raise _chat_memory_http_error(
+            400,
+            _CHAT_MEMORY_REQUIRES_FINAL_SYNTHESIS,
+        )
 
 
 class _DocumentListService(Protocol):
@@ -130,7 +235,7 @@ def _query_audit_metadata(
     route: str,
     stream: bool,
     bilingual_info: dict[str, Any] | None = None,
-    memory_info: dict[str, Any] | None = None,
+    memory_handle: AuthorizedChatMemoryHandle | None = None,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "route": route,
@@ -154,7 +259,9 @@ def _query_audit_metadata(
             metadata[f"active_{key}"] = active_metadata[key]
     if bilingual_info is not None:
         metadata.update(bilingual_audit_fields(bilingual_info))
-    metadata.update(memory_audit_fields(memory_info))
+    metadata.update(
+        memory_audit_fields(memory_handle.info if memory_handle is not None else None)
+    )
     return metadata
 
 
@@ -260,8 +367,8 @@ class KBQueryRequest(BaseModel):
         default=None,
         description=(
             "Server-side chat memory injection. Provide the chat project_id to "
-            "have the server search that project's long-term memory and prepend "
-            "the facts to the effective user_prompt (docs/ChatMemory-zh.md §6). "
+            "authorize lazy, budgeted project-memory context for final synthesis "
+            "(docs/ChatMemory-zh.md §6). "
             "Requires an interactive user owning the project and "
             "LIGHTRAG_CHAT_MEMORY_ENABLED."
         ),
@@ -616,9 +723,9 @@ class MultiKBQueryRequest(BaseModel):
         default=None,
         description=(
             "Server-side chat memory injection (docs/ChatMemory-zh.md §6). "
-            "Provide the chat project_id to prepend that project's memory facts "
-            "to the synthesis user_prompt. Requires an interactive user owning "
-            "the project and LIGHTRAG_CHAT_MEMORY_ENABLED."
+            "Provide the chat project_id to authorize lazy, budgeted project "
+            "memory for final synthesis. Requires an interactive user owning the "
+            "project and LIGHTRAG_CHAT_MEMORY_ENABLED."
         ),
     )
     bilingual: Optional[bool] = Field(
@@ -737,7 +844,7 @@ def _multi_kb_query_audit_metadata(
     reranked: bool,
     final_count: int,
     bilingual_info: Dict[str, Any] | None = None,
-    memory_info: Dict[str, Any] | None = None,
+    memory_handle: AuthorizedChatMemoryHandle | None = None,
 ) -> Dict[str, Any]:
     metadata = {
         "route": "multi_query",
@@ -755,7 +862,9 @@ def _multi_kb_query_audit_metadata(
     }
     if bilingual_info is not None:
         metadata.update(bilingual_audit_fields(bilingual_info))
-    metadata.update(memory_audit_fields(memory_info))
+    metadata.update(
+        memory_audit_fields(memory_handle.info if memory_handle is not None else None)
+    )
     return metadata
 
 
@@ -803,6 +912,7 @@ async def _prepare_multi_kb_synthesis(
     synth_param: QueryParam | None,
     *,
     bilingual_info: Dict[str, Any] | None = None,
+    sensitive_context: AuthorizedChatMemoryHandle | None = None,
 ):
     """Process merged chunks and build the single-synthesis system prompt.
 
@@ -812,6 +922,7 @@ async def _prepare_multi_kb_synthesis(
     the desired ``stream`` flag so non-streaming and streaming share this logic.
     """
     if not (merged and synth_rag is not None and synth_param is not None):
+        mark_sensitive_context_not_used(sensitive_context, "no_kb_evidence")
         return None, None, [], False, 0
 
     global_config = synth_rag._build_global_config()
@@ -856,6 +967,10 @@ async def _prepare_multi_kb_synthesis(
     final_count = len(processed)
 
     reference_list, processed_with_ids = generate_reference_list_from_chunks(processed)
+    if sensitive_context is not None and not processed_with_ids:
+        mark_sensitive_context_not_used(sensitive_context, "no_kb_evidence")
+        return None, None, [], reranked, 0
+
     chunks_context = [
         {"reference_id": c["reference_id"], "content": c["content"]}
         for c in processed_with_ids
@@ -872,9 +987,25 @@ async def _prepare_multi_kb_synthesis(
     content_data = PROMPTS["naive_query_context"].format(
         text_chunks_str=text_units_str, reference_list_str=reference_list_str
     )
-    sys_prompt = PROMPTS["naive_rag_response"].format(
-        response_type=response_type, user_prompt=user_prompt, content_data=content_data
-    )
+    def build_system_prompt(payload: SensitiveContextPayload | None) -> str:
+        effective_user_prompt = user_prompt
+        effective_content_data = content_data
+        if payload is not None:
+            # The trusted policy is the last server instruction. Only the
+            # untrusted JSONL records enter the Context section.
+            effective_user_prompt = (
+                f"{effective_user_prompt}\n\n{payload.trusted_policy}"
+            )
+            effective_content_data = (
+                f"{effective_content_data}\n\n{payload.context_data}"
+            )
+        return PROMPTS["naive_rag_response"].format(
+            response_type=response_type,
+            user_prompt=effective_user_prompt,
+            content_data=effective_content_data,
+        )
+
+    sys_prompt = build_system_prompt(None)
 
     ref_kb: Dict[str, str] = {}
     ref_content: Dict[str, List[str]] = {}
@@ -898,6 +1029,39 @@ async def _prepare_multi_kb_synthesis(
         if ref["reference_id"]
     ]
     use_model_func = global_config["role_llm_funcs"]["query"]
+    if sensitive_context is not None:
+        # Re-read the exact runtime used for final synthesis only after merged,
+        # processed authoritative evidence and the synthesis RAG are known.
+        final_global_config = synth_rag._build_global_config()
+        final_identity = get_llm_cache_identity(final_global_config, "query")
+        bind_sensitive_context_endpoint(
+            sensitive_context,
+            final_identity.get("host")
+            if isinstance(final_identity, dict)
+            else None,
+        )
+
+        def build_final_request(
+            payload: SensitiveContextPayload | None,
+        ) -> str:
+            return serialize_sensitive_final_request(
+                build_system_prompt(payload),
+                request.query,
+                synth_param.conversation_history,
+            )
+
+        final_max_total_tokens = (
+            getattr(synth_param, "max_total_tokens", None)
+            or final_global_config.get("max_total_tokens")
+            or 30000
+        )
+        payload = await sensitive_context.resolve_for_final_request(
+            final_global_config.get("tokenizer"),
+            final_max_total_tokens,
+            build_final_request,
+        )
+        sys_prompt = build_system_prompt(payload)
+        use_model_func = final_global_config["role_llm_funcs"]["query"]
     return sys_prompt, use_model_func, references, reranked, final_count
 
 
@@ -1068,16 +1232,20 @@ def create_kb_query_routes(
     @router.post(
         "/{kb_id}/query",
         response_model=KBQueryResponse,
-        dependencies=[Depends(combined_auth)],
+        dependencies=[
+            Depends(_reject_explicit_memory_without_final_synthesis),
+            Depends(combined_auth),
+        ],
         summary="Run a non-streaming RAG query against a knowledge base",
     )
     async def kb_query(kb_id: str, request: KBQueryRequest, http_request: Request):
         try:
-            await _ensure_query_filter_documents_available(
-                document_service,
-                kb_id,
-                request.filters,
-            )
+            if request.memory is None:
+                await _ensure_query_filter_documents_available(
+                    document_service,
+                    kb_id,
+                    request.filters,
+                )
             rag = cast(Any, await registry.get(kb_id))
             active_defaults = await _merge_user_query_defaults(
                 http_request,
@@ -1089,14 +1257,19 @@ def create_kb_query_routes(
                 is_stream=False,
                 active_defaults=active_defaults,
             )
+            _reject_memory_without_final_synthesis(request.memory, param)
             _enforce_resolved_bypass_permission(http_request, param)
             param.stream = False
-            memory_block, memory_info = await resolve_memory_injection(
-                http_request, request.memory, request.query
+            memory_handle = await _authorize_memory_handle(
+                http_request,
+                request.memory,
+                request.query,
             )
-            if memory_block:
-                param.user_prompt = merge_memory_block(
-                    memory_block, param.user_prompt
+            if memory_handle is not None:
+                await _ensure_query_filter_documents_available(
+                    document_service,
+                    kb_id,
+                    request.filters,
                 )
             # Enforce per-document retrieval scoping: ``filters.doc_ids`` plus
             # the enabled/archived control-plane state are translated into a
@@ -1109,11 +1282,29 @@ def create_kb_query_routes(
             )
             plan, bilingual_info = await _maybe_bilingual_plan(rag, request, param)
             if plan is not None:
-                result, bilingual_info = await bilingual_query_llm(
-                    rag, request.query, param, plan, stream=False
-                )
+                if memory_handle is None:
+                    result, bilingual_info = await bilingual_query_llm(
+                        rag, request.query, param, plan, stream=False
+                    )
+                else:
+                    result, bilingual_info = await bilingual_query_llm(
+                        rag,
+                        request.query,
+                        param,
+                        plan,
+                        stream=False,
+                        sensitive_context=memory_handle,
+                    )
             else:
-                result = await rag.aquery_llm(request.query, param=param)
+                if memory_handle is None:
+                    result = await rag.aquery_llm(request.query, param=param)
+                else:
+                    result = await rag.aquery_llm(
+                        request.query,
+                        param=param,
+                        sensitive_context=memory_handle,
+                    )
+            memory_info = memory_handle.info if memory_handle is not None else None
             llm_response = result.get("llm_response", {})
             data = result.get("data", {})
             references = data.get("references", [])
@@ -1140,7 +1331,7 @@ def create_kb_query_routes(
                     route="query",
                     stream=False,
                     bilingual_info=bilingual_info,
-                    memory_info=memory_info,
+                    memory_handle=memory_handle,
                 ),
             )
             return KBQueryResponse(
@@ -1156,28 +1347,43 @@ def create_kb_query_routes(
             )
         except HTTPException:
             raise
+        except SensitiveContextPolicyError as exc:
+            raise _map_sensitive_context_policy_error(exc) from None
         except KnowledgeBaseNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
+            if request.memory is not None:
+                logger.error(
+                    "Sensitive KB query failed for '%s' (%s)",
+                    kb_id,
+                    type(exc).__name__,
+                )
+                raise _chat_memory_http_error(
+                    500, _CHAT_MEMORY_INTERNAL_ERROR
+                ) from None
             logger.error("KB query failed for '%s': %s", kb_id, exc, exc_info=True)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @router.post(
         "/{kb_id}/query/stream",
-        dependencies=[Depends(combined_auth)],
+        dependencies=[
+            Depends(_reject_explicit_memory_without_final_synthesis),
+            Depends(combined_auth),
+        ],
         summary="Run a streaming RAG query against a knowledge base (NDJSON)",
     )
     async def kb_query_stream(
         kb_id: str, request: KBQueryRequest, http_request: Request
     ):
         try:
-            await _ensure_query_filter_documents_available(
-                document_service,
-                kb_id,
-                request.filters,
-            )
+            if request.memory is None:
+                await _ensure_query_filter_documents_available(
+                    document_service,
+                    kb_id,
+                    request.filters,
+                )
             rag = cast(Any, await registry.get(kb_id))
             active_defaults = await _merge_user_query_defaults(
                 http_request,
@@ -1190,13 +1396,18 @@ def create_kb_query_routes(
                 is_stream=stream_mode,
                 active_defaults=active_defaults,
             )
+            _reject_memory_without_final_synthesis(request.memory, param)
             _enforce_resolved_bypass_permission(http_request, param)
-            memory_block, memory_info = await resolve_memory_injection(
-                http_request, request.memory, request.query
+            memory_handle = await _authorize_memory_handle(
+                http_request,
+                request.memory,
+                request.query,
             )
-            if memory_block:
-                param.user_prompt = merge_memory_block(
-                    memory_block, param.user_prompt
+            if memory_handle is not None:
+                await _ensure_query_filter_documents_available(
+                    document_service,
+                    kb_id,
+                    request.filters,
                 )
             param.ids = await _resolve_doc_id_scope(
                 document_service,
@@ -1205,11 +1416,29 @@ def create_kb_query_routes(
             )
             plan, bilingual_info = await _maybe_bilingual_plan(rag, request, param)
             if plan is not None:
-                result, bilingual_info = await bilingual_query_llm(
-                    rag, request.query, param, plan, stream=stream_mode
-                )
+                if memory_handle is None:
+                    result, bilingual_info = await bilingual_query_llm(
+                        rag, request.query, param, plan, stream=stream_mode
+                    )
+                else:
+                    result, bilingual_info = await bilingual_query_llm(
+                        rag,
+                        request.query,
+                        param,
+                        plan,
+                        stream=stream_mode,
+                        sensitive_context=memory_handle,
+                    )
             else:
-                result = await rag.aquery_llm(request.query, param=param)
+                if memory_handle is None:
+                    result = await rag.aquery_llm(request.query, param=param)
+                else:
+                    result = await rag.aquery_llm(
+                        request.query,
+                        param=param,
+                        sensitive_context=memory_handle,
+                    )
+            memory_info = memory_handle.info if memory_handle is not None else None
             response_metadata = dict(active_metadata)
             if bilingual_info is not None:
                 response_metadata["bilingual"] = bilingual_info
@@ -1227,7 +1456,7 @@ def create_kb_query_routes(
                     route="query_stream",
                     stream=True,
                     bilingual_info=bilingual_info,
-                    memory_info=memory_info,
+                    memory_handle=memory_handle,
                 ),
             )
 
@@ -1254,6 +1483,13 @@ def create_kb_query_routes(
                                 if chunk:
                                     yield f"{json.dumps({'response': chunk})}\n"
                         except Exception as exc:  # noqa: BLE001
+                            if memory_handle is not None:
+                                logger.error(
+                                    "Sensitive KB stream failed (%s)",
+                                    type(exc).__name__,
+                                )
+                                yield f"{json.dumps({'error': 'Sensitive LLM call failed'})}\n"
+                                return
                             logger.error("KB stream error: %s", exc)
                             yield f"{json.dumps({'error': str(exc)})}\n"
                 else:
@@ -1278,11 +1514,22 @@ def create_kb_query_routes(
             )
         except HTTPException:
             raise
+        except SensitiveContextPolicyError as exc:
+            raise _map_sensitive_context_policy_error(exc) from None
         except KnowledgeBaseNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
+            if request.memory is not None:
+                logger.error(
+                    "Sensitive KB streaming query failed for '%s' (%s)",
+                    kb_id,
+                    type(exc).__name__,
+                )
+                raise _chat_memory_http_error(
+                    500, _CHAT_MEMORY_INTERNAL_ERROR
+                ) from None
             logger.error(
                 "KB streaming query failed for '%s': %s", kb_id, exc, exc_info=True
             )
@@ -1291,11 +1538,18 @@ def create_kb_query_routes(
     @router.post(
         "/{kb_id}/query/data",
         response_model=KBQueryDataResponse,
-        dependencies=[Depends(combined_auth)],
+        dependencies=[
+            Depends(_reject_explicit_memory_without_final_synthesis),
+            Depends(combined_auth),
+        ],
         summary="Return structured retrieval data without generating an LLM answer",
     )
     async def kb_query_data(kb_id: str, request: KBQueryRequest, http_request: Request):
         try:
+            _reject_memory_without_final_synthesis(
+                request.memory,
+                final_synthesis=False,
+            )
             await _ensure_query_filter_documents_available(
                 document_service,
                 kb_id,
@@ -1365,7 +1619,10 @@ def create_kb_query_routes(
     @router.post(
         "/{kb_id}/retrieve",
         response_model=KBQueryDataResponse,
-        dependencies=[Depends(combined_auth)],
+        dependencies=[
+            Depends(_reject_explicit_memory_without_final_synthesis),
+            Depends(combined_auth),
+        ],
         summary="Alias for /query/data — retrieval only, no LLM generation",
     )
     async def kb_retrieve(kb_id: str, request: KBQueryRequest, http_request: Request):
@@ -1374,11 +1631,21 @@ def create_kb_query_routes(
     @router.post(
         ":query",
         response_model=MultiKBQueryResponse,
-        dependencies=[Depends(combined_auth)],
+        dependencies=[
+            Depends(_reject_explicit_memory_without_final_synthesis),
+            Depends(combined_auth),
+        ],
         summary="Run one synthesized RAG answer across multiple knowledge bases",
     )
     async def multi_kb_query(request: MultiKBQueryRequest, http_request: Request):
         try:
+            if request.memory is not None and request.mode == "bypass":
+                _reject_memory_without_final_synthesis(request.memory)
+            memory_handle = await _authorize_memory_handle(
+                http_request,
+                request.memory,
+                request.query,
+            )
             (
                 merged,
                 synth_rag,
@@ -1391,14 +1658,6 @@ def create_kb_query_routes(
                 document_service, registry, request, http_request
             )
 
-            memory_block, memory_info = await resolve_memory_injection(
-                http_request, request.memory, request.query
-            )
-            if memory_block and synth_param is not None:
-                synth_param.user_prompt = merge_memory_block(
-                    memory_block, synth_param.user_prompt
-                )
-
             response_text = "No relevant context found for the query."
             (
                 sys_prompt,
@@ -1407,18 +1666,30 @@ def create_kb_query_routes(
                 reranked,
                 final_count,
             ) = await _prepare_multi_kb_synthesis(
-                request, merged, synth_rag, synth_param, bilingual_info=bilingual_info
+                request,
+                merged,
+                synth_rag,
+                synth_param,
+                bilingual_info=bilingual_info,
+                sensitive_context=memory_handle,
             )
             if sys_prompt is not None and use_model_func is not None:
-                llm_out = await use_model_func(
-                    request.query,
-                    system_prompt=sys_prompt,
-                    history_messages=synth_param.conversation_history,
-                    enable_cot=True,
-                    stream=False,
-                )
+                llm_kwargs: Dict[str, Any] = {
+                    "system_prompt": sys_prompt,
+                    "history_messages": (
+                        synth_param.conversation_history
+                        if synth_param is not None
+                        else None
+                    ),
+                    "enable_cot": True,
+                    "stream": False,
+                }
+                if memory_handle is not None:
+                    llm_kwargs["_sensitive"] = True
+                llm_out = await use_model_func(request.query, **llm_kwargs)
                 if isinstance(llm_out, str) and llm_out.strip():
                     response_text = llm_out.strip()
+            memory_info = memory_handle.info if memory_handle is not None else None
 
             metadata = {
                 "requested_kb_count": len(request.kb_ids),
@@ -1445,7 +1716,7 @@ def create_kb_query_routes(
                     reranked=reranked,
                     final_count=final_count,
                     bilingual_info=bilingual_info,
-                    memory_info=memory_info,
+                    memory_handle=memory_handle,
                 ),
             )
             return MultiKBQueryResponse(
@@ -1457,23 +1728,43 @@ def create_kb_query_routes(
             )
         except HTTPException:
             raise
+        except SensitiveContextPolicyError as exc:
+            raise _map_sensitive_context_policy_error(exc) from None
         except KnowledgeBaseNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
+            if request.memory is not None:
+                logger.error(
+                    "Sensitive multi-KB query failed (%s)",
+                    type(exc).__name__,
+                )
+                raise _chat_memory_http_error(
+                    500, _CHAT_MEMORY_INTERNAL_ERROR
+                ) from None
             logger.error("Multi-KB query failed: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @router.post(
         ":query/stream",
-        dependencies=[Depends(combined_auth)],
+        dependencies=[
+            Depends(_reject_explicit_memory_without_final_synthesis),
+            Depends(combined_auth),
+        ],
         summary="Stream one synthesized RAG answer across multiple KBs (NDJSON)",
     )
     async def multi_kb_query_stream(
         request: MultiKBQueryRequest, http_request: Request
     ):
         try:
+            if request.memory is not None and request.mode == "bypass":
+                _reject_memory_without_final_synthesis(request.memory)
+            memory_handle = await _authorize_memory_handle(
+                http_request,
+                request.memory,
+                request.query,
+            )
             (
                 merged,
                 synth_rag,
@@ -1485,13 +1776,6 @@ def create_kb_query_routes(
             ) = await _multi_kb_retrieve(
                 document_service, registry, request, http_request
             )
-            memory_block, memory_info = await resolve_memory_injection(
-                http_request, request.memory, request.query
-            )
-            if memory_block and synth_param is not None:
-                synth_param.user_prompt = merge_memory_block(
-                    memory_block, synth_param.user_prompt
-                )
             (
                 sys_prompt,
                 use_model_func,
@@ -1499,8 +1783,32 @@ def create_kb_query_routes(
                 reranked,
                 final_count,
             ) = await _prepare_multi_kb_synthesis(
-                request, merged, synth_rag, synth_param, bilingual_info=bilingual_info
+                request,
+                merged,
+                synth_rag,
+                synth_param,
+                bilingual_info=bilingual_info,
+                sensitive_context=memory_handle,
             )
+            prepared_llm_out: Any = None
+            if (
+                memory_handle is not None
+                and sys_prompt is not None
+                and use_model_func is not None
+            ):
+                prepared_llm_out = await use_model_func(
+                    request.query,
+                    system_prompt=sys_prompt,
+                    history_messages=(
+                        synth_param.conversation_history
+                        if synth_param is not None
+                        else None
+                    ),
+                    enable_cot=True,
+                    stream=True,
+                    _sensitive=True,
+                )
+            memory_info = memory_handle.info if memory_handle is not None else None
             metadata = {
                 "requested_kb_count": len(request.kb_ids),
                 "per_kb_chunk_counts": per_kb_counts,
@@ -1527,7 +1835,7 @@ def create_kb_query_routes(
                     reranked=reranked,
                     final_count=final_count,
                     bilingual_info=bilingual_info,
-                    memory_info=memory_info,
+                    memory_handle=memory_handle,
                 ),
             )
 
@@ -1541,13 +1849,20 @@ def create_kb_query_routes(
                         f"{json.dumps({'response': 'No relevant context found for the query.'})}\n"
                     )
                     return
-                llm_out = await use_model_func(
-                    request.query,
-                    system_prompt=sys_prompt,
-                    history_messages=synth_param.conversation_history,
-                    enable_cot=True,
-                    stream=True,
-                )
+                if memory_handle is not None:
+                    llm_out = prepared_llm_out
+                else:
+                    llm_out = await use_model_func(
+                        request.query,
+                        system_prompt=sys_prompt,
+                        history_messages=(
+                            synth_param.conversation_history
+                            if synth_param is not None
+                            else None
+                        ),
+                        enable_cot=True,
+                        stream=True,
+                    )
                 if isinstance(llm_out, str):
                     if llm_out.strip():
                         yield f"{json.dumps({'response': llm_out.strip()})}\n"
@@ -1557,6 +1872,13 @@ def create_kb_query_routes(
                         if chunk:
                             yield f"{json.dumps({'response': chunk})}\n"
                 except Exception as exc:  # noqa: BLE001
+                    if memory_handle is not None:
+                        logger.error(
+                            "Sensitive multi-KB stream failed (%s)",
+                            type(exc).__name__,
+                        )
+                        yield f"{json.dumps({'error': 'Sensitive LLM call failed'})}\n"
+                        return
                     logger.error("Multi-KB stream error: %s", exc)
                     yield f"{json.dumps({'error': str(exc)})}\n"
 
@@ -1572,22 +1894,39 @@ def create_kb_query_routes(
             )
         except HTTPException:
             raise
+        except SensitiveContextPolicyError as exc:
+            raise _map_sensitive_context_policy_error(exc) from None
         except KnowledgeBaseNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
+            if request.memory is not None:
+                logger.error(
+                    "Sensitive multi-KB streaming query failed (%s)",
+                    type(exc).__name__,
+                )
+                raise _chat_memory_http_error(
+                    500, _CHAT_MEMORY_INTERNAL_ERROR
+                ) from None
             logger.error("Multi-KB streaming query failed: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @router.post(
         ":retrieve",
         response_model=MultiKBQueryDataResponse,
-        dependencies=[Depends(combined_auth)],
+        dependencies=[
+            Depends(_reject_explicit_memory_without_final_synthesis),
+            Depends(combined_auth),
+        ],
         summary="Retrieve and merge chunks across multiple knowledge bases (no LLM)",
     )
     async def multi_kb_retrieve(request: MultiKBQueryRequest, http_request: Request):
         try:
+            _reject_memory_without_final_synthesis(
+                request.memory,
+                final_synthesis=False,
+            )
             (
                 merged,
                 synth_rag,

@@ -150,6 +150,10 @@ from lightrag.llm_roles import (
     _RoleLLMState,
 )
 from lightrag.storage_migrations import _StorageMigrationMixin
+from lightrag.sensitive_context import (
+    SensitiveContext,
+    SensitiveContextPolicyError,
+)
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -2264,6 +2268,8 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         query: str,
         param: QueryParam = QueryParam(),
         system_prompt: str | None = None,
+        *,
+        sensitive_context: SensitiveContext | None = None,
     ) -> dict[str, Any]:
         """
         Asynchronous complete query API: returns structured retrieval results with LLM generation.
@@ -2275,15 +2281,31 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             query: Query text for retrieval and LLM generation.
             param: Query parameters controlling retrieval and LLM behavior.
             system_prompt: Optional custom system prompt for LLM generation.
+            sensitive_context: Private process-local lazy context for final
+                synthesis. It is never copied into ``QueryParam`` or caches.
 
         Returns:
             dict[str, Any]: Complete response with structured data and LLM response.
         """
         logger.debug(f"[aquery_llm] Query param: {param}")
 
-        global_config = self._build_global_config()
+        if sensitive_context is not None and (
+            param.mode == "bypass"
+            or param.only_need_context
+            or param.only_need_prompt
+        ):
+            raise SensitiveContextPolicyError(
+                "chat_memory_requires_final_synthesis",
+                "chat_memory_requires_final_synthesis",
+            ) from None
+
+        global_config = (
+            self._build_global_config() if sensitive_context is None else None
+        )
 
         try:
+            if global_config is None:
+                global_config = self._build_global_config()
             query_result = None
 
             if param.mode in ["local", "global", "hybrid", "mix"]:
@@ -2298,6 +2320,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     hashing_kv=self.llm_response_cache,
                     system_prompt=system_prompt,
                     chunks_vdb=self.chunks_vdb,
+                    sensitive_context=sensitive_context,
                 )
             elif param.mode == "naive":
                 query_result = await naive_query(
@@ -2307,6 +2330,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     global_config,
                     hashing_kv=self.llm_response_cache,
                     system_prompt=system_prompt,
+                    sensitive_context=sensitive_context,
                 )
             elif param.mode == "bypass":
                 # Bypass mode: directly use LLM without knowledge retrieval
@@ -2384,12 +2408,20 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
             return raw_data
 
+        except SensitiveContextPolicyError as e:
+            logger.error("Query failed (%s)", type(e).__name__)
+            raise
         except Exception as e:
-            logger.error(f"Query failed: {e}")
+            if sensitive_context is not None:
+                logger.error("Query failed (%s)", type(e).__name__)
+                failure_message = "Query failed"
+            else:
+                logger.error(f"Query failed: {e}")
+                failure_message = f"Query failed: {str(e)}"
             # Return error response
             return {
                 "status": "failure",
-                "message": f"Query failed: {str(e)}",
+                "message": failure_message,
                 "data": {},
                 "metadata": {},
                 "llm_response": {

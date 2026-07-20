@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator
 from typing import Any, Union
 
 from lightrag.utils import wrap_embedding_func_with_attrs
+from lightrag.sensitive_context import is_sensitive_call
 
 # Import botocore exceptions for proper exception handling
 try:
@@ -97,12 +98,13 @@ def _handle_bedrock_exception(e: Exception, operation: str = "Bedrock API") -> N
         BedrockTimeoutError: For timeout issues (retryable)
         BedrockError: For validation and other non-retryable errors
     """
-    error_message = str(e)
+    error_message = type(e).__name__ if is_sensitive_call() else str(e)
 
     # Handle botocore ClientError with specific error codes
     if isinstance(e, ClientError):
         error_code = e.response.get("Error", {}).get("Code", "")
-        error_msg = e.response.get("Error", {}).get("Message", error_message)
+        raw_error_msg = e.response.get("Error", {}).get("Message", error_message)
+        error_msg = type(e).__name__ if is_sensitive_call() else raw_error_msg
 
         # Rate limiting and throttling errors (retryable)
         if error_code in [
@@ -372,9 +374,15 @@ async def bedrock_complete_if_cache(
                                 if inspect.isawaitable(result):
                                     await result
                             except Exception as close_error:
-                                logging.warning(
-                                    f"Failed to close Bedrock event stream: {close_error}"
-                                )
+                                if is_sensitive_call():
+                                    logging.warning(
+                                        "Failed to close Bedrock event stream (%s)",
+                                        type(close_error).__name__,
+                                    )
+                                else:
+                                    logging.warning(
+                                        f"Failed to close Bedrock event stream: {close_error}"
+                                    )
 
         # Return the generator that manages its own lifecycle
         return stream_generator()

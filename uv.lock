@@ -1267,6 +1267,25 @@ wheels = [
 ]
 
 [[package]]
+name = "graphiti-core"
+version = "0.29.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "neo4j" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "openai" },
+    { name = "posthog" },
+    { name = "pydantic" },
+    { name = "python-dotenv" },
+    { name = "tenacity" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ce/3a/a59990224ec20d054f1597050298a112982c638b755c9b77a7cdb2b572fc/graphiti_core-0.29.2.tar.gz", hash = "sha256:dd746a2546abfe5ff9025f088f4793a027bce949e044762cb2ea3ec8f1db8e63", size = 6944531, upload-time = "2026-06-08T14:26:07.717Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a6/c0/cc379ce0e6c54c2224886962ff78b3de9983a3f66dd27708f840d2681847/graphiti_core-0.29.2-py3-none-any.whl", hash = "sha256:536780d1dd5d2e16f50fcc75b29bc1c2f2a53e5d651fb49482c43b7d8c2841d5", size = 357991, upload-time = "2026-06-08T14:26:05.532Z" },
+]
+
+[[package]]
 name = "greenlet"
 version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2141,6 +2160,9 @@ evaluation = [
     { name = "uvicorn" },
     { name = "xlsxwriter" },
 ]
+memory = [
+    { name = "graphiti-core" },
+]
 observability = [
     { name = "langfuse" },
 ]
@@ -2311,6 +2333,7 @@ requires-dist = [
     { name = "google-genai", specifier = ">=1.0.0,<3.0.0" },
     { name = "google-genai", marker = "extra == 'api'", specifier = ">=1.0.0,<3.0.0" },
     { name = "google-genai", marker = "extra == 'offline-llm'", specifier = ">=1.0.0,<3.0.0" },
+    { name = "graphiti-core", marker = "extra == 'memory'", specifier = "==0.29.2" },
     { name = "gunicorn", marker = "extra == 'api'" },
     { name = "httpcore", marker = "extra == 'api'" },
     { name = "httpx", marker = "extra == 'api'", specifier = ">=0.28.1" },
@@ -2387,7 +2410,7 @@ requires-dist = [
     { name = "xlsxwriter", marker = "extra == 'api'", specifier = ">=3.1.0" },
     { name = "zhipuai", marker = "extra == 'offline-llm'", specifier = ">=2.0.0,<3.0.0" },
 ]
-provides-extras = ["pytest", "api", "offline-storage", "offline-llm", "offline", "test", "evaluation", "observability"]
+provides-extras = ["pytest", "api", "offline-storage", "offline-llm", "memory", "offline", "test", "evaluation", "observability"]
 
 [[package]]
 name = "llama-index"
@@ -3654,6 +3677,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/5e/77/65b857a69ed876e1951e88aaba60f5ce6120c33703f7cb61a3c894b8c1b6/portalocker-3.2.0.tar.gz", hash = "sha256:1f3002956a54a8c3730586c5c77bf18fae4149e07eaf1c29fc3faf4d5a3f89ac", size = 95644, upload-time = "2025-06-14T13:20:40.03Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4b/a6/38c8e2f318bf67d338f4d629e93b0b4b9af331f455f0390ea8ce4a099b26/portalocker-3.2.0-py3-none-any.whl", hash = "sha256:3cdc5f565312224bc570c49337bd21428bba0ef363bbcf58b9ef4a9f11779968", size = 22424, upload-time = "2025-06-14T13:20:38.083Z" },
+]
+
+[[package]]
+name = "posthog"
+version = "7.22.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "backoff" },
+    { name = "distro" },
+    { name = "requests" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b3/63/9d73e8e31611201f3737fdd5d6a7a2174f8b94397036b55d62a828f29722/posthog-7.22.4.tar.gz", hash = "sha256:7fc7e4dfa3caffb287da6c6f7fc66a13916c7a58504c0ec292a12eb18ff9dbbb", size = 331780, upload-time = "2026-07-14T22:02:23.516Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/36/3f/a14b0c3076dc37232515adbc9946be5d0a38b5eccc365d8e653d849d7f46/posthog-7.22.4-py3-none-any.whl", hash = "sha256:9f1e4d2ae7603340e1b3e1c07e276a0374ae01f2d5edcd37eab2b30fe095cefa", size = 397552, upload-time = "2026-07-14T22:02:21.769Z" },
 ]
 
 [[package]]

@@ -100,6 +100,9 @@ async def test_parse_mineru_live_parse_build_and_query(tmp_path, monkeypatch):
     monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", _MINERU_ENDPOINT)
     # Force a fresh parse so we exercise the real download path, not a cache hit.
     monkeypatch.setenv("LIGHTRAG_FORCE_REPARSE_MINERU", "true")
+    # Keep the generated sidecar under the same test-scoped INPUT_DIR so the
+    # production path-containment guard is exercised without escaping it.
+    monkeypatch.setenv("INPUT_DIR", str(tmp_path))
 
     pdf_path = _sample_pdf(tmp_path)
 

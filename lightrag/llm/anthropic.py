@@ -32,6 +32,7 @@ from lightrag.utils import (
     logger,
 )
 from lightrag.api import __api_version__
+from lightrag.sensitive_context import is_sensitive_call
 
 
 # Custom exception for retry mechanism
@@ -39,6 +40,13 @@ class InvalidResponseError(Exception):
     """Custom exception class for triggering retry mechanism"""
 
     pass
+
+
+def _log_anthropic_error(message: str, exc: Exception) -> None:
+    if is_sensitive_call():
+        logger.error("%s (%s)", message, type(exc).__name__)
+    else:
+        logger.error("%s: %s", message, exc)
 
 
 # Core Anthropic completion function with retry
@@ -83,7 +91,9 @@ async def anthropic_complete_if_cache(
     }
 
     # Set logger level to INFO when VERBOSE_DEBUG is off
-    if not VERBOSE_DEBUG and logger.level == logging.DEBUG:
+    if is_sensitive_call():
+        logging.getLogger("anthropic").setLevel(logging.INFO)
+    elif not VERBOSE_DEBUG and logger.level == logging.DEBUG:
         logging.getLogger("anthropic").setLevel(logging.INFO)
 
     kwargs.pop("hashing_kv", None)
@@ -149,8 +159,9 @@ async def anthropic_complete_if_cache(
         messages.append({"role": "user", "content": prompt})
 
     logger.debug("===== Sending Query to Anthropic LLM =====")
-    logger.debug(f"Model: {model}   Base URL: {base_url}")
-    logger.debug(f"Additional kwargs: {kwargs}")
+    if not is_sensitive_call():
+        logger.debug(f"Model: {model}   Base URL: {base_url}")
+        logger.debug(f"Additional kwargs: {kwargs}")
     verbose_debug(f"Query: {prompt}")
     verbose_debug(f"System prompt: {system_prompt}")
 
@@ -165,29 +176,32 @@ async def anthropic_complete_if_cache(
             create_params["system"] = system_prompt
         response = await anthropic_async_client.messages.create(**create_params)
     except APIConnectionError as e:
-        logger.error(f"Anthropic API Connection Error: {e}")
+        _log_anthropic_error("Anthropic API connection error", e)
         raise
     except RateLimitError as e:
-        logger.error(f"Anthropic API Rate Limit Error: {e}")
+        _log_anthropic_error("Anthropic API rate limit error", e)
         raise
     except APITimeoutError as e:
-        logger.error(f"Anthropic API Timeout Error: {e}")
+        _log_anthropic_error("Anthropic API timeout error", e)
         raise
     except Exception as e:
-        body = getattr(e, "body", None)
-        request_id = getattr(e, "request_id", None)
-        req = getattr(e, "request", None)
-        extra_parts = []
-        if body:
-            extra_parts.append(f"Response body: {body}")
-        if request_id:
-            extra_parts.append(f"Request ID: {request_id}")
-        if req is not None:
-            extra_parts.append(f"Request URL: {req.url}")
-        extra = ("\n" + "\n".join(extra_parts)) if extra_parts else ""
-        logger.error(
-            f"Anthropic API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}{extra}"
-        )
+        if is_sensitive_call():
+            logger.error("Sensitive Anthropic API call failed (%s)", type(e).__name__)
+        else:
+            body = getattr(e, "body", None)
+            request_id = getattr(e, "request_id", None)
+            req = getattr(e, "request", None)
+            extra_parts = []
+            if body:
+                extra_parts.append(f"Response body: {body}")
+            if request_id:
+                extra_parts.append(f"Request ID: {request_id}")
+            if req is not None:
+                extra_parts.append(f"Request URL: {req.url}")
+            extra = ("\n" + "\n".join(extra_parts)) if extra_parts else ""
+            logger.error(
+                f"Anthropic API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}{extra}"
+            )
         raise
 
     if not stream:
@@ -209,7 +223,7 @@ async def anthropic_complete_if_cache(
                     content = safe_unicode_decode(content.encode("utf-8"))
                 yield content
         except Exception as e:
-            logger.error(f"Error in stream response: {str(e)}")
+            _log_anthropic_error("Anthropic stream failed", e)
             raise
 
     return stream_response()

@@ -8,6 +8,7 @@ from llama_index.core.llms import (
 )
 from typing import Any, List, Optional
 from lightrag.utils import logger
+from lightrag.sensitive_context import is_sensitive_call
 
 # Install required dependencies
 if not pm.is_installed("llama-index"):
@@ -137,7 +138,12 @@ async def llama_index_complete_if_cache(
         return content
 
     except Exception as e:
-        logger.error(f"Error in llama_index_complete_if_cache: {str(e)}")
+        if is_sensitive_call():
+            logger.error(
+                "LlamaIndex completion failed (%s)", type(e).__name__
+            )
+        else:
+            logger.error(f"Error in llama_index_complete_if_cache: {str(e)}")
         raise
 
 

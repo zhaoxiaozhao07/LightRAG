@@ -1,7 +1,8 @@
-"""Route contract tests for the /chat memory endpoints and hooks.
+"""Route contract tests for Chat Memory reads and durable admin controls.
 
 The memory service is replaced by a recording fake on ``app.state`` so these
-tests exercise routing, auth, ownership and hook wiring without graphiti.
+tests exercise routing, auth, ownership and verify CRUD routes do not call the
+deprecated fire-and-forget hooks.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from fastapi import FastAPI
@@ -20,7 +22,11 @@ from fastapi.testclient import TestClient
 _original_argv = sys.argv[:]
 sys.argv = [sys.argv[0]]
 from lightrag.api.auth import auth_handler
-from lightrag.api.chat_memory_service import ChatMemoryUnavailableError
+from lightrag.api.chat_memory_service import (
+    ChatMemoryEventNotFoundError,
+    ChatMemoryRetryConflictError,
+    ChatMemoryUnavailableError,
+)
 from lightrag.api.enterprise_auth import (
     AuditService,
     AuthorizationService,
@@ -54,6 +60,12 @@ class FakeChatMemoryService:
         self.search_results: list[dict] = []
         self.search_error: Exception | None = None
         self.backlog_scan_calls: list[int] = []
+        self.enqueue_purge_calls: list[dict] = []
+        self.outbox_stats_calls = 0
+        self.retry_calls: list[dict] = []
+        self.retry_event: Any = None
+        self.retry_error: Exception | None = None
+        self.group_create_calls: list[tuple[str, str]] = []
 
     def schedule_ingest(self, *, user_id, project_id, session_id, messages):
         self.ingest_calls.append(
@@ -124,12 +136,72 @@ class FakeChatMemoryService:
         }
 
     async def purge_projects(self, user_id, project_ids):
-        self.purge_calls.append((user_id, list(project_ids)))
-        return len(project_ids)
+        raise AssertionError("admin purge must not clear Graphiti directly")
+
+    async def enqueue_purge_projects(
+        self,
+        user_id,
+        project_ids,
+        *,
+        actor_user_id,
+        actor_tenant_id=None,
+    ):
+        call = {
+            "user_id": user_id,
+            "project_ids": list(project_ids),
+            "actor_user_id": actor_user_id,
+            "actor_tenant_id": actor_tenant_id,
+        }
+        self.enqueue_purge_calls.append(call)
+        return {"queued": len(call["project_ids"]), "noop": 0}
+
+    async def outbox_stats(self):
+        self.outbox_stats_calls += 1
+        return {
+            "pending": 3,
+            "running": 1,
+            "retry_wait": 2,
+            "dead_letter": 0,
+            "oldest_available_at": "2026-07-16T00:00:00+00:00",
+            "oldest_lag_seconds": 4.5,
+        }
+
+    async def retry_purge_event(
+        self,
+        event_id,
+        *,
+        actor_user_id,
+        actor_tenant_id=None,
+    ):
+        self.retry_calls.append(
+            {
+                "event_id": event_id,
+                "actor_user_id": actor_user_id,
+                "actor_tenant_id": actor_tenant_id,
+            }
+        )
+        if self.retry_error is not None:
+            raise self.retry_error
+        if self.retry_event is None:
+            raise ChatMemoryEventNotFoundError(event_id)
+        return self.retry_event
 
     async def run_backlog_scan(self, *, limit=100):
         self.backlog_scan_calls.append(limit)
+        raise AssertionError("legacy watermark backlog scan must not run")
+
+
+class FakeChatMemoryWorker:
+    def __init__(self):
+        self.recover_calls: list[int] = []
+        self.nudge_calls = 0
+
+    async def recover_once(self, *, limit=100):
+        self.recover_calls.append(limit)
         return 5
+
+    def nudge(self):
+        self.nudge_calls += 1
 
 
 def _enterprise_args(**overrides):
@@ -232,6 +304,8 @@ def _build_client(
     app.state.enterprise_audit_service = audit_service
     if memory_service is not None:
         app.state.enterprise_chat_memory_service = memory_service
+        app.state.enterprise_chat_memory_maintenance_service = memory_service
+        app.state.enterprise_chat_memory_worker = FakeChatMemoryWorker()
     app.include_router(create_chat_routes(api_key=api_key))
     if with_admin_routes:
         app.include_router(
@@ -412,7 +486,7 @@ def test_memory_search_rejects_api_key_principal(monkeypatch, tmp_path):
     ).status_code in (401, 403)
 
 
-def test_append_messages_triggers_memory_ingest(monkeypatch, tmp_path):
+def test_append_messages_does_not_schedule_legacy_memory_ingest(monkeypatch, tmp_path):
     memory = FakeChatMemoryService()
     client, user_service, alice, _bob = _build_client(
         monkeypatch, tmp_path, memory_service=memory
@@ -434,16 +508,7 @@ def test_append_messages_triggers_memory_ingest(monkeypatch, tmp_path):
         headers=headers,
     )
     assert appended.status_code == 200, appended.text
-
-    assert len(memory.ingest_calls) == 1
-    call = memory.ingest_calls[0]
-    assert call["user_id"] == alice.id
-    assert call["project_id"] == project_id
-    assert call["session_id"] == session_id
-    # The hook receives the persisted records (with assigned seq), not the
-    # raw request payload.
-    assert [message.seq for message in call["messages"]] == [1, 2]
-    assert [message.role for message in call["messages"]] == ["user", "assistant"]
+    assert memory.ingest_calls == []
 
     # A failed append (foreign session) must not ingest.
     foreign = client.post(
@@ -452,7 +517,7 @@ def test_append_messages_triggers_memory_ingest(monkeypatch, tmp_path):
         headers=headers,
     )
     assert foreign.status_code == 404
-    assert len(memory.ingest_calls) == 1
+    assert memory.ingest_calls == []
 
 
 def test_append_messages_works_without_memory_service(monkeypatch, tmp_path):
@@ -470,7 +535,7 @@ def test_append_messages_works_without_memory_service(monkeypatch, tmp_path):
     assert appended.status_code == 200, appended.text
 
 
-def test_delete_message_and_session_trigger_forget(monkeypatch, tmp_path):
+def test_delete_message_and_session_do_not_schedule_legacy_forget(monkeypatch, tmp_path):
     memory = FakeChatMemoryService()
     client, user_service, alice, _bob = _build_client(
         monkeypatch, tmp_path, memory_service=memory
@@ -491,23 +556,13 @@ def test_delete_message_and_session_trigger_forget(monkeypatch, tmp_path):
         headers=headers,
     ).json()
     message_id = appended["messages"][0]["id"]
-    message_seq = appended["messages"][0]["seq"]
 
-    # Deleting a message forgets the episode(s) it was distilled into (the seq
-    # is captured before deletion so the memory layer can locate them).
     deleted = client.delete(
         f"/chat/projects/{project_id}/sessions/{session_id}/messages/{message_id}",
         headers=headers,
     )
     assert deleted.status_code == 200, deleted.text
-    assert memory.forget_message_calls == [
-        {
-            "user_id": alice.id,
-            "project_id": project_id,
-            "session_id": session_id,
-            "seq": message_seq,
-        }
-    ]
+    assert memory.forget_message_calls == []
 
     # A no-op delete (missing message) does not schedule a forget.
     missing = client.delete(
@@ -515,23 +570,16 @@ def test_delete_message_and_session_trigger_forget(monkeypatch, tmp_path):
         headers=headers,
     )
     assert missing.status_code == 404
-    assert len(memory.forget_message_calls) == 1
+    assert memory.forget_message_calls == []
 
-    # Deleting the session forgets every episode of that session.
     session_deleted = client.delete(
         f"/chat/projects/{project_id}/sessions/{session_id}", headers=headers
     )
     assert session_deleted.status_code == 200, session_deleted.text
-    assert memory.forget_session_calls == [
-        {
-            "user_id": alice.id,
-            "project_id": project_id,
-            "session_id": session_id,
-        }
-    ]
+    assert memory.forget_session_calls == []
 
 
-def test_delete_project_triggers_memory_purge(monkeypatch, tmp_path):
+def test_delete_project_does_not_schedule_legacy_purge(monkeypatch, tmp_path):
     memory = FakeChatMemoryService()
     client, user_service, alice, bob = _build_client(
         monkeypatch, tmp_path, memory_service=memory
@@ -549,10 +597,45 @@ def test_delete_project_triggers_memory_purge(monkeypatch, tmp_path):
 
     deleted = client.delete(f"/chat/projects/{project_id}", headers=alice_headers)
     assert deleted.status_code == 200, deleted.text
-    assert memory.purge_calls == [(alice.id, [project_id])]
+    assert memory.purge_calls == []
 
 
-def test_admin_delete_user_purges_all_project_memory(monkeypatch, tmp_path):
+def test_admin_delete_user_does_not_enumerate_or_schedule_legacy_purge(
+    monkeypatch, tmp_path
+):
+    memory = FakeChatMemoryService()
+    client, user_service, alice, bob = _build_client(
+        monkeypatch, tmp_path, memory_service=memory, with_admin_routes=True
+    )
+
+    async def make_admin():
+        return await user_service.bootstrap_super_admin(
+            username="root", password="root-pass", password_hash=None
+        )
+
+    admin = asyncio.run(make_admin())
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+    _create_project(client, alice_headers, name="项目A")
+    _create_project(client, alice_headers, name="项目B")
+    # Another user's project must not be swept up.
+    _create_project(client, bob_headers, name="bob的项目")
+
+    deleted = client.delete(f"/admin/users/{alice.id}", headers=admin_headers)
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json() == {"deleted": True}
+
+    assert memory.purge_calls == []
+    assert memory.enqueue_purge_calls == []
+
+    # Deleting a user without chat projects schedules nothing.
+    missing = client.delete("/admin/users/usr_ghost", headers=admin_headers)
+    assert missing.status_code == 404
+    assert memory.purge_calls == []
+
+
+def test_admin_purge_and_backlog_endpoints(monkeypatch, tmp_path):
     memory = FakeChatMemoryService()
     client, user_service, alice, bob = _build_client(
         monkeypatch, tmp_path, memory_service=memory, with_admin_routes=True
@@ -569,40 +652,7 @@ def test_admin_delete_user_purges_all_project_memory(monkeypatch, tmp_path):
     bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
     project_a = _create_project(client, alice_headers, name="项目A")
     project_b = _create_project(client, alice_headers, name="项目B")
-    # Another user's project must not be swept up.
-    _create_project(client, bob_headers, name="bob的项目")
-
-    deleted = client.delete(f"/admin/users/{alice.id}", headers=admin_headers)
-    assert deleted.status_code == 200, deleted.text
-    assert deleted.json() == {"deleted": True}
-
-    assert len(memory.purge_calls) == 1
-    purge_user_id, purge_projects = memory.purge_calls[0]
-    assert purge_user_id == alice.id
-    assert sorted(purge_projects) == sorted([project_a, project_b])
-
-    # Deleting a user without chat projects schedules nothing.
-    missing = client.delete("/admin/users/usr_ghost", headers=admin_headers)
-    assert missing.status_code == 404
-    assert len(memory.purge_calls) == 1
-
-
-def test_admin_purge_and_backlog_endpoints(monkeypatch, tmp_path):
-    memory = FakeChatMemoryService()
-    client, user_service, alice, _bob = _build_client(
-        monkeypatch, tmp_path, memory_service=memory, with_admin_routes=True
-    )
-
-    async def make_admin():
-        return await user_service.bootstrap_super_admin(
-            username="root", password="root-pass", password_hash=None
-        )
-
-    admin = asyncio.run(make_admin())
-    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
-    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
-    project_a = _create_project(client, alice_headers, name="项目A")
-    project_b = _create_project(client, alice_headers, name="项目B")
+    bob_project = _create_project(client, bob_headers, name="bob项目")
 
     # Explicit project list purge.
     resp = client.post(
@@ -611,8 +661,22 @@ def test_admin_purge_and_backlog_endpoints(monkeypatch, tmp_path):
         headers=admin_headers,
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"purged": 1, "project_ids": [project_a]}
-    assert memory.purge_calls[-1] == (alice.id, [project_a])
+    assert resp.json() == {"queued": 1, "noop": 0, "project_ids": [project_a]}
+    assert memory.enqueue_purge_calls[-1] == {
+        "user_id": alice.id,
+        "project_ids": [project_a],
+        "actor_user_id": admin.id,
+        "actor_tenant_id": None,
+    }
+    assert memory.purge_calls == []
+
+    foreign = client.post(
+        f"/admin/users/{alice.id}/chat-memory:purge",
+        json={"project_ids": [bob_project]},
+        headers=admin_headers,
+    )
+    assert foreign.status_code == 404
+    assert len(memory.enqueue_purge_calls) == 1
 
     # Omitted list => purge every project of the user.
     resp = client.post(
@@ -622,6 +686,8 @@ def test_admin_purge_and_backlog_endpoints(monkeypatch, tmp_path):
     )
     assert resp.status_code == 200, resp.text
     assert set(resp.json()["project_ids"]) == {project_a, project_b}
+    assert resp.json()["queued"] == 2
+    assert resp.json()["noop"] == 0
 
     # Purge for an unknown user => 404.
     assert (
@@ -636,8 +702,120 @@ def test_admin_purge_and_backlog_endpoints(monkeypatch, tmp_path):
         "/admin/chat-memory:backlog-scan", json={"limit": 50}, headers=admin_headers
     )
     assert scan.status_code == 200, scan.text
-    assert scan.json() == {"reingested_batches": 5}
-    assert memory.backlog_scan_calls == [50]
+    assert scan.json() == {
+        "recovered_events": 5,
+        "outbox": {
+            "pending": 3,
+            "running": 1,
+            "retry_wait": 2,
+            "dead_letter": 0,
+            "oldest_available_at": "2026-07-16T00:00:00+00:00",
+            "oldest_lag_seconds": 4.5,
+        },
+    }
+    assert memory.backlog_scan_calls == []
+    assert memory.outbox_stats_calls == 1
+    assert memory.retry_calls == []
+    worker = cast(FastAPI, client.app).state.enterprise_chat_memory_worker
+    assert worker.recover_calls == [50]
+    assert worker.nudge_calls == 1
+
+
+def test_admin_retry_purge_event_by_durable_id_after_source_deletion(
+    monkeypatch, tmp_path
+):
+    memory = FakeChatMemoryService()
+    memory.retry_event = SimpleNamespace(
+        event_id="evt-deleted-target",
+        status="retry_wait",
+        user_id="usr-already-deleted",
+        project_id="proj-already-deleted",
+        event_type="purge",
+    )
+    client, user_service, alice, _bob = _build_client(
+        monkeypatch, tmp_path, memory_service=memory, with_admin_routes=True
+    )
+
+    async def make_admin():
+        return await user_service.bootstrap_super_admin(
+            username="root", password="root-pass", password_hash=None
+        )
+
+    admin = asyncio.run(make_admin())
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+
+    response = client.post(
+        "/admin/chat-memory/events/evt-deleted-target:retry",
+        headers=admin_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "event_id": "evt-deleted-target",
+        "status": "retry_wait",
+        "user_id": "usr-already-deleted",
+        "project_id": "proj-already-deleted",
+        "event_type": "purge",
+    }
+    assert memory.retry_calls == [
+        {
+            "event_id": "evt-deleted-target",
+            "actor_user_id": admin.id,
+            "actor_tenant_id": None,
+        }
+    ]
+    assert memory.group_create_calls == []
+
+    denied = client.post(
+        "/admin/chat-memory/events/evt-deleted-target:retry",
+        headers=alice_headers,
+    )
+    assert denied.status_code == 403
+    assert len(memory.retry_calls) == 1
+
+
+def test_admin_retry_purge_event_maps_missing_and_conflict_errors(
+    monkeypatch, tmp_path
+):
+    memory = FakeChatMemoryService()
+    client, user_service, _alice, _bob = _build_client(
+        monkeypatch, tmp_path, memory_service=memory, with_admin_routes=True
+    )
+
+    async def make_admin():
+        return await user_service.bootstrap_super_admin(
+            username="root", password="root-pass", password_hash=None
+        )
+
+    admin = asyncio.run(make_admin())
+    headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+
+    memory.retry_error = ChatMemoryEventNotFoundError("evt-forged")
+    missing = client.post(
+        "/admin/chat-memory/events/evt-forged:retry",
+        headers=headers,
+    )
+    assert missing.status_code == 404
+    assert missing.json() == {"detail": "Chat memory event not found"}
+    assert memory.group_create_calls == []
+
+    memory.retry_error = ChatMemoryRetryConflictError(
+        "chat_memory_old_graph_store_required",
+        "Restore the original MEMORY_NEO4J_DEPLOYMENT_ID or Neo4j backend, then retry",
+    )
+    conflict = client.post(
+        "/admin/chat-memory/events/evt-old-graph:retry",
+        headers=headers,
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"] == {
+        "error_code": "chat_memory_old_graph_store_required",
+        "message": (
+            "Restore the original MEMORY_NEO4J_DEPLOYMENT_ID or Neo4j backend, "
+            "then retry"
+        ),
+    }
 
 
 def test_admin_memory_endpoints_503_when_disabled(monkeypatch, tmp_path):
@@ -661,6 +839,13 @@ def test_admin_memory_endpoints_503_when_disabled(monkeypatch, tmp_path):
     assert (
         client.post(
             "/admin/chat-memory:backlog-scan", json={}, headers=admin_headers
+        ).status_code
+        == 503
+    )
+    assert (
+        client.post(
+            "/admin/chat-memory/events/evt-missing:retry",
+            headers=admin_headers,
         ).status_code
         == 503
     )

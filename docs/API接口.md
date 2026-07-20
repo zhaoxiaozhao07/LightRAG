@@ -54,7 +54,7 @@ Content-Type: application/json
   "description": "Optional",       // 可选
   "owner_id": null,                // 默认模式下为兼容 metadata；企业模式会忽略并由当前 principal 派生
   "tenant_id": null,               // 默认模式下为兼容 metadata；企业模式会忽略并由当前 principal 派生
-  "visibility": "private",         // 枚举：private / internal / public；企业模式下 internal=同租户隐含只读、public=全员隐含只读（语义见 10.4），写权限仍以 KB ACL 为准
+  "visibility": "private",         // 枚举：private / internal / public；企业模式下 internal=同租户隐含只读、public=全员隐含只读（语义见 10.4），写权限仍以 KB ACL 为准；租户用户创建时仅可选 private / internal（public 返回 400）
   "metadata": {"tags": ["legal"]}  // 可选自由 dict（前端标签/分组/扩展字段），序列化 ≤16KB；响应与列表原样返回
 }
 ```
@@ -82,9 +82,9 @@ Content-Type: application/json
 
 企业模式（`LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true`）下：
 
-- `POST /kbs` 需要 super admin、`tenant_admin` / `tenant_owner`，或 `can_create_kb=true`。非 super admin 的 `owner_id`/`tenant_id` 由当前 principal 派生并自动授予创建者 `kb_owner` ACL；租户用户创建的 KB 固定 `origin="tenant"`、`visibility="private"`，并规范化加入 `tenant:{tenant_id}` 标签。
-- `GET /kbs` 对普通用户返回已授权 KB（direct user ACL / tenant ACL）以及 visibility 命中的 KB（`public` / 同租户 `internal`，见 10.4）；super admin 返回全部；service key 仅按 `kb_roles` scope（可选显式 `inherit_tenant_kb_acl`），不受 visibility 影响。
-- `PATCH /kbs/{kb_id}` 忽略非 super admin 请求体中的 `owner_id`/`tenant_id`；非 super admin 不能修改 visibility，租户 KB 的 tenant 标签与不可变 `origin` 不能由 metadata 伪造。
+- `POST /kbs` 需要 super admin、`tenant_admin` / `tenant_owner`，或 `can_create_kb=true`。非 super admin 的 `owner_id`/`tenant_id` 由当前 principal 派生并自动授予创建者 `kb_owner` ACL；租户用户创建的 KB 固定 `origin="tenant"`，`visibility` 可选 `private`（默认，仅创建者与显式授权可见）或 `internal`（共享：同租户成员隐含只读），`public` 返回 `400`；并规范化加入 `tenant:{tenant_id}` 标签。
+- `GET /kbs` 对普通用户返回已授权 KB（direct user ACL / tenant ACL）以及 visibility 命中的 KB（`public` / 同租户 `internal`，见 10.4）；`tenant_admin` / `tenant_owner` 额外**始终**可见本租户成员创建（`origin="tenant"`、同 `tenant_id`）的全部 KB——包括 `private`（隐含只读 oversight，见 10.4）；super admin 返回全部；service key 仅按 `kb_roles` scope（可选显式 `inherit_tenant_kb_acl`），不受 visibility 影响。
+- `PATCH /kbs/{kb_id}` 忽略非 super admin 请求体中的 `owner_id`/`tenant_id`。visibility 修改规则：super admin 可改任意 KB 为任意值；租户创建的 KB（`origin="tenant"`）允许 effective `kb_owner`（通常为创建者）在 `private` 与 `internal` 之间**随时切换**（改 `public` 返回 `400`，非 owner 返回 `403`）；platform KB 的 visibility 仍仅 super admin 可改。visibility 实际变化时写入 `kb_visibility_changed` 审计事件（metadata 含 `from`/`to`/`origin`）。租户 KB 的 tenant 标签与不可变 `origin` 不能由 metadata 伪造。
 - `DELETE /kbs/{kb_id}`、`?hard=true` 与 `POST /kbs/{kb_id}:restore`：super admin 可操作任意 KB；目标 KB 必须为 `origin="tenant"` 且 `tenant_id` 等于当前 canonical tenant 时，该租户的 `tenant_admin` / `tenant_owner` 也可操作。tenant ACL、direct KB admin/owner 或可编辑 metadata 都不能获得 platform KB 的生命周期权限。缺失 `origin` 的历史 catalog 行安全地按 `platform` 处理。
 
 ### 1.3 知识库状态
@@ -1049,25 +1049,122 @@ Content-Type: application/json
 - `/query/data` 的合并结果中，实体按 `entity_name`、关系按 `(src_id, tgt_id)` 去重；两路各自的 `reference_id` 编号体系无法跨路复用，合并后置空（chunks 与 references 保持一致编号）。
 - 审计 metadata 记录 `bilingual_enabled` 与 `bilingual_translated_query_hash`（只记 hash 不记原文，与 `query_hash` 口径一致）。
 
-### 8.3 记忆自动注入
+### 8.3 项目记忆自动注入（仅终答合成）
 
-> 企业模式、`LIGHTRAG_CHAT_MEMORY_ENABLED=true` 时可用。让服务端在问答时自动召回并注入该用户该项目的历史对话记忆，**前端无需先调 `memory:search` 再拼接**。设计见 [`docs/ChatMemory-zh.md`](ChatMemory-zh.md) §6.1。
+> 当前公开契约仅适用于企业认证 + PostgreSQL metadata 部署，并要求 `LIGHTRAG_CHAT_MEMORY_ENABLED=true`。客户端只声明项目记忆作用域；原始事实由服务端按需召回，不能由客户端拼入受信任提示词。
 
-覆盖端点：`/kbs/{kb_id}/query`、`/query/stream`、`/kbs:query`、`:query/stream`、`/agent/query`、`/query/stream`。请求体新增可选字段：
+支持执行**最终 query LLM 合成**的下列端点：
+
+| 类型 | 非流式 | 流式 | 说明 |
+|---|---|---|---|
+| 单 KB | `POST /kbs/{kb_id}/query` | `POST /kbs/{kb_id}/query/stream` | 普通与 `bilingual=true` 双语双路均支持 |
+| 多 KB | `POST /kbs:query` | `POST /kbs:query/stream` | 普通与 `bilingual=true` 双语双路均支持 |
+| Agent | `POST /agent/query` | `POST /agent/query/stream` | `workflow="plan"` 与 `workflow="staged"` 均支持，也可启用双语检索 |
+
+兼容旧版的全局 `/query`、`/query/stream`、`/query/data` 当前不公开 `memory` 请求字段，不属于本契约。
+
+请求体新增可选作用域：
 
 ```json
 {
   "query": "低温性能怎么做？",
   "mode": "mix",
-  "memory": {"project_id": "proj_1a2b3c4d5e6f", "limit": 10}
+  "memory": {
+    "project_id": "proj_1a2b3c4d5e6f",
+    "limit": 10
+  }
 }
 ```
 
-- 服务端校验当前交互式用户拥有该 `project_id`，检索项目记忆，把事实块（"[项目记忆] …"）**前置**到最终 `user_prompt` 再进入检索/合成链路。检索本身不受记忆影响（记忆只注入 LLM 上下文，与 `conversation_history` 同性质）。
-- `limit` 可省略（取 `MEMORY_SEARCH_LIMIT`），1..50。`/query/data`、`/retrieve` 纯检索不调 LLM，`memory` 对其无效。
-- `/agent/query` 同时新增 `conversation_history` 字段（`[{role, content}]`），传给规划与终答合成 LLM；记忆注入终答合成。
-- 错误：功能未启用 `503`；非交互式用户 `403`；他人/不存在项目 `404`；后端不可用 **fail-open**（不注入、查询照常，`metadata.memory={"enabled":false,"reason":"unavailable"}`）。
-- 响应 `metadata.memory` 上报 `{enabled, project_id, fact_count}`；审计增加 `memory_enabled/memory_project_id/memory_fact_count`（不记事实文本）。省略 `memory` 时请求/响应与未启用记忆的部署逐字节一致。
+- `project_id` 必填，长度 `1..128`；`limit` 可省略，省略时取部署默认 `MEMORY_SEARCH_LIMIT`，合法范围 `1..50`。
+- 只要携带 `memory`，`query` 最长为 **4096 字符**；超限在项目记忆检索前返回 `400`。
+- **授权早（authorize early）**：在 KB 检索或 Agent 规划前校验功能开关、交互式 JWT principal、项目归属与查询长度，只创建不含事实的进程内授权句柄。不存在和属于他人的项目统一 `404`，不泄露项目是否存在。
+- **检索晚（search late）**：先完成规划、KB 选择、双语预处理、检索、合并、rerank 与当前权威证据预算；只有确定将执行最终合成、选定实际 query LLM/tokenizer 并算出完整最终请求的剩余预算后，才校验 egress 并至多检索一次项目记忆。
+- **仅终答合成（final-synthesis-only）**：记忆不会进入 Agent 规划、staged 需求解析/骨架召回/指标验证、KB 选择、检索查询、关键词提取、rerank 或结构化 verdict，也不会改变召回结果。Agent 需要澄清时已完成作用域授权，但不搜索记忆；返回 `not_used/clarification_required`。
+- **必须有当前 KB 证据**：最终处理后的当前 KB 证据为空时，不搜索记忆、不调用最终 query LLM，也不能仅凭记忆作答；返回 `not_used/no_kb_evidence`。该约束同样适用于单 KB、多 KB、双语、Agent plan 和 Agent staged。
+
+以下请求没有最终合成；携带 `memory` 时会在任何项目记忆检索前直接返回 HTTP `400`，稳定错误码为 `chat_memory_requires_final_synthesis`：
+
+| 不支持组合/端点 | 结果 |
+|---|---|
+| 单 KB 或多 KB query/query-stream 的 `mode="bypass"` | `400 chat_memory_requires_final_synthesis` |
+| 单 KB query/query-stream 的 `only_need_context=true` | `400 chat_memory_requires_final_synthesis` |
+| 单 KB query/query-stream 的 `only_need_prompt=true` | `400 chat_memory_requires_final_synthesis` |
+| 单 KB query/query-stream 同时设置两个 flag 为 `true` | `400 chat_memory_requires_final_synthesis` |
+| `POST /kbs/{kb_id}/query/data` | `400 chat_memory_requires_final_synthesis` |
+| `POST /kbs/{kb_id}/retrieve` | `400 chat_memory_requires_final_synthesis` |
+| `POST /kbs:retrieve` | `400 chat_memory_requires_final_synthesis` |
+
+#### `metadata.memory` 响应契约
+
+请求了 `memory` 时，非流式响应在原有 `metadata` 下增加 `memory`；单/多 KB stream 在首个 NDJSON 头事件中返回，Agent stream 在最终 `done` 事件中返回：
+
+```json
+{
+  "metadata": {
+    "memory": {
+      "enabled": true,
+      "project_id": "proj_1a2b3c4d5e6f",
+      "status": "injected",
+      "fact_count": 5,
+      "injected_count": 3,
+      "truncated": true,
+      "references": [
+        {
+          "reference_id": "M1",
+          "fact_id": "edge-uuid",
+          "valid_at": "2026-07-10T08:00:05+00:00"
+        }
+      ],
+      "reason": "可选，仅特定状态出现"
+    }
+  }
+}
+```
+
+字段与冻结状态如下：
+
+| 字段/状态 | 契约 |
+|---|---|
+| `enabled` | 本次记忆作用域是否可用；后端可用但未使用/无结果/预算不足时仍为 `true`，仅 typed backend availability 故障的 fail-open 结果为 `false` |
+| `project_id` | 已授权的 chat 项目；只在响应 metadata 中返回，不复制到 query/Agent 审计的记忆投影 |
+| `status="injected"` | 至少一条完整事实记录进入最终上下文 |
+| `status="empty"` | 已搜索，但没有可用事实 |
+| `status="budget_exhausted"` | tokenizer/总容量不可用、固定安全框架放不下，或有事实但没有完整记录能同时满足 token/字符/最终请求预算；若有可用事实因预算被省略，`truncated=true` |
+| `status="unavailable"` | 仅限 typed Chat Memory backend availability 故障；fail-open，`enabled=false`、`reason="unavailable"`，主查询继续 |
+| `status="not_used"` | 已授权但不搜索；`reason` 固定为 `clarification_required` 或 `no_kb_evidence` |
+| `fact_count` | 项目记忆搜索匹配数（保持兼容口径），未搜索时为 `0` |
+| `injected_count` | 实际注入的完整 JSONL 记录数 |
+| `truncated` | 是否至少有一条可用事实因预算未被注入；空白/格式错误事实不算预算截断 |
+| `references` | 仅包含已注入事实的内容无关溯源；`reason` 不适用时省略 |
+
+引用命名空间严格分离：普通/多 KB 当前证据沿用数字 `[1]`、`[2]`；Agent 当前证据沿用 `[A1]`、`[A2]`；项目记忆只使用本次请求内连续分配的 `[M1]`、`[M2]`。`metadata.memory.references[].fact_id` 是 **Graphiti generation-scoped** 标识，重建后可能变化，不得作为永久业务主键。`[M*]` 不进入既有顶层 `references`，也不进入模型生成的 `### References` 段；该段始终只列当前 KB 证据。
+
+#### 信任、预算、缓存与敏感数据边界
+
+- 服务端把记忆拆成两部分：受信任的 **Server Memory Policy** 放在服务端控制的指令区；事实只以带显式 begin/end delimiter 的**不受信任 JSONL 数据**放入最终 Context。事实中的控制符、换行、尖括号和方括号会转义，事实文本不能伪造 delimiter 或 `[M99]` 记录。
+- 记忆通过私有 sensitive-context 参数直达最终合成，且不修改 `QueryParam.user_prompt`；它也不会进入查询配置反射、持久化 query param、hash 或缓存 metadata。只有服务端生成的 `reference_id` 字段可建立 `[M*]`。
+- `[M*]` 声明必须由本次当前权威 KB 证据独立佐证后才可作为次级 inline provenance；冲突时以 KB 证据为准，未佐证记忆必须丢弃。Agent 的客观结论和 staged verdict 仍必须由 `[A*]` 支撑。
+- 预算同时受 `LIGHTRAG_CHAT_MEMORY_PROMPT_MAX_TOKENS`、`LIGHTRAG_CHAT_MEMORY_PROMPT_MAX_CHARS` 和完整最终请求的 `max_total_tokens` 约束；完整请求计入 system prompt、query、全部 conversation history、确定性分隔符和 framing reserve。记忆永不挤掉已选定的 KB 证据。
+- 默认 egress 策略要求记忆抽取 LLM 与本次实际最终 query LLM 的 credential-free canonical endpoint identity 均非空且相等；不相等、只解析出一方或双方都未知都会在搜索记忆前拒绝。只有显式设置 `LIGHTRAG_CHAT_MEMORY_ALLOW_CROSS_PROVIDER_QUERY_EGRESS=true` 才可跨 endpoint；原始 endpoint 不进入响应、审计或敏感日志。
+- 只要请求携带授权记忆句柄，KG/naive 最终 query-result cache 的 lookup/write 均绕过，即使最终状态为 `empty`、`unavailable` 或 `budget_exhausted`；关键词缓存仍可使用，因为记忆不进入关键词 prompt。
+- 最终 LLM 调用在整个非流式/流式生命周期标记为敏感调用：抑制 prompt/response debug 日志与 tracing，避免使用会采集内容的可选 instrumentation，并把 provider/stream 异常清洗为不含 endpoint、请求体、事实或模型输出的错误。
+- 省略 `memory` 时不创建敏感句柄，不添加 `metadata.memory`，现有 JSON/NDJSON 字段和字节形态保持兼容；Agent stream 的 `done` 事件也不新增 `metadata`。
+
+#### 错误与 fail-open
+
+| 条件 | HTTP/流契约 | 是否搜索记忆 |
+|---|---|---|
+| 功能未启用/读取服务未挂载 | `503` | 否 |
+| principal 不是交互式 JWT 用户 | `403` | 否 |
+| 项目不存在或不属于当前用户 | `404` | 否 |
+| `memory` 请求的 query 超过 4096 字符 | `400`；KB 路径使用 `chat_memory_query_too_long`，Agent 当前返回内容无关的长度错误 | 否 |
+| 无最终合成（上表全部组合） | `400 chat_memory_requires_final_synthesis` | 否 |
+| 最终 query LLM egress 不符合默认同 endpoint 策略 | `403 chat_memory_query_llm_egress_not_allowed` | 否 |
+| 最终请求 builder 返回无效内容 | 内容无关 `500 chat_memory_final_request_builder_invalid` | 可能尚未搜索或已在候选预算阶段搜索；均立即硬失败 |
+| typed backend availability 故障 | 不返回错误；主查询继续，`metadata.memory={enabled:false,status:"unavailable",fact_count:0,injected_count:0,truncated:false,references:[],reason:"unavailable"}` | 已尝试或在 read fence/backend 阶段失败 |
+
+Agent 流在响应头发出后才发现 egress/builder 等 hard policy error 时，HTTP 状态不能再改写；服务端发出一个终止 NDJSON 事件：`{"event":"error","error_code":"...","status_code":403|400|500,"message":"..."}`，不泄露 provider 或记忆内容。
 
 ---
 
@@ -1452,10 +1549,12 @@ KB Agent Profile 用于帮助 `/agent/query` 在多 KB 候选集中选库，不�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/health` | 系统健康、配置和队列状态（含 `chat_memory: {enabled, available, pending_tasks}` 记忆子系统状态）；默认 whitelist 放行 |
+| `GET` | `/health` | 系统健康、配置和队列状态；`chat_memory` 当前返回 `{enabled, available, pending_tasks, worker_running, extraction_fingerprint, graph_store_fingerprint}`。其中 `pending_tasks` 仅是进程内兼容任务数，durable outbox backlog 以管理恢复接口返回的状态计数为准；默认 whitelist 放行 |
 | `GET` | `/metrics` | Prometheus text format 指标（KB/doc/job/audit gauge + process-local HTTP counter/histogram）；受 `combined_auth` 保护，默认不在 whitelist；单服务器部署配套告警/SLO/dashboard 见 `deploy/monitoring/` |
 | `GET` | `/auth-status` | 认证模式状态；非企业模式下可能签发 guest token |
 | `POST` | `/login` | 非企业模式下使用 `AUTH_ACCOUNTS`；企业模式下使用企业用户表 |
+
+Chat Memory 运维信号：`enabled` 是新消息 admission/自动召回开关，`available` 表示当前 Graphiti/Neo4j backend slot 是否可用，`worker_running` 表示本进程 durable outbox consumer 是否运行；两个 fingerprint 只返回缩短后的 extraction/graph-store 身份用于部署核对。`/health` 不扫描 PostgreSQL outbox；需要 durable `pending/running/retry_wait/dead_letter` 数量、最老可执行事件和 lag 时，使用 super-admin `POST /admin/chat-memory:backlog-scan`。
 
 ---
 
@@ -1626,7 +1725,7 @@ username=admin&password=change-me
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/admin/settings/registration` | 读取实时注册策略，返回 `enabled` 与 `mode` |
-| `GET` | `/admin/overview` | 平台总览 JSON 聚合：KB 状态分布、文档/job/artifact 全局聚合与计数器合计、dead-letter 总数、企业用户/租户/service key/审计事件计数、**项目记忆全局统计**（`chat_memory`：启用/可用、episode 总数、distinct 用户/项目数）；仅查控制面，不加载引擎实例（面向管理台 dashboard，替代解析 `/metrics` 文本） |
+| `GET` | `/admin/overview` | 平台总览 JSON 聚合：KB 状态分布、文档/job/artifact 全局聚合与计数器合计、dead-letter 总数、企业用户/租户/service key/审计事件计数、**项目记忆全局统计**（`chat_memory`：`enabled`、`available`、兼容 `pending_tasks`、`episode_count`、`user_count`、`project_count`）；仅查控制面，不加载引擎实例。durable outbox 状态使用下述 backlog recovery 接口读取 |
 | `PATCH` / `PUT` | `/admin/settings/registration` | 更新实时注册策略，body：`{"enabled": true}` 或 `{"mode":"open"}` |
 | `GET` | `/admin/users` | 列出企业用户；支持 `status`/`tenant_id`/`q`(用户名子串) 过滤与 `limit`/`offset` 分页 |
 | `POST` | `/admin/users` | 创建用户，可设置 `can_create_kb`、`can_use_bypass_query`、`can_use_agent_query`、`can_delete_documents`、`can_download_files`、`tenant_id` |
@@ -1636,9 +1735,10 @@ username=admin&password=change-me
 | `POST` | `/admin/users/{user_id}:disable` | 禁用用户并递增 `token_version`，旧 token 失效 |
 | `POST` | `/admin/users/{user_id}:enable` | 启用用户并递增 `token_version` |
 | `POST` | `/admin/users/{user_id}:reset-password` | 重置用户密码并递增 `token_version` |
-| `DELETE` | `/admin/users/{user_id}` | 删除用户；级联清理租户 membership、KB ACL、个人查询设置、对话项目/会话/消息，并异步清空其全部项目记忆图；不允许删除 super admin |
-| `POST` | `/admin/users/{user_id}/chat-memory:purge` | **手动清空用户项目记忆**（`LIGHTRAG_CHAT_MEMORY_ENABLED=true`）；body 可选 `{"project_ids": [...]}`，省略则清空该用户全部项目；返回 `{purged, project_ids}`；用户不存在 `404`，功能未启用 `503` |
-| `POST` | `/admin/chat-memory:backlog-scan` | **手动触发记忆补偿扫描**：重摄取 seq 超过水位的会话（LLM 恢复后不必等重启）；body 可选 `{"limit": 100}`，返回 `{reingested_batches}`；未启用 `503` |
+| `DELETE` | `/admin/users/{user_id}` | 删除用户；在同一 PostgreSQL 事务中级联清理租户 membership、KB ACL、个人查询设置、对话项目/会话/消息，并为已有记忆组持久化 purge outbox 事件；事件不外键级联，源用户/项目删除后仍可恢复；不允许删除 super admin |
+| `POST` | `/admin/users/{user_id}/chat-memory:purge` | **持久化排队用户项目 purge**；使用 maintenance service，不要求 read/ingest 开关仍开启。body 可选 `{"project_ids":[...]}`：显式列表去重并逐项校验属于该用户，省略/空列表枚举该用户当前全部项目；返回 `{queued, noop, project_ids}`。用户/项目不存在 `404`，maintenance 未挂载 `503`，graph-store 不匹配等写冲突 `409` |
+| `POST` | `/admin/chat-memory:backlog-scan` | **durable stale-claim recovery + worker wakeup**，不是旧 seq 水位重摄取扫描。body 可选 `{"limit":100}`（`1..1000`）；尝试恢复 stale `running` 事件、nudge worker，并返回 `{recovered_events, outbox:{pending,running,retry_wait,dead_letter,oldest_available_at,oldest_lag_seconds}}`；maintenance/worker 未挂载 `503` |
+| `POST` | `/admin/chat-memory/events/{event_id}:retry` | **按 durable event ID 恢复 purge**；可在源用户/项目已删除后使用。仅 `purge` 事件可操作：`dead_letter` 立即重排，`pending/retry_wait` 幂等返回并唤醒 worker；不存在 `404`，非 purge、`running/succeeded/superseded` 或状态竞争返回 `409`。若事件属于另一 graph store，返回 `409 chat_memory_old_graph_store_required`，须恢复原 `MEMORY_NEO4J_DEPLOYMENT_ID`/Neo4j backend 后重试 |
 | `POST` | `/admin/users/{user_id}/kb-access:batch-set` | 按用户维度批量 grant/revoke 多个 KB ACL；与按 KB 维度 `/admin/kbs/{kb_id}/acl:batch-set` 互补 |
 | `POST` | `/admin/tenants` | 创建租户实体（可指定 `tenant_id`，省略则生成 `tenant_<hex>`；重复 `409`） |
 | `GET` | `/admin/tenants` | 列出所有租户 |
@@ -1689,7 +1789,7 @@ Tenant membership 响应对象字段：`tenant_id`、`user_id`、`role`、`grant
 
 租户用户管理边界：目标必须在事务提交时仍是本 tenant 的普通 `tenant_member`；tenant admin 不能修改或删除自己、`tenant_admin`、`tenant_owner`、super admin，也不能通过 scoped API 迁移用户到其他 tenant。用户快照、membership、角色与写入采用事务级 CAS；并发迁移/晋升发生时返回 `409`，不会把旧快照写回覆盖新状态。
 
-KB ACL 角色使用规范名称：`kb_viewer`、`kb_editor`、`kb_admin`、`kb_owner`。平台来源角色取 direct user ACL 与 visibility 隐含角色最高值；tenant 来源另按 KB provenance 计算：tenant-owned KB 只有显式 allow override 才给普通成员角色，deny/无 override 均不授予；platform-provisioned KB 无 override 时继承当前 tenant ACL，allow 不能超过当前 tenant ACL，deny 只压制 tenant-derived access，`reset=true` 后恢复当前继承。最终 effective role 是 platform 与 tenant contribution 的最高值，因此 tenant admin 的 revoke 不会删除 super admin 的 direct grant 或 public/internal visibility。Service/scoped API key 默认只按自身 `kb_roles` scope；设置 `tenant_id + inherit_tenant_kb_acl=true` 时才显式继承 tenant ACL。
+KB ACL 角色使用规范名称：`kb_viewer`、`kb_editor`、`kb_admin`、`kb_owner`。平台来源角色取 direct user ACL 与 visibility 隐含角色最高值；tenant 来源另按 KB provenance 计算：tenant-owned KB 只有显式 allow override 才给普通成员角色，deny/无 override 均不授予，但 `tenant_admin` / `tenant_owner` 对本租户 tenant-owned KB **始终**保底隐含 `kb_viewer`（source=`tenant_admin_oversight`，deny override 也不能移除；显式 allow override 给出的更高角色优先）；platform-provisioned KB 无 override 时继承当前 tenant ACL，allow 不能超过当前 tenant ACL，deny 只压制 tenant-derived access，`reset=true` 后恢复当前继承。最终 effective role 是 platform 与 tenant contribution 的最高值，因此 tenant admin 的 revoke 不会删除 super admin 的 direct grant 或 public/internal visibility。Service/scoped API key 默认只按自身 `kb_roles` scope；设置 `tenant_id + inherit_tenant_kb_acl=true` 时才显式继承 tenant ACL。
 
 知识库生命周期权限不等同于 KB role：租户管理员只能软删除、硬删除或恢复 `origin="tenant"` 且 `tenant_id` 为本部门的 KB；super admin 下发的 `origin="platform"` KB 即使 tenant ACL 为 `kb_admin` 也不能由租户管理员删除。`origin` 是不可变 catalog 字段，历史缺失值 fail-safe 为 `platform`。
 
@@ -1731,10 +1831,11 @@ KB ACL 请求/响应约束：
 - service API key：`service_api_key_created`、`service_api_key_rotated`、`service_api_key_revoked`
 - KB ACL / tenant：`kb_acl_granted`、`kb_acl_revoked`、`tenant_created`、`tenant_updated`、`tenant_deleted`、`tenant_membership_granted`、`tenant_membership_revoked`、`tenant_kb_acl_granted`、`tenant_kb_acl_revoked`
 - 权限/限流/配额：`permission_denied`、`rate_limited`、`quota_exceeded`
-- KB/config/query/Agent：`kb_created`、`kb_deleted`、`kb_hard_deleted`、`kb_restored`、`kb_config_activated`、`query_executed`、`query_stream_started`、`retrieve_executed`、`agent_session_started`、`agent_retrieve_round`、`agent_query_completed`、`agent_session_failed`
+- KB/config/query/Agent：`kb_created`、`kb_deleted`、`kb_hard_deleted`、`kb_restored`、`kb_visibility_changed`、`kb_config_activated`、`query_executed`、`query_stream_started`、`retrieve_executed`、`agent_session_started`、`agent_retrieve_round`、`agent_query_completed`、`agent_session_failed`
 - KB 图谱编辑：`kb_graph_entity_edited`、`kb_graph_entity_created`、`kb_graph_entity_deleted`、`kb_graph_entities_merged`、`kb_graph_relation_edited`、`kb_graph_relation_created`、`kb_graph_relation_deleted`
 - 用户对话管理：`chat_project_created`、`chat_project_renamed`、`chat_project_deleted`、`chat_session_created`、`chat_session_updated`、`chat_session_deleted`、`chat_messages_appended`、`chat_message_deleted`（metadata 仅记录 id/计数/标志，不记录项目、会话名称或消息正文）
-- 项目记忆（chat memory）：`chat_memory_ingested`、`chat_memory_searched`、`chat_memory_purged`、`chat_memory_forgotten`（metadata 仅记录 id、计数、`query_hash`、`episode_uuid`、`scope` 等安全字段，不记录消息正文或查询原文）
+- 项目记忆（chat memory，当前 durable 路径）：成功执行的显式/自动 search 写 `chat_memory_searched`（记录 query hash/计数，不记录 query 或事实正文）；管理员排队 purge 与按事件恢复分别写 `chat_memory_purge_queued`、`chat_memory_purge_retry_queued`。消息追加/删除仍由 `chat_messages_appended`、`chat_message_deleted` 等源数据审计覆盖，durable outbox/worker 负责执行，不再把旧 fire-and-forget `chat_memory_ingested` / `chat_memory_forgotten` 当作可靠性或完成性凭据。
+- 自动注入附加到 `query_executed`、`query_stream_started`、`multi_kb_query_executed`、`multi_kb_query_stream_started`、`agent_query_completed` 的记忆投影严格限于 `memory_enabled`、`memory_fact_count`、`memory_injected_count`、`memory_status`、`memory_truncated`、`memory_reason`；不会复制 memory project ID、Graphiti fact ID/UUID、`M*` reference ID/数组或事实文本。`memory_status`/`memory_reason` 只接受 §8.3 的冻结枚举。
 - artifact/job/document 类事件：`artifact_downloaded`、`artifact_previewed`、`artifact_download_url_created`、`kb_rebuild_queued`、`job_cancel_requested`、`job_retry_queued`、`document_batch_enabled`、`document_batch_disabled`，以及文档 upload/texts/urls/import/scan/sync/patch/enable/disable/replace/delete/batch-delete/parse/batch-parse/build/reindex/batch-build/batch-reindex/rebuild 相关事件。
 
 审计覆盖：企业模式下，KB 创建/删除、KB Agent Profile 人工更新/刷新排队、config 激活、query/query-stream/retrieve、artifact download/preview/download-url、文档 upload/texts/urls/import/scan/sync/patch/enable/disable/replace/delete/batch-delete/parse/batch-parse/build/reindex/batch-build/batch-reindex/rebuild，以及 job cancel/retry 均写入 audit event。审计 metadata 采用白名单字段：query 仅记录 `query_hash`、mode、过滤摘要；文档与 artifact 事件仅记录 job/batch/document/artifact id、count、flag、hash、size/type 等，不记录 raw query、上传正文、URL、local path、presigned URL、密码/token/API key 明文。
@@ -1874,7 +1975,7 @@ Service API key 行为约束：
 - legacy/global `/documents`、`/query`、`/graph`、Ollama `/api/*` 在 `LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES=true` 时默认拒绝；关闭该开关后仍需 super admin。
 - super admin bootstrap 来自 `.env`，启动后同步为 active super admin；企业模式要求非默认 `TOKEN_SECRET`。
 - Tenant membership、tenant-scoped KB ACL 与 tenant-user override 已接入统一 effective-role resolver；KB 列表、普通 query/retrieve 与 Agent candidate filtering 复用同一结果。Tenant deny 只屏蔽 tenant-derived access，不能覆盖 direct user ACL 或 visibility。Service key 默认只按显式 `kb_roles` scope；设置 `tenant_id + inherit_tenant_kb_acl=true` 时才继承 tenant ACL。
-- **KB 可见性（visibility）语义**：`knowledge_bases.visibility ∈ {private, internal, public}`，默认 `private`。`private` 无隐含权限；`internal` 在 KB `tenant_id` 非空时对该租户用户隐含 `kb_viewer`；`public` 对全部已认证企业交互用户（JWT principal）隐含 `kb_viewer`。隐含角色仅为只读。service/scoped API key 与 legacy enterprise API key 不受 visibility 影响。`GET /admin/users/{id}/access` 仅列显式授权，不枚举 visibility。只有 super admin 可通过 `PATCH /kbs/{kb_id}` 改 visibility；tenant-created KB 固定 private。
+- **KB 可见性（visibility）语义**：`knowledge_bases.visibility ∈ {private, internal, public}`，默认 `private`。`private` 无隐含权限；`internal` 在 KB `tenant_id` 非空时对该租户用户隐含 `kb_viewer`；`public` 对全部已认证企业交互用户（JWT principal）隐含 `kb_viewer`。隐含角色仅为只读。service/scoped API key 与 legacy enterprise API key 不受 visibility 影响。`GET /admin/users/{id}/access` 仅列显式授权，不枚举 visibility。visibility 修改：super admin 可改任意 KB；tenant-created KB（`origin="tenant"`）的 effective `kb_owner`（通常为创建者）可在 `private` ↔ `internal` 间随时切换实现"私有/共享"（`public` 仍为 super admin 专属）；platform KB 仍仅 super admin 可改。**tenant admin oversight**：`tenant_admin` / `tenant_owner` 对本租户 tenant-owned KB 始终隐含只读 `kb_viewer`，成员私有 KB 对租户管理员始终可见。
 - 文档删除为所有权感知模型：`kb_editor` 仅可删除本人上传（`metadata.created_by`）的文档；删除他人文档需用户级能力 `can_delete_documents`（super admin 通过 `/admin/users` 授予）或 `kb_admin`+/`super_admin`。service/scoped API key 不会获得 `can_delete_documents`：只能按 `kb_admin` scope 删任意，或按 `kb_editor` scope 删除该 key 自身上传的文档；无 `created_by` 的历史文档仅 privileged 主体可删。
 - 文件导出是 KB role 与用户能力的双重门禁：交互式用户访问 artifact `:download` / `:download-url`，以及 original `:preview`，除满足 artifact role policy 外还需 `can_download_files=true`；问答引用文献的下载链接走相同端点，因此不能绕过。派生安全预览不要求该能力。super admin 与 service key 例外，但 service key 仍受显式 KB scope/role。
 
@@ -1882,14 +1983,14 @@ KB 路由角色矩阵：
 
 | 范围 | 最低角色 / 能力 |
 |---|---|
-| `POST /kbs` | super admin、canonical `tenant_admin`/`tenant_owner`，或 `can_create_kb=true`；租户用户创建时强制 tenant provenance/private/tag |
-| `GET /kbs` | super admin 看全部；普通用户看 direct user ACL / tenant ACL 授权 KB + visibility 命中 KB（`public` / 同租户 `internal`）；service key 默认仅看 `kb_roles` scope，显式 `inherit_tenant_kb_acl` 时额外继承 tenant ACL，不受 visibility 影响 |
+| `POST /kbs` | super admin、canonical `tenant_admin`/`tenant_owner`，或 `can_create_kb=true`；租户用户创建时强制 tenant provenance/tag，visibility 限 `private`（默认）/`internal` |
+| `GET /kbs` | super admin 看全部；普通用户看 direct user ACL / tenant ACL 授权 KB + visibility 命中 KB（`public` / 同租户 `internal`）；`tenant_admin`/`tenant_owner` 额外始终看到本租户 `origin=tenant` 的全部 KB（含 private，oversight 只读）；service key 默认仅看 `kb_roles` scope，显式 `inherit_tenant_kb_acl` 时额外继承 tenant ACL，不受 visibility 影响 |
 | `GET /kbs/{kb_id}`、`GET /kbs/{kb_id}/status`、`/stats`、`/documents/{id}/chunks`、graph 读取、artifact/doc/job/config/query 读取 | `kb_viewer` 或更高（可由 visibility 隐含，见上）；artifact action policy 可提升最低角色；`:download` / `:download-url` 与 original `:preview` 对交互式用户额外要求 `can_download_files=true` |
 | `/kbs/{kb_id}/query`、`/query/stream`、`/query/data`、`/retrieve` | `kb_viewer` 或更高；最终 `mode="bypass"` 额外需要 `can_use_bypass_query=true` |
 | `POST /kbs:query`、`/kbs:query/stream`、`/kbs:retrieve`（跨库合并查询） | `kb_ids` 中每个 KB 均需 `kb_viewer`+（handler 自鉴权，中央中间件不覆盖 collection 级路径）；`bypass` 不支持(400) |
 | 文档上传/解析/构建/替换/sync、批量启停（`:batch-enable`/`:batch-disable`）、`:rebuild`、job wait/cancel/retry 等写操作 | `kb_editor` 或更高 |
 | 文档删除（`DELETE …/documents/{id}`、`:batch-delete`） | `kb_editor` 仅删本人上传(`metadata.created_by`)的文档；删他人需 `can_delete_documents` 能力或 `kb_admin`+/`super_admin` |
-| KB 配置创建/激活/diff、`PATCH /kbs/{kb_id}`、图谱编辑（`/graph` 下全部非 GET 端点） | `kb_admin` 或更高；非 super admin 不能改 owner/tenant/visibility/provenance |
+| KB 配置创建/激活/diff、`PATCH /kbs/{kb_id}`、图谱编辑（`/graph` 下全部非 GET 端点） | `kb_admin` 或更高；非 super admin 不能改 owner/tenant/provenance；visibility 例外：tenant-created KB 的 effective `kb_owner` 可切换 `private`/`internal`，其余情况仍 super admin 专属 |
 | `DELETE /kbs/{kb_id}`、`?hard=true`、`POST /kbs/{kb_id}:restore` | super admin；或该 KB 为 `origin=tenant` 且当前用户是其 canonical tenant 的 `tenant_admin` / `tenant_owner`。direct/tenant ACL 的 `kb_admin`/`kb_owner` 本身不授予生命周期权限 |
 | `/admin/...` | super admin；仅精确 `GET /admin/tenants/{tenant_id}` 允许目标 tenant admin/owner |
 
@@ -1911,7 +2012,7 @@ KB 路由角色矩阵：
 | `GET` | `/chat/projects/{project_id}/sessions/{session_id}` | 会话详情 |
 | `PATCH` | `/chat/projects/{project_id}/sessions/{session_id}` | 更新会话；body 为 `name` / `context_rounds` 的任意组合，至少给一个字段（空 body `400`） |
 | `DELETE` | `/chat/projects/{project_id}/sessions/{session_id}` | 删除会话并**级联删除其全部消息**，响应含 `deleted_messages` 计数 |
-| `POST` | `/chat/projects/{project_id}/sessions/{session_id}/messages` | 批量追加消息（1..20 条，单事务原子写入并分配连续 `seq`）；同一事务内刷新会话 `updated_at`；启用项目记忆时，落库成功后异步触发记忆摄取（见下） |
+| `POST` | `/chat/projects/{project_id}/sessions/{session_id}/messages` | 批量追加消息（1..20 条，单事务原子写入并分配连续 `seq`）；同一事务内刷新会话 `updated_at`；启用项目记忆 admission 时，同一 PostgreSQL 事务还会分配项目事件序号/参考时间并持久化 durable ingest outbox，提交后只 nudge worker（见下） |
 | `GET` | `/chat/projects/{project_id}/sessions/{session_id}/messages?limit=100&offset=0` | 会话消息列表，按 `seq` 升序（`limit` 1..500，返回 `total`）；会话不存在返回 `404` |
 | `DELETE` | `/chat/projects/{project_id}/sessions/{session_id}/messages/{message_id}` | 删除单条消息 |
 | `POST` | `/chat/projects/{project_id}/memory:search` | **项目记忆检索**（`LIGHTRAG_CHAT_MEMORY_ENABLED=true` 时可用）：在该项目的长期记忆图谱中混合检索历史会话沉淀的事实，见 [10.5.1 项目记忆](#1051-项目记忆chat-memorygraphiti) |
@@ -1975,6 +2076,7 @@ Content-Type: application/json
       "role": "assistant",
       "content": "建议 NR/BR 并用… [A1]",
       "metadata": {
+        "memory_eligible": true,
         "mode": "mix",
         "kb_ids": ["kb_formula"],
         "references": [{"reference_id": "A1", "kb_id": "kb_formula", "file_path": "formula.md"}]
@@ -1990,7 +2092,7 @@ Content-Type: application/json
   "project_id": "proj_1a2b3c4d5e6f",
   "messages": [
     {"id": "msg_...", "session_id": "sess_9f8e7d6c5b4a", "project_id": "proj_...", "user_id": "usr_...", "role": "user", "content": "低温屈挠性怎么提升？", "metadata": {}, "seq": 1, "created_at": "..."},
-    {"id": "msg_...", "role": "assistant", "content": "建议 NR/BR 并用… [A1]", "metadata": {"mode": "mix", "kb_ids": ["kb_formula"], "references": [...]}, "seq": 2, "created_at": "...", "session_id": "...", "project_id": "...", "user_id": "..."}
+    {"id": "msg_...", "role": "assistant", "content": "建议 NR/BR 并用… [A1]", "metadata": {"memory_eligible": true, "mode": "mix", "kb_ids": ["kb_formula"], "references": [...]}, "seq": 2, "created_at": "...", "session_id": "...", "project_id": "...", "user_id": "..."}
   ]
 }
 ```
@@ -2016,14 +2118,36 @@ CHAT_SESSION_DEFAULT_CONTEXT_ROUNDS=1
 
 #### 10.5.1 项目记忆（Chat Memory，graphiti）
 
-> 完整设计（选型、隔离模型、成本、运维核对清单）见 [`docs/ChatMemory-zh.md`](ChatMemory-zh.md)。依赖可选 extra：`uv sync --extra memory`（graphiti-core）；图存储复用 Neo4j（server ≥ 5.26）。
+> 当前部署契约：依赖可选 extra `uv sync --extra memory`（`graphiti-core==0.29.2`）与 Neo4j server ≥ 5.26。自动 admission/召回只支持企业认证 + `LIGHTRAG_KB_METADATA_BACKEND=postgres`；若 `LIGHTRAG_CHAT_MEMORY_ENABLED=true` 但未启用企业认证或 metadata backend 不是 PostgreSQL，服务启动配置校验直接失败。
 
-给**每个用户的每个 chat 项目**一张独立的长期记忆图谱（graphiti `group_id = {user_id}--{project_id}`），实现跨会话记忆："用户在项目内新建会话提问时，能召回以前会话沉淀的需求、约束与结论"。
+项目记忆以 PostgreSQL chat 消息为**唯一源数据**，Graphiti/Neo4j 是可重建的派生状态。隔离维度是 `(user_id, project_id)`：逻辑组使用稳定 hash ID，实际 Graphiti group 使用带 generation 的物理 ID（形如 `cm_<hash>_gN`）。客户端不得依赖 group ID、generation 或 Graphiti UUID 的长期稳定性。
 
-- **写入（自动，异步）**：前端照常把一问一答 `POST` 到 `.../messages`；服务端落库成功后 fire-and-forget 把该批消息提炼为时序知识图谱 episode（实体 + 事实边 + bi-temporal 时间戳，矛盾旧事实自动标记 `invalid_at` 而非删除）。摄取不阻塞请求、失败只记日志（best-effort）；同一项目串行摄取，全局并发受 `MEMORY_INGEST_CONCURRENCY` 钳制。摄取幂等（按会话 `seq` 水位去重），服务重启后启动补偿扫描会补摄取丢失的批次。
-- **读取有两种方式**：
-  1. **服务端自动注入（推荐，前端零拼接）**——在 `/kbs/{kb_id}/query`(+stream)、`/kbs:query`(+stream)、`/agent/query`(+stream) 请求体加 `memory: {"project_id": "...", "limit": 10}`，服务端校验项目归属→检索→把事实块前置到 `user_prompt`，前端无需自己调检索再拼接。详见 [8.3 记忆自动注入](#83-记忆自动注入)。
-  2. **独立检索端点**——`POST /chat/projects/{project_id}/memory:search`，供需要显式控制注入内容的场景：
+##### Durable outbox、FIFO 与 generation fence
+
+- **源写入与工作排队原子提交**：启用 admission 时，`POST .../messages` 在一个 PostgreSQL 事务中写入消息、分配同项目单调 `event_seq/project_event_seq` 与 `memory_reference_time`，并插入 `ingest` outbox；请求提交后只唤醒 worker。不存在“消息已提交但 fire-and-forget 任务丢失”的可靠性窗口。
+- outbox 事件类型固定为 `ingest`、`rebuild`、`purge`；状态固定为 `pending`、`running`、`retry_wait`、`succeeded`、`superseded`、`dead_letter`。同一用户×项目按 `event_seq` FIFO，`pending/running/retry_wait/dead_letter` 都会阻塞本组后续普通事件，不能越过 dead-letter gap；不同组可并发，默认并发由 `MEMORY_INGEST_CONCURRENCY` 控制。
+- worker 用 PostgreSQL claim token + session advisory group lock 取得所有权，不使用可调时间 lease。`LIGHTRAG_CHAT_MEMORY_WORKER_SIDE_EFFECT_TIMEOUT_SECONDS` 同时界定 Graphiti side effect 总 deadline，并作为 stale-running 判定默认阈值；独立 recovery loop 定期验证 owner 已消失后再恢复事件。
+- Graphiti side effect **开始前**的确定失败按当前 worker 默认延迟/次数进入 `retry_wait`，耗尽后进入 `dead_letter`。side effect 已可能开始但结果未知时，ingest/rebuild 不在同一物理 generation 盲重试：旧 generation 标记 abandoned，推进到新 generation 并从 SQL 源数据重建；purge 则保持 `purge_pending`，直到某次 definite clear 成功。
+- 每个 generation 有持久化 inventory。读取前后都核对 group state、active generation、state version、extraction fingerprint 与 graph-store fingerprint；只有完整重放且 CAS 激活的 generation 可读。重建超过 `LIGHTRAG_CHAT_MEMORY_REBUILD_MAX_MESSAGES` 或 `...REBUILD_MAX_BYTES` 时 fail closed，绝不激活部分快照。
+- `LIGHTRAG_CHAT_MEMORY_ENABLED=false` 关闭**新消息 admission 和自动召回**；该期间追加的消息没有 memory event sequence，不会在以后被静默补录。`LIGHTRAG_CHAT_MEMORY_MAINTENANCE_ENABLED=true` 可让已有组的 rebuild/purge 继续排队和执行，读写开关与维护可靠性相互独立。
+
+##### Admission 与内容策略
+
+- 非空 `user` 消息默认可进入 episode；`assistant` 消息只有在该消息 `metadata.memory_eligible` 为 JSON boolean `true` 时才可进入，避免模型回答自动自我强化。其他 role、空白内容不进入 Graphiti；一个 append batch 仍保留为一个 replay 边界。
+- 每条已 admission 消息送入抽取前最多使用 `MEMORY_INGEST_MAX_CHARS` 个字符，超出部分带截断标记；该策略和抽取/embedding/LLM 设置参与 extraction fingerprint，变更会触发新 generation。
+- `LIGHTRAG_CHAT_MEMORY_STORE_RAW_EPISODE_CONTENT=false` 是企业隐私默认值：SQL 消息保留为源数据，Neo4j 不额外保存 Graphiti raw episode content。显式改为 `true` 会增加原文副本与隐私面，并改变 extraction fingerprint。
+- `MEMORY_INGEST_MODE`、`MEMORY_INGEST_DEBOUNCE_SECONDS`、`MEMORY_BACKLOG_SCAN_ON_START`、`MEMORY_BACKLOG_BATCH_MESSAGES`、`MEMORY_MAX_INFLIGHT_PER_USER` 仍为旧调用方兼容/聚合参数；当前 enterprise server 已禁用 legacy `schedule_*` fire-and-forget 路径，它们不是 durable reliability 机制，也不控制下述管理员 backlog recovery。
+
+##### 删除、重建与 graph-store 绑定
+
+- 删除单条消息或会话：源删除与 generation 推进/`rebuild` outbox 在同一事务提交；worker 从仍存活且曾 admission 的 SQL append batches 完整重放，不调用非可逆的单 episode rollback。
+- 删除项目或用户：源数据删除与 durable `purge` 事件原子提交；outbox/generation 记录不随源行级联删除。purge 清理 active、building、retired、abandoned、purge-pending generation 以及旧版 `{user_id}--{project_id}` group，全部 definite clear 后才成功，因此源用户/项目删除后仍可按 event ID 恢复。
+- 一个逻辑组绑定一个 graph-store fingerprint。更换 `MEMORY_NEO4J_DEPLOYMENT_ID`、Neo4j endpoint/database 后继续对旧组 append/rebuild/delete/purge 会显式返回 `409 graph_store_migration_required`，不会把同一组分裂写入不同图。管理员重试旧 purge 时若 runtime graph store 不匹配，返回 `409 chat_memory_old_graph_store_required`。
+
+##### 两种读取方式
+
+1. **最终合成自动注入**：在单 KB、多 KB、Agent plan/staged 的 query/query-stream 请求体加 `memory: {"project_id":"...","limit":10}`。服务端授权早、搜索晚，仅在当前 KB 证据完成后把 trusted policy 与 untrusted JSONL 数据加入最终合成，不影响规划/检索，完整状态、引用、错误和 egress 契约见 [8.3](#83-项目记忆自动注入仅终答合成)。
+2. **独立检索端点**：`POST /chat/projects/{project_id}/memory:search` 直接返回当前 generation 的有效事实，供管理/展示或由受信任客户端自行处理；它不是自动注入的前置步骤：
 
 ```http
 POST /chat/projects/{project_id}/memory:search
@@ -2050,36 +2174,57 @@ Content-Type: application/json
 }
 ```
 
-- 行为约束：
-  - `query` 1..4096 字符；`limit` 1..50，缺省取部署默认 `MEMORY_SEARCH_LIMIT`。检索为 BM25 + 向量余弦 + RRF 混合（`MEMORY_RERANK_ENABLED=true` 时改用部署 reranker 走 cross-encoder 精排配方）。
-  - 鉴权同 `/chat` 其余端点（仅交互式 JWT 用户）；他人/不存在的项目统一 `404`。
-  - 记忆功能未启用返回 `503 Chat memory is not enabled`；已启用但后端（Neo4j/依赖）暂不可用返回 `503 Chat memory is temporarily unavailable`（服务启动失败会懒重试，Neo4j 恢复后自动可用）。
-  - 生命周期与撤销：删除项目 → 异步清理该项目记忆图；删除用户（`DELETE /admin/users/{user_id}`）→ 异步清理其全部项目记忆图；**删除会话 → 移除该会话全部 episode**；**删除单条消息 → 移除对应 episode 并重摄取该轮幸存消息**。
-  - 审计：`chat_memory_ingested`、`chat_memory_searched`（记 `query_hash`，不记原文）、`chat_memory_purged`、`chat_memory_forgotten`。
+- 独立检索行为：
+  - `query` 为 `1..4096` 字符；`limit` 为 `1..50`，缺省取 `MEMORY_SEARCH_LIMIT`。默认使用 Graphiti hybrid/RRF；`MEMORY_RERANK_ENABLED=true` 且部署 reranker 可用时走 cross-encoder recipe。
+  - 只搜索 `invalid_at IS NULL` 且 `expired_at IS NULL` 的当前事实，并在搜索前后执行 active-generation 双重 read fence；fence 改变时丢弃结果或 fail closed 为临时不可用。
+  - 仅交互式 JWT 用户可用；他人/不存在项目统一 `404`。功能未启用返回 `503 Chat memory is not enabled`；Graphiti/Neo4j/依赖或 read fence 不可用返回 `503 Chat memory is temporarily unavailable`。这与自动注入的 typed availability **fail-open metadata** 不同。
+  - 响应中的 `facts[].uuid` 也是 generation-scoped Graphiti fact ID；重建后可能改变。`invalid_at/expired_at` 字段保留在 schema 中，但正常当前事实搜索结果应为空值。
+  - `GET /chat/projects/{project_id}/memory` 返回 SQL mapping 统计 `{project_id,enabled,available,episode_count,last_ingested_at}`，不搜索 Neo4j，也不代表 durable outbox 已清空。
 
-配置（`.env`，未设置的 MEMORY_* 字段逐项继承 QUERY_LLM_* / EMBEDDING_* / NEO4J_*）：
+##### 运维与恢复
+
+- `/health.chat_memory` 给出 read/ingest 开关、backend availability、worker 是否运行和缩短 fingerprint；`pending_tasks` 仅为 legacy 进程内任务计数，不是 outbox 深度。
+- super-admin `POST /admin/chat-memory:backlog-scan {"limit":100}` 执行 stale `running` claim recovery、唤醒 worker，并返回 durable outbox 的 `pending/running/retry_wait/dead_letter/oldest_available_at/oldest_lag_seconds`。它不扫描会话 seq 水位，也不直接重摄取消息。
+- `POST /admin/users/{user_id}/chat-memory:purge` 只**持久化排队** purge，返回 `{queued,noop,project_ids}`；新建事件或已存在 `pending/running/retry_wait` purge 都按幂等已排队计入 `queued`，metadata group 已处于终态 `deleted` 时计入 `noop`。
+- `POST /admin/chat-memory/events/{event_id}:retry` 只恢复已有 purge outbox 行，不从请求重建 target，因此可安全用于源删除后的 dead letter。成功返回 `{event_id,status,user_id,project_id,event_type}`；不存在 `404`。非 purge 为 `409 chat_memory_retry_purge_only`，`running/succeeded/superseded` 等终态为 `409 chat_memory_event_not_retryable`，并发状态变化为 `409 chat_memory_event_retry_conflict`，错误 graph store 为 `409 chat_memory_old_graph_store_required`。
+
+当前主要配置（未设置的 provider `MEMORY_*` 字段逐项继承 QUERY LLM / deployment embedding / Neo4j）：
 
 ```bash
 LIGHTRAG_CHAT_MEMORY_ENABLED=true
+# read/ingest 关闭后仍可 drain 已存在的 rebuild/purge
+LIGHTRAG_CHAT_MEMORY_MAINTENANCE_ENABLED=true
+
+# durable worker / stale recovery；worker 使用 advisory ownership，不是时间 lease
+LIGHTRAG_CHAT_MEMORY_WORKER_POLL_SECONDS=1.0
+LIGHTRAG_CHAT_MEMORY_WORKER_RECOVERY_INTERVAL_SECONDS=30.0
+LIGHTRAG_CHAT_MEMORY_WORKER_SIDE_EFFECT_TIMEOUT_SECONDS=900.0
+LIGHTRAG_CHAT_MEMORY_WORKER_SHUTDOWN_TIMEOUT_SECONDS=10.0
+LIGHTRAG_CHAT_MEMORY_REBUILD_MAX_MESSAGES=10000
+LIGHTRAG_CHAT_MEMORY_REBUILD_MAX_BYTES=67108864
+
+# privacy/admission/final synthesis
+LIGHTRAG_CHAT_MEMORY_STORE_RAW_EPISODE_CONTENT=false
+LIGHTRAG_CHAT_MEMORY_PROMPT_MAX_TOKENS=1024
+LIGHTRAG_CHAT_MEMORY_PROMPT_MAX_CHARS=8192
+LIGHTRAG_CHAT_MEMORY_ALLOW_CROSS_PROVIDER_QUERY_EGRESS=false
+
 MEMORY_LLM_MODEL=qwen3.6-36b                 # 记忆抽取 LLM（OpenAI-compatible）
 MEMORY_LLM_TEMPERATURE=0.0
 MEMORY_STRUCTURED_OUTPUT_MODE=json_schema    # vLLM 约束解码；不支持时改 json_object
 MEMORY_OPENAI_LLM_EXTRA_BODY='{"chat_template_kwargs": {"enable_thinking": false}}'
 # MEMORY_EMBEDDING_DIM=4096                  # 必须与 embedding 服务实际维度一致
 # MEMORY_NEO4J_DATABASE=neo4j                # 需要物理隔离时指向独立 database（企业版）
+# MEMORY_NEO4J_DEPLOYMENT_ID=memory-prod-a   # graph-store 稳定身份；迁移时不可随意改变
 MEMORY_SEARCH_LIMIT=10
-MEMORY_INGEST_CONCURRENCY=2                  # 全局并发摄取上限
+MEMORY_INGEST_CONCURRENCY=2                  # durable worker 跨项目并发上限
 MEMORY_MAX_COROUTINES=4                      # graphiti 单次摄取内部并发
 MEMORY_INGEST_MAX_CHARS=6000                 # 单条消息参与摄取的最大字符数
 MEMORY_RERANK_ENABLED=false                  # true 时用部署 reranker 精排（cross-encoder 配方）
-MEMORY_INGEST_MODE=immediate                 # immediate 每轮即提炼 / debounced 按会话缓冲合并
-MEMORY_INGEST_DEBOUNCE_SECONDS=20            # debounced 模式静默窗口
-MEMORY_BACKLOG_SCAN_ON_START=true            # 启动补偿：重启后补摄取 seq 超过水位的会话
-MEMORY_BACKLOG_BATCH_MESSAGES=20
 GRAPHITI_TELEMETRY_ENABLED=false             # 内网部署关闭 graphiti 匿名遥测
 ```
 
-完整设计（写入/检索/注入/补偿/撤销/精排、配置回退链、运维核对清单）见 [`docs/ChatMemory-zh.md`](ChatMemory-zh.md)。
+除主开关 `LIGHTRAG_CHAT_MEMORY_ENABLED` 外，本节 namespaced maintenance/worker/rebuild/raw-content/prompt/egress setting 同时接受相应 `MEMORY_*` alias；新部署应使用上面的 `LIGHTRAG_CHAT_MEMORY_*` canonical key。旧 immediate/debounced/watermark backlog 参数仍被 parser 接受，但当前 enterprise server 不用它们承诺可靠性。
 
 ---
 

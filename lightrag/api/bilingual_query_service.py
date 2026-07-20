@@ -37,6 +37,13 @@ from lightrag.api.llm_json_utils import call_llm_json
 from lightrag.base import QueryParam
 from lightrag.constants import DEFAULT_QUERY_PRIORITY
 from lightrag.prompt import PROMPTS
+from lightrag.sensitive_context import (
+    SensitiveContext,
+    SensitiveContextPayload,
+    bind_sensitive_context_endpoint,
+    mark_sensitive_context_not_used,
+    serialize_sensitive_final_request,
+)
 from lightrag.utils import (
     CacheData,
     compute_args_hash,
@@ -701,6 +708,7 @@ async def bilingual_query_llm(
     plan: BilingualQueryPlan,
     *,
     stream: bool,
+    sensitive_context: SensitiveContext | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Dual-path variant of ``aquery_llm``.
 
@@ -714,6 +722,7 @@ async def bilingual_query_llm(
 
     if not merged_chunks:
         info["final_chunks"] = 0
+        mark_sensitive_context_not_used(sensitive_context, "no_kb_evidence")
         return (
             {
                 "llm_response": {"content": "", "is_streaming": False},
@@ -751,6 +760,19 @@ async def bilingual_query_llm(
     info["final_chunks"] = len(processed_with_ids)
     info["reranked"] = reranked
 
+    if sensitive_context is not None and not processed_with_ids:
+        mark_sensitive_context_not_used(sensitive_context, "no_kb_evidence")
+        return (
+            {
+                "llm_response": {"content": "", "is_streaming": False},
+                "data": {
+                    "references": reference_list,
+                    "chunks": processed_with_ids,
+                },
+            },
+            info,
+        )
+
     chunks_context = [
         {"reference_id": chunk["reference_id"], "content": chunk["content"]}
         for chunk in processed_with_ids
@@ -773,13 +795,71 @@ async def bilingual_query_llm(
         content_data=content_data,
     )
     use_model_func = global_config["role_llm_funcs"]["query"]
-    llm_out = await use_model_func(
-        query,
-        system_prompt=sys_prompt,
-        history_messages=param.conversation_history,
-        enable_cot=True,
-        stream=stream,
-    )
+
+    if sensitive_context is not None:
+        # Resolve against the exact query-role runtime that will perform final
+        # synthesis, after authoritative bilingual evidence is fully merged.
+        final_global_config = rag._build_global_config()
+        final_identity = get_llm_cache_identity(final_global_config, "query")
+        bind_sensitive_context_endpoint(
+            sensitive_context,
+            final_identity.get("host")
+            if isinstance(final_identity, dict)
+            else None,
+        )
+
+        def build_system_prompt(
+            payload: SensitiveContextPayload | None,
+        ) -> str:
+            effective_user_prompt = user_prompt_text
+            effective_content_data = content_data
+            if payload is not None:
+                # Trusted policy is the last server-controlled Additional
+                # Instruction; only untrusted JSONL data enters Context.
+                effective_user_prompt = (
+                    f"{effective_user_prompt}\n\n{payload.trusted_policy}"
+                )
+                effective_content_data = (
+                    f"{effective_content_data}\n\n{payload.context_data}"
+                )
+            return PROMPTS["naive_rag_response"].format(
+                response_type=response_type,
+                user_prompt=effective_user_prompt,
+                content_data=effective_content_data,
+            )
+
+        def build_final_request(
+            payload: SensitiveContextPayload | None,
+        ) -> str:
+            return serialize_sensitive_final_request(
+                build_system_prompt(payload),
+                query,
+                param.conversation_history,
+            )
+
+        payload = await sensitive_context.resolve_for_final_request(
+            final_global_config.get("tokenizer"),
+            param.max_total_tokens,
+            build_final_request,
+        )
+        sys_prompt = build_system_prompt(payload)
+        use_model_func = final_global_config["role_llm_funcs"]["query"]
+        llm_out = await use_model_func(
+            query,
+            system_prompt=sys_prompt,
+            history_messages=param.conversation_history,
+            enable_cot=True,
+            stream=stream,
+            _sensitive=True,
+        )
+    else:
+        llm_out = await use_model_func(
+            query,
+            system_prompt=sys_prompt,
+            history_messages=param.conversation_history,
+            enable_cot=True,
+            stream=stream,
+        )
 
     llm_response: dict[str, Any]
     if hasattr(llm_out, "__aiter__"):

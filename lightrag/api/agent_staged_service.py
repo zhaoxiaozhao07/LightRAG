@@ -26,7 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator, Literal
+from typing import TYPE_CHECKING, Any, AsyncIterator, Literal, cast
 
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
@@ -36,10 +36,15 @@ from lightrag.api.agent_query_service import (
     BILINGUAL_PLAN_PROMPT_SUFFIX,
     AgentPlanStep,
     AgentRunResult,
+    _authoritative_chunk_content,
+    _done_memory_metadata,
+    _has_authoritative_evidence,
+    _sensitive_context_info,
     agent_bilingual_enabled,
     agent_kb_profile,
 )
 from lightrag.api.bilingual_query_service import contains_cjk
+from lightrag.api.chat_memory_routing import memory_audit_fields
 from lightrag.api.enterprise_auth import (
     agent_staged_max_kbs_per_step,
     agent_staged_max_retrievals,
@@ -49,6 +54,11 @@ from lightrag.api.kb_service import KnowledgeBaseRecord
 from lightrag.api.llm_json_utils import LLMJsonError, call_llm_json
 from lightrag.api.query_tool_service import QueryToolResult
 from lightrag.constants import DEFAULT_QUERY_PRIORITY
+from lightrag.sensitive_context import (
+    SensitiveContext,
+    SensitiveContextPolicyError,
+    mark_sensitive_context_not_used,
+)
 from lightrag.utils import logger, truncate_list_by_token_size
 
 if TYPE_CHECKING:
@@ -630,6 +640,9 @@ class _EvidenceBoard:
         round_index: int,
         mode: str,
     ) -> dict[str, Any] | None:
+        content = _authoritative_chunk_content(chunk)
+        if content is None:
+            return None
         kb_id = chunk.get("kb_id")
         chunk_id = chunk.get("chunk_id")
         if kb_id and chunk_id:
@@ -639,7 +652,7 @@ class _EvidenceBoard:
                 "content",
                 kb_id,
                 chunk.get("file_path") or chunk.get("source"),
-                hashlib.sha256(str(chunk.get("content", "")).encode("utf-8")).hexdigest(),
+                hashlib.sha256(content.encode("utf-8")).hexdigest(),
             )
         if key in self._seen:
             return None
@@ -647,6 +660,7 @@ class _EvidenceBoard:
         reference_id = f"A{len(self.chunks) + 1}"
         tagged = {
             **chunk,
+            "content": content,
             "reference_id": reference_id,
             "source_reference_id": chunk.get("reference_id"),
             "stage": stage,
@@ -687,6 +701,7 @@ class AgentStagedRunner:
         session_id: str,
         effective_records: list[KnowledgeBaseRecord],
         stream_synthesis: bool,
+        sensitive_context: SensitiveContext | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         allowed_ids = {record.id for record in effective_records}
         effective_kb_ids = [record.id for record in effective_records]
@@ -722,22 +737,34 @@ class AgentStagedRunner:
             bilingual=bilingual,
         )
         if requirement.clarification_required:
+            mark_sensitive_context_not_used(
+                sensitive_context, "clarification_required"
+            )
+            result_metadata = {
+                "workflow": "staged",
+                "effective_kb_ids": effective_kb_ids,
+            }
+            memory_info = _sensitive_context_info(sensitive_context)
+            if memory_info is not None:
+                result_metadata["memory"] = memory_info
             result = AgentRunResult(
                 status="clarification_required",
                 session_id=session_id,
                 clarification_question=requirement.clarification_question
                 or "请补充关键约束。",
-                metadata={
-                    "workflow": "staged",
-                    "effective_kb_ids": effective_kb_ids,
-                },
+                metadata=result_metadata,
             )
             yield {
                 "event": "clarification_required",
                 "session_id": session_id,
                 "clarification_question": result.clarification_question,
             }
-            yield {"event": "done", "session_id": session_id, "_result": result}
+            yield {
+                "event": "done",
+                "session_id": session_id,
+                **_done_memory_metadata(sensitive_context),
+                "_result": result,
+            }
             return
         properties = requirement.limited_properties()
         requirement_payload = self._requirement_payload(requirement, properties)
@@ -815,6 +842,7 @@ class AgentStagedRunner:
                 hl_keywords_alt=step.hl_keywords_alt,
                 ll_keywords_alt=step.ll_keywords_alt,
                 priority=step.priority,
+                sensitive_context=sensitive_context,
             ):
                 yield event
 
@@ -882,6 +910,7 @@ class AgentStagedRunner:
                     mode="mix",
                     query_alt=factor_query_alt,
                     priority="P1",
+                    sensitive_context=sensitive_context,
                 ):
                     yield event
 
@@ -944,6 +973,7 @@ class AgentStagedRunner:
                 query_alt=prop_query_alt,
                 hl_keywords_alt=prop_hl_alt,
                 priority=prop.priority,
+                sensitive_context=sensitive_context,
             ):
                 yield event
             # Only map the property to its round when the step actually ran
@@ -1018,6 +1048,7 @@ class AgentStagedRunner:
                     hl_keywords_alt=step.hl_keywords_alt,
                     ll_keywords_alt=step.ll_keywords_alt,
                     priority=step.priority,
+                    sensitive_context=sensitive_context,
                 ):
                     yield event
             repair_added = any(
@@ -1049,6 +1080,7 @@ class AgentStagedRunner:
         failed_rounds = [s for s in steps_summary if s.get("status") == "failed"]
         synth_result: QueryToolResult | None = state["synth_result"]
         if synth_result is None:
+            mark_sensitive_context_not_used(sensitive_context, "no_kb_evidence")
             raise HTTPException(
                 status_code=502,
                 detail={
@@ -1074,7 +1106,8 @@ class AgentStagedRunner:
             }
 
         answer_parts: list[str] = []
-        if not context_units:
+        if not _has_authoritative_evidence(context_units):
+            mark_sensitive_context_not_used(sensitive_context, "no_kb_evidence")
             answer = "未检索到可用于回答的证据。"
             yield {"event": "response", "session_id": session_id, "delta": answer}
         else:
@@ -1093,6 +1126,7 @@ class AgentStagedRunner:
                 steps_summary=steps_summary,
                 stream=stream_synthesis,
                 extra_rules=extra_rules,
+                sensitive_context=sensitive_context,
             ):
                 if delta:
                     answer_parts.append(delta)
@@ -1108,44 +1142,56 @@ class AgentStagedRunner:
             verdict_counts[verdict["verdict"]] = (
                 verdict_counts.get(verdict["verdict"], 0) + 1
             )
+        completion_audit_metadata = {
+            "workflow": "staged",
+            "round_count": len(steps_summary),
+            "failed_round_count": len(failed_rounds),
+            "reference_count": len(references),
+            "effective_kb_ids": effective_kb_ids,
+            "verdict_counts": verdict_counts,
+        }
+        memory_info = _sensitive_context_info(sensitive_context)
+        if memory_info is not None:
+            completion_audit_metadata.update(memory_audit_fields(memory_info))
         await append_enterprise_audit_event(
             request,
             "agent_query_completed",
             target_type="agent_session",
             target_id=session_id,
-            metadata={
-                "workflow": "staged",
-                "round_count": len(steps_summary),
-                "failed_round_count": len(failed_rounds),
-                "reference_count": len(references),
-                "effective_kb_ids": effective_kb_ids,
-                "verdict_counts": verdict_counts,
-            },
+            metadata=completion_audit_metadata,
         )
+        result_metadata = {
+            "workflow": "staged",
+            "effective_kb_ids": effective_kb_ids,
+            "kb_roles": kb_roles,
+            "requirement": requirement_payload,
+            "skeleton_component_count": len(skeleton.components)
+            if skeleton
+            else 0,
+            "dropped_component_count": dropped_components,
+            "property_verdicts": verdicts,
+            "round_count": len(steps_summary),
+            "failed_round_count": len(failed_rounds),
+            "retrieval_budget": {"max": max_retrievals, "used": state["round"]},
+            "clipped": clipped_notes,
+            "bilingual_retrieval": bilingual,
+        }
+        if memory_info is not None:
+            result_metadata["memory"] = memory_info
         result = AgentRunResult(
             status="success",
             session_id=session_id,
             answer=answer,
             references=references if body.include_references else [],
             steps_summary=steps_summary,
-            metadata={
-                "workflow": "staged",
-                "effective_kb_ids": effective_kb_ids,
-                "kb_roles": kb_roles,
-                "requirement": requirement_payload,
-                "skeleton_component_count": len(skeleton.components)
-                if skeleton
-                else 0,
-                "dropped_component_count": dropped_components,
-                "property_verdicts": verdicts,
-                "round_count": len(steps_summary),
-                "failed_round_count": len(failed_rounds),
-                "retrieval_budget": {"max": max_retrievals, "used": state["round"]},
-                "clipped": clipped_notes,
-                "bilingual_retrieval": bilingual,
-            },
+            metadata=result_metadata,
         )
-        yield {"event": "done", "session_id": session_id, "_result": result}
+        yield {
+            "event": "done",
+            "session_id": session_id,
+            **_done_memory_metadata(sensitive_context),
+            "_result": result,
+        }
 
     # ------------------------------------------------------------------
     # Step execution
@@ -1174,6 +1220,7 @@ class AgentStagedRunner:
         hl_keywords_alt: list[str] | None = None,
         ll_keywords_alt: list[str] | None = None,
         priority: str = "P1",
+        sensitive_context: SensitiveContext | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         if state["round"] >= max_retrievals:
             clipped_notes.append(
@@ -1223,8 +1270,13 @@ class AgentStagedRunner:
         )
         try:
             tool_result, retried_mode = await self._service._retrieve_with_empty_retry(
-                http_request=request, body=body, step=step
+                http_request=request,
+                body=body,
+                step=step,
+                sensitive_context=sensitive_context,
             )
+        except SensitiveContextPolicyError:
+            raise
         except Exception as exc:  # noqa: BLE001 — tolerate per-step failure
             if isinstance(exc, HTTPException):
                 detail = exc.detail
@@ -1235,9 +1287,17 @@ class AgentStagedRunner:
                 )
             else:
                 error_code = "agent_step_failed"
-                logger.error(
-                    "Agent staged step %d failed: %s", round_index, exc, exc_info=True
-                )
+                if sensitive_context is not None:
+                    logger.error(
+                        "Memory-scoped Agent staged step %d failed", round_index
+                    )
+                else:
+                    logger.error(
+                        "Agent staged step %d failed: %s",
+                        round_index,
+                        exc,
+                        exc_info=True,
+                    )
             summary["status"] = "failed"
             summary["error_code"] = error_code
             steps_summary.append(summary)
@@ -1271,7 +1331,11 @@ class AgentStagedRunner:
             if tool_result.alt_failed_kbs:
                 summary["alt_failed_kbs"] = tool_result.alt_failed_kbs
         new_chunks = 0
+        authoritative_chunk_count = 0
         for chunk in tool_result.chunks:
+            if _authoritative_chunk_content(chunk) is None:
+                continue
+            authoritative_chunk_count += 1
             if board.add(
                 chunk,
                 stage=stage,
@@ -1283,7 +1347,7 @@ class AgentStagedRunner:
         summary.update(
             {
                 "kb_ids": tool_result.queried_kb_ids,
-                "chunk_count": len(tool_result.chunks),
+                "chunk_count": authoritative_chunk_count,
                 "new_chunk_count": new_chunks,
                 "per_kb_chunk_counts": tool_result.per_kb_chunk_counts,
                 "skipped_kbs": tool_result.skipped_kbs,
@@ -1298,7 +1362,7 @@ class AgentStagedRunner:
             "mode": mode,
             "status": "ok",
             "query_hash": hashlib.sha256(query.encode("utf-8")).hexdigest(),
-            "chunk_count": len(tool_result.chunks),
+            "chunk_count": authoritative_chunk_count,
             "skipped_kbs": tool_result.skipped_kbs,
         }
         if retried_mode:
@@ -1902,8 +1966,13 @@ class AgentStagedRunner:
         Chunks cited by the skeleton or by property verdicts are placed
         before uncited ones so budget truncation can only drop evidence that
         no structured conclusion depends on."""
-        cited = [c for c in board.chunks if c["reference_id"] in cited_ids]
-        uncited = [c for c in board.chunks if c["reference_id"] not in cited_ids]
+        final_chunks = [
+            chunk
+            for chunk in board.chunks
+            if _authoritative_chunk_content(chunk) is not None
+        ]
+        cited = [c for c in final_chunks if c["reference_id"] in cited_ids]
+        uncited = [c for c in final_chunks if c["reference_id"] not in cited_ids]
         ordered = cited + uncited
         rag = synth_result.rag
         param = synth_result.param
@@ -1914,17 +1983,22 @@ class AgentStagedRunner:
             getattr(param, "max_total_tokens", None) if param is not None else None
         )
         if tokenizer is not None and budget:
-            ordered = truncate_list_by_token_size(
-                ordered,
-                key=lambda chunk: str(chunk.get("content", "")),
-                max_token_size=int(budget),
-                tokenizer=tokenizer,
+            ordered = cast(
+                list[dict[str, Any]],
+                truncate_list_by_token_size(
+                    ordered,
+                    key=lambda chunk: _authoritative_chunk_content(chunk) or "",
+                    max_token_size=int(budget),
+                    tokenizer=tokenizer,
+                ),
             )
         ordered = sorted(ordered, key=lambda chunk: int(chunk["reference_id"][1:]))
         references: list[dict[str, Any]] = []
         context_units: list[dict[str, str]] = []
         for chunk in ordered:
-            content = str(chunk.get("content", ""))
+            content = _authoritative_chunk_content(chunk)
+            if content is None:
+                continue
             ref = {
                 "reference_id": chunk["reference_id"],
                 "kb_id": str(chunk.get("kb_id", "")),

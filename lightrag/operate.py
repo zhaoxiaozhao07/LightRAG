@@ -5,6 +5,7 @@ from pathlib import Path
 import asyncio
 import json
 import re
+import string
 import json_repair
 from typing import Any, AsyncIterator, overload, Literal
 from collections import Counter, defaultdict
@@ -56,6 +57,13 @@ from lightrag.base import (
 )
 from lightrag.chunk_schema import strip_internal_multimodal_markup_for_extraction
 from lightrag.prompt import PROMPTS, resolve_entity_extraction_prompt_profile
+from lightrag.sensitive_context import (
+    SensitiveContext,
+    SensitiveContextPayload,
+    bind_sensitive_context_endpoint,
+    mark_sensitive_context_not_used,
+    serialize_sensitive_final_request,
+)
 from lightrag.constants import (
     GRAPH_FIELD_SEP,
     DEFAULT_MAX_ENTITY_TOKENS,
@@ -82,6 +90,42 @@ from dotenv import load_dotenv
 # allows to use different .env file for each lightrag instance
 # the OS environment variables take precedence over the .env file
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
+
+
+def _prompt_template_fields(template: str) -> set[str]:
+    """Return root format-field names used by a prompt template."""
+
+    fields: set[str] = set()
+    for _literal, field_name, _format_spec, _conversion in string.Formatter().parse(
+        template
+    ):
+        if field_name:
+            fields.add(re.split(r"[.[]", field_name, maxsplit=1)[0])
+    return fields
+
+
+def _append_missing_sensitive_sections(
+    rendered_prompt: str,
+    *,
+    template_fields: set[str],
+    context_field: str,
+    context_data: str,
+    payload: SensitiveContextPayload | None,
+) -> str:
+    """Keep custom prompt templates inside the universal trust boundary."""
+
+    if payload is None:
+        return rendered_prompt
+    additions: list[str] = []
+    if "user_prompt" not in template_fields:
+        additions.extend(
+            ("---Additional Instructions---", payload.trusted_policy)
+        )
+    if context_field not in template_fields:
+        additions.extend(("---Context---", context_data))
+    if not additions:
+        return rendered_prompt
+    return f"{rendered_prompt}\n\n" + "\n\n".join(additions)
 
 
 def _get_relationship_vdb_timeout_seconds(global_config: dict[str, Any]) -> float:
@@ -4096,6 +4140,8 @@ async def kg_query(
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
     chunks_vdb: BaseVectorStorage = None,
+    *,
+    sensitive_context: SensitiveContext | None = None,
 ) -> QueryResult | None:
     """
     Execute knowledge graph query and return unified QueryResult object.
@@ -4111,6 +4157,7 @@ async def kg_query(
         hashing_kv: Cache storage
         system_prompt: System prompt
         chunks_vdb: Document chunks vector database
+        sensitive_context: Private lazy context resolved only for final synthesis
 
     Returns:
         QueryResult | None: Unified query result object containing:
@@ -4128,6 +4175,7 @@ async def kg_query(
         Returns None when no relevant context could be constructed for the query.
     """
     if not query:
+        mark_sensitive_context_not_used(sensitive_context, "no_kb_evidence")
         return QueryResult(content=PROMPTS["fail_response"])
 
     # Apply higher priority (5) to query relation LLM function
@@ -4153,6 +4201,7 @@ async def kg_query(
             logger.warning(f"Forced low_level_keywords to origin query: {query}")
             ll_keywords = [query]
         else:
+            mark_sensitive_context_not_used(sensitive_context, "no_kb_evidence")
             return QueryResult(content=PROMPTS["fail_response"])
 
     ll_keywords_str = ", ".join(ll_keywords) if ll_keywords else ""
@@ -4173,6 +4222,7 @@ async def kg_query(
 
     if context_result is None:
         logger.info("[kg_query] No query context could be built; returning no-result.")
+        mark_sensitive_context_not_used(sensitive_context, "no_kb_evidence")
         return None
 
     # Return different content based on query parameters
@@ -4188,13 +4238,39 @@ async def kg_query(
         else "Multiple Paragraphs"
     )
 
-    # Build system prompt
+    # Build the authoritative KB prompt first. Sensitive policy is appended last
+    # in Additional Instructions and only JSONL context data enters Context.
     sys_prompt_temp = system_prompt if system_prompt else PROMPTS["rag_response"]
-    sys_prompt = sys_prompt_temp.format(
-        response_type=response_type,
-        user_prompt=user_prompt,
-        context_data=context_result.context,
+    sys_prompt_fields = (
+        _prompt_template_fields(sys_prompt_temp)
+        if sensitive_context is not None
+        else set()
     )
+
+    def build_system_prompt(
+        payload: SensitiveContextPayload | None,
+    ) -> str:
+        effective_user_prompt = user_prompt
+        context_data = context_result.context
+        if payload is not None:
+            effective_user_prompt = (
+                f"{effective_user_prompt}\n\n{payload.trusted_policy}"
+            )
+            context_data = f"{context_data}\n\n{payload.context_data}"
+        rendered_prompt = sys_prompt_temp.format(
+            response_type=response_type,
+            user_prompt=effective_user_prompt,
+            context_data=context_data,
+        )
+        return _append_missing_sensitive_sections(
+            rendered_prompt,
+            template_fields=sys_prompt_fields,
+            context_field="context_data",
+            context_data=context_data,
+            payload=payload,
+        )
+
+    sys_prompt = build_system_prompt(None)
 
     user_query = query
 
@@ -4202,12 +4278,40 @@ async def kg_query(
         prompt_content = "\n\n".join([sys_prompt, "---User Query---", user_query])
         return QueryResult(content=prompt_content, raw_data=context_result.raw_data)
 
-    # Call LLM
+    # Resolve sensitive data only after the complete authoritative request is
+    # known. The resolver re-encodes this callback for every candidate.
     tokenizer: Tokenizer = global_config["tokenizer"]
-    len_of_prompts = len(tokenizer.encode(query + sys_prompt))
-    logger.debug(
-        f"[kg_query] Sending to LLM: {len_of_prompts:,} tokens (Query: {len(tokenizer.encode(query))}, System: {len(tokenizer.encode(sys_prompt))})"
-    )
+    if sensitive_context is not None:
+        bind_sensitive_context_endpoint(
+            sensitive_context,
+            llm_cache_identity.get("host")
+            if isinstance(llm_cache_identity, dict)
+            else None,
+        )
+
+        def build_final_request(payload: SensitiveContextPayload | None) -> str:
+            return serialize_sensitive_final_request(
+                build_system_prompt(payload),
+                user_query,
+                query_param.conversation_history,
+            )
+
+        payload = await sensitive_context.resolve_for_final_request(
+            tokenizer,
+            query_param.max_total_tokens,
+            build_final_request,
+        )
+        sys_prompt = build_system_prompt(payload)
+
+    if tokenizer is not None:
+        len_of_prompts = len(tokenizer.encode(query + sys_prompt))
+        logger.debug(
+            f"[kg_query] Sending to LLM: {len_of_prompts:,} tokens (Query: {len(tokenizer.encode(query))}, System: {len(tokenizer.encode(sys_prompt))})"
+        )
+    elif sensitive_context is None:
+        # Preserve the legacy no-memory failure behavior when tokenizer is
+        # unexpectedly absent.
+        tokenizer.encode(query + sys_prompt)
 
     # Handle cache
     args_hash = compute_args_hash(
@@ -4227,9 +4331,11 @@ async def kg_query(
         serialize_llm_cache_identity(llm_cache_identity),
     )
 
-    cached_result = await handle_cache(
-        hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
-    )
+    cached_result = None
+    if sensitive_context is None:
+        cached_result = await handle_cache(
+            hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
+        )
 
     if cached_result is not None:
         cached_response, _ = cached_result  # Extract content, ignore timestamp
@@ -4238,15 +4344,21 @@ async def kg_query(
         )
         response = cached_response
     else:
-        response = await use_model_func(
-            user_query,
-            system_prompt=sys_prompt,
-            history_messages=query_param.conversation_history,
-            enable_cot=True,
-            stream=query_param.stream,
-        )
+        llm_call_kwargs: dict[str, Any] = {
+            "system_prompt": sys_prompt,
+            "history_messages": query_param.conversation_history,
+            "enable_cot": True,
+            "stream": query_param.stream,
+        }
+        if sensitive_context is not None:
+            llm_call_kwargs["_sensitive"] = True
+        response = await use_model_func(user_query, **llm_call_kwargs)
 
-        if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
+        if (
+            sensitive_context is None
+            and hashing_kv
+            and hashing_kv.global_config.get("enable_llm_cache")
+        ):
             queryparam_dict = {
                 "mode": query_param.mode,
                 "response_type": query_param.response_type,
@@ -6024,6 +6136,8 @@ async def naive_query(
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
     return_raw_data: Literal[True] = True,
+    *,
+    sensitive_context: SensitiveContext | None = None,
 ) -> dict[str, Any]: ...
 
 
@@ -6036,6 +6150,8 @@ async def naive_query(
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
     return_raw_data: Literal[False] = False,
+    *,
+    sensitive_context: SensitiveContext | None = None,
 ) -> str | AsyncIterator[str]: ...
 
 
@@ -6046,6 +6162,8 @@ async def naive_query(
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
+    *,
+    sensitive_context: SensitiveContext | None = None,
 ) -> QueryResult | None:
     """
     Execute naive query and return unified QueryResult object.
@@ -6057,6 +6175,7 @@ async def naive_query(
         global_config: Global configuration
         hashing_kv: Cache storage
         system_prompt: System prompt
+        sensitive_context: Private lazy context resolved only for final synthesis
 
     Returns:
         QueryResult | None: Unified query result object containing:
@@ -6069,6 +6188,7 @@ async def naive_query(
     """
 
     if not query:
+        mark_sensitive_context_not_used(sensitive_context, "no_kb_evidence")
         return QueryResult(content=PROMPTS["fail_response"])
 
     # Apply higher priority (5) to query relation LLM function
@@ -6079,6 +6199,18 @@ async def naive_query(
 
     tokenizer: Tokenizer = global_config["tokenizer"]
     if not tokenizer:
+        if sensitive_context is not None:
+            bind_sensitive_context_endpoint(
+                sensitive_context,
+                llm_cache_identity.get("host")
+                if isinstance(llm_cache_identity, dict)
+                else None,
+            )
+            await sensitive_context.resolve_for_final_request(
+                None,
+                query_param.max_total_tokens,
+                lambda _payload: "",
+            )
         logger.error("Tokenizer not found in global configuration.")
         return QueryResult(content=PROMPTS["fail_response"])
 
@@ -6088,6 +6220,7 @@ async def naive_query(
         logger.info(
             "[naive_query] No relevant document chunks found; returning no-result."
         )
+        mark_sensitive_context_not_used(sensitive_context, "no_kb_evidence")
         return None
 
     # Calculate dynamic token limit for chunks
@@ -6108,6 +6241,11 @@ async def naive_query(
     # Use the provided system prompt or default
     sys_prompt_template = (
         system_prompt if system_prompt else PROMPTS["naive_rag_response"]
+    )
+    sys_prompt_fields = (
+        _prompt_template_fields(sys_prompt_template)
+        if sensitive_context is not None
+        else set()
     )
 
     # Create a preliminary system prompt with empty content_data to calculate overhead
@@ -6143,6 +6281,10 @@ async def naive_query(
     reference_list, processed_chunks_with_ref_ids = generate_reference_list_from_chunks(
         processed_chunks
     )
+
+    if sensitive_context is not None and not processed_chunks_with_ref_ids:
+        mark_sensitive_context_not_used(sensitive_context, "no_kb_evidence")
+        return None
 
     logger.info(f"Final context: {len(processed_chunks_with_ref_ids)} chunks")
 
@@ -6195,17 +6337,58 @@ async def naive_query(
     if query_param.only_need_context and not query_param.only_need_prompt:
         return QueryResult(content=context_content, raw_data=raw_data)
 
-    sys_prompt = sys_prompt_template.format(
-        response_type=query_param.response_type,
-        user_prompt=user_prompt,
-        content_data=context_content,
-    )
+    def build_system_prompt(
+        payload: SensitiveContextPayload | None,
+    ) -> str:
+        effective_user_prompt = user_prompt
+        content_data = context_content
+        if payload is not None:
+            effective_user_prompt = (
+                f"{effective_user_prompt}\n\n{payload.trusted_policy}"
+            )
+            content_data = f"{content_data}\n\n{payload.context_data}"
+        rendered_prompt = sys_prompt_template.format(
+            response_type=query_param.response_type,
+            user_prompt=effective_user_prompt,
+            content_data=content_data,
+        )
+        return _append_missing_sensitive_sections(
+            rendered_prompt,
+            template_fields=sys_prompt_fields,
+            context_field="content_data",
+            context_data=content_data,
+            payload=payload,
+        )
+
+    sys_prompt = build_system_prompt(None)
 
     user_query = query
 
     if query_param.only_need_prompt:
         prompt_content = "\n\n".join([sys_prompt, "---User Query---", user_query])
         return QueryResult(content=prompt_content, raw_data=raw_data)
+
+    if sensitive_context is not None:
+        bind_sensitive_context_endpoint(
+            sensitive_context,
+            llm_cache_identity.get("host")
+            if isinstance(llm_cache_identity, dict)
+            else None,
+        )
+
+        def build_final_request(payload: SensitiveContextPayload | None) -> str:
+            return serialize_sensitive_final_request(
+                build_system_prompt(payload),
+                user_query,
+                query_param.conversation_history,
+            )
+
+        payload = await sensitive_context.resolve_for_final_request(
+            tokenizer,
+            max_total_tokens,
+            build_final_request,
+        )
+        sys_prompt = build_system_prompt(payload)
 
     # Handle cache
     args_hash = compute_args_hash(
@@ -6222,9 +6405,11 @@ async def naive_query(
         "\n<llm_identity>\n",
         serialize_llm_cache_identity(llm_cache_identity),
     )
-    cached_result = await handle_cache(
-        hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
-    )
+    cached_result = None
+    if sensitive_context is None:
+        cached_result = await handle_cache(
+            hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
+        )
     if cached_result is not None:
         cached_response, _ = cached_result  # Extract content, ignore timestamp
         logger.info(
@@ -6232,15 +6417,21 @@ async def naive_query(
         )
         response = cached_response
     else:
-        response = await use_model_func(
-            user_query,
-            system_prompt=sys_prompt,
-            history_messages=query_param.conversation_history,
-            enable_cot=True,
-            stream=query_param.stream,
-        )
+        llm_call_kwargs: dict[str, Any] = {
+            "system_prompt": sys_prompt,
+            "history_messages": query_param.conversation_history,
+            "enable_cot": True,
+            "stream": query_param.stream,
+        }
+        if sensitive_context is not None:
+            llm_call_kwargs["_sensitive"] = True
+        response = await use_model_func(user_query, **llm_call_kwargs)
 
-        if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
+        if (
+            sensitive_context is None
+            and hashing_kv
+            and hashing_kv.global_config.get("enable_llm_cache")
+        ):
             queryparam_dict = {
                 "mode": query_param.mode,
                 "response_type": query_param.response_type,

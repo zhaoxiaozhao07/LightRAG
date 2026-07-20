@@ -60,7 +60,12 @@ class KnowledgeBaseCreateRequest(BaseModel):
     owner_id: Optional[str] = Field(default=None, description="Reserved owner id")
     tenant_id: Optional[str] = Field(default=None, description="Reserved tenant id")
     visibility: KnowledgeBaseVisibility = Field(
-        default="private", description="Reserved visibility flag"
+        default="private",
+        description=(
+            "KB visibility: private (owner/ACL only), internal (implicit "
+            "read-only for the KB's tenant members), public (implicit "
+            "read-only for all authenticated users; super admin only)"
+        ),
     )
     metadata: Optional[dict[str, Any]] = Field(
         default=None,
@@ -549,12 +554,12 @@ def create_kb_routes(
                     tenant_id = principal.tenant_id
                     if tenant_id is not None:
                         origin = "tenant"
-                        if visibility != "private":
+                        if visibility == "public":
                             raise HTTPException(
                                 status_code=400,
                                 detail=(
-                                    "Tenant-managed knowledge bases must use private "
-                                    "visibility"
+                                    "Tenant-managed knowledge bases must use "
+                                    "private or internal visibility"
                                 ),
                             )
                         metadata = _tenant_managed_metadata(metadata, tenant_id)
@@ -689,24 +694,39 @@ def create_kb_routes(
                             + ", ".join(reserved_keys)
                         ),
                     )
+            previous_visibility: str | None = None
             if enterprise_auth_enabled():
                 principal = get_request_principal(request)
                 if principal is None:
                     raise HTTPException(status_code=401, detail="Login required")
-                if "visibility" in data and not principal.is_super_admin:
-                    raise HTTPException(
-                        status_code=403,
-                        detail=(
-                            "Only super administrators may update knowledge base "
-                            "visibility"
-                        ),
-                    )
                 data.pop("owner_id", None)
                 data.pop("tenant_id", None)
-                if not principal.is_super_admin:
+                if "visibility" in data:
                     current = await kb_service.get(kb_id)
-                    if current.origin == "tenant":
-                        data["visibility"] = "private"
+                    previous_visibility = current.visibility
+                    if not principal.is_super_admin:
+                        if current.origin != "tenant":
+                            raise HTTPException(
+                                status_code=403,
+                                detail=(
+                                    "Only super administrators may update knowledge "
+                                    "base visibility"
+                                ),
+                            )
+                        if data["visibility"] == "public":
+                            raise HTTPException(
+                                status_code=400,
+                                detail=(
+                                    "Tenant-managed knowledge bases must use "
+                                    "private or internal visibility"
+                                ),
+                            )
+                        # Only an effective kb_owner (the creator, or an
+                        # explicitly granted owner) may toggle sharing.
+                        authz_service = get_enterprise_authorization_service(request)
+                        await authz_service.require_kb_role(
+                            principal, current.id, KB_ROLE_OWNER
+                        )
             if "active_config_version_id" in data:
                 raise HTTPException(
                     status_code=400,
@@ -716,6 +736,22 @@ def create_kb_routes(
                     ),
                 )
             record = await kb_service.update(kb_id, **data)
+            if (
+                enterprise_auth_enabled()
+                and previous_visibility is not None
+                and record.visibility != previous_visibility
+            ):
+                await append_enterprise_audit_event(
+                    request,
+                    "kb_visibility_changed",
+                    target_type="kb",
+                    target_id=record.id,
+                    metadata={
+                        "from": previous_visibility,
+                        "to": record.visibility,
+                        "origin": record.origin,
+                    },
+                )
             return KnowledgeBaseResponse.from_record(record)
         except HTTPException:
             raise

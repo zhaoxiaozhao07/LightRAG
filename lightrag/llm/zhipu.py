@@ -28,6 +28,7 @@ from lightrag.utils import (
     wrap_embedding_func_with_attrs,
     logger,
 )
+from lightrag.sensitive_context import is_sensitive_call
 
 import numpy as np
 from typing import Union, List, Optional, Dict
@@ -92,7 +93,8 @@ async def zhipu_complete_if_cache(
 
     # Add debug logging
     logger.debug("===== Query Input to LLM =====")
-    logger.debug(f"Query: {prompt}")
+    if not is_sensitive_call():
+        logger.debug(f"Query: {prompt}")
     verbose_debug(f"System prompt: {system_prompt}")
 
     # Deprecation shims: map legacy extraction booleans to response_format only

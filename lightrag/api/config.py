@@ -62,6 +62,83 @@ ENTERPRISE_KB_ROLES = {"kb_viewer", "kb_editor", "kb_admin", "kb_owner"}
 NO_PREFIX_SENTINEL = "NO_PREFIX"
 PROVIDER_ASYMMETRIC_EMBEDDING_BINDINGS = {"gemini", "jina", "voyageai"}
 PREFIX_ASYMMETRIC_EMBEDDING_BINDINGS = {"azure_openai", "ollama", "openai"}
+POSTGRES_METADATA_BACKEND_ALIASES = {"postgres", "postgresql", "pg"}
+LOCAL_METADATA_BACKEND_ALIASES = {"", "local", "json", "sqlite"}
+
+
+def normalize_kb_metadata_backend(value: object | None) -> str:
+    """Normalize the metadata backend to the two server-supported values."""
+    normalized = str(value or "local").strip().lower()
+    if normalized in POSTGRES_METADATA_BACKEND_ALIASES:
+        return "postgres"
+    if normalized in LOCAL_METADATA_BACKEND_ALIASES:
+        return "local"
+    raise ValueError(
+        "Unsupported LIGHTRAG_KB_METADATA_BACKEND: "
+        f"{normalized!r}; expected local or postgres"
+    )
+
+
+def _config_bool(value: object) -> bool:
+    """Coerce programmatic string/bool configuration without truthy-string bugs."""
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "t", "on"}
+    return bool(value)
+
+
+def validate_chat_memory_configuration(
+    args: argparse.Namespace, *, kb_metadata_backend: str | None = None
+) -> None:
+    """Validate the enterprise durability boundary for Chat Memory.
+
+    ``LIGHTRAG_CHAT_MEMORY_ENABLED`` controls new read/ingest admission. Durable
+    maintenance has a separate switch and is intentionally not gated here, so
+    future workers can drain purge/rebuild events while read/ingest is disabled.
+    """
+    if not _config_bool(getattr(args, "chat_memory_enabled", False)):
+        return
+
+    if not _config_bool(getattr(args, "enterprise_auth_enabled", False)):
+        raise ValueError(
+            "LIGHTRAG_CHAT_MEMORY_ENABLED=true requires "
+            "LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true; Chat Memory read/ingest "
+            "is supported only for enterprise-authenticated users."
+        )
+
+    configured_backend: object | None = kb_metadata_backend
+    if configured_backend is None:
+        configured_backend = getattr(args, "kb_metadata_backend", None)
+    if configured_backend is None:
+        configured_backend = os.getenv("LIGHTRAG_KB_METADATA_BACKEND", "local")
+    normalized_backend = normalize_kb_metadata_backend(configured_backend)
+    if normalized_backend != "postgres":
+        raise ValueError(
+            "LIGHTRAG_CHAT_MEMORY_ENABLED=true requires "
+            "LIGHTRAG_KB_METADATA_BACKEND=postgres; durable Chat Memory cannot "
+            f"run with the {normalized_backend!r} metadata backend."
+        )
+
+
+def get_chat_memory_env_value(
+    suffix: str,
+    default,
+    value_type: type = str,
+    *,
+    aliases: tuple[str, ...] = (),
+):
+    """Read a Chat Memory setting with a namespaced key and MEMORY_* alias.
+
+    New durability settings use ``LIGHTRAG_CHAT_MEMORY_*`` as the canonical
+    namespace. ``MEMORY_*`` aliases keep them consistent with the existing
+    provider settings and make staged deployments easier to upgrade.
+    """
+    keys = (
+        f"LIGHTRAG_CHAT_MEMORY_{suffix}",
+        f"MEMORY_{suffix}",
+        *aliases,
+    )
+    selected = next((key for key in keys if key in os.environ), keys[0])
+    return get_env_value(selected, default, value_type)
 
 
 class DefaultRAGStorageConfig:
@@ -633,6 +710,9 @@ def parse_args() -> argparse.Namespace:
     args.vector_storage = get_env_value(
         "LIGHTRAG_VECTOR_STORAGE", DefaultRAGStorageConfig.VECTOR_STORAGE
     )
+    args.kb_metadata_backend = normalize_kb_metadata_backend(
+        get_env_value("LIGHTRAG_KB_METADATA_BACKEND", "local")
+    )
 
     # Get MAX_PARALLEL_INSERT from environment
     args.max_parallel_insert = get_env_value(
@@ -894,6 +974,44 @@ def parse_args() -> argparse.Namespace:
     args.chat_memory_enabled = get_env_value(
         "LIGHTRAG_CHAT_MEMORY_ENABLED", False, bool
     )
+    # Read/ingest admission and durable maintenance are intentionally separate.
+    # The enterprise PostgreSQL server uses this setting to keep rebuild/purge
+    # workers draining even when new admission and recall are disabled.
+    args.chat_memory_maintenance_enabled = get_chat_memory_env_value(
+        "MAINTENANCE_ENABLED", True, bool
+    )
+    args.memory_worker_poll_seconds = get_chat_memory_env_value(
+        "WORKER_POLL_SECONDS", 1.0, float
+    )
+    args.memory_worker_recovery_interval_seconds = get_chat_memory_env_value(
+        "WORKER_RECOVERY_INTERVAL_SECONDS", 30.0, float
+    )
+    args.memory_worker_side_effect_timeout_seconds = get_chat_memory_env_value(
+        "WORKER_SIDE_EFFECT_TIMEOUT_SECONDS",
+        900.0,
+        float,
+        aliases=(
+            "LIGHTRAG_CHAT_MEMORY_OPERATION_TIMEOUT_SECONDS",
+            "MEMORY_SIDE_EFFECT_TIMEOUT_SECONDS",
+            "MEMORY_OPERATION_TIMEOUT_SECONDS",
+            "MEMORY_GRAPHITI_TIMEOUT_SECONDS",
+        ),
+    )
+    args.memory_worker_shutdown_timeout_seconds = get_chat_memory_env_value(
+        "WORKER_SHUTDOWN_TIMEOUT_SECONDS", 10.0, float
+    )
+    # These are hard project snapshot caps, not page sizes. A future rebuild
+    # must fail closed rather than activate a partial replay when either cap is
+    # exceeded.
+    args.memory_rebuild_max_messages = get_chat_memory_env_value(
+        "REBUILD_MAX_MESSAGES", 10_000, int
+    )
+    args.memory_rebuild_max_bytes = get_chat_memory_env_value(
+        "REBUILD_MAX_BYTES", 64 * 1024 * 1024, int
+    )
+    args.memory_store_raw_episode_content = get_chat_memory_env_value(
+        "STORE_RAW_EPISODE_CONTENT", False, bool
+    )
     args.memory_llm_binding_host = get_env_value(
         "MEMORY_LLM_BINDING_HOST", None, str, special_none=True
     )
@@ -943,7 +1061,19 @@ def parse_args() -> argparse.Namespace:
     args.memory_neo4j_database = get_env_value(
         "MEMORY_NEO4J_DATABASE", None, str, special_none=True
     )
+    args.memory_neo4j_deployment_id = get_env_value(
+        "MEMORY_NEO4J_DEPLOYMENT_ID", None, str, special_none=True
+    )
     args.memory_search_limit = get_env_value("MEMORY_SEARCH_LIMIT", 10, int)
+    args.chat_memory_prompt_max_tokens = get_chat_memory_env_value(
+        "PROMPT_MAX_TOKENS", 1024, int
+    )
+    args.chat_memory_prompt_max_chars = get_chat_memory_env_value(
+        "PROMPT_MAX_CHARS", 8192, int
+    )
+    args.chat_memory_allow_cross_provider_query_egress = get_chat_memory_env_value(
+        "ALLOW_CROSS_PROVIDER_QUERY_EGRESS", False, bool
+    )
     args.memory_ingest_concurrency = get_env_value(
         "MEMORY_INGEST_CONCURRENCY", 2, int
     )
@@ -1082,6 +1212,9 @@ def parse_args() -> argparse.Namespace:
             args.workspace = sanitized
 
     validate_auth_configuration(args)
+    validate_chat_memory_configuration(
+        args, kb_metadata_backend=args.kb_metadata_backend
+    )
     validate_bedrock_auth_configuration(args)
     return args
 
@@ -1137,6 +1270,7 @@ def initialize_config(args=None, force=False):
 
     resolved_args = args if args is not None else parse_args()
     validate_auth_configuration(resolved_args)
+    validate_chat_memory_configuration(resolved_args)
     validate_bedrock_auth_configuration(resolved_args)
     _global_args = resolved_args
     _initialized = True

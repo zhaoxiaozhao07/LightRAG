@@ -47,6 +47,7 @@ from lightrag.constants import (
     SOURCE_IDS_LIMIT_METHOD_FIFO,
     PARSED_DIR_NAME,
 )
+from lightrag.sensitive_context import is_sensitive_call
 
 # Precompile regex pattern for JSON sanitization (module-level, compiled once)
 _SURROGATE_PATTERN = re.compile(r"[\uD800-\uDFFF\uFFFE\uFFFF]")
@@ -322,6 +323,8 @@ def verbose_debug(msg: str, *args, **kwargs):
         *args: Arguments to be formatted into the message
         **kwargs: Keyword arguments passed to logger.debug()
     """
+    if is_sensitive_call():
+        return
     if VERBOSE_DEBUG:
         logger.debug(msg, *args, **kwargs)
     else:

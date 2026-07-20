@@ -15,12 +15,18 @@ import inspect
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping, cast
 
 from lightrag.utils import (
     get_env_value,
     logger,
     priority_limit_async_func_call,
+)
+from lightrag.sensitive_context import (
+    SensitiveContextPolicyError,
+    SensitiveLLMError,
+    sensitive_call_scope,
+    wrap_sensitive_async_iterator,
 )
 
 
@@ -187,17 +193,42 @@ class _RoleLLMMixin:
         model_kwargs: dict[str, Any],
     ) -> Callable[..., object]:
         spec = ROLES_BY_NAME[role_name]
+        bound_func = partial(
+            raw_func,
+            hashing_kv=self.llm_response_cache,
+            **model_kwargs,
+        )
+
+        async def invoke_with_sensitive_scope(*args: Any, **kwargs: Any) -> object:
+            sensitive = bool(kwargs.pop("_sensitive", False))
+            sanitized_error: SensitiveLLMError | None = None
+            result: object = None
+            try:
+                with sensitive_call_scope(sensitive):
+                    result = bound_func(*args, **kwargs)
+                    if inspect.isawaitable(result):
+                        result = await cast(Awaitable[object], result)
+            except asyncio.CancelledError:
+                raise
+            except SensitiveContextPolicyError:
+                raise
+            except Exception:
+                if sensitive:
+                    sanitized_error = SensitiveLLMError()
+                else:
+                    raise
+            if sanitized_error is not None:
+                raise sanitized_error
+            if sensitive:
+                with sensitive_call_scope():
+                    return wrap_sensitive_async_iterator(result)
+            return result
+
         return priority_limit_async_func_call(
             max_async,
             llm_timeout=timeout,
             queue_name=spec.queue_name,
-        )(
-            partial(
-                raw_func,
-                hashing_kv=self.llm_response_cache,
-                **model_kwargs,
-            )
-        )
+        )(invoke_with_sensitive_scope)
 
     def _rebuild_role_llm_funcs(self) -> None:
         """Wrap each role's raw_func with its own priority queue.

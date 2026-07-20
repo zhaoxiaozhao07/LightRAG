@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import contextvars
 import hashlib
+import inspect
 import json
 from importlib import import_module
 import os
@@ -25,6 +26,8 @@ from lightrag.api.kb_service import (
 from lightrag.api.metadata_store import (
     AuditEventRecord,
     ChatMessageRecord,
+    ChatMemoryOutboxEventRecord,
+    ChatMemoryOutboxStats,
     ChatProjectRecord,
     ChatSessionRecord,
     EnterpriseAPIKeyRecord,
@@ -43,6 +46,7 @@ from lightrag.api.metadata_store import (
     TenantUserKBOverrideEffect,
 )
 from lightrag.api.passwords import hash_password, verify_password
+from lightrag.utils import logger
 
 ENTERPRISE_REGISTRATION_ENABLED_KEY = "registration_enabled"
 ENTERPRISE_REGISTRATION_MODE_KEY = "registration_mode"
@@ -188,6 +192,17 @@ class EnterpriseMetadataStore(Protocol):
         self, user_id: str, project_id: str
     ) -> tuple[bool, int, int]: ...
 
+    async def delete_chat_project_with_memory(
+        self,
+        user_id: str,
+        project_id: str,
+        *,
+        config_fingerprint: str,
+        graph_store_fingerprint: str,
+        actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
+    ) -> tuple[bool, int, int]: ...
+
     async def create_chat_session(
         self, record: ChatSessionRecord
     ) -> ChatSessionRecord: ...
@@ -214,8 +229,30 @@ class EnterpriseMetadataStore(Protocol):
         self, user_id: str, project_id: str, session_id: str
     ) -> tuple[bool, int]: ...
 
+    async def delete_chat_session_with_memory(
+        self,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        *,
+        config_fingerprint: str,
+        graph_store_fingerprint: str,
+        actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
+    ) -> tuple[bool, int]: ...
+
     async def append_chat_messages(
         self, records: Sequence[ChatMessageRecord]
+    ) -> list[ChatMessageRecord]: ...
+
+    async def append_chat_messages_with_memory(
+        self,
+        records: Sequence[ChatMessageRecord],
+        *,
+        config_fingerprint: str,
+        graph_store_fingerprint: str,
+        actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
     ) -> list[ChatMessageRecord]: ...
 
     async def list_chat_messages(
@@ -239,6 +276,45 @@ class EnterpriseMetadataStore(Protocol):
     async def delete_chat_message(
         self, user_id: str, project_id: str, session_id: str, message_id: str
     ) -> bool: ...
+
+    async def delete_chat_message_with_memory(
+        self,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        message_id: str,
+        *,
+        config_fingerprint: str,
+        graph_store_fingerprint: str,
+        actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
+    ) -> bool: ...
+
+    async def enqueue_chat_memory_purge(
+        self,
+        user_id: str,
+        project_id: str,
+        config_fingerprint: str,
+        *,
+        graph_store_fingerprint: str,
+        actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
+    ) -> ChatMemoryOutboxEventRecord | None: ...
+
+    async def get_chat_memory_event(
+        self, event_id: str
+    ) -> ChatMemoryOutboxEventRecord | None: ...
+
+    async def requeue_chat_memory_purge(
+        self,
+        event_id: str,
+        runtime_fingerprint: str,
+        *,
+        runtime_graph_store_fingerprint: str | None = None,
+        retry_delay_seconds: float = 5.0,
+    ) -> ChatMemoryOutboxEventRecord: ...
+
+    async def get_chat_memory_outbox_stats(self) -> ChatMemoryOutboxStats: ...
 
     async def create_enterprise_api_key(
         self,
@@ -311,6 +387,20 @@ class EnterpriseMetadataStore(Protocol):
         self,
         user_id: str,
         *,
+        expected_updated_at: str | None = None,
+        expected_token_version: int | None = None,
+        expected_tenant_id: str | None = None,
+        expected_membership: Any = UNSET,
+    ) -> bool: ...
+
+    async def delete_enterprise_user_with_memory(
+        self,
+        user_id: str,
+        *,
+        config_fingerprint: str,
+        graph_store_fingerprint: str,
+        actor_user_id: str | None = None,
+        actor_tenant_id: str | None = None,
         expected_updated_at: str | None = None,
         expected_token_version: int | None = None,
         expected_tenant_id: str | None = None,
@@ -455,6 +545,38 @@ def _user_write_conflict(exc: MetadataConflictError) -> HTTPException:
         status_code=status.HTTP_409_CONFLICT,
         detail="User was modified concurrently; retry the request",
     )
+
+
+def chat_memory_write_conflict(exc: MetadataConflictError) -> HTTPException:
+    """Map durable Chat Memory metadata conflicts to a stable HTTP contract."""
+
+    error_code = str(exc.current.get("error_code") or "chat_memory_conflict")
+    if error_code == "graph_store_migration_required":
+        message = "Chat memory graph store migration is required"
+    else:
+        error_code = "chat_memory_conflict"
+        message = "Chat memory state changed concurrently; retry the request"
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"error_code": error_code, "message": message},
+    )
+
+
+async def _run_post_commit_nudge(
+    callback: Callable[[], Any] | None,
+    *,
+    owner: str,
+) -> None:
+    """Wake the durable worker without changing an already-committed result."""
+
+    if callback is None:
+        return
+    try:
+        result = callback()
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:  # noqa: BLE001 - commit already succeeded
+        logger.warning("%s Chat Memory worker nudge failed: %s", owner, exc)
 
 
 def _kb_lifecycle_write_conflict(exc: KBLifecycleConflictError) -> HTTPException:
@@ -1442,9 +1564,74 @@ class ChatConversationService:
         self,
         metadata_store: EnterpriseMetadataStore,
         audit_service: AuditService | None = None,
+        *,
+        memory_admission_enabled: bool = False,
+        memory_extraction_fingerprint: str | None = None,
+        memory_graph_store_fingerprint: str | None = None,
+        post_commit_nudge: Callable[[], Any] | None = None,
     ):
         self._metadata_store = metadata_store
         self._audit_service = audit_service
+        self._memory_admission_enabled = bool(memory_admission_enabled)
+        self._memory_extraction_fingerprint = (
+            str(memory_extraction_fingerprint).strip()
+            if memory_extraction_fingerprint
+            else None
+        )
+        self._memory_graph_store_fingerprint = (
+            str(memory_graph_store_fingerprint).strip()
+            if memory_graph_store_fingerprint
+            else None
+        )
+        if bool(self._memory_extraction_fingerprint) != bool(
+            self._memory_graph_store_fingerprint
+        ):
+            raise ValueError(
+                "Chat Memory extraction and graph-store fingerprints must be "
+                "configured together"
+            )
+        if self._memory_admission_enabled and not self.memory_maintenance_configured:
+            raise ValueError(
+                "Chat Memory admission requires extraction and graph-store fingerprints"
+            )
+        self._post_commit_nudge = post_commit_nudge
+
+    @property
+    def memory_admission_enabled(self) -> bool:
+        return self._memory_admission_enabled
+
+    @property
+    def memory_extraction_fingerprint(self) -> str | None:
+        return self._memory_extraction_fingerprint
+
+    @property
+    def memory_graph_store_fingerprint(self) -> str | None:
+        return self._memory_graph_store_fingerprint
+
+    @property
+    def memory_maintenance_configured(self) -> bool:
+        return bool(
+            self._memory_extraction_fingerprint
+            and self._memory_graph_store_fingerprint
+        )
+
+    def set_post_commit_nudge_callback(
+        self, callback: Callable[[], Any] | None
+    ) -> None:
+        self._post_commit_nudge = callback
+
+    async def _nudge_after_memory_commit(self) -> None:
+        await _run_post_commit_nudge(
+            self._post_commit_nudge,
+            owner="ChatConversationService",
+        )
+
+    def _memory_fingerprints(self) -> tuple[str, str]:
+        extraction = self._memory_extraction_fingerprint
+        graph_store = self._memory_graph_store_fingerprint
+        if extraction is None or graph_store is None:
+            raise RuntimeError("Chat Memory maintenance runtime is not configured")
+        return extraction, graph_store
 
     @staticmethod
     def default_session_name() -> str:
@@ -1527,9 +1714,28 @@ class ChatConversationService:
     async def delete_project(
         self, *, user_id: str, project_id: str, actor_user_id: str | None = None
     ) -> tuple[bool, int, int]:
-        deleted, deleted_sessions, deleted_messages = (
-            await self._metadata_store.delete_chat_project(user_id, project_id)
-        )
+        if self.memory_maintenance_configured:
+            extraction_fingerprint, graph_store_fingerprint = (
+                self._memory_fingerprints()
+            )
+            try:
+                deleted, deleted_sessions, deleted_messages = (
+                    await self._metadata_store.delete_chat_project_with_memory(
+                        user_id,
+                        project_id,
+                        config_fingerprint=extraction_fingerprint,
+                        graph_store_fingerprint=graph_store_fingerprint,
+                        actor_user_id=actor_user_id or user_id,
+                    )
+                )
+            except MetadataConflictError as exc:
+                raise chat_memory_write_conflict(exc) from exc
+            if deleted:
+                await self._nudge_after_memory_commit()
+        else:
+            deleted, deleted_sessions, deleted_messages = (
+                await self._metadata_store.delete_chat_project(user_id, project_id)
+            )
         if deleted:
             await self._audit(
                 "chat_project_deleted",
@@ -1649,9 +1855,29 @@ class ChatConversationService:
         session_id: str,
         actor_user_id: str | None = None,
     ) -> tuple[bool, int]:
-        deleted, deleted_messages = await self._metadata_store.delete_chat_session(
-            user_id, project_id, session_id
-        )
+        if self.memory_maintenance_configured:
+            extraction_fingerprint, graph_store_fingerprint = (
+                self._memory_fingerprints()
+            )
+            try:
+                deleted, deleted_messages = (
+                    await self._metadata_store.delete_chat_session_with_memory(
+                        user_id,
+                        project_id,
+                        session_id,
+                        config_fingerprint=extraction_fingerprint,
+                        graph_store_fingerprint=graph_store_fingerprint,
+                        actor_user_id=actor_user_id or user_id,
+                    )
+                )
+            except MetadataConflictError as exc:
+                raise chat_memory_write_conflict(exc) from exc
+            if deleted:
+                await self._nudge_after_memory_commit()
+        else:
+            deleted, deleted_messages = await self._metadata_store.delete_chat_session(
+                user_id, project_id, session_id
+            )
         if deleted:
             await self._audit(
                 "chat_session_deleted",
@@ -1694,9 +1920,24 @@ class ChatConversationService:
             for message in messages
         ]
         try:
-            saved = await self._metadata_store.append_chat_messages(records)
+            if self._memory_admission_enabled:
+                extraction_fingerprint, graph_store_fingerprint = (
+                    self._memory_fingerprints()
+                )
+                saved = await self._metadata_store.append_chat_messages_with_memory(
+                    records,
+                    config_fingerprint=extraction_fingerprint,
+                    graph_store_fingerprint=graph_store_fingerprint,
+                    actor_user_id=actor_user_id or user_id,
+                )
+            else:
+                saved = await self._metadata_store.append_chat_messages(records)
         except MetadataRecordNotFoundError:
             return None
+        except MetadataConflictError as exc:
+            raise chat_memory_write_conflict(exc) from exc
+        if self._memory_admission_enabled:
+            await self._nudge_after_memory_commit()
         await self._audit(
             "chat_messages_appended",
             actor_user_id=actor_user_id or user_id,
@@ -1743,9 +1984,28 @@ class ChatConversationService:
         message_id: str,
         actor_user_id: str | None = None,
     ) -> bool:
-        deleted = await self._metadata_store.delete_chat_message(
-            user_id, project_id, session_id, message_id
-        )
+        if self.memory_maintenance_configured:
+            extraction_fingerprint, graph_store_fingerprint = (
+                self._memory_fingerprints()
+            )
+            try:
+                deleted = await self._metadata_store.delete_chat_message_with_memory(
+                    user_id,
+                    project_id,
+                    session_id,
+                    message_id,
+                    config_fingerprint=extraction_fingerprint,
+                    graph_store_fingerprint=graph_store_fingerprint,
+                    actor_user_id=actor_user_id or user_id,
+                )
+            except MetadataConflictError as exc:
+                raise chat_memory_write_conflict(exc) from exc
+            if deleted:
+                await self._nudge_after_memory_commit()
+        else:
+            deleted = await self._metadata_store.delete_chat_message(
+                user_id, project_id, session_id, message_id
+            )
         if deleted:
             await self._audit(
                 "chat_message_deleted",
@@ -1938,9 +2198,74 @@ class UserService:
         self,
         metadata_store: EnterpriseMetadataStore,
         audit_service: AuditService | None = None,
+        *,
+        memory_admission_enabled: bool = False,
+        memory_extraction_fingerprint: str | None = None,
+        memory_graph_store_fingerprint: str | None = None,
+        post_commit_nudge: Callable[[], Any] | None = None,
     ):
         self._metadata_store = metadata_store
         self._audit_service = audit_service
+        self._memory_admission_enabled = bool(memory_admission_enabled)
+        self._memory_extraction_fingerprint = (
+            str(memory_extraction_fingerprint).strip()
+            if memory_extraction_fingerprint
+            else None
+        )
+        self._memory_graph_store_fingerprint = (
+            str(memory_graph_store_fingerprint).strip()
+            if memory_graph_store_fingerprint
+            else None
+        )
+        if bool(self._memory_extraction_fingerprint) != bool(
+            self._memory_graph_store_fingerprint
+        ):
+            raise ValueError(
+                "Chat Memory extraction and graph-store fingerprints must be "
+                "configured together"
+            )
+        if self._memory_admission_enabled and not self.memory_maintenance_configured:
+            raise ValueError(
+                "Chat Memory admission requires extraction and graph-store fingerprints"
+            )
+        self._post_commit_nudge = post_commit_nudge
+
+    @property
+    def memory_admission_enabled(self) -> bool:
+        return self._memory_admission_enabled
+
+    @property
+    def memory_extraction_fingerprint(self) -> str | None:
+        return self._memory_extraction_fingerprint
+
+    @property
+    def memory_graph_store_fingerprint(self) -> str | None:
+        return self._memory_graph_store_fingerprint
+
+    @property
+    def memory_maintenance_configured(self) -> bool:
+        return bool(
+            self._memory_extraction_fingerprint
+            and self._memory_graph_store_fingerprint
+        )
+
+    def set_post_commit_nudge_callback(
+        self, callback: Callable[[], Any] | None
+    ) -> None:
+        self._post_commit_nudge = callback
+
+    async def _nudge_after_memory_commit(self) -> None:
+        await _run_post_commit_nudge(
+            self._post_commit_nudge,
+            owner="UserService",
+        )
+
+    def _memory_fingerprints(self) -> tuple[str, str]:
+        extraction = self._memory_extraction_fingerprint
+        graph_store = self._memory_graph_store_fingerprint
+        if extraction is None or graph_store is None:
+            raise RuntimeError("Chat Memory maintenance runtime is not configured")
+        return extraction, graph_store
 
     async def bootstrap_super_admin(
         self,
@@ -2112,12 +2437,34 @@ class UserService:
         if expected_membership is not UNSET:
             kwargs["expected_membership"] = expected_membership
         try:
-            deleted = await self._metadata_store.delete_enterprise_user(
-                user_id, **kwargs
-            )
+            if self.memory_maintenance_configured:
+                extraction_fingerprint, graph_store_fingerprint = (
+                    self._memory_fingerprints()
+                )
+                memory_kwargs = {
+                    **kwargs,
+                    "config_fingerprint": extraction_fingerprint,
+                    "graph_store_fingerprint": graph_store_fingerprint,
+                    "actor_user_id": actor_user_id,
+                }
+                if actor_tenant_id is not _ACTOR_TENANT_UNSET:
+                    memory_kwargs["actor_tenant_id"] = actor_tenant_id
+                deleted = (
+                    await self._metadata_store.delete_enterprise_user_with_memory(
+                        user_id, **memory_kwargs
+                    )
+                )
+            else:
+                deleted = await self._metadata_store.delete_enterprise_user(
+                    user_id, **kwargs
+                )
         except MetadataConflictError as exc:
+            if exc.entity_type.startswith("chat_memory"):
+                raise chat_memory_write_conflict(exc) from exc
             raise _user_write_conflict(exc) from exc
         if deleted:
+            if self.memory_maintenance_configured:
+                await self._nudge_after_memory_commit()
             await self._audit(
                 "user_deleted",
                 actor_user_id=actor_user_id,
@@ -3365,6 +3712,16 @@ class AuthorizationService:
             if override_effect == "allow":
                 tenant_role = override_role
                 tenant_source = "tenant_owned_override"
+            if (
+                tenant_role is None
+                and _tenant_role_rank(primary_tenant_role)
+                >= _TENANT_ROLE_RANK[TENANT_ROLE_ADMIN]
+            ):
+                # Tenant administrators keep read-level oversight of every KB
+                # owned by their tenant, shared or private; a deny override
+                # cannot remove it.
+                tenant_role = KB_ROLE_VIEWER
+                tenant_source = "tenant_admin_oversight"
         elif tenant_acl_role is not None:
             if override is None:
                 tenant_role = tenant_acl_role
