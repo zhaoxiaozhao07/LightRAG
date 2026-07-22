@@ -40,7 +40,7 @@
 | `DELETE` | `/kbs/{kb_id}` | 软删除知识库；附加 `?hard=true` 触发硬删除（durable worker 启用时入队 `clear_kb`，否则同步执行） |
 | `GET` | `/kbs/{kb_id}/status` | 知识库状态聚合（含运行中任务、pipeline 状态） |
 | `POST` | `/kbs/{kb_id}:restore` | 恢复软删除的知识库（`deleted`→`active`）；企业模式允许 super admin 或该 tenant-created KB 所属租户的 `tenant_admin` / `tenant_owner` |
-| `GET` | `/kbs/{kb_id}/stats` | 控制面统计：文档状态分布、chunks/entity/relation 合计、job 状态分布、dead-letter、artifact 数 |
+| `GET` | `/kbs/{kb_id}/stats` | 控制面统计：文档状态分布、chunks 合计、entity/relation 数（取自图谱）、job 状态分布、dead-letter、artifact 数、graph 节点/边数 |
 
 ### 1.1 创建知识库
 
@@ -135,12 +135,13 @@ GET /kbs/{kb_id}/stats
   "documents": {"total": 12, "by_status": {"ready": 10, "parse_failed": 2}},
   "counters": {"chunks": 340, "entities": 1200, "relations": 980},
   "jobs": {"total": 25, "by_status": {"succeeded": 23, "failed": 2}, "dead_letter": 1},
-  "artifacts": {"total": 96}
+  "artifacts": {"total": 96},
+  "graph": {"node_count": 1200, "edge_count": 980}
 }
 ```
 
-- **仅查控制面 metadata store**，不加载 LightRAG 实例，调用廉价且无副作用；图谱规模（节点/边数）继续使用 `GET /kbs/{kb_id}/graph/status`。
-- `counters` 为各文档构建回填计数的合计；已删除文档的计数在删除时已清零，不计入。
+- 读控制面 metadata store 取文档/job/artifact 统计；实体/关系数取自该 KB 的图谱（按需加载 LightRAG 实例做一次有界全图扫描，与 `GET /kbs/{kb_id}/graph/status` 同源，受 `max_nodes_scanned` 上限保护）。LightRAG 的 `doc_status` 行不保存 entity/relation 计数（表无此列、构建只写 `chunks_count`），所以控制面合计恒为 0，故用图谱规模回填 `counters.entities`/`counters.relations`；`graph` 另外携带原始 `node_count`/`edge_count` 供区分。
+- 已删除文档的计数在删除时已清零，不计入 `chunks` 合计。
 - `dead_letter` 为 `failed` 且重试耗尽的任务数（与 `/jobs/dead-letter` 口径一致）。
 - 企业模式 `kb_viewer`+ 可读；KB 不存在返回 `404`。
 

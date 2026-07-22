@@ -76,6 +76,8 @@ DOCUMENT_PROFILE_SYSTEM_PROMPT = """
 You generate a compact routing profile for one knowledge-base document.
 Return strict JSON only. Do not include markdown or chain-of-thought.
 The profile is used only to decide which KB should be searched by an Agent.
+Always write a concrete non-empty `summary` (1-4 sentences) describing the
+document's routing-relevant scope; never return an empty summary.
 """.strip()
 
 GROUP_PROFILE_SYSTEM_PROMPT = """
@@ -83,12 +85,16 @@ You merge a batch of document routing profiles from ONE knowledge base into a
 single compact group digest. Return strict JSON only. Do not include markdown
 or chain-of-thought. Preserve topical coverage: mention every distinct theme
 present in the batch, not only the dominant one.
+Always write a concrete non-empty `description` summarizing the batch; never
+return an empty description.
 """.strip()
 
 KB_PROFILE_SYSTEM_PROMPT = """
 You aggregate document routing profiles into one compact knowledge-base Agent profile.
 Return strict JSON only. Do not include markdown or chain-of-thought.
 Focus on what questions this KB is good for, not a full content summary.
+You MUST write a concrete non-empty `description` (1-3 sentences) stating what
+questions this knowledge base can answer; never return an empty description.
 """.strip()
 
 
@@ -485,6 +491,36 @@ def _compact_kb_profile_for_metadata(
         if _over_budget():
             result["description"] = result["description"][:cut]
     return result
+
+
+def _profile_response_format(
+    model: type[DocumentAgentProfile]
+    | type[DocumentGroupProfile]
+    | type[KBAgentAutoProfile],
+) -> dict[str, Any]:
+    """Build an OpenAI-style ``json_schema`` response_format for one profile model.
+
+    Guided decoding forces the model to emit the exact profile shape, so the
+    routing-critical ``description``/``summary`` no longer gets dropped or
+    renamed (a recurring failure with plain ``json_object`` mode on local
+    models that otherwise invent a different JSON structure). A ``minLength``
+    floor on the prose field nudges the model toward substantive output; the
+    ``mode="before"`` pydantic validator still coerces missing/whitespace
+    values down to ``""`` for callers that tolerate empty strings.
+    """
+    schema = model.model_json_schema()
+    schema.pop("title", None)
+    # Tighten the single prose field so the model is steered to write content;
+    # the field name differs per profile (summary vs description).
+    prose_field = "summary" if issubclass(model, DocumentAgentProfile) else "description"
+    prose_schema = schema.setdefault("properties", {}).setdefault(prose_field, {})
+    if prose_schema.get("type") != "string":
+        prose_schema["type"] = "string"
+    prose_schema.setdefault("minLength", 1)
+    schema.setdefault("required", [])
+    if prose_field not in schema["required"]:
+        schema["required"].append(prose_field)
+    return {"type": "json_schema", "json_schema": {"name": model.__name__, "schema": schema}}
 
 
 class AgentProfileService:
@@ -1332,6 +1368,12 @@ class AgentProfileService:
         | type[KBAgentAutoProfile],
     ) -> DocumentAgentProfile | DocumentGroupProfile | KBAgentAutoProfile:
         prompt = json.dumps(payload, ensure_ascii=False)
+        # Use vLLM/OpenAI `json_schema` guided decoding so the model emits the
+        # exact profile shape (it has a tendency to emit a different structure
+        # under a plain `json_object` mode, leaving the routing-critical
+        # description empty). Bindings that reject a schema response_format are
+        # detected by ``call_llm_json`` and retried with plain ``json_object``.
+        response_format = _profile_response_format(model)
         try:
             return await call_llm_json(
                 profile_func,
@@ -1341,6 +1383,7 @@ class AgentProfileService:
                 parse=model.model_validate,
                 attempts=PROFILE_LLM_ATTEMPTS,
                 label=f"agent_profile:{model.__name__}",
+                response_format=response_format,
             )
         except LLMJsonError as exc:
             raise HTTPException(

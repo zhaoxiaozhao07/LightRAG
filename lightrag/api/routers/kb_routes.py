@@ -188,6 +188,7 @@ class KnowledgeBaseStatsResponse(BaseModel):
     counters: dict[str, int]
     jobs: dict[str, Any]
     artifacts: dict[str, int]
+    graph: dict[str, int] = Field(default_factory=dict)
 
 
 class ConfigVersionCreateRequest(BaseModel):
@@ -344,6 +345,40 @@ def _storage_workspaces_for_rag(rag: Any) -> dict[str, Any]:
         if storage is not None:
             result[attr] = getattr(storage, "workspace", None)
     return result
+
+
+# Bounded full-graph scan so very large graphs cannot OOM the stats read.
+# Mirrors ``/kbs/{kb_id}/graph/status``; kept local so the stats endpoint stays
+# a single read with no dependency on the graph router module.
+_STATS_GRAPH_SCAN_NODES = 100_000
+
+
+async def _kb_graph_scale(registry: LightRAGInstanceRegistry, kb_id: str) -> dict[str, int]:
+    """Return ``{"node_count", "edge_count"}`` from the KB's live graph.
+
+    LightRAG's ``doc_status`` row never carries entity/relation counts (the
+    schema has no such columns and the merge path only writes
+    ``chunks_count``), so the per-document ``entity_count``/``relation_count``
+    projected by the metadata store are always NULL and sum to 0. The control-
+    plane aggregate therefore cannot report graph scale; this reads it from the
+    KB's knowledge graph instead. The LightRAG instance is loaded on demand
+    (registry.get) so the count is correct on a cold server too; this is more
+    work than the rest of the stats read but the endpoint is admin-triggered,
+    not a hot path. Best-effort: any failure (instance build, storage error)
+    returns an empty dict so the stats endpoint stays available rather than
+    erroring on graph state.
+    """
+    try:
+        rag = await registry.get(kb_id)
+        graph = await rag.get_knowledge_graph(
+            node_label="*",
+            max_depth=1,
+            max_nodes=_STATS_GRAPH_SCAN_NODES,
+        )
+    except Exception as exc:  # noqa: BLE001 — graph state must not break stats
+        logger.warning("KB graph scale read failed for '%s': %s", kb_id, exc)
+        return {}
+    return {"node_count": len(graph.nodes), "edge_count": len(graph.edges)}
 
 
 def _hard_delete_worker_enabled(request: Request) -> bool:
@@ -1044,19 +1079,33 @@ def create_kb_routes(
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         documents_by_status = stats["documents_by_status"]
         jobs_by_status = stats["jobs_by_status"]
+        # LightRAG's doc_status rows never carry entity/relation counts
+        # (the table has no such columns), so the control-plane ``counters``
+        # sum them to 0. Read the live graph scale and backfill the
+        # ``entities``/``relations`` counters with the real node/edge counts
+        # so the overview shows accurate totals; ``graph`` carries the raw
+        # counts separately for clients that distinguish them.
+        graph_scale = await _kb_graph_scale(registry, record.id)
+        counters = dict(stats["document_counters"])
+        if graph_scale:
+            # The control-plane counter is structurally always 0 (NULL sum);
+            # the graph read is the source of truth for entity/relation totals.
+            counters["entities"] = graph_scale["node_count"]
+            counters["relations"] = graph_scale["edge_count"]
         return KnowledgeBaseStatsResponse(
             kb_id=record.id,
             documents={
                 "total": sum(documents_by_status.values()),
                 "by_status": documents_by_status,
             },
-            counters=stats["document_counters"],
+            counters=counters,
             jobs={
                 "total": sum(jobs_by_status.values()),
                 "by_status": jobs_by_status,
                 "dead_letter": stats["dead_letter_jobs"],
             },
             artifacts={"total": stats["artifacts"]},
+            graph=graph_scale,
         )
 
     @router.get(
