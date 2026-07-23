@@ -63,6 +63,13 @@ from lightrag.api.chat_memory_service import (
 from lightrag.api.kb_service import KnowledgeBaseNotFoundError
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry
 from lightrag.api.metadata_store import DocumentRecord
+from lightrag.api.streaming_lifecycle import (
+    ClientGoneError,
+    await_with_disconnect_check,
+    client_closed_response,
+    safe_aclose,
+    stream_with_disconnect_guard,
+)
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.base import QueryParam
 from lightrag.prompt import PROMPTS
@@ -1280,29 +1287,42 @@ def create_kb_query_routes(
                 kb_id,
                 request.filters,
             )
-            plan, bilingual_info = await _maybe_bilingual_plan(rag, request, param)
+            plan, bilingual_info = await await_with_disconnect_check(
+                http_request, _maybe_bilingual_plan(rag, request, param)
+            )
             if plan is not None:
                 if memory_handle is None:
-                    result, bilingual_info = await bilingual_query_llm(
-                        rag, request.query, param, plan, stream=False
+                    result, bilingual_info = await await_with_disconnect_check(
+                        http_request,
+                        bilingual_query_llm(
+                            rag, request.query, param, plan, stream=False
+                        ),
                     )
                 else:
-                    result, bilingual_info = await bilingual_query_llm(
-                        rag,
-                        request.query,
-                        param,
-                        plan,
-                        stream=False,
-                        sensitive_context=memory_handle,
+                    result, bilingual_info = await await_with_disconnect_check(
+                        http_request,
+                        bilingual_query_llm(
+                            rag,
+                            request.query,
+                            param,
+                            plan,
+                            stream=False,
+                            sensitive_context=memory_handle,
+                        ),
                     )
             else:
                 if memory_handle is None:
-                    result = await rag.aquery_llm(request.query, param=param)
+                    result = await await_with_disconnect_check(
+                        http_request, rag.aquery_llm(request.query, param=param)
+                    )
                 else:
-                    result = await rag.aquery_llm(
-                        request.query,
-                        param=param,
-                        sensitive_context=memory_handle,
+                    result = await await_with_disconnect_check(
+                        http_request,
+                        rag.aquery_llm(
+                            request.query,
+                            param=param,
+                            sensitive_context=memory_handle,
+                        ),
                     )
             memory_info = memory_handle.info if memory_handle is not None else None
             llm_response = result.get("llm_response", {})
@@ -1347,6 +1367,8 @@ def create_kb_query_routes(
             )
         except HTTPException:
             raise
+        except ClientGoneError:
+            return client_closed_response()
         except SensitiveContextPolicyError as exc:
             raise _map_sensitive_context_policy_error(exc) from None
         except KnowledgeBaseNotFoundError as exc:
@@ -1414,29 +1436,42 @@ def create_kb_query_routes(
                 kb_id,
                 request.filters,
             )
-            plan, bilingual_info = await _maybe_bilingual_plan(rag, request, param)
+            plan, bilingual_info = await await_with_disconnect_check(
+                http_request, _maybe_bilingual_plan(rag, request, param)
+            )
             if plan is not None:
                 if memory_handle is None:
-                    result, bilingual_info = await bilingual_query_llm(
-                        rag, request.query, param, plan, stream=stream_mode
+                    result, bilingual_info = await await_with_disconnect_check(
+                        http_request,
+                        bilingual_query_llm(
+                            rag, request.query, param, plan, stream=stream_mode
+                        ),
                     )
                 else:
-                    result, bilingual_info = await bilingual_query_llm(
-                        rag,
-                        request.query,
-                        param,
-                        plan,
-                        stream=stream_mode,
-                        sensitive_context=memory_handle,
+                    result, bilingual_info = await await_with_disconnect_check(
+                        http_request,
+                        bilingual_query_llm(
+                            rag,
+                            request.query,
+                            param,
+                            plan,
+                            stream=stream_mode,
+                            sensitive_context=memory_handle,
+                        ),
                     )
             else:
                 if memory_handle is None:
-                    result = await rag.aquery_llm(request.query, param=param)
+                    result = await await_with_disconnect_check(
+                        http_request, rag.aquery_llm(request.query, param=param)
+                    )
                 else:
-                    result = await rag.aquery_llm(
-                        request.query,
-                        param=param,
-                        sensitive_context=memory_handle,
+                    result = await await_with_disconnect_check(
+                        http_request,
+                        rag.aquery_llm(
+                            request.query,
+                            param=param,
+                            sensitive_context=memory_handle,
+                        ),
                     )
             memory_info = memory_handle.info if memory_handle is not None else None
             response_metadata = dict(active_metadata)
@@ -1478,8 +1513,14 @@ def create_kb_query_routes(
                     yield f"{json.dumps(payload)}\n"
                     iterator = llm_response.get("response_iterator")
                     if iterator:
+                        # Drive the upstream LLM stream through a disconnect guard:
+                        # a client abort stops pulling tokens promptly and the
+                        # underlying response is released (aclose) on exit.
+                        guarded = stream_with_disconnect_guard(
+                            iterator, http_request
+                        )
                         try:
-                            async for chunk in iterator:
+                            async for chunk in guarded:
                                 if chunk:
                                     yield f"{json.dumps({'response': chunk})}\n"
                         except Exception as exc:  # noqa: BLE001
@@ -1492,6 +1533,8 @@ def create_kb_query_routes(
                                 return
                             logger.error("KB stream error: %s", exc)
                             yield f"{json.dumps({'error': str(exc)})}\n"
+                        finally:
+                            await safe_aclose(iterator)
                 else:
                     body = {
                         "kb_id": kb_id,
@@ -1514,6 +1557,8 @@ def create_kb_query_routes(
             )
         except HTTPException:
             raise
+        except ClientGoneError:
+            return client_closed_response()
         except SensitiveContextPolicyError as exc:
             raise _map_sensitive_context_policy_error(exc) from None
         except KnowledgeBaseNotFoundError as exc:
@@ -1573,12 +1618,19 @@ def create_kb_query_routes(
                 kb_id,
                 request.filters,
             )
-            plan, bilingual_info = await _maybe_bilingual_plan(rag, request, param)
+            plan, bilingual_info = await await_with_disconnect_check(
+                http_request, _maybe_bilingual_plan(rag, request, param)
+            )
             if plan is not None:
-                result = await bilingual_query_data(rag, request.query, param, plan)
+                result = await await_with_disconnect_check(
+                    http_request,
+                    bilingual_query_data(rag, request.query, param, plan),
+                )
                 bilingual_info = (result.get("metadata") or {}).get("bilingual")
             else:
-                result = await rag.aquery_data(request.query, param=param)
+                result = await await_with_disconnect_check(
+                    http_request, rag.aquery_data(request.query, param=param)
+                )
                 if bilingual_info is not None:
                     result.setdefault("metadata", {})["bilingual"] = bilingual_info
             await append_enterprise_audit_event(
@@ -1606,6 +1658,8 @@ def create_kb_query_routes(
             )
         except HTTPException:
             raise
+        except ClientGoneError:
+            return client_closed_response()
         except KnowledgeBaseNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -1654,8 +1708,11 @@ def create_kb_query_routes(
                 skipped,
                 per_kb_counts,
                 bilingual_info,
-            ) = await _multi_kb_retrieve(
-                document_service, registry, request, http_request
+            ) = await await_with_disconnect_check(
+                http_request,
+                _multi_kb_retrieve(
+                    document_service, registry, request, http_request
+                ),
             )
 
             response_text = "No relevant context found for the query."
@@ -1665,13 +1722,16 @@ def create_kb_query_routes(
                 references_out,
                 reranked,
                 final_count,
-            ) = await _prepare_multi_kb_synthesis(
-                request,
-                merged,
-                synth_rag,
-                synth_param,
-                bilingual_info=bilingual_info,
-                sensitive_context=memory_handle,
+            ) = await await_with_disconnect_check(
+                http_request,
+                _prepare_multi_kb_synthesis(
+                    request,
+                    merged,
+                    synth_rag,
+                    synth_param,
+                    bilingual_info=bilingual_info,
+                    sensitive_context=memory_handle,
+                ),
             )
             if sys_prompt is not None and use_model_func is not None:
                 llm_kwargs: Dict[str, Any] = {
@@ -1686,7 +1746,9 @@ def create_kb_query_routes(
                 }
                 if memory_handle is not None:
                     llm_kwargs["_sensitive"] = True
-                llm_out = await use_model_func(request.query, **llm_kwargs)
+                llm_out = await await_with_disconnect_check(
+                    http_request, use_model_func(request.query, **llm_kwargs)
+                )
                 if isinstance(llm_out, str) and llm_out.strip():
                     response_text = llm_out.strip()
             memory_info = memory_handle.info if memory_handle is not None else None
@@ -1728,6 +1790,8 @@ def create_kb_query_routes(
             )
         except HTTPException:
             raise
+        except ClientGoneError:
+            return client_closed_response()
         except SensitiveContextPolicyError as exc:
             raise _map_sensitive_context_policy_error(exc) from None
         except KnowledgeBaseNotFoundError as exc:
@@ -1773,8 +1837,11 @@ def create_kb_query_routes(
                 skipped,
                 per_kb_counts,
                 bilingual_info,
-            ) = await _multi_kb_retrieve(
-                document_service, registry, request, http_request
+            ) = await await_with_disconnect_check(
+                http_request,
+                _multi_kb_retrieve(
+                    document_service, registry, request, http_request
+                ),
             )
             (
                 sys_prompt,
@@ -1782,13 +1849,16 @@ def create_kb_query_routes(
                 references_out,
                 reranked,
                 final_count,
-            ) = await _prepare_multi_kb_synthesis(
-                request,
-                merged,
-                synth_rag,
-                synth_param,
-                bilingual_info=bilingual_info,
-                sensitive_context=memory_handle,
+            ) = await await_with_disconnect_check(
+                http_request,
+                _prepare_multi_kb_synthesis(
+                    request,
+                    merged,
+                    synth_rag,
+                    synth_param,
+                    bilingual_info=bilingual_info,
+                    sensitive_context=memory_handle,
+                ),
             )
             prepared_llm_out: Any = None
             if (
@@ -1796,17 +1866,20 @@ def create_kb_query_routes(
                 and sys_prompt is not None
                 and use_model_func is not None
             ):
-                prepared_llm_out = await use_model_func(
-                    request.query,
-                    system_prompt=sys_prompt,
-                    history_messages=(
-                        synth_param.conversation_history
-                        if synth_param is not None
-                        else None
+                prepared_llm_out = await await_with_disconnect_check(
+                    http_request,
+                    use_model_func(
+                        request.query,
+                        system_prompt=sys_prompt,
+                        history_messages=(
+                            synth_param.conversation_history
+                            if synth_param is not None
+                            else None
+                        ),
+                        enable_cot=True,
+                        stream=True,
+                        _sensitive=True,
                     ),
-                    enable_cot=True,
-                    stream=True,
-                    _sensitive=True,
                 )
             memory_info = memory_handle.info if memory_handle is not None else None
             metadata = {
@@ -1852,23 +1925,29 @@ def create_kb_query_routes(
                 if memory_handle is not None:
                     llm_out = prepared_llm_out
                 else:
-                    llm_out = await use_model_func(
-                        request.query,
-                        system_prompt=sys_prompt,
-                        history_messages=(
-                            synth_param.conversation_history
-                            if synth_param is not None
-                            else None
+                    llm_out = await await_with_disconnect_check(
+                        http_request,
+                        use_model_func(
+                            request.query,
+                            system_prompt=sys_prompt,
+                            history_messages=(
+                                synth_param.conversation_history
+                                if synth_param is not None
+                                else None
+                            ),
+                            enable_cot=True,
+                            stream=True,
                         ),
-                        enable_cot=True,
-                        stream=True,
                     )
                 if isinstance(llm_out, str):
                     if llm_out.strip():
                         yield f"{json.dumps({'response': llm_out.strip()})}\n"
                     return
                 try:
-                    async for chunk in llm_out:
+                    # Disconnect guard: a client abort stops pulling tokens and the
+                    # upstream stream is released (aclose) on exit.
+                    guarded = stream_with_disconnect_guard(llm_out, http_request)
+                    async for chunk in guarded:
                         if chunk:
                             yield f"{json.dumps({'response': chunk})}\n"
                 except Exception as exc:  # noqa: BLE001
@@ -1881,6 +1960,8 @@ def create_kb_query_routes(
                         return
                     logger.error("Multi-KB stream error: %s", exc)
                     yield f"{json.dumps({'error': str(exc)})}\n"
+                finally:
+                    await safe_aclose(llm_out)
 
             return StreamingResponse(
                 stream_generator(),
@@ -1894,6 +1975,8 @@ def create_kb_query_routes(
             )
         except HTTPException:
             raise
+        except ClientGoneError:
+            return client_closed_response()
         except SensitiveContextPolicyError as exc:
             raise _map_sensitive_context_policy_error(exc) from None
         except KnowledgeBaseNotFoundError as exc:
@@ -1935,8 +2018,11 @@ def create_kb_query_routes(
                 skipped,
                 per_kb_counts,
                 bilingual_info,
-            ) = await _multi_kb_retrieve(
-                document_service, registry, request, http_request
+            ) = await await_with_disconnect_check(
+                http_request,
+                _multi_kb_retrieve(
+                    document_service, registry, request, http_request
+                ),
             )
 
             reranked = False
@@ -2008,6 +2094,8 @@ def create_kb_query_routes(
             )
         except HTTPException:
             raise
+        except ClientGoneError:
+            return client_closed_response()
         except KnowledgeBaseNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:

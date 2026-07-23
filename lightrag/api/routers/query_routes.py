@@ -4,7 +4,8 @@ This module contains all query-related routes for the LightRAG API.
 
 import json
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends, HTTPException
+
+from fastapi import APIRouter, Depends, HTTPException, Request
 from lightrag.api.bilingual_query_service import (
     apply_plan_keywords_to_param,
     bilingual_applies,
@@ -12,6 +13,12 @@ from lightrag.api.bilingual_query_service import (
     bilingual_query_llm,
     prepare_bilingual_queries,
     resolve_bilingual_mode,
+)
+from lightrag.api.streaming_lifecycle import (
+    ClientGoneError,
+    await_with_disconnect_check,
+    safe_aclose,
+    stream_with_disconnect_guard,
 )
 from lightrag.base import QueryParam
 from lightrag.api.utils_api import get_combined_auth_dependency
@@ -354,7 +361,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text(request: QueryRequest):
+    async def query_text(request: QueryRequest, http_request: Request):
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
 
@@ -441,13 +448,18 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             param.stream = False
 
             # Unified approach: always use aquery_llm for both cases
-            plan = await _legacy_bilingual_plan(rag, request, param)
+            plan = await await_with_disconnect_check(
+                http_request, _legacy_bilingual_plan(rag, request, param)
+            )
             if plan is not None:
-                result, _bilingual_info = await bilingual_query_llm(
-                    rag, request.query, param, plan, stream=False
+                result, _bilingual_info = await await_with_disconnect_check(
+                    http_request,
+                    bilingual_query_llm(rag, request.query, param, plan, stream=False),
                 )
             else:
-                result = await rag.aquery_llm(request.query, param=param)
+                result = await await_with_disconnect_check(
+                    http_request, rag.aquery_llm(request.query, param=param)
+                )
 
             # Extract LLM response and references from unified result
             llm_response = result.get("llm_response", {})
@@ -487,6 +499,12 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 return QueryResponse(response=response_content, references=references)
             else:
                 return QueryResponse(response=response_content, references=None)
+        except ClientGoneError:
+            # Client disconnected before headers were sent. Return a 499 so the
+            # ASGI teardown stays clean (body is never delivered to a gone socket).
+            from lightrag.api.streaming_lifecycle import client_closed_response
+
+            return client_closed_response()
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
@@ -570,7 +588,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text_stream(request: QueryRequest):
+    async def query_text_stream(request: QueryRequest, http_request: Request):
         """
         Advanced RAG query endpoint with flexible streaming response.
 
@@ -705,13 +723,18 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             from fastapi.responses import StreamingResponse
 
             # Unified approach: always use aquery_llm for all cases
-            plan = await _legacy_bilingual_plan(rag, request, param)
+            plan = await await_with_disconnect_check(
+                http_request, _legacy_bilingual_plan(rag, request, param)
+            )
             if plan is not None:
-                result, _bilingual_info = await bilingual_query_llm(
-                    rag, request.query, param, plan, stream=stream_mode
+                result, _bilingual_info = await await_with_disconnect_check(
+                    http_request,
+                    bilingual_query_llm(rag, request.query, param, plan, stream=stream_mode),
                 )
             else:
-                result = await rag.aquery_llm(request.query, param=param)
+                result = await await_with_disconnect_check(
+                    http_request, rag.aquery_llm(request.query, param=param)
+                )
 
             async def stream_generator():
                 # Extract references and LLM response from unified result
@@ -749,13 +772,22 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
                     response_stream = llm_response.get("response_iterator")
                     if response_stream:
+                        # Drive the upstream LLM stream through a disconnect guard so a
+                        # client abort stops pulling tokens immediately and the
+                        # underlying response/connection is released (aclose) on the
+                        # way out rather than relying on GC finalizer timing.
+                        guarded = stream_with_disconnect_guard(
+                            response_stream, http_request
+                        )
                         try:
-                            async for chunk in response_stream:
+                            async for chunk in guarded:
                                 if chunk:  # Only send non-empty content
                                     yield f"{json.dumps({'response': chunk})}\n"
                         except Exception as e:
                             logger.error(f"Streaming error: {str(e)}")
                             yield f"{json.dumps({'error': str(e)})}\n"
+                        finally:
+                            await safe_aclose(response_stream)
                 else:
                     # Non-streaming mode: send complete response in one message
                     response_content = llm_response.get("content", "")
@@ -779,6 +811,12 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     "X-Accel-Buffering": "no",  # Ensure proper handling of streaming response when proxied by Nginx
                 },
             )
+        except ClientGoneError:
+            # Client disconnected before streaming started; 499 keeps teardown
+            # clean (nothing can be written to a closed socket anyway).
+            from lightrag.api.streaming_lifecycle import client_closed_response
+
+            return client_closed_response()
         except Exception as e:
             logger.error(f"Error processing streaming query: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
@@ -1079,7 +1117,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_data(request: QueryRequest):
+    async def query_data(request: QueryRequest, http_request: Request):
         """
         Advanced data retrieval endpoint for structured RAG analysis.
 
@@ -1184,11 +1222,18 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         """
         try:
             param = request.to_query_params(False)  # No streaming for data endpoint
-            plan = await _legacy_bilingual_plan(rag, request, param)
+            plan = await await_with_disconnect_check(
+                http_request, _legacy_bilingual_plan(rag, request, param)
+            )
             if plan is not None:
-                response = await bilingual_query_data(rag, request.query, param, plan)
+                response = await await_with_disconnect_check(
+                    http_request,
+                    bilingual_query_data(rag, request.query, param, plan),
+                )
             else:
-                response = await rag.aquery_data(request.query, param=param)
+                response = await await_with_disconnect_check(
+                    http_request, rag.aquery_data(request.query, param=param)
+                )
 
             # aquery_data returns the new format with status, message, data, and metadata
             if isinstance(response, dict):
@@ -1201,6 +1246,12 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     data={},
                     metadata={},
                 )
+        except ClientGoneError:
+            # Client disconnected before retrieval completed. 499 keeps the
+            # teardown clean; the JSON body is never delivered to a gone socket.
+            from lightrag.api.streaming_lifecycle import client_closed_response
+
+            return client_closed_response()
         except Exception as e:
             logger.error(f"Error processing data query: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))

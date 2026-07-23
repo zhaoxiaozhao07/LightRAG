@@ -956,6 +956,14 @@ def test_active_embedding_model_reaches_rebuilt_provider_closure(
     monkeypatch.setenv("RERANK_BINDING", "null")
     monkeypatch.setenv("LIGHTRAG_API_KEY", _API_KEY)
     monkeypatch.setenv("LIGHTRAG_KB_METADATA_BACKEND", "local")
+    # A local metadata backend is incompatible with Chat Memory (which requires
+    # postgres). The isolation list deletes LIGHTRAG_CHAT_MEMORY_ENABLED, but a
+    # developer .env with it enabled re-leaks into os.environ via the
+    # load_dotenv(override=False) call at lightrag_server import time, recreating
+    # the (chat_memory=true, backend=local) pair that validate_chat_memory_configuration
+    # rejects. Set it explicitly so override=False cannot refill it. This is
+    # test-process local (monkeypatch) and never touches production .env.
+    monkeypatch.setenv("LIGHTRAG_CHAT_MEMORY_ENABLED", "false")
     monkeypatch.setenv("LIGHTRAG_OBJECT_STORAGE", "local")
     monkeypatch.setattr(
         sys,
@@ -1074,6 +1082,14 @@ def test_active_llm_role_config_reaches_built_instance(tmp_path, monkeypatch):
     monkeypatch.setenv("RERANK_BINDING", "null")
     monkeypatch.setenv("LIGHTRAG_API_KEY", _API_KEY)
     monkeypatch.setenv("LIGHTRAG_KB_METADATA_BACKEND", "local")
+    # A local metadata backend is incompatible with Chat Memory (which requires
+    # postgres). The isolation list deletes LIGHTRAG_CHAT_MEMORY_ENABLED, but a
+    # developer .env with it enabled re-leaks into os.environ via the
+    # load_dotenv(override=False) call at lightrag_server import time, recreating
+    # the (chat_memory=true, backend=local) pair that validate_chat_memory_configuration
+    # rejects. Set it explicitly so override=False cannot refill it. This is
+    # test-process local (monkeypatch) and never touches production .env.
+    monkeypatch.setenv("LIGHTRAG_CHAT_MEMORY_ENABLED", "false")
     monkeypatch.setenv("LIGHTRAG_OBJECT_STORAGE", "local")
     monkeypatch.setattr(
         sys,
