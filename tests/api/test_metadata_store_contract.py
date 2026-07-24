@@ -277,14 +277,17 @@ def _enterprise_invitation(*, expires_at: str | None = None) -> EnterpriseInvita
 
 async def test_enterprise_metadata_contract(store):
     kb_id = _unique_kb(store)
-    user = await store.upsert_enterprise_user(_enterprise_user("alice"))
+    # Unique per run: the live-postgres test DB persists across runs, and a
+    # fixed username would violate enterprise_users_username_key on rerun.
+    username = f"alice_{uuid.uuid4().hex[:10]}"
+    user = await store.upsert_enterprise_user(_enterprise_user(username))
 
-    by_username = await store.get_enterprise_user_by_username("alice")
+    by_username = await store.get_enterprise_user_by_username(username)
     by_id = await store.get_enterprise_user_by_id(user.id)
     assert by_username is not None
     assert by_username.id == user.id
     assert by_id is not None
-    assert by_id.username == "alice"
+    assert by_id.username == username
 
     updated_user = EnterpriseUserRecord(
         **{
@@ -1417,13 +1420,21 @@ async def test_enterprise_tenant_entity_contract(store):
 
 async def test_enterprise_tenant_membership_and_kb_acl_contract(store):
     kb_id = _unique_kb(store)
-    alice = await store.upsert_enterprise_user(_enterprise_user("tenant-alice"))
-    bob = await store.upsert_enterprise_user(_enterprise_user("tenant-bob"))
+    # Unique per run: the live-postgres test DB persists across runs; fixed
+    # usernames collide on enterprise_users_username_key and a fixed tenant id
+    # would surface stale memberships in the exact list assertions below.
+    tenant_id = f"tenant_ct_{uuid.uuid4().hex[:10]}"
+    alice = await store.upsert_enterprise_user(
+        _enterprise_user(f"tenant-alice-{uuid.uuid4().hex[:10]}")
+    )
+    bob = await store.upsert_enterprise_user(
+        _enterprise_user(f"tenant-bob-{uuid.uuid4().hex[:10]}")
+    )
     now = utc_now_iso()
 
     alice_membership = await store.upsert_tenant_membership(
         EnterpriseTenantMembershipRecord(
-            tenant_id="tenant-a",
+            tenant_id=tenant_id,
             user_id=alice.id,
             role="tenant_admin",
             granted_by=bob.id,
@@ -1433,7 +1444,7 @@ async def test_enterprise_tenant_membership_and_kb_acl_contract(store):
     )
     bob_membership = await store.upsert_tenant_membership(
         EnterpriseTenantMembershipRecord(
-            tenant_id="tenant-a",
+            tenant_id=tenant_id,
             user_id=bob.id,
             role="tenant_member",
             granted_by=alice.id,
@@ -1443,20 +1454,20 @@ async def test_enterprise_tenant_membership_and_kb_acl_contract(store):
     )
     assert alice_membership.role == "tenant_admin"
     assert bob_membership.role == "tenant_member"
-    assert [item.user_id for item in await store.list_tenant_memberships("tenant-a")] == [
+    assert [item.user_id for item in await store.list_tenant_memberships(tenant_id)] == [
         alice.id,
         bob.id,
     ]
     assert [item.tenant_id for item in await store.list_user_tenant_memberships(alice.id)] == [
-        "tenant-a"
+        tenant_id
     ]
-    fetched_membership = await store.get_tenant_membership("tenant-a", alice.id)
+    fetched_membership = await store.get_tenant_membership(tenant_id, alice.id)
     assert fetched_membership is not None
     assert fetched_membership.role == "tenant_admin"
 
     updated_membership = await store.upsert_tenant_membership(
         EnterpriseTenantMembershipRecord(
-            tenant_id="tenant-a",
+            tenant_id=tenant_id,
             user_id=alice.id,
             role="tenant_owner",
             granted_by=bob.id,
@@ -1469,7 +1480,7 @@ async def test_enterprise_tenant_membership_and_kb_acl_contract(store):
 
     tenant_acl = await store.upsert_tenant_kb_acl(
         EnterpriseTenantKBACLRecord(
-            tenant_id="tenant-a",
+            tenant_id=tenant_id,
             kb_id=kb_id,
             role="kb_viewer",
             granted_by=alice.id,
@@ -1478,15 +1489,15 @@ async def test_enterprise_tenant_membership_and_kb_acl_contract(store):
         )
     )
     assert tenant_acl.role == "kb_viewer"
-    assert await store.get_tenant_kb_acl_role("tenant-a", kb_id) == "kb_viewer"
-    assert await store.list_kb_ids_for_tenants(["tenant-a", "tenant-missing"]) == [kb_id]
+    assert await store.get_tenant_kb_acl_role(tenant_id, kb_id) == "kb_viewer"
+    assert await store.list_kb_ids_for_tenants([tenant_id, "tenant-missing"]) == [kb_id]
     assert [item.tenant_id for item in await store.list_kb_tenant_acl(kb_id)] == [
-        "tenant-a"
+        tenant_id
     ]
 
     updated_acl = await store.upsert_tenant_kb_acl(
         EnterpriseTenantKBACLRecord(
-            tenant_id="tenant-a",
+            tenant_id=tenant_id,
             kb_id=kb_id,
             role="kb_editor",
             granted_by=bob.id,
@@ -1495,12 +1506,12 @@ async def test_enterprise_tenant_membership_and_kb_acl_contract(store):
         )
     )
     assert updated_acl.created_at == tenant_acl.created_at
-    assert await store.get_tenant_kb_acl_role("tenant-a", kb_id) == "kb_editor"
+    assert await store.get_tenant_kb_acl_role(tenant_id, kb_id) == "kb_editor"
 
-    assert await store.delete_tenant_kb_acl("tenant-a", kb_id) is True
-    assert await store.get_tenant_kb_acl_role("tenant-a", kb_id) is None
-    assert await store.delete_tenant_membership("tenant-a", alice.id) is True
-    assert await store.get_tenant_membership("tenant-a", alice.id) is None
+    assert await store.delete_tenant_kb_acl(tenant_id, kb_id) is True
+    assert await store.get_tenant_kb_acl_role(tenant_id, kb_id) is None
+    assert await store.delete_tenant_membership(tenant_id, alice.id) is True
+    assert await store.get_tenant_membership(tenant_id, alice.id) is None
 
 
 async def test_enterprise_api_key_metadata_contract(store):
