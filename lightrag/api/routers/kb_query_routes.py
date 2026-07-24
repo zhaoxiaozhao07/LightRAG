@@ -65,6 +65,7 @@ from lightrag.api.lightrag_registry import LightRAGInstanceRegistry
 from lightrag.api.metadata_store import DocumentRecord
 from lightrag.api.streaming_lifecycle import (
     ClientGoneError,
+    abort_if_client_gone,
     await_with_disconnect_check,
     client_closed_response,
     safe_aclose,
@@ -1545,6 +1546,13 @@ def create_kb_query_routes(
                         body["references"] = references
                     yield f"{json.dumps(body)}\n"
 
+            # If the client vanished while the pre-stream work finished, the
+            # generator below may never start (so never clean up) — release the
+            # already-open upstream stream now and unwind via the 499 path.
+            await abort_if_client_gone(
+                http_request, result.get("llm_response", {}).get("response_iterator")
+            )
+
             return StreamingResponse(
                 stream_generator(),
                 media_type="application/x-ndjson",
@@ -1925,20 +1933,26 @@ def create_kb_query_routes(
                 if memory_handle is not None:
                     llm_out = prepared_llm_out
                 else:
-                    llm_out = await await_with_disconnect_check(
-                        http_request,
-                        use_model_func(
-                            request.query,
-                            system_prompt=sys_prompt,
-                            history_messages=(
-                                synth_param.conversation_history
-                                if synth_param is not None
-                                else None
+                    try:
+                        llm_out = await await_with_disconnect_check(
+                            http_request,
+                            use_model_func(
+                                request.query,
+                                system_prompt=sys_prompt,
+                                history_messages=(
+                                    synth_param.conversation_history
+                                    if synth_param is not None
+                                    else None
+                                ),
+                                enable_cot=True,
+                                stream=True,
                             ),
-                            enable_cot=True,
-                            stream=True,
-                        ),
-                    )
+                        )
+                    except ClientGoneError:
+                        # The head line already went out, so a 499 is impossible
+                        # here — end the body quietly instead of letting the
+                        # error escape the generator into the server log.
+                        return
                 if isinstance(llm_out, str):
                     if llm_out.strip():
                         yield f"{json.dumps({'response': llm_out.strip()})}\n"
@@ -1962,6 +1976,11 @@ def create_kb_query_routes(
                     yield f"{json.dumps({'error': str(exc)})}\n"
                 finally:
                     await safe_aclose(llm_out)
+
+            # If the client vanished while the pre-stream work finished, the
+            # generator below may never start (so never clean up) — release the
+            # pre-opened synthesis stream now and unwind via the 499 path.
+            await abort_if_client_gone(http_request, prepared_llm_out)
 
             return StreamingResponse(
                 stream_generator(),

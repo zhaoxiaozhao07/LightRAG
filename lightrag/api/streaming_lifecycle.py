@@ -7,7 +7,7 @@ handler awaits ``rag.aquery_llm(...)`` then returns ``StreamingResponse``). If
 the user hits "stop" during that window the server keeps running the whole
 pipeline to completion and discards the result.
 
-This module closes three gaps while preserving byte-identical normal behavior:
+This module closes four gaps while preserving byte-identical normal behavior:
 
 1. **Pre-stream cancellation** — ``await_with_disconnect_check`` races the
    retrieval/synthesis coroutine against a client-disconnect poller and cancels
@@ -17,6 +17,10 @@ This module closes three gaps while preserving byte-identical normal behavior:
    the upstream LLM response.
 3. **Deterministic upstream release** — ``safe_aclose`` closes an LLM stream
    iterator explicitly instead of relying on GC finalization timing.
+4. **Pre-response abort** — ``abort_if_client_gone`` is a last check right
+   before a handler returns ``StreamingResponse``: if the client vanished after
+   the guarded work finished, the response generator may never start (so its
+   cleanup never runs); this releases the already-open upstream stream now.
 
 All helpers degrade gracefully (never raise) when a disconnect probe is
 unavailable, so a transport that cannot report ``http.disconnect`` simply
@@ -47,6 +51,12 @@ _CLIENT_CLOSED_STATUS = 499
 #: work. Snappy enough to feel responsive to a human, cheap enough that the
 #: probe (one non-blocking ASGI receive) is negligible.
 _DISCONNECT_POLL_INTERVAL = 0.5
+
+#: How long (seconds) a cancelled work task is allowed to run its cleanup
+#: before being abandoned. Waiting forever would let a pipeline that swallows
+#: ``CancelledError`` (or is stuck in a synchronous call) hold the connection
+#: slot and delay the 499 response indefinitely.
+_CANCEL_GRACE_SECONDS = 5.0
 
 
 class ClientGoneError(Exception):
@@ -84,6 +94,44 @@ async def is_client_disconnected(request: Request | None) -> bool:
         return False
 
 
+def _consume_task_result(task: "asyncio.Future[Any]") -> None:
+    """Retrieve a finished task's outcome so asyncio never logs it as unretrieved."""
+
+    with contextlib.suppress(BaseException):
+        task.result()
+
+
+async def _cancel_and_reap(
+    task: "asyncio.Future[Any]", *, grace: float | None = None
+) -> None:
+    """Cancel ``task`` and wait a bounded time for its cleanup to finish.
+
+    Normally the cancelled work acknowledges within milliseconds and its
+    resource cleanup (LLM stream close, lock release) completes before we
+    return. If it is still running after ``grace`` seconds (stuck in a blocking
+    sync call, or swallowing ``CancelledError``) it is abandoned with a warning
+    so the caller — typically a 499 teardown — is not stalled indefinitely. The
+    done-callback consumes the task's eventual outcome either way, including
+    when this coroutine is itself cancelled mid-wait.
+    """
+
+    if grace is None:
+        grace = _CANCEL_GRACE_SECONDS
+    if task.done():
+        _consume_task_result(task)
+        return
+    task.add_done_callback(_consume_task_result)
+    task.cancel()
+    _done, pending = await asyncio.wait({task}, timeout=grace)
+    if pending:
+        logger.warning(
+            "Cancelled query work is still running after %.1fs "
+            "(likely blocked in sync code or swallowing CancelledError); "
+            "abandoning it",
+            grace,
+        )
+
+
 async def await_with_disconnect_check(
     request: Request | None,
     awaitable: Awaitable[T],
@@ -95,7 +143,8 @@ async def await_with_disconnect_check(
     The retrieval/synthesis phase (before the first token streams) can take
     several seconds and Starlette's disconnect watcher is not active yet. This
     coroutine polls ``request.is_disconnected()`` between short waits; on
-    disconnect it cancels the in-flight work, lets its cleanup run, and raises
+    disconnect it cancels the in-flight work, waits (bounded by
+    :data:`_CANCEL_GRACE_SECONDS`) for its cleanup, and raises
     :class:`ClientGoneError`.
 
     With ``poll_interval <= 0`` the work is awaited directly with no polling
@@ -125,19 +174,14 @@ async def await_with_disconnect_check(
                 logger.debug(
                     "Client disconnected during query preparation; cancelling work"
                 )
-                task.cancel()
-                # Let cancellation propagate through the work so its resource
-                # cleanup (LLM stream close, lock release) actually runs.
-                with contextlib.suppress(BaseException):
-                    await task
+                # The finally below cancels the work and waits (bounded) for its
+                # cleanup before this exception reaches the route handler.
                 raise ClientGoneError(
                     "client disconnected before the response started streaming"
                 )
     finally:
         if not task.done():
-            task.cancel()
-            with contextlib.suppress(BaseException):
-                await task
+            await _cancel_and_reap(task)
 
 
 async def safe_aclose(iterator: Any) -> None:
@@ -163,6 +207,28 @@ async def safe_aclose(iterator: Any) -> None:
         raise
     except Exception:  # noqa: BLE001 — cleanup must never replace the real error
         return
+
+
+async def abort_if_client_gone(request: Request | None, *upstreams: Any) -> None:
+    """Raise :class:`ClientGoneError` now if the client already disconnected.
+
+    Final check for streaming handlers, right before ``return
+    StreamingResponse(...)``: between the guarded pre-stream work completing
+    (upstream LLM stream already open) and the response generator actually
+    starting there is a small window in which a disconnect means the generator
+    may never run — so its ``finally`` cleanup never fires either. On a
+    detected disconnect this closes every non-``None`` ``upstream`` via
+    :func:`safe_aclose` and raises, letting the handler unwind through its
+    normal ``ClientGoneError`` → 499 path. No-op while the client is connected
+    or the probe is unavailable.
+    """
+
+    if not await is_client_disconnected(request):
+        return
+    for upstream in upstreams:
+        if upstream is not None:
+            await safe_aclose(upstream)
+    raise ClientGoneError("client disconnected before the response started streaming")
 
 
 async def stream_with_disconnect_guard(
@@ -210,8 +276,6 @@ async def stream_with_disconnect_guard(
                         return
             finally:
                 if not nxt.done():
-                    nxt.cancel()
-                    with contextlib.suppress(BaseException):
-                        await nxt
+                    await _cancel_and_reap(nxt)
     finally:
         await safe_aclose(iterator)

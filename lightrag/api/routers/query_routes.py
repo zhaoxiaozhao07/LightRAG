@@ -16,7 +16,9 @@ from lightrag.api.bilingual_query_service import (
 )
 from lightrag.api.streaming_lifecycle import (
     ClientGoneError,
+    abort_if_client_gone,
     await_with_disconnect_check,
+    client_closed_response,
     safe_aclose,
     stream_with_disconnect_guard,
 )
@@ -502,8 +504,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         except ClientGoneError:
             # Client disconnected before headers were sent. Return a 499 so the
             # ASGI teardown stays clean (body is never delivered to a gone socket).
-            from lightrag.api.streaming_lifecycle import client_closed_response
-
             return client_closed_response()
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
@@ -801,6 +801,13 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
                     yield f"{json.dumps(complete_response)}\n"
 
+            # If the client vanished while the pre-stream work finished, the
+            # generator below may never start (so never clean up) — release the
+            # already-open upstream stream now and unwind via the 499 path.
+            await abort_if_client_gone(
+                http_request, result.get("llm_response", {}).get("response_iterator")
+            )
+
             return StreamingResponse(
                 stream_generator(),
                 media_type="application/x-ndjson",
@@ -814,8 +821,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         except ClientGoneError:
             # Client disconnected before streaming started; 499 keeps teardown
             # clean (nothing can be written to a closed socket anyway).
-            from lightrag.api.streaming_lifecycle import client_closed_response
-
             return client_closed_response()
         except Exception as e:
             logger.error(f"Error processing streaming query: {str(e)}", exc_info=True)
@@ -1249,8 +1254,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         except ClientGoneError:
             # Client disconnected before retrieval completed. 499 keeps the
             # teardown clean; the JSON body is never delivered to a gone socket.
-            from lightrag.api.streaming_lifecycle import client_closed_response
-
             return client_closed_response()
         except Exception as e:
             logger.error(f"Error processing data query: {str(e)}", exc_info=True)

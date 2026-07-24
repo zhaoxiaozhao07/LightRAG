@@ -963,7 +963,7 @@ POST /kbs/{kb_id}/configs/{version_id}:diff
 - `bilingual`（可选，`true`/`false`/缺省）：双语双路检索显式覆盖；缺省时跟随 KB `query_config.bilingual_query` 与部署默认值，详见 [8.2 双语双路检索](#82-双语双路检索bilingual)。双路生效时响应 `metadata.bilingual` 返回 `{enabled, source_language, translated_query, primary_chunks, secondary_chunks, merged_chunks, final_chunks, ...}`。
 - 非流式、结构化检索和流式首行都会在 `metadata` 中返回 active config 信息（存在时包含 `config_version_id`、`parser_hash`、`index_hash`、`query_hash`）。
 - 流式响应 `Content-Type: application/x-ndjson`：第一行是 `{kb_id, metadata}`，若 `include_references=true` 则同一行还包含 `references`；后续每行 `{response: "..."}`，错误时 `{error: "..."}`。当请求体 `stream=false` 或底层返回非流式结果时，`/query/stream` 会返回单行完整 NDJSON，而不是多段 chunk。
-- **客户端中断（停止生成）行为**：前端断开连接（关闭 socket / abort 请求）时，服务端会同步停止该请求的后端工作，尽量不浪费检索与 LLM 算力：
+- **客户端中断（停止生成）行为**：前端断开连接（关闭 socket / abort 请求）时，服务端会停止该请求的后端工作，尽量不浪费检索与 LLM 算力（断开检测为轮询式，间隔约 0.5s，最坏情况有相应的检测延迟；取消后的资源清理最多等待 5s，超时会记录告警并弃置该后台任务）：
   - 首 token 之前的检索/合成阶段（关键词抽取、向量/图谱检索、rerank、拼 prompt、非流式 LLM 调用）期间断开 → 服务端取消正在进行的 RAG 任务并返回 `499 Client Closed Request`（空响应体，连接已断开，客户端通常收不到 body，仅用于保持服务端 teardown 干净、避免记成 500）。
   - 首 token 之后的流式输出阶段断开 → 服务端立即停止从上游 LLM 拉取 token 并显式关闭上游流式连接（`aclose`），不再继续输出。
   - 非流式 `/query`、`/query/data` 同样支持：断开后取消检索/生成并返回 `499`。

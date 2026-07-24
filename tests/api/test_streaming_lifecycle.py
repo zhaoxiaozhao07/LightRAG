@@ -14,6 +14,7 @@ from starlette.requests import Request
 
 from lightrag.api.streaming_lifecycle import (
     ClientGoneError,
+    abort_if_client_gone,
     await_with_disconnect_check,
     client_closed_response,
     is_client_disconnected,
@@ -135,6 +136,68 @@ async def test_does_not_cry_on_already_done_work():
     # Work resolves immediately on the first tick; disconnect must not win.
     result = await await_with_disconnect_check(req, work(), poll_interval=0.01)
     assert result == 7
+
+
+async def test_disconnect_waits_for_cooperative_cleanup():
+    """Cleanup that acknowledges cancellation promptly completes before raising."""
+
+    state = {"cleaned": False}
+
+    async def work() -> None:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)  # cleanup itself awaits
+            state["cleaned"] = True
+            raise
+
+    with pytest.raises(ClientGoneError):
+        await await_with_disconnect_check(
+            _make_request(disconnected=True), work(), poll_interval=0.01
+        )
+    assert state["cleaned"] is True
+
+
+async def test_disconnect_abandons_stuck_cleanup_after_grace(monkeypatch):
+    """Work whose cleanup outlives the grace period must not stall the 499."""
+
+    import lightrag.api.streaming_lifecycle as mod
+
+    monkeypatch.setattr(mod, "_CANCEL_GRACE_SECONDS", 0.05)
+    warnings: list[str] = []
+    # The lightrag logger has propagate=False, so capture directly.
+    monkeypatch.setattr(
+        mod.logger, "warning", lambda msg, *args, **kw: warnings.append(msg % args)
+    )
+
+    release = asyncio.Event()
+    state = {"finished": False}
+
+    async def stubborn() -> None:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            await release.wait()  # cleanup stuck far beyond the grace window
+            state["finished"] = True
+            raise
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(ClientGoneError):
+        await await_with_disconnect_check(
+            _make_request(disconnected=True), stubborn(), poll_interval=0.01
+        )
+    # Bounded: the caller got its ClientGoneError long before the 30s sleep,
+    # while the stuck cleanup was abandoned with a warning.
+    assert loop.time() - started < 2
+    assert state["finished"] is False
+    assert any("abandoning it" in w for w in warnings)
+
+    # Let the abandoned task finish so the loop closes clean; its outcome is
+    # consumed by the reap callback (no "exception was never retrieved").
+    release.set()
+    await asyncio.sleep(0.01)
+    assert state["finished"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +330,40 @@ async def test_stream_no_polling_request_none_yields_everything():
 
     out = [item async for item in stream_with_disconnect_guard(src(), None)]
     assert out == ["x", "y"]
+
+
+# ---------------------------------------------------------------------------
+# abort_if_client_gone
+# ---------------------------------------------------------------------------
+
+
+class _ClosableUpstream:
+    def __init__(self) -> None:
+        self.closed = 0
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+
+async def test_abort_if_client_gone_noop_while_connected():
+    upstream = _ClosableUpstream()
+    await abort_if_client_gone(_make_request(disconnected=False), upstream)
+    assert upstream.closed == 0
+
+
+async def test_abort_if_client_gone_noop_without_request():
+    await abort_if_client_gone(None, _ClosableUpstream())  # must not raise
+
+
+async def test_abort_if_client_gone_closes_upstreams_and_raises():
+    first, second = _ClosableUpstream(), _ClosableUpstream()
+    with pytest.raises(ClientGoneError):
+        # None entries (e.g. a non-streaming result) are skipped silently.
+        await abort_if_client_gone(
+            _make_request(disconnected=True), first, None, second
+        )
+    assert first.closed == 1
+    assert second.closed == 1
 
 
 # Sanity: Request typing is importable and is what the helpers accept.

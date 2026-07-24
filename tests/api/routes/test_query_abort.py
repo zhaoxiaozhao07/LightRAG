@@ -73,6 +73,7 @@ async def _drive(
     path: str,
     body: dict[str, Any] | None,
     disconnect_after_body: bool = True,
+    spec_version: str = "2.3",
 ) -> tuple[int, bytes]:
     """Run ``app`` with a receive() that yields the request then disconnects.
 
@@ -101,8 +102,10 @@ async def _drive(
     scope = {
         "type": "http",
         # spec_version 2.3 (< 2.4) is what uvicorn reports, which forces the
-        # anyio task-group disconnect-listening branch in StreamingResponse.
-        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        # anyio task-group disconnect-listening branch in StreamingResponse;
+        # pass "2.4" to exercise the branch with no listener task, where the
+        # cooperative poller is the only disconnect detector.
+        "asgi": {"version": "3.0", "spec_version": spec_version},
         "http_version": "1.1",
         "method": method,
         "scheme": "http",
@@ -241,6 +244,81 @@ async def test_query_data_aborts_retrieval_on_client_disconnect():
     assert status == 499
     assert rag.cancelled is True
     assert rag.completed is False
+
+
+async def test_query_stream_abort_without_starlette_listener_spec_2_4():
+    """spec_version >= 2.4: Starlette starts no listen_for_disconnect task, so
+    the cooperative poller is the ONLY pre-stream disconnect detector."""
+
+    rag = _StreamingBlockingFakeRAG()
+    app = FastAPI()
+    app.include_router(create_query_routes(rag, api_key=_API_KEY))
+
+    status, _body = await _drive(
+        app,
+        method="POST",
+        path="/query/stream",
+        body={"query": "streaming please", "stream": True},
+        spec_version="2.4",
+    )
+
+    assert status == 499
+    assert rag.cancelled is True
+    assert rag.completed is False
+
+
+class _NeverStartedUpstream:
+    """An upstream LLM stream whose closure is observable even if never iterated.
+
+    (An unstarted async *generator*'s ``finally`` never runs, so it cannot
+    witness the pre-response release; a plain object with ``aclose`` can.)
+    """
+
+    def __init__(self) -> None:
+        self.closed = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        await asyncio.sleep(30)
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+
+async def test_query_stream_disconnect_after_prepare_releases_upstream():
+    """Disconnect landing between aquery_llm returning (upstream open) and the
+    response generator starting must aclose the upstream deterministically and
+    return 499 — not leave the stream to GC finalization."""
+
+    upstream = _NeverStartedUpstream()
+
+    class _InstantRAG:
+        async def aquery_llm(self, query: str, *, param):
+            return {
+                "llm_response": {
+                    "is_streaming": True,
+                    "response_iterator": upstream,
+                },
+                "data": {"references": []},
+            }
+
+    app = FastAPI()
+    app.include_router(create_query_routes(_InstantRAG(), api_key=_API_KEY))
+
+    # aquery_llm resolves instantly (before any poll tick fires), so the
+    # disconnect is only observable at the final pre-response check.
+    status, _body = await _drive(
+        app,
+        method="POST",
+        path="/query/stream",
+        body={"query": "streaming please", "stream": True},
+    )
+
+    assert status == 499
+    assert upstream.closed >= 1
 
 
 async def test_query_stream_normal_path_is_unchanged():
