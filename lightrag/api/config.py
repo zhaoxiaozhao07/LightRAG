@@ -59,6 +59,10 @@ load_dotenv(dotenv_path=".env", override=False)
 ollama_server_infos = OllamaServerInfos()
 DEFAULT_TOKEN_SECRET = "please-change-me"
 ENTERPRISE_KB_ROLES = {"kb_viewer", "kb_editor", "kb_admin", "kb_owner"}
+# Oversight floor roles a tenant admin/owner may receive on tenant-owned KBs.
+# kb_owner is excluded: ownership is platform-granted and would unlock
+# visibility changes over members' private KBs.
+TENANT_ADMIN_OVERSIGHT_ROLES = {"kb_viewer", "kb_editor", "kb_admin"}
 NO_PREFIX_SENTINEL = "NO_PREFIX"
 PROVIDER_ASYMMETRIC_EMBEDDING_BINDINGS = {"gemini", "jina", "voyageai"}
 PREFIX_ASYMMETRIC_EMBEDDING_BINDINGS = {"azure_openai", "ollama", "openai"}
@@ -311,6 +315,16 @@ def validate_auth_configuration(args: argparse.Namespace) -> None:
             raise ValueError(
                 "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE must be one of: "
                 f"{', '.join(sorted(ENTERPRISE_KB_ROLES))}."
+            )
+        oversight_role = (
+            getattr(args, "enterprise_tenant_admin_oversight_role", "kb_viewer")
+            or "kb_viewer"
+        ).strip()
+        if oversight_role not in TENANT_ADMIN_OVERSIGHT_ROLES:
+            raise ValueError(
+                "LIGHTRAG_ENTERPRISE_TENANT_ADMIN_OVERSIGHT_ROLE must be one of: "
+                f"{', '.join(sorted(TENANT_ADMIN_OVERSIGHT_ROLES))}. "
+                "kb_owner is not permitted as an oversight floor."
             )
         artifact_policy = getattr(args, "enterprise_artifact_download_policy", None)
         if artifact_policy:
@@ -887,6 +901,9 @@ def parse_args() -> argparse.Namespace:
     )
     args.enterprise_artifact_download_min_role = get_env_value(
         "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE", "kb_viewer"
+    )
+    args.enterprise_tenant_admin_oversight_role = get_env_value(
+        "LIGHTRAG_ENTERPRISE_TENANT_ADMIN_OVERSIGHT_ROLE", "kb_viewer"
     )
     args.enterprise_artifact_download_policy = get_env_value(
         "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY", ""

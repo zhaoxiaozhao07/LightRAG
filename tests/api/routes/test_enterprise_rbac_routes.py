@@ -159,6 +159,7 @@ def _enterprise_args(**overrides):
         "enterprise_tenant_quota_requests": 0,
         "enterprise_tenant_quota_window_seconds": 86400.0,
         "enterprise_artifact_download_min_role": "kb_viewer",
+        "enterprise_tenant_admin_oversight_role": "kb_viewer",
         "enterprise_artifact_download_policy": "",
         "enterprise_artifact_action_policy": "",
         "enterprise_mask_storage_uris": True,
@@ -4158,7 +4159,11 @@ def test_enterprise_acl_generation_is_captured_before_other_awaits(
     asyncio.run(scenario())
 
 
-def test_source_aware_kb_decision_lifecycle_and_generation_guard(tmp_path):
+def test_source_aware_kb_decision_lifecycle_and_generation_guard(monkeypatch, tmp_path):
+    # Pin the default oversight role (kb_viewer) so this source-aware unit test
+    # is isolated from any LIGHTRAG_ENTERPRISE_TENANT_ADMIN_OVERSIGHT_ROLE set
+    # in the local .env; it asserts the default read-level oversight behavior.
+    _patch_enterprise_args(monkeypatch, _enterprise_args())
     from lightrag.api.enterprise_auth import (
         AuditService,
         AuthorizationService,
@@ -6179,3 +6184,131 @@ def test_enterprise_tenant_private_kb_sharing_and_admin_oversight(
         (event["metadata"]["from"], event["metadata"]["to"])
         for event in visibility_events
     ] == [("internal", "private"), ("private", "internal")]
+
+
+def test_enterprise_tenant_admin_oversight_role_is_configurable(monkeypatch, tmp_path):
+    """LIGHTRAG_ENTERPRISE_TENANT_ADMIN_OVERSIGHT_ROLE raises the tenant admin
+    oversight floor above read-only kb_viewer, so a tenant admin can manage
+    members' private KBs. kb_owner-only powers (visibility change) stay locked,
+    and the floor is reported via the same `tenant_admin_oversight` source."""
+    from lightrag.api.enterprise_auth import Principal
+
+    args = _enterprise_args(enterprise_tenant_admin_oversight_role="kb_admin")
+    client, user_service, authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path, args=args
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-a", alice.id, "tenant_admin", granted_by=admin.id
+        )
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-a", bob.id, "tenant_member", granted_by=admin.id
+        )
+    )
+    asyncio.run(
+        user_service.update_user(bob.id, can_create_kb=True, actor_user_id=admin.id)
+    )
+    alice = asyncio.run(user_service.get_user_or_404(alice.id))
+    bob = asyncio.run(user_service.get_user_or_404(bob.id))
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_bob_private", "name": "Bob Private"},
+        headers=bob_headers,
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["visibility"] == "private"
+
+    # Tenant admin now has kb_admin oversight: can read, rename (kb_admin),
+    # and would clear kb_editor/kb_admin guards on the member's private KB.
+    assert client.get("/kbs/kb_bob_private", headers=alice_headers).status_code == 200
+    renamed = client.patch(
+        "/kbs/kb_bob_private", json={"name": "Renamed by Admin"}, headers=alice_headers
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["name"] == "Renamed by Admin"
+
+    # kb_owner-only powers remain out of reach: visibility change still 403.
+    assert (
+        client.patch(
+            "/kbs/kb_bob_private",
+            json={"visibility": "internal"},
+            headers=alice_headers,
+        ).status_code
+        == 403
+    )
+
+    alice_principal = Principal(
+        user_id=alice.id,
+        username="alice",
+        system_role="user",
+        status="active",
+        tenant_id="tenant-a",
+        tenant_roles={"tenant-a": "tenant_admin"},
+        can_create_kb=True,
+        can_use_bypass_query=False,
+        token_version=1,
+        auth_method="jwt",
+        metadata={},
+    )
+    decision = asyncio.run(authz.resolve_kb_access(alice_principal, "kb_bob_private"))
+    assert decision.effective_role == "kb_admin"
+    assert decision.sources == ("tenant_admin_oversight",)
+
+
+def test_enterprise_tenant_admin_oversight_role_rejects_kb_owner(
+    monkeypatch, tmp_path
+):
+    """kb_owner is not a valid oversight floor: the accessor clamps it back to
+    the kb_viewer default so tenant admins cannot gain visibility-changing
+    powers over members' private KBs through misconfiguration."""
+    from lightrag.api.enterprise_auth import Principal
+
+    args = _enterprise_args(enterprise_tenant_admin_oversight_role="kb_owner")
+    client, user_service, authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path, args=args
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-a", alice.id, "tenant_admin", granted_by=admin.id
+        )
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-a", bob.id, "tenant_member", granted_by=admin.id
+        )
+    )
+    asyncio.run(
+        user_service.update_user(bob.id, can_create_kb=True, actor_user_id=admin.id)
+    )
+    alice = asyncio.run(user_service.get_user_or_404(alice.id))
+    bob = asyncio.run(user_service.get_user_or_404(bob.id))
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_bob_private", "name": "Bob Private"},
+        headers=bob_headers,
+    )
+    assert created.status_code == 200, created.text
+
+    alice_principal = Principal(
+        user_id=alice.id,
+        username="alice",
+        system_role="user",
+        status="active",
+        tenant_id="tenant-a",
+        tenant_roles={"tenant-a": "tenant_admin"},
+        can_create_kb=True,
+        can_use_bypass_query=False,
+        token_version=1,
+        auth_method="jwt",
+        metadata={},
+    )
+    decision = asyncio.run(authz.resolve_kb_access(alice_principal, "kb_bob_private"))
+    assert decision.effective_role == "kb_viewer"
+    assert decision.sources == ("tenant_admin_oversight",)

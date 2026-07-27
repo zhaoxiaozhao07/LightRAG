@@ -97,6 +97,13 @@ _KB_ROLE_RANK = {
     KB_ROLE_ADMIN: 3,
     KB_ROLE_OWNER: 4,
 }
+# Roles a tenant admin/owner may receive as the oversight floor on
+# tenant-owned KBs. kb_owner is intentionally excluded: ownership is
+# platform-granted and would unlock visibility changes over members'
+# private KBs.
+_TENANT_ADMIN_OVERSIGHT_ROLES = frozenset(
+    {KB_ROLE_VIEWER, KB_ROLE_EDITOR, KB_ROLE_ADMIN}
+)
 _KB_ROLE_ALIASES = {
     "viewer": KB_ROLE_VIEWER,
     "editor": KB_ROLE_EDITOR,
@@ -784,6 +791,26 @@ def enterprise_artifact_download_min_role() -> str:
     if normalized is None:
         return KB_ROLE_VIEWER
     return normalized
+
+
+def enterprise_tenant_admin_oversight_role() -> str:
+    """Oversight floor role for tenant_admin/tenant_owner on tenant-owned KBs.
+
+    Configurable via LIGHTRAG_ENTERPRISE_TENANT_ADMIN_OVERSIGHT_ROLE; accepts
+    kb_viewer/kb_editor/kb_admin. kb_owner is intentionally rejected (ownership
+    is platform-granted and would unlock visibility changes over members'
+    private KBs). Falls back to kb_viewer on any invalid value.
+    """
+
+    configured = getattr(
+        _global_args(),
+        "enterprise_tenant_admin_oversight_role",
+        KB_ROLE_VIEWER,
+    )
+    normalized = _normalize_kb_role(str(configured))
+    if normalized in _TENANT_ADMIN_OVERSIGHT_ROLES:
+        return normalized
+    return KB_ROLE_VIEWER
 
 
 def enterprise_artifact_download_policy() -> dict[str, str]:
@@ -3717,10 +3744,12 @@ class AuthorizationService:
                 and _tenant_role_rank(primary_tenant_role)
                 >= _TENANT_ROLE_RANK[TENANT_ROLE_ADMIN]
             ):
-                # Tenant administrators keep read-level oversight of every KB
-                # owned by their tenant, shared or private; a deny override
-                # cannot remove it.
-                tenant_role = KB_ROLE_VIEWER
+                # Tenant administrators keep oversight of every KB owned by
+                # their tenant, shared or private; a deny override cannot
+                # remove it. The oversight floor role is configurable via
+                # LIGHTRAG_ENTERPRISE_TENANT_ADMIN_OVERSIGHT_ROLE (default
+                # kb_viewer); a direct platform ACL still wins via _max_kb_role.
+                tenant_role = enterprise_tenant_admin_oversight_role()
                 tenant_source = "tenant_admin_oversight"
         elif tenant_acl_role is not None:
             if override is None:
@@ -4551,6 +4580,9 @@ def _global_args() -> Any:
         ),
         enterprise_artifact_download_min_role=os.getenv(
             "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_MIN_ROLE", KB_ROLE_VIEWER
+        ),
+        enterprise_tenant_admin_oversight_role=os.getenv(
+            "LIGHTRAG_ENTERPRISE_TENANT_ADMIN_OVERSIGHT_ROLE", KB_ROLE_VIEWER
         ),
         enterprise_artifact_download_policy=os.getenv(
             "LIGHTRAG_ENTERPRISE_ARTIFACT_DOWNLOAD_POLICY", ""
