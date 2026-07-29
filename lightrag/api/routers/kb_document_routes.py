@@ -55,6 +55,7 @@ from lightrag.api.metadata_store import (
     InvalidJobTransitionError,
     JobRecord,
     MetadataRecordNotFoundError,
+    _same_job_execution_identity,
 )
 from lightrag.api.routers.document_routes import SUPPORTED_DOCUMENT_EXTENSIONS
 from lightrag.api.enterprise_auth import (
@@ -5835,7 +5836,7 @@ def create_kb_document_routes(
             )
             return JobResponse.from_record(final_job)
 
-        async def _build_task() -> None:
+        async def _run_build_task() -> None:
             try:
                 await job_service.transition_job(
                     kb_id, job.id, status="running", progress=0.1
@@ -5921,6 +5922,22 @@ def create_kb_document_routes(
                         job.id,
                         transition_exc,
                     )
+
+        async def _build_task() -> None:
+            async with job_service.job_execution_guard(
+                job.id, wait=False
+            ) as acquired:
+                if not acquired:
+                    return
+                try:
+                    current = await job_service.get_persisted_job(job)
+                except MetadataRecordNotFoundError:
+                    return
+                if current.status != "queued" or not _same_job_execution_identity(
+                    job, current
+                ):
+                    return
+                await _run_build_task()
 
         background_tasks.add_task(_build_task)
         return JobResponse.from_record(job)
@@ -6138,7 +6155,7 @@ def create_kb_document_routes(
             ),
         )
 
-        async def _batch_build_task() -> None:
+        async def _run_batch_build_task() -> None:
             item_results: list[dict[str, Any]] = [
                 *batch_plan.failures,
                 *claim_failures,
@@ -6280,6 +6297,22 @@ def create_kb_document_routes(
                     error_code="batch_build_failed",
                     error_message=str(exc),
                 )
+
+        async def _batch_build_task() -> None:
+            async with job_service.job_execution_guard(
+                job.id, wait=False
+            ) as acquired:
+                if not acquired:
+                    return
+                try:
+                    current = await job_service.get_persisted_job(job)
+                except MetadataRecordNotFoundError:
+                    return
+                if current.status != "queued" or not _same_job_execution_identity(
+                    job, current
+                ):
+                    return
+                await _run_batch_build_task()
 
         background_tasks.add_task(_batch_build_task)
 

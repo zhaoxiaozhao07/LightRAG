@@ -748,6 +748,7 @@ async def _await_doc_status_terminal(
         return None
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(0.0, timeout)
+    consecutive_missing = 0
     while True:
         try:
             rows = await doc_status_storage.get_by_ids([lightrag_doc_id])
@@ -759,9 +760,16 @@ async def _await_doc_status_terminal(
             )
             return None
         row = rows[0] if rows else None
-        status = (row or {}).get("status")
+        if row is None:
+            consecutive_missing += 1
+            if consecutive_missing >= 2 or loop.time() >= deadline:
+                return None
+            await asyncio.sleep(poll_interval)
+            continue
+        consecutive_missing = 0
+        status = row.get("status")
         if status not in _INFLIGHT_BUILD_STATUSES:
-            # processed / failed / missing → terminal enough to classify.
+            # processed / failed → terminal enough to classify.
             return row
         if loop.time() >= deadline:
             return row

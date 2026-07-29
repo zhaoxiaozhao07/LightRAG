@@ -6,6 +6,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI
@@ -15,6 +16,7 @@ from lightrag.api.document_lifecycle_service import DocumentLifecycleService
 from lightrag.api.index_build_service import (
     IndexBuildPlan,
     IndexBuildService,
+    _await_doc_status_terminal,
     _collect_doc_status,
 )
 from lightrag.api.job_service import JobService
@@ -338,9 +340,39 @@ def _upload_and_parse(
 async def test_collect_doc_status_missing_row_fails():
     rag = FakeRAG("workspace")
     plan = _build_plan(_document_record())
+    rag.doc_status.get_by_ids = AsyncMock(return_value=[None])
 
     with pytest.raises(RuntimeError, match="did not create doc_status row"):
-        await _collect_doc_status(rag, plan)
+        await _collect_doc_status(rag, plan, timeout=1, poll_interval=0)
+
+    assert rag.doc_status.get_by_ids.await_count == 2
+
+
+async def test_await_doc_status_terminal_retries_missing_and_inflight():
+    rag = FakeRAG("workspace")
+    processed = {
+        "status": "processed",
+        "chunks_count": 5,
+        "entity_count": 12,
+        "relation_count": 7,
+    }
+    rag.doc_status.get_by_ids = AsyncMock(
+        side_effect=[
+            [None],
+            [{"status": "processing"}],
+            [processed],
+        ]
+    )
+
+    row = await _await_doc_status_terminal(
+        rag,
+        "doc-lr",
+        timeout=1,
+        poll_interval=0,
+    )
+
+    assert row == processed
+    assert rag.doc_status.get_by_ids.await_count == 3
 
 
 def test_build_kg_succeeds_and_stamps_index_hash(tmp_path):
