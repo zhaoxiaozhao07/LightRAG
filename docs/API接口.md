@@ -64,7 +64,7 @@ Content-Type: application/json
 ### 1.2 列出 / 获取 / 更新 / 删除
 
 - `GET /kbs?include_deleted=false`：默认排除软删除记录。
-- `GET /kbs/{kb_id}`：404 表示未找到或已软删除。
+- `GET /kbs/{kb_id}`：404 表示未找到或已软删除。企业模式下，super admin 与该 KB 所属租户的 `tenant_admin` / `tenant_owner` 可读取软删除（`status="deleted"`）的 `origin="tenant"` KB 详情（生命周期 oversight 语义，见 1.2 末尾与 10.4），其它主体仍返回 404。
 - `PATCH /kbs/{kb_id}`：仅更新请求体显式给出的字段；`status` 不允许直接置为 `deleted`；`active_config_version_id` 不能通过 PATCH 修改，若请求体包含该字段返回 `400`，请改用 `POST /kbs/{kb_id}/configs/{version_id}:activate`。`metadata` 为**合并**语义：给出的 key 覆盖现值、value=null 删除该 key、未提及的 key 保留；顶层 `metadata: null` 返回 `400`；合并后序列化超 16KB 返回 `400`。
 - Agent 选库可使用 KB `metadata` 中的 profile 字段。人工覆盖字段为 `agent_description`（字符串，面向 Agent 的知识库说明）、`agent_tags`（字符串数组，或逗号分隔字符串）、`agent_priority`（整数，默认 0）；自动字段为 `agent_auto_profile`，由 `PROFILE` 角色 LLM 基于文档级 `metadata.agent_doc_profile` 聚合生成。人工字段优先于自动字段；这些字段不会改变 RBAC，只会随授权 KB 的 `allowed_kbs` 注入 `/agent/query` 的规划上下文。
 - `DELETE /kbs/{kb_id}`：默认软删除，同步从 `LightRAGInstanceRegistry` 卸载实例。
@@ -84,6 +84,7 @@ Content-Type: application/json
 
 - `POST /kbs` 需要 super admin、`tenant_admin` / `tenant_owner`，或 `can_create_kb=true`。非 super admin 的 `owner_id`/`tenant_id` 由当前 principal 派生并自动授予创建者 `kb_owner` ACL；租户用户创建的 KB 固定 `origin="tenant"`，`visibility` 可选 `private`（默认，仅创建者与显式授权可见）或 `internal`（共享：同租户成员隐含只读），`public` 返回 `400`；并规范化加入 `tenant:{tenant_id}` 标签。
 - `GET /kbs` 对普通用户返回已授权 KB（direct user ACL / tenant ACL）以及 visibility 命中的 KB（`public` / 同租户 `internal`，见 10.4）；`tenant_admin` / `tenant_owner` 额外**始终**可见本租户成员创建（`origin="tenant"`、同 `tenant_id`）的全部 KB——包括 `private`（隐含只读 oversight，见 10.4）；super admin 返回全部；service key 仅按 `kb_roles` scope（可选显式 `inherit_tenant_kb_acl`），不受 visibility 影响。
+  - **软删除 oversight**：默认 `GET /kbs` 仍排除软删除记录；`GET /kbs?include_deleted=true` 时，super admin 与本租户成员创建的 `origin="tenant"` KB 所属租户的 `tenant_admin` / `tenant_owner` 可在列表中看到其软删除（`status="deleted"`）的 KB（只读，便于审计与决定是否 `:restore`）。普通成员（含创建者本人）、其它租户管理员，以及 `origin="platform"` 的软删除 KB 均**不会**通过 oversight 暴露——仍需 super admin。其它非 `active` 生命周期态（`creating` / `deleting` / ...）一律不在列表中出现。该 oversight 复用 `DELETE` / `:restore` 的 catalog provenance 规则（`has_tenant_lifecycle_oversight`），不改变 RBAC、不授予写权限，也不会出现在 `/kbs` 默认列表或 `GET /kbs/{kb_id}` 的普通访问路径中。
 - `PATCH /kbs/{kb_id}` 忽略非 super admin 请求体中的 `owner_id`/`tenant_id`。visibility 修改规则：super admin 可改任意 KB 为任意值；租户创建的 KB（`origin="tenant"`）允许 effective `kb_owner`（通常为创建者）在 `private` 与 `internal` 之间**随时切换**（改 `public` 返回 `400`，非 owner 返回 `403`）；platform KB 的 visibility 仍仅 super admin 可改。visibility 实际变化时写入 `kb_visibility_changed` 审计事件（metadata 含 `from`/`to`/`origin`）。租户 KB 的 tenant 标签与不可变 `origin` 不能由 metadata 伪造。
 - `DELETE /kbs/{kb_id}`、`?hard=true` 与 `POST /kbs/{kb_id}:restore`：super admin 可操作任意 KB；目标 KB 必须为 `origin="tenant"` 且 `tenant_id` 等于当前 canonical tenant 时，该租户的 `tenant_admin` / `tenant_owner` 也可操作。tenant ACL、direct KB admin/owner 或可编辑 metadata 都不能获得 platform KB 的生命周期权限。缺失 `origin` 的历史 catalog 行安全地按 `platform` 处理。
 
@@ -120,6 +121,7 @@ POST /kbs/{kb_id}:restore
 - KB 不存在返回 `404`；KB 当前不是 deleted 状态返回 `409`。
 - 存在在途（queued/running/retrying/cancelling）`clear_kb` 硬删除任务时返回 `409`，`detail.error_code="kb_hard_delete_in_progress"` 并携带 `job_id`——此时数据即将被硬删 worker 清除，恢复无意义；硬删除完成后控制面已 purge，`:restore` 返回 `404`。
 - 企业模式下由同一 catalog provenance 规则授权：super admin 可恢复任意 KB；所属租户的 `tenant_admin` / `tenant_owner` 仅可恢复真正的 `origin="tenant"` KB。restore 在 shared fence 内完成，若 hard-delete 已进入 `deleting` 或存在未完成的 generation-bound clear job 则返回 `409`；成功写入 `kb_restored` 审计事件。
+  - 配合软删除 oversight（见 1.2）：`tenant_admin` / `tenant_owner` 可通过 `GET /kbs?include_deleted=true` 与 `GET /kbs/{kb_id}`（软删除态）发现并查看本租户成员被软删的 KB，再据此调用 `:restore`。
 
 ### 1.5 知识库控制面统计
 

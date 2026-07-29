@@ -6312,3 +6312,231 @@ def test_enterprise_tenant_admin_oversight_role_rejects_kb_owner(
     decision = asyncio.run(authz.resolve_kb_access(alice_principal, "kb_bob_private"))
     assert decision.effective_role == "kb_viewer"
     assert decision.sources == ("tenant_admin_oversight",)
+
+
+def test_enterprise_tenant_admin_oversight_extends_to_soft_deleted_kbs(
+    monkeypatch, tmp_path
+):
+    """Tenant admin/owner oversight covers members' *soft-deleted* KBs.
+
+    A tenant administrator must be able to see and inspect a member's deleted
+    KB (in both the listing with ``include_deleted=true`` and the single-KB
+    GET) so they can decide whether to restore it. The same lifecycle
+    provenance rule as delete/restore applies: the KB must be genuinely
+    tenant-owned by the admin's tenant. Regular members (even the creator),
+    cross-tenant admins, and platform lifecycle rows are excluded.
+    """
+    from lightrag.api.enterprise_auth import Principal
+
+    client, user_service, authz, admin, alice, bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    carol = asyncio.run(
+        user_service.create_user(username="carol", password="carol-pass")
+    )
+    # alice = tenant_admin of tenant-a; bob = tenant_admin of tenant-b;
+    # carol = tenant_member of tenant-a (the KB creator).
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-a", alice.id, "tenant_admin", granted_by=admin.id
+        )
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-b", bob.id, "tenant_admin", granted_by=admin.id
+        )
+    )
+    asyncio.run(
+        authz.grant_tenant_membership(
+            "tenant-a", carol.id, "tenant_member", granted_by=admin.id
+        )
+    )
+    asyncio.run(
+        user_service.update_user(carol.id, can_create_kb=True, actor_user_id=admin.id)
+    )
+    alice = asyncio.run(user_service.get_user_or_404(alice.id))
+    bob = asyncio.run(user_service.get_user_or_404(bob.id))
+    carol = asyncio.run(user_service.get_user_or_404(carol.id))
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    alice_headers = {"Authorization": f"Bearer {_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_token(user_service, bob)}"}
+    carol_headers = {"Authorization": f"Bearer {_token(user_service, carol)}"}
+
+    created = client.post(
+        "/kbs",
+        json={"id": "kb_carol_private", "name": "Carol Private"},
+        headers=carol_headers,
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["origin"] == "tenant"
+
+    # Soft-delete the KB. Per lifecycle provenance (docs 1.2), only super admin
+    # or the owning tenant's tenant_admin/tenant_owner may delete a tenant KB;
+    # the regular member who created it cannot. alice (tenant_admin) deletes it.
+    deleted = client.delete("/kbs/kb_carol_private", headers=alice_headers)
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["status"] == "deleted"
+
+    # 1) Default listing hides soft-deleted KBs for everyone (incl. tenant admin).
+    assert (
+        client.get("/kbs", headers=alice_headers).json()["knowledge_bases"] == []
+    )
+    # 2) include_deleted=true surfaces it to the tenant admin via oversight.
+    alice_deleted_ids = [
+        kb["id"]
+        for kb in client.get(
+            "/kbs?include_deleted=true", headers=alice_headers
+        ).json()["knowledge_bases"]
+    ]
+    assert alice_deleted_ids == ["kb_carol_private"]
+    # 3) The tenant admin can GET the soft-deleted KB detail.
+    alice_get = client.get("/kbs/kb_carol_private", headers=alice_headers)
+    assert alice_get.status_code == 200, alice_get.text
+    assert alice_get.json()["status"] == "deleted"
+    # 4) The tenant admin cannot mutate the soft-deleted KB via PATCH (the
+    #    pre-handler gate denies admin-level writes on non-active KBs).
+    assert (
+        client.patch(
+            "/kbs/kb_carol_private", json={"name": "Hijack"}, headers=alice_headers
+        ).status_code
+        == 403
+    )
+
+    # The owning member cannot see their own soft-deleted KB via the listing,
+    # even with include_deleted=true (oversight is admin/owner-only).
+    assert (
+        client.get("/kbs?include_deleted=true", headers=carol_headers).json()[
+            "knowledge_bases"
+        ]
+        == []
+    )
+    assert (
+        client.get("/kbs/kb_carol_private", headers=carol_headers).status_code == 404
+    )
+
+    # A cross-tenant admin cannot see the soft-deleted tenant KB.
+    assert (
+        client.get("/kbs?include_deleted=true", headers=bob_headers).json()[
+            "knowledge_bases"
+        ]
+        == []
+    )
+    assert (
+        client.get("/kbs/kb_carol_private", headers=bob_headers).status_code == 404
+    )
+
+    # Super admin sees the soft-deleted KB everywhere.
+    admin_deleted_ids = [
+        kb["id"]
+        for kb in client.get(
+            "/kbs?include_deleted=true", headers=admin_headers
+        ).json()["knowledge_bases"]
+    ]
+    assert "kb_carol_private" in admin_deleted_ids
+    admin_get = client.get("/kbs/kb_carol_private", headers=admin_headers)
+    assert admin_get.status_code == 200
+    assert admin_get.json()["status"] == "deleted"
+
+    # A platform-provisioned soft-deleted KB is NOT surfaced to the tenant
+    # admin via oversight (provenance rule: origin must be "tenant").
+    client.post(
+        "/kbs",
+        json={"id": "kb_platform", "name": "Platform", "tenant_id": "tenant-a"},
+        headers=admin_headers,
+    )
+    client.delete("/kbs/kb_platform", headers=admin_headers)
+    platform_listed = [
+        kb["id"]
+        for kb in client.get(
+            "/kbs?include_deleted=true", headers=alice_headers
+        ).json()["knowledge_bases"]
+    ]
+    assert "kb_platform" not in platform_listed
+    assert (
+        client.get("/kbs/kb_platform", headers=alice_headers).status_code == 404
+    )
+
+    # The tenant admin can restore the soft-deleted tenant KB.
+    restored = client.post("/kbs/kb_carol_private:restore", headers=alice_headers)
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["status"] == "active"
+    # After restore, the KB is visible in the default listing again.
+    assert (
+        client.get("/kbs", headers=alice_headers).json()["knowledge_bases"][0]["id"]
+        == "kb_carol_private"
+    )
+
+    # Unit-level: the oversight helper is a pure boolean mirroring the
+    # lifecycle provenance rule on the deleted record itself.
+    kb_service = client.app.state.kb_service
+    # Re-delete to obtain a fresh deleted record for the helper check.
+    client.delete("/kbs/kb_carol_private", headers=alice_headers)
+    deleted_record = asyncio.run(
+        kb_service.get("kb_carol_private", include_deleted=True)
+    )
+    assert deleted_record.status == "deleted"
+    alice_principal = Principal(
+        user_id=alice.id,
+        username="alice",
+        system_role="user",
+        status="active",
+        tenant_id="tenant-a",
+        tenant_roles={"tenant-a": "tenant_admin"},
+        can_create_kb=True,
+        can_use_bypass_query=False,
+        token_version=1,
+        auth_method="jwt",
+        metadata={},
+    )
+    bob_principal = Principal(
+        user_id=bob.id,
+        username="bob",
+        system_role="user",
+        status="active",
+        tenant_id="tenant-b",
+        tenant_roles={"tenant-b": "tenant_admin"},
+        can_create_kb=True,
+        can_use_bypass_query=False,
+        token_version=1,
+        auth_method="jwt",
+        metadata={},
+    )
+    assert (
+        authz.has_tenant_lifecycle_oversight(alice_principal, deleted_record) is True
+    )
+    assert (
+        authz.has_tenant_lifecycle_oversight(bob_principal, deleted_record) is False
+    )
+    carol_member = Principal(
+        user_id=carol.id,
+        username="carol",
+        system_role="user",
+        status="active",
+        tenant_id="tenant-a",
+        tenant_roles={"tenant-a": "tenant_member"},
+        can_create_kb=True,
+        can_use_bypass_query=False,
+        token_version=1,
+        auth_method="jwt",
+        metadata={},
+    )
+    assert (
+        authz.has_tenant_lifecycle_oversight(carol_member, deleted_record) is False
+    )
+    # And it works for tenant_owner too.
+    alice_owner = Principal(
+        user_id=alice.id,
+        username="alice",
+        system_role="user",
+        status="active",
+        tenant_id="tenant-a",
+        tenant_roles={"tenant-a": "tenant_owner"},
+        can_create_kb=True,
+        can_use_bypass_query=False,
+        token_version=1,
+        auth_method="jwt",
+        metadata={},
+    )
+    assert (
+        authz.has_tenant_lifecycle_oversight(alice_owner, deleted_record) is True
+    )

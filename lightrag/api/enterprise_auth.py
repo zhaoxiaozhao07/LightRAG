@@ -2874,6 +2874,47 @@ class AuthorizationService:
     # More grammatical alias for callers introduced after the original API.
     require_download_files = require_file_download
 
+    def has_tenant_lifecycle_oversight(
+        self, principal: Principal | None, record: KnowledgeBaseRecord
+    ) -> bool:
+        """Whether ``principal`` holds tenant lifecycle oversight over ``record``.
+
+        Mirrors the provenance rule of :meth:`authorize_kb_lifecycle` but is a
+        pure boolean check (no audit, no raise). Used to retain soft-deleted
+        tenant-owned KBs in listings/detail for tenant administrators and
+        owners so they can inspect and restore their members' deleted KBs.
+
+        Returns ``True`` for a super admin, or for a tenant_admin/tenant_owner
+        of the KB's canonical owning tenant. Service API keys never qualify.
+        """
+        principal = _require_principal(principal)
+        if principal.is_super_admin:
+            return True
+        if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
+            return False
+        tenant_role = _canonical_primary_tenant_role(principal)
+        return is_tenant_owned_kb(
+            record, principal.tenant_id
+        ) and _tenant_role_rank(tenant_role) >= _TENANT_ROLE_RANK[TENANT_ROLE_ADMIN]
+
+    async def kb_is_soft_deleted(self, kb_id: str) -> bool:
+        """Whether ``kb_id`` resolves to a soft-deleted catalog row.
+
+        The pre-handler access gate uses this to defer the exact KB detail GET
+        (``GET /kbs/{kb_id}``) on a soft-deleted KB to the handler, which then
+        renders the deleted record for an oversight-eligible tenant
+        admin/owner (or super admin) and returns 404 for everyone else.
+        Returns ``False`` for a missing row or any non-deleted row so normal
+        active-KB authorization is unchanged.
+        """
+        if self._kb_service is None:
+            return False
+        try:
+            record = await self._kb_service.get(kb_id, include_deleted=True)
+        except (KnowledgeBaseNotFoundError, ValueError):
+            return False
+        return getattr(record, "status", None) == "deleted"
+
     async def authorize_kb_lifecycle(
         self,
         principal: Principal | None,
@@ -2893,18 +2934,7 @@ class AuthorizationService:
         if normalized_action not in {"delete", "soft-delete", "hard-delete", "restore"}:
             raise ValueError(f"Unsupported KB lifecycle action: {action}")
         principal = _require_principal(principal)
-        if principal.is_super_admin:
-            return principal
-        if principal.auth_method == SERVICE_API_KEY_AUTH_METHOD:
-            await self._audit_lifecycle_denied(principal, record, normalized_action)
-            raise HTTPException(status_code=403, detail="Knowledge-base lifecycle denied")
-
-        tenant_role = _canonical_primary_tenant_role(principal)
-        if (
-            is_tenant_owned_kb(record, principal.tenant_id)
-            and _tenant_role_rank(tenant_role)
-            >= _TENANT_ROLE_RANK[TENANT_ROLE_ADMIN]
-        ):
+        if self.has_tenant_lifecycle_oversight(principal, record):
             return principal
 
         await self._audit_lifecycle_denied(principal, record, normalized_action)
@@ -3127,6 +3157,15 @@ class AuthorizationService:
         authorized: list[KnowledgeBaseRecord] = []
         for record in records:
             if record.status != "active":
+                # Tenant administrators/owners keep lifecycle oversight over
+                # their members' soft-deleted tenant KBs so they can inspect
+                # and restore them (mirrors authorize_kb_lifecycle provenance).
+                # Other non-active lifecycle rows (creating/deleting/...) are
+                # never surfaced via listings.
+                if record.status == "deleted" and self.has_tenant_lifecycle_oversight(
+                    principal, record
+                ):
+                    authorized.append(record)
                 continue
             decision = await self.resolve_kb_access(principal, record)
             if decision.effective_role is not None:
@@ -4161,6 +4200,17 @@ async def enforce_enterprise_request_access(
         return
 
     if method == "GET":
+        # The exact KB detail GET (``GET /kbs/{kb_id}``) may target a
+        # soft-deleted KB that a tenant admin/owner can view under lifecycle
+        # oversight. resolve_kb_access denies non-active rows, so defer such
+        # requests to the handler, which re-checks oversight and returns 404
+        # for everyone else. All other GETs (sub-resources, status, etc.) are
+        # out of scope here.
+        if (
+            path.rstrip("/") == f"/kbs/{kb_id}"
+            and await authz.kb_is_soft_deleted(kb_id)
+        ):
+            return
         await authz.require_kb_role(principal, kb_id, KB_ROLE_VIEWER)
         return
 

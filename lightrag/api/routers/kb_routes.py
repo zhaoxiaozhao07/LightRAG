@@ -694,11 +694,30 @@ def create_kb_routes(
         dependencies=[Depends(combined_auth)],
         summary="Get a knowledge base",
     )
-    async def get_knowledge_base(kb_id: str):
+    async def get_knowledge_base(kb_id: str, request: Request):
         try:
             record = await kb_service.get(kb_id)
             return KnowledgeBaseResponse.from_record(record)
         except KnowledgeBaseNotFoundError as exc:
+            # Enterprise oversight: a tenant admin/owner may view a soft-deleted
+            # KB owned by their tenant (mirrors the list and restore paths) so
+            # they can inspect a member's deleted KB before deciding to restore.
+            # The catalog row is loaded with include_deleted=True and then gated
+            # on the same lifecycle provenance rule as delete/restore.
+            if enterprise_auth_enabled():
+                try:
+                    deleted_record = await kb_service.get(
+                        kb_id, include_deleted=True
+                    )
+                except (KnowledgeBaseNotFoundError, ValueError):
+                    deleted_record = None
+                if deleted_record is not None and deleted_record.status == "deleted":
+                    principal = get_request_principal(request)
+                    authz_service = get_enterprise_authorization_service(request)
+                    if authz_service.has_tenant_lifecycle_oversight(
+                        principal, deleted_record
+                    ):
+                        return KnowledgeBaseResponse.from_record(deleted_record)
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
