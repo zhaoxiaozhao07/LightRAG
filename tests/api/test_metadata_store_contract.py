@@ -49,6 +49,11 @@ from lightrag.api.metadata_store import (
     DocumentRecord,
     EnterpriseAPIKeyRecord,
     EnterpriseInvitationRecord,
+    EnterprisePersonAccountLinkRecord,
+    EnterprisePersonCredentialRecord,
+    EnterprisePersonEnrollmentGrantRecord,
+    EnterprisePersonLoginSessionRecord,
+    EnterprisePersonRecord,
     EnterpriseUserRecord,
     EnterpriseUserKBQuerySettingsRecord,
     EnterpriseTenantKBACLRecord,
@@ -4449,3 +4454,1070 @@ async def test_postgres_operation_guards_preserve_shared_exclusive_order(
     assert order == ["shared-a", "shared-b", "exclusive", "shared-c"]
     assert operation_pool.acquired == 4
     assert operation_pool.released == 4
+
+
+# ----------------------------------------------------------------------
+# Multi-account person identity store contract tests.
+#
+# Parametrized over SQLite (always) and PostgreSQL (when a live DSN is set).
+# See docs/多账号身份关联与切换执行文档.md sections 4 and 7. Records use unique
+# IDs per run so re-runs against a persistent PG test DB do not collide on the
+# partial unique indexes.
+# ----------------------------------------------------------------------
+
+_PERSON_BCRYPT_HASH = "{bcrypt}$2b$12$placeholderplaceholderplaceholderplaceholderplace"
+
+
+def _person() -> EnterprisePersonRecord:
+    now = utc_now_iso()
+    return EnterprisePersonRecord(
+        id=f"per_{uuid.uuid4().hex[:12]}",
+        status="active",
+        auth_epoch=1,
+        metadata={"display_name": "contract-person"},
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _person_credential(person_id: str) -> EnterprisePersonCredentialRecord:
+    now = utc_now_iso()
+    return EnterprisePersonCredentialRecord(
+        id=f"pcred_{uuid.uuid4().hex[:12]}",
+        person_id=person_id,
+        credential_type="password",
+        algorithm="bcrypt",
+        password_hash=_PERSON_BCRYPT_HASH,
+        status="active",
+        failed_count=0,
+        locked_until=None,
+        last_used_at=None,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _person_grant(
+    account_id: str,
+    *,
+    token_hash: str | None = None,
+    expires_at: str = "2099-01-01T00:00:00+00:00",
+    status: str = "active",
+) -> EnterprisePersonEnrollmentGrantRecord:
+    now = utc_now_iso()
+    return EnterprisePersonEnrollmentGrantRecord(
+        id=f"pgrant_{uuid.uuid4().hex[:12]}",
+        account_id=account_id,
+        token_hash=token_hash or f"sha256:{uuid.uuid4().hex}",
+        status=status,
+        created_by="usr_admin",
+        consumed_by_person=None,
+        expires_at=expires_at,
+        created_at=now,
+        updated_at=now,
+        consumed_at=None,
+    )
+
+
+def _person_link(
+    person_id: str,
+    account_id: str,
+    *,
+    status: str = "active",
+    bound_by: str = "usr_admin",
+) -> EnterprisePersonAccountLinkRecord:
+    now = utc_now_iso()
+    return EnterprisePersonAccountLinkRecord(
+        id=f"plink_{uuid.uuid4().hex[:12]}",
+        person_id=person_id,
+        account_id=account_id,
+        status=status,
+        bound_by=bound_by,
+        bound_at=now,
+        confirmed_by_person_at=now if status == "active" else None,
+        revoked_by=None,
+        revoked_at=None,
+        reason=None,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _person_session(
+    person_id: str,
+    account_id: str,
+    *,
+    person_epoch: int = 1,
+    session_epoch: int = 1,
+    status: str = "active",
+    expires_at: str = "2099-01-01T00:00:00+00:00",
+) -> EnterprisePersonLoginSessionRecord:
+    now = utc_now_iso()
+    return EnterprisePersonLoginSessionRecord(
+        id=f"psess_{uuid.uuid4().hex[:12]}",
+        person_id=person_id,
+        active_account_id=account_id,
+        status=status,
+        person_epoch=person_epoch,
+        session_epoch=session_epoch,
+        absolute_expires_at=expires_at,
+        created_at=now,
+        last_seen_at=None,
+        revoked_at=None,
+    )
+
+
+async def _enroll(
+    store,
+    *,
+    account_id: str,
+    person: EnterprisePersonRecord | None = None,
+    token_hash: str | None = None,
+    expires_at: str = "2099-01-01T00:00:00+00:00",
+    actor_user_id: str | None = "usr_admin",
+) -> tuple[
+    EnterprisePersonRecord,
+    EnterprisePersonCredentialRecord,
+    EnterprisePersonAccountLinkRecord,
+    EnterprisePersonLoginSessionRecord,
+    EnterprisePersonEnrollmentGrantRecord,
+]:
+    person = person or _person()
+    grant = _person_grant(
+        account_id, token_hash=token_hash, expires_at=expires_at
+    )
+    await store.create_person_enrollment_grant_atomic(grant, actor_user_id=actor_user_id)
+    credential = _person_credential(person.id)
+    link = _person_link(person.id, account_id, status="active")
+    session = _person_session(person.id, account_id, person_epoch=person.auth_epoch)
+    saved_person, saved_cred, saved_link, saved_session = await store.enroll_person_atomic(
+        grant_token_hash=grant.token_hash,
+        person=person,
+        credential=credential,
+        link=link,
+        session=session,
+        actor_user_id=actor_user_id,
+    )
+    return saved_person, saved_cred, saved_link, saved_session, grant
+
+
+async def test_person_crud_and_credential_uniqueness(store):
+    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+
+    saved_person, saved_cred, saved_link, saved_session, grant = await _enroll(
+        store, account_id=account.id
+    )
+
+    # Person read-back.
+    fetched = await store.get_person_by_id(saved_person.id)
+    assert fetched is not None
+    assert fetched.status == "active"
+    assert fetched.auth_epoch == 1
+    assert fetched.metadata == saved_person.metadata
+
+    # Credential read-back (only the active password credential is returned).
+    cred = await store.get_person_credential(saved_person.id)
+    assert cred is not None
+    assert cred.id == saved_cred.id
+    assert cred.algorithm == "bcrypt"
+    assert cred.password_hash == _PERSON_BCRYPT_HASH
+
+    # Account link reads.
+    active_links = await store.list_person_account_links(
+        saved_person.id, only_active=True
+    )
+    assert len(active_links) == 1
+    assert active_links[0].account_id == account.id
+    direct = await store.get_person_account_link(saved_person.id, account.id)
+    assert direct is not None and direct.status == "active"
+    by_account = await store.get_active_person_link_for_account(account.id)
+    assert by_account is not None and by_account.person_id == saved_person.id
+
+    # Session reads.
+    sessions = await store.list_person_login_sessions(saved_person.id, only_active=True)
+    assert len(sessions) == 1
+    fetched_session = await store.get_person_login_session(saved_session.id)
+    assert fetched_session is not None
+    assert fetched_session.person_epoch == 1
+    assert fetched_session.session_epoch == 1
+
+    # Grant reads.
+    g_by_hash = await store.get_person_enrollment_grant_by_token_hash(grant.token_hash)
+    assert g_by_hash is not None
+    assert g_by_hash.status == "consumed"
+    g_by_id = await store.get_person_enrollment_grant(grant.id)
+    assert g_by_id is not None
+    assert g_by_id.consumed_by_person == saved_person.id
+
+
+async def test_person_credential_unique_constraint(store):
+    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    saved_person, _, _, _, _ = await _enroll(store, account_id=account.id)
+
+    # A second active password credential for the same person must fail the
+    # UNIQUE(person_id, credential_type) constraint at the DB level.
+    extra = _person_credential(saved_person.id)
+
+    if isinstance(store, SQLiteMetadataStore):
+        import sqlite3
+
+        def write(conn):
+            conn.execute(
+                """
+                INSERT INTO enterprise_person_credentials (
+                    id, person_id, credential_type, algorithm,
+                    password_hash, status, failed_count, locked_until,
+                    last_used_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    extra.id,
+                    extra.person_id,
+                    extra.credential_type,
+                    extra.algorithm,
+                    extra.password_hash,
+                    extra.status,
+                    extra.failed_count,
+                    extra.locked_until,
+                    extra.last_used_at,
+                    extra.created_at,
+                    extra.updated_at,
+                ),
+            )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            await store._write(write)
+    else:
+        # PostgreSQL surfaces a UniqueViolationError from asyncpg.
+        async def write_pg(conn):
+            await conn.execute(
+                """
+                INSERT INTO enterprise_person_credentials (
+                    id, person_id, credential_type, algorithm,
+                    password_hash, status, failed_count, locked_until,
+                    last_used_at, created_at, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                """,
+                extra.id,
+                extra.person_id,
+                extra.credential_type,
+                extra.algorithm,
+                extra.password_hash,
+                extra.status,
+                extra.failed_count,
+                extra.locked_until,
+                extra.last_used_at,
+                extra.created_at,
+                extra.updated_at,
+            )
+
+        with pytest.raises(Exception):
+            await store._write(write_pg)
+
+
+async def test_enrollment_grant_partial_unique_index(store):
+    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    grant1 = _person_grant(account.id)
+    await store.create_person_enrollment_grant_atomic(grant1, actor_user_id="usr_admin")
+
+    # A second ACTIVE grant for the same account must be rejected by the
+    # partial unique index uq_person_enrollment_grant_active.
+    grant2 = _person_grant(account.id)
+    with pytest.raises(MetadataConflictError):
+        await store.create_person_enrollment_grant_atomic(
+            grant2, actor_user_id="usr_admin"
+        )
+
+    # Revoking the first grant frees the slot; a new active grant succeeds.
+    revoked = await store.revoke_person_enrollment_grant_atomic(
+        grant1.id, actor_user_id="usr_admin"
+    )
+    assert revoked is not None and revoked.status == "revoked"
+    grant3 = _person_grant(account.id)
+    await store.create_person_enrollment_grant_atomic(grant3, actor_user_id="usr_admin")
+
+
+async def test_consume_enrollment_grant_atomic_is_single_use(store):
+    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    grant = _person_grant(account.id)
+    await store.create_person_enrollment_grant_atomic(grant, actor_user_id="usr_admin")
+
+    person = _person()
+    consumed = await store.consume_enrollment_grant_atomic(
+        grant.token_hash, person_id=person.id
+    )
+    assert consumed.status == "consumed"
+    assert consumed.consumed_by_person == person.id
+
+    # Second consume of the same token fails (no longer active).
+    with pytest.raises(MetadataConflictError):
+        await store.consume_enrollment_grant_atomic(
+            grant.token_hash, person_id=person.id
+        )
+
+    # Expired grant is rejected.
+    expired = _person_grant(account.id, expires_at="2000-01-01T00:00:00+00:00")
+    await store.create_person_enrollment_grant_atomic(expired, actor_user_id="usr_admin")
+    with pytest.raises(MetadataConflictError):
+        await store.consume_enrollment_grant_atomic(
+            expired.token_hash, person_id=person.id
+        )
+
+
+async def test_person_link_state_transitions(store):
+    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    person, _, _, _, _ = await _enroll(store, account_id=account.id)
+
+    # Add a second account and propose a pending link to it.
+    account_b = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    proposed = await store.propose_person_account_link_atomic(
+        _person_link(person.id, account_b.id, status="pending"),
+        actor_user_id="usr_admin",
+    )
+    assert proposed.status == "pending"
+    # Pending link is NOT in the active set.
+    active = await store.list_person_account_links(person.id, only_active=True)
+    assert {item.account_id for item in active} == {account.id}
+
+    # Confirm pending -> active bumps auth_epoch and revokes prior sessions.
+    refreshed_person, confirmed = await store.confirm_person_account_link_atomic(
+        person_id=person.id,
+        account_id=account_b.id,
+        actor_user_id=account.id,
+    )
+    assert confirmed.status == "active"
+    assert confirmed.confirmed_by_person_at is not None
+    assert refreshed_person.auth_epoch == person.auth_epoch + 1
+    # The original session (created at epoch 1) is revoked.
+    prior_sessions = await store.list_person_login_sessions(person.id)
+    assert all(s.status == "revoked" for s in prior_sessions)
+
+    # Revoke (unbind) the active link.
+    unbound, revoked_count = await store.revoke_person_account_link_atomic(
+        person_id=person.id,
+        account_id=account_b.id,
+        actor_user_id="usr_admin",
+        reason="rotated",
+    )
+    assert unbound.status == "revoked"
+    assert unbound.revoked_at is not None
+
+
+async def test_person_account_active_link_partial_unique_index(store):
+    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    # Person 1 binds account as an active link.
+    person_a, _, _, _, _ = await _enroll(store, account_id=account.id)
+
+    # Person 2 must exist in enterprise_persons first; enroll it on a separate
+    # throwaway account so its identity row is present.
+    other_account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    person_b, _, _, _, _ = await _enroll(store, account_id=other_account.id)
+
+    # Person 2 proposes a pending link to the SAME account as person_a; the
+    # propose itself succeeds (pending does not occupy the active slot).
+    await store.propose_person_account_link_atomic(
+        _person_link(person_b.id, account.id, status="pending"),
+        actor_user_id="usr_admin",
+    )
+    # But confirming it must fail the partial unique index because account is
+    # already actively linked to person_a.
+    with pytest.raises(MetadataConflictError) as exc_info:
+        await store.confirm_person_account_link_atomic(
+            person_id=person_b.id,
+            account_id=account.id,
+            actor_user_id="usr_admin",
+        )
+    assert exc_info.value.entity_type == "person_account_link_active"
+
+
+async def test_person_session_epoch_advances_on_switch(store):
+    account_a = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    account_b = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    person, _, _, session, _ = await _enroll(store, account_id=account_a.id)
+    # Give the person a second active account to switch to.
+    await store.propose_person_account_link_atomic(
+        _person_link(person.id, account_b.id, status="pending"),
+        actor_user_id="usr_admin",
+    )
+    await store.confirm_person_account_link_atomic(
+        person_id=person.id,
+        account_id=account_b.id,
+        actor_user_id=account_a.id,
+    )
+    # After confirm, auth_epoch advanced and the enroll session was revoked;
+    # create a fresh session on account_a for the switch test.
+    refreshed = await store.get_person_by_id(person.id)
+    assert refreshed is not None
+    fresh = _person_session(
+        person.id, account_a.id, person_epoch=refreshed.auth_epoch
+    )
+    created = await store.create_person_session_atomic(
+        fresh, expected_person_epoch=refreshed.auth_epoch, actor_user_id=account_a.id
+    )
+    assert created.session_epoch == 1
+
+    # Switch account_a -> account_b increments session_epoch.
+    switched = await store.switch_person_session_atomic(
+        session_id=created.id,
+        expected_session_epoch=1,
+        target_account_id=account_b.id,
+        actor_user_id=account_b.id,
+    )
+    assert switched.session_epoch == 2
+    assert switched.active_account_id == account_b.id
+
+    # A replay using the old epoch (1) must be rejected (CAS).
+    with pytest.raises(MetadataConflictError):
+        await store.switch_person_session_atomic(
+            session_id=created.id,
+            expected_session_epoch=1,
+            target_account_id=account_a.id,
+            actor_user_id=account_a.id,
+        )
+
+    # Switching to an unlinked account fails with not-found.
+    account_c = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    with pytest.raises(MetadataRecordNotFoundError):
+        await store.switch_person_session_atomic(
+            session_id=created.id,
+            expected_session_epoch=2,
+            target_account_id=account_c.id,
+            actor_user_id=account_a.id,
+        )
+
+
+async def test_enroll_person_atomic_rollback_on_link_conflict(store):
+    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    # First enrollment binds account as active link.
+    await _enroll(store, account_id=account.id)
+
+    # A second enrollment targeting the SAME account must roll back entirely;
+    # no orphan person/credential should remain.
+    person_b = _person()
+    grant_b = _person_grant(account.id)
+    await store.create_person_enrollment_grant_atomic(grant_b, actor_user_id="usr_admin")
+    with pytest.raises(MetadataConflictError):
+        await store.enroll_person_atomic(
+            grant_token_hash=grant_b.token_hash,
+            person=person_b,
+            credential=_person_credential(person_b.id),
+            link=_person_link(person_b.id, account.id, status="active"),
+            session=_person_session(person_b.id, account.id),
+            actor_user_id="usr_admin",
+        )
+
+    assert await store.get_person_by_id(person_b.id) is None
+    assert await store.get_person_credential(person_b.id) is None
+    # The grant was consumed as part of the (rolled-back) transaction? No: the
+    # whole transaction rolled back, so the grant must still be active.
+    leftover = await store.get_person_enrollment_grant(grant_b.id)
+    assert leftover is not None
+    assert leftover.status == "active"
+
+
+async def test_revoke_person_session_and_logout_all(store):
+    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    person, _, _, session_a, _ = await _enroll(store, account_id=account.id)
+    # Create a second session on the same account.
+    refreshed = await store.get_person_by_id(person.id)
+    session_b = await store.create_person_session_atomic(
+        _person_session(person.id, account.id, person_epoch=refreshed.auth_epoch),
+        expected_person_epoch=refreshed.auth_epoch,
+        actor_user_id=account.id,
+    )
+
+    # Single-session logout revokes only session_a.
+    revoked_a = await store.revoke_person_session_atomic(
+        session_a.id, actor_user_id=account.id
+    )
+    assert revoked_a is not None and revoked_a.status == "revoked"
+    still_active = await store.list_person_login_sessions(person.id, only_active=True)
+    assert {s.id for s in still_active} == {session_b.id}
+
+    # logout-all bumps auth_epoch and revokes all remaining sessions.
+    refreshed2 = await store.get_person_by_id(person.id)
+    after_logout, count = await store.revoke_all_person_sessions_atomic(
+        person.id, actor_user_id=account.id
+    )
+    assert count >= 1
+    assert after_logout.auth_epoch == refreshed2.auth_epoch + 1
+    assert await store.list_person_login_sessions(person.id, only_active=True) == []
+
+
+async def test_rotate_credential_revokes_sessions(store):
+    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    person, cred, _, _, _ = await _enroll(store, account_id=account.id)
+    refreshed = await store.get_person_by_id(person.id)
+
+    new_cred = _person_credential(person.id)
+    new_cred.password_hash = "{bcrypt}$2b$12$rotatedrotatedrotatedrotatedrotatedrotat"
+    rotated_person, rotated_cred = await store.rotate_person_credential_atomic(
+        person_id=person.id,
+        new_credential=new_cred,
+        actor_user_id=account.id,
+    )
+    # Rotation updates the existing active row in place (doc 4.2); the
+    # credential id is unchanged but the hash reflects the new value.
+    assert rotated_cred.id == cred.id
+    assert rotated_cred.password_hash == new_cred.password_hash
+    assert rotated_cred.failed_count == 0
+    assert rotated_person.auth_epoch == refreshed.auth_epoch + 1
+    # All sessions revoked by the epoch bump.
+    assert await store.list_person_login_sessions(person.id, only_active=True) == []
+
+
+async def test_disable_and_enable_person(store):
+    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    person, _, _, _, _ = await _enroll(store, account_id=account.id)
+    refreshed = await store.get_person_by_id(person.id)
+
+    disabled = await store.disable_person_atomic(
+        person_id=person.id, actor_user_id="usr_admin", reason="audit"
+    )
+    assert disabled.status == "disabled"
+    assert disabled.auth_epoch == refreshed.auth_epoch + 1
+    assert await store.list_person_login_sessions(person.id, only_active=True) == []
+
+    # Enabling restores active status without bumping epoch or issuing a token.
+    enabled = await store.enable_person_atomic(
+        person_id=person.id, actor_user_id="usr_admin"
+    )
+    assert enabled.status == "active"
+    assert enabled.auth_epoch == disabled.auth_epoch
+
+
+async def test_account_delete_revokes_person_sessions_and_links(store):
+    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    person, _, _, session, _ = await _enroll(store, account_id=account.id)
+
+    # The person has an active link + active session pointing at `account`.
+    assert await store.get_active_person_link_for_account(account.id) is not None
+    assert (await store.get_person_login_session(session.id)).status == "active"
+
+    deleted = await store.delete_enterprise_user(account.id)
+    assert deleted is True
+
+    # Session revoked, link cleaned up, no active session points at the
+    # deleted account.
+    leftover_session = await store.get_person_login_session(session.id)
+    assert leftover_session is not None
+    assert leftover_session.status == "revoked"
+    assert leftover_session.active_account_id is None
+    assert await store.get_active_person_link_for_account(account.id) is None
+    # The person record itself survives (account delete does not delete persons).
+    assert await store.get_person_by_id(person.id) is not None
+
+
+# ----------------------------------------------------------------------
+# Phase 2 Oracle gate follow-up tests (person session/link lifecycle,
+# platform-level audit isolation, transaction fault injection / concurrency).
+# See docs/多账号身份关联与切换执行文档.md sections 7.3, 8.4.
+# ----------------------------------------------------------------------
+
+
+# A normalized, valid Chat Memory config fingerprint; the _with_memory delete
+# path requires one even when no Chat Memory groups exist for the user.
+_MEMORY_CONFIG_FINGERPRINT = "chat-memory-extraction:v1:contract-test"
+
+
+async def test_account_delete_with_memory_revokes_person_sessions_and_links(store):
+    """P1: ``delete_enterprise_user_with_memory`` mirrors the plain delete path
+    for person session/link cleanup (account_delete联动, second path). The
+    memory-aware path also enqueues per-project purges, but those are
+    independent of the person lifecycle; this test asserts the person
+    session is revoked, the link is cleared, and a platform-level
+    ``person_session_revoked_by_account_change`` audit row is written."""
+
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    person, _, _, session, _ = await _enroll(store, account_id=account.id)
+    # Precondition: the person has an active link + active session on account.
+    assert await store.get_active_person_link_for_account(account.id) is not None
+    assert (await store.get_person_login_session(session.id)).status == "active"
+
+    deleted = await store.delete_enterprise_user_with_memory(
+        account.id,
+        config_fingerprint=_MEMORY_CONFIG_FINGERPRINT,
+        graph_store_fingerprint="chat-memory-graph-store:v1:contract-test",
+        actor_user_id="usr_admin",
+    )
+    assert deleted is True
+
+    # Session revoked, link cleared, no active session points at the account.
+    leftover = await store.get_person_login_session(session.id)
+    assert leftover is not None
+    assert leftover.status == "revoked"
+    assert leftover.active_account_id is None
+    assert await store.get_active_person_link_for_account(account.id) is None
+    # The person survives account deletion.
+    assert await store.get_person_by_id(person.id) is not None
+
+    # A platform-level audit row records the session revocation.
+    revoke_events = await store.list_audit_events(
+        event_type="person_session_revoked_by_account_change"
+    )
+    assert any(ev.target_id == session.id for ev in revoke_events)
+
+
+async def test_account_delete_with_memory_missing_user_is_noop_for_person(store):
+    """``delete_enterprise_user_with_memory`` on a non-existent account returns
+    False without touching person state, mirroring the plain delete path."""
+
+    # Seed an unrelated person so we can confirm nothing is disturbed.
+    other_account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    person, _, _, session, _ = await _enroll(store, account_id=other_account.id)
+
+    deleted = await store.delete_enterprise_user_with_memory(
+        "usr_does_not_exist",
+        config_fingerprint=_MEMORY_CONFIG_FINGERPRINT,
+    )
+    assert deleted is False
+    # The unrelated person's session and link are untouched.
+    untouched = await store.get_person_login_session(session.id)
+    assert untouched is not None and untouched.status == "active"
+    assert await store.get_active_person_link_for_account(other_account.id) is not None
+
+
+async def test_person_identity_events_are_platform_level(store):
+    """P2 / contract 7.3 + I-12: person identity security-state events must
+    carry ``actor_tenant_id=None`` (platform-level) and must NOT surface in
+    any tenant-scoped audit query."""
+
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    # enroll writes person_enrolled + consumes the grant (active->consumed).
+    person, _, _, session, grant = await _enroll(
+        store, account_id=account.id, actor_user_id=account.id
+    )
+
+    # switch (needs a second active link to switch to).
+    account_b = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    await store.propose_person_account_link_atomic(
+        _person_link(person.id, account_b.id, status="pending"),
+        actor_user_id=account.id,
+    )
+    await store.confirm_person_account_link_atomic(
+        person_id=person.id,
+        account_id=account_b.id,
+        actor_user_id=account.id,
+    )
+    # Confirm bumped auth_epoch + revoked the enroll session; create a fresh
+    # session on account then switch to account_b.
+    refreshed = await store.get_person_by_id(person.id)
+    assert refreshed is not None
+    fresh = _person_session(
+        person.id, account.id, person_epoch=refreshed.auth_epoch
+    )
+    created = await store.create_person_session_atomic(
+        fresh, expected_person_epoch=refreshed.auth_epoch, actor_user_id=account.id
+    )
+    await store.switch_person_session_atomic(
+        session_id=created.id,
+        expected_session_epoch=created.session_epoch,
+        target_account_id=account_b.id,
+        actor_user_id=account.id,
+    )
+
+    # logout-all (writes person_sessions_logout_all).
+    await store.revoke_all_person_sessions_atomic(
+        person.id, actor_user_id=account.id
+    )
+
+    # Grant lifecycle: create + revoke a fresh grant. The target account must
+    # exist for the partial-unique index semantics.
+    grant_account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    grant_rec = _person_grant(grant_account.id)
+    await store.create_person_enrollment_grant_atomic(
+        grant_rec, actor_user_id=account.id
+    )
+    await store.revoke_person_enrollment_grant_atomic(
+        grant_rec.id, actor_user_id=account.id
+    )
+
+    # disable then enable person (writes person_disabled / person_enabled).
+    await store.disable_person_atomic(
+        person_id=person.id, actor_user_id=account.id
+    )
+    await store.enable_person_atomic(person_id=person.id, actor_user_id=account.id)
+
+    # Collect every person_* event type the contract defines.
+    person_event_types = [
+        "person_enrolled",
+        "person_login_succeeded",
+        "person_account_switched",
+        "person_sessions_logout_all",
+        "person_account_link_proposed",
+        "person_account_link_confirmed",
+        "person_enrollment_grant_created",
+        "person_enrollment_grant_revoked",
+        "person_disabled",
+        "person_enabled",
+        "person_session_revoked_by_link_activation",
+        "person_session_revoked_by_person_disable",
+        "person_session_revoked_by_logout_all",
+    ]
+    seen_events: list[AuditEventRecord] = []
+    for event_type in person_event_types:
+        events = await store.list_audit_events(event_type=event_type, limit=50)
+        # Restrict to events for THIS person/account so concurrent tests on the
+        # shared PG test DB do not pollute the assertion.
+        relevant = [
+            ev
+            for ev in events
+            if ev.metadata.get("person_id") == person.id
+            or ev.target_id == person.id
+            or ev.target_id == grant_rec.id
+        ]
+        seen_events.extend(relevant)
+
+    assert seen_events, "expected at least one person identity audit event"
+    # Every person identity event MUST be platform-level (actor_tenant_id None).
+    for ev in seen_events:
+        assert ev.actor_tenant_id is None, (
+            f"person event {ev.event_type} {ev.id} must be platform-level "
+            f"(actor_tenant_id=None), got {ev.actor_tenant_id!r}"
+        )
+
+    # Negative isolation: querying by any non-null tenant_id must not return
+    # any of these person events (cross-tenant leak guard, contract I-12).
+    arbitrary_tenant = f"tenant-{uuid.uuid4().hex[:8]}"
+    tenant_scoped = await store.list_audit_events(actor_tenant_id=arbitrary_tenant)
+    person_ids = {ev.id for ev in seen_events}
+    leaked = [ev for ev in tenant_scoped if ev.id in person_ids]
+    assert not leaked, (
+        f"person identity events leaked into tenant {arbitrary_tenant!r}: "
+        f"{[ev.id for ev in leaked]}"
+    )
+
+
+async def test_switch_then_logout_all_invalidates_switched_token(store):
+    """P2 / doc 8.4 concurrency: a switch (bumps session_epoch) followed by
+    logout-all (bumps auth_epoch + revokes all sessions) must leave no
+    partially-valid state. The switched session is revoked and the auth_epoch
+    has advanced, so any token minted before logout-all is invalid."""
+
+    account_a = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    account_b = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    person, _, _, _, _ = await _enroll(store, account_id=account_a.id)
+    # Second active link + confirm (revokes enroll session via epoch bump).
+    await store.propose_person_account_link_atomic(
+        _person_link(person.id, account_b.id, status="pending"),
+        actor_user_id=account_a.id,
+    )
+    await store.confirm_person_account_link_atomic(
+        person_id=person.id,
+        account_id=account_b.id,
+        actor_user_id=account_a.id,
+    )
+    refreshed = await store.get_person_by_id(person.id)
+    assert refreshed is not None
+    session = await store.create_person_session_atomic(
+        _person_session(person.id, account_a.id, person_epoch=refreshed.auth_epoch),
+        expected_person_epoch=refreshed.auth_epoch,
+        actor_user_id=account_a.id,
+    )
+
+    # switch A -> B (bumps session_epoch on this session).
+    switched = await store.switch_person_session_atomic(
+        session_id=session.id,
+        expected_session_epoch=session.session_epoch,
+        target_account_id=account_b.id,
+        actor_user_id=account_b.id,
+    )
+    assert switched.session_epoch == session.session_epoch + 1
+    assert switched.active_account_id == account_b.id
+
+    # logout-all immediately after (bumps auth_epoch, revokes all sessions).
+    pre_epoch = (await store.get_person_by_id(person.id)).auth_epoch
+    post_person, revoked = await store.revoke_all_person_sessions_atomic(
+        person.id, actor_user_id=account_b.id
+    )
+    assert revoked >= 1
+    assert post_person.auth_epoch == pre_epoch + 1
+
+    # The switched session is now revoked; its session_epoch is moot.
+    final = await store.get_person_login_session(session.id)
+    assert final is not None and final.status == "revoked"
+    # No active sessions remain.
+    assert await store.list_person_login_sessions(person.id, only_active=True) == []
+
+
+async def test_switch_and_unbind_cas_no_orphan_session(store):
+    """P2 / doc 8.4 concurrency: unbinding account A revokes any session whose
+    active_account_id == A, so a subsequent switch from that session cannot
+    succeed (the session itself is revoked, not merely unlinked). The CAS
+    invariant: no orphan active session points at the unbound account, and the
+    switch fails rather than partially applying."""
+
+    account_a = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    account_b = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    person, _, _, _, _ = await _enroll(store, account_id=account_a.id)
+    # Add account_b as a second active link (so a switch target exists).
+    await store.propose_person_account_link_atomic(
+        _person_link(person.id, account_b.id, status="pending"),
+        actor_user_id=account_a.id,
+    )
+    await store.confirm_person_account_link_atomic(
+        person_id=person.id,
+        account_id=account_b.id,
+        actor_user_id=account_a.id,
+    )
+    refreshed = await store.get_person_by_id(person.id)
+    assert refreshed is not None
+    session = await store.create_person_session_atomic(
+        _person_session(person.id, account_a.id, person_epoch=refreshed.auth_epoch),
+        expected_person_epoch=refreshed.auth_epoch,
+        actor_user_id=account_a.id,
+    )
+
+    # Unbind account_a: revokes sessions whose active_account_id == account_a.
+    unbound, revoked_sessions = await store.revoke_person_account_link_atomic(
+        person_id=person.id,
+        account_id=account_a.id,
+        actor_user_id="usr_admin",
+        reason="rotated",
+    )
+    assert unbound.status == "revoked"
+    assert revoked_sessions >= 1
+    # The session pointing at account_a was revoked by the unbind (CAS guard).
+    assert (await store.get_person_login_session(session.id)).status == "revoked"
+
+    # A switch from the now-revoked session must fail because the session is
+    # revoked (MetadataConflictError, status guard) — the CAS invariant holds.
+    with pytest.raises(MetadataConflictError):
+        await store.switch_person_session_atomic(
+            session_id=session.id,
+            expected_session_epoch=session.session_epoch,
+            target_account_id=account_b.id,
+            actor_user_id=account_b.id,
+        )
+    # account_a no longer has an active person link; no orphan session points
+    # at the unbound account.
+    assert await store.get_active_person_link_for_account(account_a.id) is None
+    # The session row stays revoked; it was not resurrected by the failed switch.
+    final = await store.get_person_login_session(session.id)
+    assert final is not None and final.status == "revoked"
+
+
+async def test_propose_re_propose_after_revoke_reuses_row(store):
+    """P2: a revoked (person_id, account_id) link can be re-proposed as
+    pending and the same row is reused (no duplicate history rows). Covers
+    the metadata_store propose revoked->pending branch (Phase 2)."""
+
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    person, _, link, _, _ = await _enroll(store, account_id=account.id)
+    original_link_id = link.id
+
+    # Unbind (revoke) the active link.
+    revoked, _ = await store.revoke_person_account_link_atomic(
+        person_id=person.id,
+        account_id=account.id,
+        actor_user_id="usr_admin",
+    )
+    assert revoked.status == "revoked"
+    assert revoked.id == original_link_id
+
+    # Re-propose: must reuse the existing row (same id), flip to pending.
+    re_proposed = await store.propose_person_account_link_atomic(
+        _person_link(person.id, account.id, status="pending"),
+        actor_user_id="usr_admin",
+    )
+    assert re_proposed.id == original_link_id
+    assert re_proposed.status == "pending"
+    # confirmed/revoked fields are cleared on re-propose.
+    assert re_proposed.confirmed_by_person_at is None
+    assert re_proposed.revoked_by is None
+    assert re_proposed.revoked_at is None
+
+    # Exactly one row exists for (person, account): no duplicate history rows.
+    direct = await store.get_person_account_link(person.id, account.id)
+    assert direct is not None and direct.id == original_link_id
+
+    # The re-proposed pending link can be confirmed active again.
+    refreshed_person, confirmed = await store.confirm_person_account_link_atomic(
+        person_id=person.id,
+        account_id=account.id,
+        actor_user_id=account.id,
+    )
+    assert confirmed.id == original_link_id
+    assert confirmed.status == "active"
+    assert confirmed.confirmed_by_person_at is not None
+    # Confirm bumped auth_epoch.
+    pre = await store.get_person_by_id(person.id)
+    assert refreshed_person.auth_epoch == pre.auth_epoch
+
+
+
+async def test_person_credential_failure_counter_is_atomic(store):
+    """Failure counting increments in SQL so concurrent failures never lose a
+    count; the lock trips exactly once at the threshold and audit rows land in
+    the same transaction (person_login_failed / person_login_locked)."""
+
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    person, credential, _, _, _ = await _enroll(store, account_id=account.id)
+
+    await asyncio.gather(
+        *[
+            store.record_person_credential_failure_atomic(
+                credential.id, max_attempts=5, lockout_seconds=60.0
+            )
+            for _ in range(5)
+        ]
+    )
+    final = await store.get_person_credential(person.id)
+    assert final is not None
+    assert final.failed_count == 5
+    assert final.locked_until is not None
+
+    failed_events = await store.list_audit_events(
+        event_type="person_login_failed", limit=50
+    )
+    assert sum(1 for e in failed_events if e.target_id == credential.id) == 5
+    assert all(
+        e.actor_user_id is None and e.actor_tenant_id is None
+        for e in failed_events
+        if e.target_id == credential.id
+    )
+    locked_events = await store.list_audit_events(
+        event_type="person_login_locked", limit=50
+    )
+    assert sum(1 for e in locked_events if e.target_id == credential.id) == 1
+
+    await store.reset_person_credential_failures_atomic(credential.id)
+    cleared = await store.get_person_credential(person.id)
+    assert cleared is not None
+    assert cleared.failed_count == 0
+    assert cleared.locked_until is None
+
+
+async def test_person_schema_reinitialize_is_idempotent(store):
+    """Repeated initialize() runs (fresh start, restart, extra worker) must
+    converge without duplicate-table/index errors and leave the person tables
+    fully usable."""
+
+    await store.initialize()
+    await store.initialize()
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    person, _, link, session, _ = await _enroll(store, account_id=account.id)
+    assert await store.get_person_by_id(person.id) is not None
+    assert (await store.get_person_account_link(person.id, account.id)) is not None
+    assert (await store.get_person_login_session(session.id)) is not None
+
+
+async def test_concurrent_confirm_same_account_single_winner(store):
+    """Two persons racing to activate a link on the SAME account: exactly one
+    confirm wins; the loser gets a conflict (partial unique index / in-txn
+    clash check), never a second active link."""
+
+    account_a = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    account_b = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    contested = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    person_1, _, _, _, _ = await _enroll(store, account_id=account_a.id)
+    person_2, _, _, _, _ = await _enroll(store, account_id=account_b.id)
+    await store.propose_person_account_link_atomic(
+        _person_link(person_1.id, contested.id, status="pending")
+    )
+    await store.propose_person_account_link_atomic(
+        _person_link(person_2.id, contested.id, status="pending")
+    )
+
+    results = await asyncio.gather(
+        store.confirm_person_account_link_atomic(
+            person_id=person_1.id, account_id=contested.id
+        ),
+        store.confirm_person_account_link_atomic(
+            person_id=person_2.id, account_id=contested.id
+        ),
+        return_exceptions=True,
+    )
+    winners = [r for r in results if not isinstance(r, BaseException)]
+    losers = [r for r in results if isinstance(r, MetadataConflictError)]
+    assert len(winners) == 1, results
+    assert len(losers) == 1, results
+    active = await store.get_active_person_link_for_account(contested.id)
+    assert active is not None
+    assert active.person_id in {person_1.id, person_2.id}
+
+
+async def test_concurrent_switch_and_logout_all_leave_no_live_session(store):
+    """switch racing logout-all: whatever the interleaving, the session ends
+    revoked and the person epoch is bumped — no resurrected token path."""
+
+    account_a = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    account_b = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    person, _, _, _, _ = await _enroll(store, account_id=account_a.id)
+    await store.propose_person_account_link_atomic(
+        _person_link(person.id, account_b.id, status="pending")
+    )
+    await store.confirm_person_account_link_atomic(
+        person_id=person.id, account_id=account_b.id
+    )
+    refreshed = await store.get_person_by_id(person.id)
+    assert refreshed is not None
+    fresh = _person_session(
+        person.id, account_a.id, person_epoch=refreshed.auth_epoch
+    )
+    created = await store.create_person_session_atomic(
+        fresh, expected_person_epoch=refreshed.auth_epoch
+    )
+    pre_epoch = refreshed.auth_epoch
+
+    results = await asyncio.gather(
+        store.switch_person_session_atomic(
+            session_id=created.id,
+            expected_session_epoch=created.session_epoch,
+            target_account_id=account_b.id,
+        ),
+        store.revoke_all_person_sessions_atomic(person.id),
+        return_exceptions=True,
+    )
+    # logout-all itself never conflicts.
+    assert not isinstance(results[1], BaseException), results
+    final_session = await store.get_person_login_session(created.id)
+    assert final_session is not None
+    assert final_session.status == "revoked"
+    final_person = await store.get_person_by_id(person.id)
+    assert final_person is not None
+    assert final_person.auth_epoch == pre_epoch + 1

@@ -29,6 +29,7 @@ from lightrag.api.enterprise_auth import (
     ChatMessageRecord,
     ChatProjectRecord,
     ChatSessionRecord,
+    INTERACTIVE_AUTH_METHODS,
     Principal,
     get_enterprise_chat_conversation_service,
     get_enterprise_chat_memory_service,
@@ -264,7 +265,7 @@ def create_chat_routes(api_key: str | None = None) -> APIRouter:
         principal = get_request_principal(request)
         if principal is None:
             raise HTTPException(status_code=401, detail="Login required")
-        if principal.auth_method != "jwt":
+        if principal.auth_method not in INTERACTIVE_AUTH_METHODS:
             raise HTTPException(
                 status_code=403,
                 detail="Only available for interactive users",

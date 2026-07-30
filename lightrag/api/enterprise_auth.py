@@ -32,6 +32,11 @@ from lightrag.api.metadata_store import (
     ChatSessionRecord,
     EnterpriseAPIKeyRecord,
     EnterpriseInvitationRecord,
+    EnterprisePersonAccountLinkRecord,
+    EnterprisePersonCredentialRecord,
+    EnterprisePersonEnrollmentGrantRecord,
+    EnterprisePersonLoginSessionRecord,
+    EnterprisePersonRecord,
     EnterpriseUserKBQuerySettingsRecord,
     EnterpriseUserRecord,
     KBACLRecord,
@@ -74,6 +79,12 @@ ENTERPRISE_API_KEY_STATUS_VALUES = {
     ENTERPRISE_API_KEY_STATUS_REVOKED,
 }
 SERVICE_API_KEY_AUTH_METHOD = "service_api_key"
+# v2 person access JWTs build an account-scoped Principal with this
+# auth_method so audit can tell the entry path apart. Every surface that gates
+# on "interactive user" must treat it exactly like a legacy login JWT — use
+# INTERACTIVE_AUTH_METHODS instead of comparing against "jwt" directly.
+PERSON_JWT_AUTH_METHOD = "person_jwt"
+INTERACTIVE_AUTH_METHODS = frozenset({"jwt", PERSON_JWT_AUTH_METHOD})
 SYSTEM_ROLE_SUPER_ADMIN = "super_admin"
 SYSTEM_ROLE_USER = "user"
 KB_ROLE_VIEWER = "kb_viewer"
@@ -545,6 +556,194 @@ class EnterpriseMetadataStore(Protocol):
     async def revoke_enterprise_invitation(
         self, invitation_id: str, *, revoked_at: str | None = None
     ) -> EnterpriseInvitationRecord | None: ...
+
+    # ------------------------------------------------------------------
+    # Multi-account person identity store.
+    #
+    # Simple reads/writes plus aggregate atomic methods. The atomic methods
+    # perform state reads, CAS, multi-table writes and an in-transaction
+    # audit-row insert inside a single write transaction; they never nest
+    # another write transaction nor call the public ``AuditService.append``.
+    # See docs/多账号身份关联与切换执行文档.md sections 4 and 7.2.
+    # ------------------------------------------------------------------
+
+    async def get_person_by_id(
+        self, person_id: str
+    ) -> EnterprisePersonRecord | None: ...
+
+    async def list_person_account_links(
+        self, person_id: str, *, only_active: bool = False
+    ) -> list[EnterprisePersonAccountLinkRecord]: ...
+
+    async def get_person_account_link(
+        self, person_id: str, account_id: str
+    ) -> EnterprisePersonAccountLinkRecord | None: ...
+
+    async def get_active_person_link_for_account(
+        self, account_id: str
+    ) -> EnterprisePersonAccountLinkRecord | None: ...
+
+    async def get_person_credential(
+        self, person_id: str
+    ) -> EnterprisePersonCredentialRecord | None: ...
+
+    async def record_person_credential_failure_atomic(
+        self,
+        credential_id: str,
+        *,
+        max_attempts: int,
+        lockout_seconds: float,
+        now: str | None = None,
+    ) -> EnterprisePersonCredentialRecord: ...
+
+    async def reset_person_credential_failures_atomic(
+        self,
+        credential_id: str,
+        *,
+        now: str | None = None,
+    ) -> None: ...
+
+    async def get_person_login_session(
+        self, session_id: str
+    ) -> EnterprisePersonLoginSessionRecord | None: ...
+
+    async def list_person_login_sessions(
+        self, person_id: str, *, only_active: bool = False
+    ) -> list[EnterprisePersonLoginSessionRecord]: ...
+
+    async def get_person_enrollment_grant_by_token_hash(
+        self, token_hash: str
+    ) -> EnterprisePersonEnrollmentGrantRecord | None: ...
+
+    async def get_person_enrollment_grant(
+        self, grant_id: str
+    ) -> EnterprisePersonEnrollmentGrantRecord | None: ...
+
+    async def create_person_enrollment_grant_atomic(
+        self,
+        grant: EnterprisePersonEnrollmentGrantRecord,
+        *,
+        actor_user_id: str | None = None,
+    ) -> EnterprisePersonEnrollmentGrantRecord: ...
+
+    async def revoke_person_enrollment_grant_atomic(
+        self,
+        grant_id: str,
+        *,
+        actor_user_id: str | None = None,
+        revoked_at: str | None = None,
+        reason: str | None = None,
+    ) -> EnterprisePersonEnrollmentGrantRecord | None: ...
+
+    async def consume_enrollment_grant_atomic(
+        self,
+        token_hash: str,
+        *,
+        person_id: str,
+        actor_user_id: str | None = None,
+        consumed_at: str | None = None,
+    ) -> EnterprisePersonEnrollmentGrantRecord: ...
+
+    async def enroll_person_atomic(
+        self,
+        *,
+        grant_token_hash: str,
+        person: EnterprisePersonRecord,
+        credential: EnterprisePersonCredentialRecord,
+        link: EnterprisePersonAccountLinkRecord,
+        session: EnterprisePersonLoginSessionRecord,
+        actor_user_id: str | None = None,
+    ) -> tuple[
+        EnterprisePersonRecord,
+        EnterprisePersonCredentialRecord,
+        EnterprisePersonAccountLinkRecord,
+        EnterprisePersonLoginSessionRecord,
+    ]: ...
+
+    async def create_person_session_atomic(
+        self,
+        session: EnterprisePersonLoginSessionRecord,
+        *,
+        expected_person_epoch: int,
+        actor_user_id: str | None = None,
+    ) -> EnterprisePersonLoginSessionRecord: ...
+
+    async def switch_person_session_atomic(
+        self,
+        *,
+        session_id: str,
+        expected_session_epoch: int,
+        target_account_id: str,
+        actor_user_id: str | None = None,
+        switched_at: str | None = None,
+    ) -> EnterprisePersonLoginSessionRecord: ...
+
+    async def rotate_person_credential_atomic(
+        self,
+        *,
+        person_id: str,
+        new_credential: EnterprisePersonCredentialRecord,
+        actor_user_id: str | None = None,
+    ) -> tuple[EnterprisePersonRecord, EnterprisePersonCredentialRecord]: ...
+
+    async def disable_person_atomic(
+        self,
+        *,
+        person_id: str,
+        actor_user_id: str | None = None,
+        reason: str | None = None,
+        disabled_at: str | None = None,
+    ) -> EnterprisePersonRecord: ...
+
+    async def enable_person_atomic(
+        self,
+        *,
+        person_id: str,
+        actor_user_id: str | None = None,
+        enabled_at: str | None = None,
+    ) -> EnterprisePersonRecord: ...
+
+    async def propose_person_account_link_atomic(
+        self,
+        link: EnterprisePersonAccountLinkRecord,
+        *,
+        actor_user_id: str | None = None,
+    ) -> EnterprisePersonAccountLinkRecord: ...
+
+    async def confirm_person_account_link_atomic(
+        self,
+        *,
+        person_id: str,
+        account_id: str,
+        actor_user_id: str | None = None,
+        confirmed_at: str | None = None,
+    ) -> tuple[EnterprisePersonRecord, EnterprisePersonAccountLinkRecord]: ...
+
+    async def revoke_person_account_link_atomic(
+        self,
+        *,
+        person_id: str,
+        account_id: str,
+        actor_user_id: str | None = None,
+        revoked_at: str | None = None,
+        reason: str | None = None,
+    ) -> tuple[EnterprisePersonAccountLinkRecord, int]: ...
+
+    async def revoke_person_session_atomic(
+        self,
+        session_id: str,
+        *,
+        actor_user_id: str | None = None,
+        revoked_at: str | None = None,
+    ) -> EnterprisePersonLoginSessionRecord | None: ...
+
+    async def revoke_all_person_sessions_atomic(
+        self,
+        person_id: str,
+        *,
+        actor_user_id: str | None = None,
+        revoked_at: str | None = None,
+    ) -> tuple[EnterprisePersonRecord, int]: ...
 
 
 def _user_write_conflict(exc: MetadataConflictError) -> HTTPException:
@@ -4015,11 +4214,75 @@ def get_enterprise_user_service(request: Request) -> UserService:
     return service
 
 
+# Module-level registry of the app-bound metadata store / services. This is
+# populated by the server lifespan (see lightrag_server) once the app state is
+# assembled, so person-session validation (which runs before any request
+# service is materialized) can resolve the store without request state.
+_active_metadata_store: EnterpriseMetadataStore | None = None
+
+
+def set_active_metadata_store(store: EnterpriseMetadataStore | None) -> None:
+    """Register the running app's metadata store for person-session validation."""
+
+    global _active_metadata_store
+    _active_metadata_store = store
+
+
+def _get_request_app_state_metadata_store() -> EnterpriseMetadataStore:
+    """Resolve the app-bound metadata store for person-session validation.
+
+    Person-session validation runs from ``combined_auth`` before any request
+    service has been materialized, so it cannot read ``request.app.state``
+    via a dependency. Instead it uses the module-level singleton registered by
+    the server lifespan. Fallback-free: if nothing is registered, person auth
+    is unavailable.
+    """
+
+    if _active_metadata_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Person auth metadata store is unavailable",
+        )
+    return _active_metadata_store
+
+
 def get_enterprise_settings_service(request: Request) -> SystemSettingsService:
     service = getattr(request.app.state, "enterprise_settings_service", None)
     if not isinstance(service, SystemSettingsService):
         raise HTTPException(status_code=500, detail="Enterprise settings service unavailable")
     return service
+
+
+def get_person_service(request: Request) -> Any:
+    """Return the app-bound :class:`PersonService` (lazy import to avoid cycle).
+
+    Raises 503 when person auth is disabled or the service was not constructed.
+    """
+
+    if not enterprise_auth_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Person auth is unavailable",
+        )
+    service = getattr(request.app.state, "person_service", None)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Person auth is unavailable",
+        )
+    return service
+
+
+def get_person_token_handler(request: Request) -> Any:
+    """Return the app-bound :class:`PersonTokenHandler` (lazy import to avoid cycle)."""
+
+    handler = getattr(request.app.state, "person_token_handler", None)
+    if handler is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Person auth is unavailable",
+        )
+    return handler
 
 
 def get_enterprise_api_key_service(request: Request) -> ServiceAPIKeyService:
@@ -4154,6 +4417,13 @@ async def enforce_enterprise_request_access(
         # tenant.  Do not use prefix matching here: every sibling /admin route
         # and every subpath remains super-admin-only.
         if method == "GET" and _exact_admin_tenant_detail_id(path) is not None:
+            return
+        # POST /admin/persons/{person_id}/accounts/{account_id} (pending-link
+        # proposal) authorizes super admin OR the target account's tenant admin
+        # inside its handler (PersonService.authorize_link_proposal). Exact
+        # match only: DELETE on the same path (unbind) and every other person
+        # admin route remain super-admin-only.
+        if method == "POST" and _exact_admin_person_link_proposal(path):
             return
         authz.require_super_admin(principal)
         return
@@ -4315,6 +4585,12 @@ def _tenant_role_rank(role: str | None) -> int:
     if normalized is None:
         return 0
     return _TENANT_ROLE_RANK.get(normalized, 0)
+
+
+def tenant_role_is_admin(role: str | None) -> bool:
+    """True when ``role`` ranks at or above tenant admin (admin or owner)."""
+
+    return _tenant_role_rank(role) >= _TENANT_ROLE_RANK[TENANT_ROLE_ADMIN]
 
 
 def _normalize_required_id(value: str, label: str) -> str:
@@ -4737,6 +5013,21 @@ def _exact_admin_tenant_detail_id(path: str) -> str | None:
     ):
         return parts[3]
     return None
+
+
+def _exact_admin_person_link_proposal(path: str) -> bool:
+    """Exact match for /admin/persons/{person_id}/accounts/{account_id}."""
+
+    parts = path.rstrip("/").split("/")
+    return (
+        len(parts) == 6
+        and parts[0] == ""
+        and parts[1] == "admin"
+        and parts[2] == "persons"
+        and bool(parts[3])
+        and parts[4] == "accounts"
+        and bool(parts[5])
+    )
 
 
 def _is_artifact_download_action(path: str) -> bool:

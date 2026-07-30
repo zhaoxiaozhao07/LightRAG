@@ -392,6 +392,31 @@ def validate_auth_configuration(args: argparse.Namespace) -> None:
                             f"{', '.join(sorted(ENTERPRISE_KB_ROLES))}."
                         )
 
+    # Multi-account person auth (Phase 3). Person auth requires enterprise auth
+    # and a signing key that is distinct from the legacy TOKEN_SECRET so that a
+    # rollback to an older binary (which lacks the person key) cannot verify
+    # v2 person tokens. See docs/多账号身份关联与切换执行文档.md section 6.1.
+    person_auth_enabled = bool(getattr(args, "person_auth_enabled", False))
+    if person_auth_enabled:
+        if not enterprise_enabled:
+            raise ValueError(
+                "LIGHTRAG_PERSON_AUTH_ENABLED=true requires "
+                "LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true."
+            )
+        person_token_secret = (
+            getattr(args, "person_token_secret", "") or ""
+        ).strip()
+        if not person_token_secret or person_token_secret == DEFAULT_TOKEN_SECRET:
+            raise ValueError(
+                "LIGHTRAG_PERSON_TOKEN_SECRET must be explicitly set to a "
+                "non-default value when LIGHTRAG_PERSON_AUTH_ENABLED=true."
+            )
+        if person_token_secret == token_secret:
+            raise ValueError(
+                "LIGHTRAG_PERSON_TOKEN_SECRET must differ from TOKEN_SECRET "
+                "so a legacy binary cannot verify person tokens."
+            )
+
 
 def _is_set(value: str | None) -> bool:
     return bool((value or "").strip())
@@ -949,6 +974,40 @@ def parse_args() -> argparse.Namespace:
     )
     args.enterprise_login_lockout_seconds = get_env_value(
         "LIGHTRAG_ENTERPRISE_LOGIN_LOCKOUT_SECONDS", 900.0, float
+    )
+    # Multi-account person identity (Phase 3). These flags are opt-in and must
+    # not change legacy/enterprise behavior unless explicitly set. See
+    # docs/多账号身份关联与切换执行文档.md section 6.
+    args.person_auth_enabled = get_env_value(
+        "LIGHTRAG_PERSON_AUTH_ENABLED", False, bool
+    )
+    args.person_token_secret = get_env_value("LIGHTRAG_PERSON_TOKEN_SECRET", None)
+    args.person_access_token_ttl = get_env_value(
+        "LIGHTRAG_PERSON_ACCESS_TOKEN_TTL", 3600, int
+    )
+    args.person_session_ttl = get_env_value(
+        "LIGHTRAG_PERSON_SESSION_TTL", 28800, int
+    )
+    args.person_login_max_attempts = get_env_value(
+        "LIGHTRAG_PERSON_LOGIN_MAX_ATTEMPTS", 5, int
+    )
+    args.person_password_min_length = get_env_value(
+        "LIGHTRAG_PERSON_PASSWORD_MIN_LENGTH", 8, int
+    )
+    args.person_login_lockout_seconds = get_env_value(
+        "LIGHTRAG_PERSON_LOGIN_LOCKOUT_SECONDS", 900.0, float
+    )
+    # Public /auth/person/enroll rate limiting (per client address). Guards
+    # against enrollment-grant guessing; mirrors the enterprise registration
+    # tracker semantics (0 attempts disables the tracker).
+    args.person_enroll_max_attempts = get_env_value(
+        "LIGHTRAG_PERSON_ENROLL_MAX_ATTEMPTS", 10, int
+    )
+    args.person_enroll_window_seconds = get_env_value(
+        "LIGHTRAG_PERSON_ENROLL_WINDOW_SECONDS", 300.0, float
+    )
+    args.person_enroll_lockout_seconds = get_env_value(
+        "LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS", 900.0, float
     )
     args.enterprise_registration_max_attempts = get_env_value(
         "LIGHTRAG_ENTERPRISE_REGISTRATION_MAX_ATTEMPTS", 10, int

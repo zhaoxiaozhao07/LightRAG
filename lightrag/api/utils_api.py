@@ -19,6 +19,7 @@ from lightrag.api.runtime_validation import validate_runtime_target_from_env_fil
 from fastapi import HTTPException, Security, Request, Response, status
 from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from starlette.status import HTTP_403_FORBIDDEN
+import jwt
 from .auth import auth_handler
 from .config import ollama_server_infos, global_args, get_env_value
 from lightrag.api.enterprise_auth import (
@@ -144,6 +145,46 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
 
         # 2. Validate token first if provided in the request (Ensure 401 error if token is invalid)
         if token:
+            # kid-based deterministic dispatch (doc 6.1). Peek the JOSE header
+            # WITHOUT verifying signature to route person-v1 tokens to the
+            # independent v2 validator. Legacy tokens (no kid) take the original
+            # path below, unchanged. Any failure here raises 401; there is NO
+            # fallback between paths.
+            try:
+                unverified_header = jwt.get_unverified_header(token)
+            except jwt.PyJWTError:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid token",
+                )
+            kid = unverified_header.get("kid")
+            if kid == "person-v1":
+                # v2 person access token. Requires person auth enabled; when
+                # disabled we reject (no fallback to legacy).
+                from lightrag.api.person_auth import (
+                    person_auth_enabled as _person_auth_enabled,
+                    person_account_access_validate,
+                )
+                if not _person_auth_enabled():
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail={"error_code": "person_session_invalid", "message": "Person auth is disabled"},
+                    )
+                person_session = await person_account_access_validate(request, token)
+                principal = person_session.principal
+                request.state.principal = principal
+                request.state.person_session = person_session
+                set_current_principal(principal)
+                await enforce_enterprise_request_access(request, principal)
+                await enforce_enterprise_request_limits(request, principal)
+                return principal
+            elif kid is not None:
+                # kid present but not recognized -> reject, do not fall back.
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Unknown token kid",
+                )
+            # kid is None -> legacy token path (unchanged below).
             try:
                 token_info = auth_handler.validate_token(token)
 

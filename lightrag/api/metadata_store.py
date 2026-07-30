@@ -10,7 +10,7 @@ import threading
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -2180,6 +2180,185 @@ class AuditEventRecord:
         return asdict(self)
 
 
+@dataclass(slots=True)
+class EnterprisePersonRecord:
+    """A natural-person identity that can be linked to multiple accounts."""
+
+    id: str
+    status: str
+    auth_epoch: int
+    metadata: dict[str, Any]
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "EnterprisePersonRecord":
+        return cls(
+            id=str(row["id"]),
+            status=str(row["status"]),
+            auth_epoch=int(row["auth_epoch"]),
+            metadata=_loads_json_object(row["metadata_json"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class EnterprisePersonCredentialRecord:
+    """Strict bcrypt credential for a person (no legacy plaintext fallback)."""
+
+    id: str
+    person_id: str
+    credential_type: str
+    algorithm: str
+    password_hash: str
+    status: str
+    failed_count: int
+    locked_until: str | None
+    last_used_at: str | None
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "EnterprisePersonCredentialRecord":
+        return cls(
+            id=str(row["id"]),
+            person_id=str(row["person_id"]),
+            credential_type=str(row["credential_type"]),
+            algorithm=str(row["algorithm"]),
+            password_hash=str(row["password_hash"]),
+            status=str(row["status"]),
+            failed_count=int(row["failed_count"]),
+            locked_until=row["locked_until"],
+            last_used_at=row["last_used_at"],
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class EnterprisePersonEnrollmentGrantRecord:
+    """One-time enrollment grant signed by a super admin."""
+
+    id: str
+    account_id: str
+    token_hash: str
+    status: str
+    created_by: str | None
+    consumed_by_person: str | None
+    expires_at: str
+    created_at: str
+    updated_at: str
+    consumed_at: str | None
+
+    @classmethod
+    def from_row(
+        cls, row: sqlite3.Row
+    ) -> "EnterprisePersonEnrollmentGrantRecord":
+        return cls(
+            id=str(row["id"]),
+            account_id=str(row["account_id"]),
+            token_hash=str(row["token_hash"]),
+            status=str(row["status"]),
+            created_by=row["created_by"],
+            consumed_by_person=row["consumed_by_person"],
+            expires_at=str(row["expires_at"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+            consumed_at=row["consumed_at"],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class EnterprisePersonAccountLinkRecord:
+    """A binding between a person and an enterprise account."""
+
+    id: str
+    person_id: str
+    account_id: str
+    status: str
+    bound_by: str | None
+    bound_at: str | None
+    confirmed_by_person_at: str | None
+    revoked_by: str | None
+    revoked_at: str | None
+    reason: str | None
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "EnterprisePersonAccountLinkRecord":
+        return cls(
+            id=str(row["id"]),
+            person_id=str(row["person_id"]),
+            account_id=str(row["account_id"]),
+            status=str(row["status"]),
+            bound_by=row["bound_by"],
+            bound_at=row["bound_at"],
+            confirmed_by_person_at=row["confirmed_by_person_at"],
+            revoked_by=row["revoked_by"],
+            revoked_at=row["revoked_at"],
+            reason=row["reason"],
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class EnterprisePersonLoginSessionRecord:
+    """A person login session; identity proven via sid + session_epoch."""
+
+    id: str
+    person_id: str
+    active_account_id: str | None
+    status: str
+    person_epoch: int
+    session_epoch: int
+    absolute_expires_at: str
+    created_at: str
+    last_seen_at: str | None
+    revoked_at: str | None
+    # Snapshot of the active account's token_version at issue/switch time.
+    # account-access validation compares this against the live account row so
+    # that a password reset (which bumps token_version without changing status)
+    # invalidates outstanding v2 account-access tokens. session-control skips
+    # this check (doc 6.4: reset still allows list/switch/logout).
+    account_token_version: int = 0
+
+    @classmethod
+    def from_row(
+        cls, row: sqlite3.Row
+    ) -> "EnterprisePersonLoginSessionRecord":
+        return cls(
+            id=str(row["id"]),
+            person_id=str(row["person_id"]),
+            active_account_id=row["active_account_id"],
+            status=str(row["status"]),
+            person_epoch=int(row["person_epoch"]),
+            session_epoch=int(row["session_epoch"]),
+            absolute_expires_at=str(row["absolute_expires_at"]),
+            created_at=str(row["created_at"]),
+            last_seen_at=row["last_seen_at"],
+            revoked_at=row["revoked_at"],
+            account_token_version=int(row["account_token_version"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def _dumps_json(value: dict[str, Any] | None) -> str:
     return json.dumps(value or {}, ensure_ascii=False, sort_keys=True)
 
@@ -2191,6 +2370,38 @@ def _loads_json_object(value: str | bytes | None) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         raise MetadataStoreError("Metadata JSON must be an object")
     return loaded
+
+
+def _new_audit_id() -> str:
+    return f"audit_{secrets.token_hex(12)}"
+
+
+def _insert_audit_event(conn: sqlite3.Connection, event: AuditEventRecord) -> None:
+    """Insert an audit row inside an in-flight _write() transaction.
+
+    Person identity events are platform-level: callers pass
+    ``actor_tenant_id=None``. Use this instead of the public
+    ``AuditService.append`` to avoid opening a nested write transaction.
+    """
+
+    conn.execute(
+        """
+        INSERT INTO enterprise_audit_events (
+            id, event_type, actor_user_id, actor_tenant_id, target_type,
+            target_id, metadata_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event.id,
+            event.event_type,
+            event.actor_user_id,
+            event.actor_tenant_id,
+            event.target_type,
+            event.target_id,
+            _dumps_json(event.metadata),
+            event.created_at,
+        ),
+    )
 
 
 def _loads_optional_json_object(value: str | bytes | None) -> dict[str, Any] | None:
@@ -4110,6 +4321,26 @@ class SQLiteMetadataStore:
                     ],
                     expected_membership=expected_membership,
                 )
+            # Person identity lifecycle: revoke person login sessions pointing
+            # at this account and remove person-account links BEFORE deleting
+            # the account row. Links would otherwise CASCADE-delete (SQLite
+            # honors ON DELETE CASCADE with PRAGMA foreign_keys=ON) but the
+            # explicit delete is clearer and safer; sessions are revoked so no
+            # active session can survive pointing at a deleted account. Both
+            # the revoke and the audit row stay inside this transaction.
+            now = utc_now_iso()
+            self._sqlite_revoke_person_sessions_locked(
+                conn,
+                None,
+                account_id=user_id,
+                actor_user_id=None,
+                now=now,
+                audit_event_type="person_session_revoked_by_account_change",
+            )
+            conn.execute(
+                "DELETE FROM enterprise_person_account_links WHERE account_id = ?",
+                (user_id,),
+            )
             # Cascade: remove related records first.
             conn.execute(
                 "DELETE FROM enterprise_tenant_memberships WHERE user_id = ?",
@@ -5472,6 +5703,23 @@ class SQLiteMetadataStore:
                     actor_user_id=actor_user_id or user_id,
                     actor_tenant_id=actor_tenant_id,
                 )
+
+            # Person identity lifecycle: revoke person login sessions pointing
+            # at this account and remove person-account links BEFORE deleting
+            # the account row (see delete_enterprise_user for rationale).
+            now = utc_now_iso()
+            self._sqlite_revoke_person_sessions_locked(
+                conn,
+                None,
+                account_id=user_id,
+                actor_user_id=actor_user_id,
+                now=now,
+                audit_event_type="person_session_revoked_by_account_change",
+            )
+            conn.execute(
+                "DELETE FROM enterprise_person_account_links WHERE account_id = ?",
+                (user_id,),
+            )
 
             conn.execute(
                 "DELETE FROM enterprise_tenant_memberships WHERE user_id = ?",
@@ -10035,6 +10283,1531 @@ class SQLiteMetadataStore:
 
         return await self._write(write)
 
+    # ------------------------------------------------------------------
+    # Multi-account person identity store (SQLite)
+    #
+    # Simple reads/writes plus aggregate atomic methods. The atomic methods
+    # perform state reads, CAS, multi-table writes and audit-row inserts
+    # inside a single ``_write()`` transaction. They never call the public
+    # ``AuditService.append`` (which opens its own write transaction) nor
+    # nest another ``_write()``. See docs/多账号身份关联与切换执行文档.md 7.2.
+    # ------------------------------------------------------------------
+
+    async def get_person_by_id(
+        self, person_id: str
+    ) -> EnterprisePersonRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_persons WHERE id = ?", (person_id,)
+            ).fetchone()
+        return EnterprisePersonRecord.from_row(row) if row is not None else None
+
+    async def list_person_account_links(
+        self, person_id: str, *, only_active: bool = False
+    ) -> list[EnterprisePersonAccountLinkRecord]:
+        await self._ensure_initialized()
+        if only_active:
+            sql = (
+                "SELECT * FROM enterprise_person_account_links "
+                "WHERE person_id = ? AND status = 'active' "
+                "ORDER BY bound_at ASC, id ASC"
+            )
+        else:
+            sql = (
+                "SELECT * FROM enterprise_person_account_links "
+                "WHERE person_id = ? ORDER BY status ASC, id ASC"
+            )
+        with self._connect() as conn:
+            rows = conn.execute(sql, (person_id,)).fetchall()
+        return [EnterprisePersonAccountLinkRecord.from_row(row) for row in rows]
+
+    async def get_person_account_link(
+        self, person_id: str, account_id: str
+    ) -> EnterprisePersonAccountLinkRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_account_links "
+                "WHERE person_id = ? AND account_id = ?",
+                (person_id, account_id),
+            ).fetchone()
+        return (
+            EnterprisePersonAccountLinkRecord.from_row(row)
+            if row is not None
+            else None
+        )
+
+    async def get_active_person_link_for_account(
+        self, account_id: str
+    ) -> EnterprisePersonAccountLinkRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_account_links "
+                "WHERE account_id = ? AND status = 'active'",
+                (account_id,),
+            ).fetchone()
+        return (
+            EnterprisePersonAccountLinkRecord.from_row(row)
+            if row is not None
+            else None
+        )
+
+    async def get_person_credential(
+        self, person_id: str
+    ) -> EnterprisePersonCredentialRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_credentials "
+                "WHERE person_id = ? AND credential_type = 'password' "
+                "AND status = 'active'",
+                (person_id,),
+            ).fetchone()
+        return (
+            EnterprisePersonCredentialRecord.from_row(row)
+            if row is not None
+            else None
+        )
+
+    async def record_person_credential_failure_atomic(
+        self,
+        credential_id: str,
+        *,
+        max_attempts: int,
+        lockout_seconds: float,
+        now: str | None = None,
+    ) -> EnterprisePersonCredentialRecord:
+        """Atomically count a failed person-password attempt.
+
+        The increment happens in SQL (``failed_count = failed_count + 1``) so
+        concurrent failures never lose counts. When the new count reaches
+        ``max_attempts`` the credential is locked for ``lockout_seconds`` and a
+        ``person_login_locked`` audit row is written; every failure writes a
+        ``person_login_failed`` row. Failure events carry no actor (doc 7.3:
+        failures must not fabricate an actor).
+        """
+
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterprisePersonCredentialRecord:
+            timestamp = now or utc_now_iso()
+            cursor = conn.execute(
+                "UPDATE enterprise_person_credentials "
+                "SET failed_count = failed_count + 1, updated_at = ? "
+                "WHERE id = ?",
+                (timestamp, credential_id),
+            )
+            if not cursor.rowcount:
+                raise MetadataRecordNotFoundError(
+                    f"Person credential '{credential_id}' not found"
+                )
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_credentials WHERE id = ?",
+                (credential_id,),
+            ).fetchone()
+            assert row is not None
+            current = EnterprisePersonCredentialRecord.from_row(row)
+            locked = False
+            if max_attempts > 0 and current.failed_count >= max_attempts:
+                locked_until = (
+                    datetime.fromisoformat(timestamp)
+                    + timedelta(seconds=float(lockout_seconds))
+                ).isoformat()
+                conn.execute(
+                    "UPDATE enterprise_person_credentials "
+                    "SET locked_until = ? WHERE id = ?",
+                    (locked_until, credential_id),
+                )
+                current = replace(current, locked_until=locked_until)
+                locked = True
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_login_failed",
+                    actor_user_id=None,
+                    actor_tenant_id=None,
+                    target_type="person_credential",
+                    target_id=credential_id,
+                    metadata={
+                        "person_id": current.person_id,
+                        "failed_count": current.failed_count,
+                    },
+                    created_at=timestamp,
+                ),
+            )
+            if locked:
+                _insert_audit_event(
+                    conn,
+                    AuditEventRecord(
+                        id=_new_audit_id(),
+                        event_type="person_login_locked",
+                        actor_user_id=None,
+                        actor_tenant_id=None,
+                        target_type="person_credential",
+                        target_id=credential_id,
+                        metadata={
+                            "person_id": current.person_id,
+                            "failed_count": current.failed_count,
+                            "locked_until": current.locked_until,
+                        },
+                        created_at=timestamp,
+                    ),
+                )
+            return current
+
+        return await self._write(write)
+
+    async def reset_person_credential_failures_atomic(
+        self,
+        credential_id: str,
+        *,
+        now: str | None = None,
+    ) -> None:
+        """Clear failure counters after a successful person authentication."""
+
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> None:
+            timestamp = now or utc_now_iso()
+            conn.execute(
+                "UPDATE enterprise_person_credentials "
+                "SET failed_count = 0, locked_until = NULL, last_used_at = ?, "
+                "updated_at = ? WHERE id = ?",
+                (timestamp, timestamp, credential_id),
+            )
+
+        await self._write(write)
+
+    async def get_person_login_session(
+        self, session_id: str
+    ) -> EnterprisePersonLoginSessionRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_login_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        return (
+            EnterprisePersonLoginSessionRecord.from_row(row)
+            if row is not None
+            else None
+        )
+
+    async def list_person_login_sessions(
+        self, person_id: str, *, only_active: bool = False
+    ) -> list[EnterprisePersonLoginSessionRecord]:
+        await self._ensure_initialized()
+        if only_active:
+            sql = (
+                "SELECT * FROM enterprise_person_login_sessions "
+                "WHERE person_id = ? AND status = 'active' "
+                "ORDER BY created_at ASC, id ASC"
+            )
+        else:
+            sql = (
+                "SELECT * FROM enterprise_person_login_sessions "
+                "WHERE person_id = ? ORDER BY created_at DESC, id DESC"
+            )
+        with self._connect() as conn:
+            rows = conn.execute(sql, (person_id,)).fetchall()
+        return [EnterprisePersonLoginSessionRecord.from_row(row) for row in rows]
+
+    async def get_person_enrollment_grant_by_token_hash(
+        self, token_hash: str
+    ) -> EnterprisePersonEnrollmentGrantRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_enrollment_grants "
+                "WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+        return (
+            EnterprisePersonEnrollmentGrantRecord.from_row(row)
+            if row is not None
+            else None
+        )
+
+    async def get_person_enrollment_grant(
+        self, grant_id: str
+    ) -> EnterprisePersonEnrollmentGrantRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_enrollment_grants WHERE id = ?",
+                (grant_id,),
+            ).fetchone()
+        return (
+            EnterprisePersonEnrollmentGrantRecord.from_row(row)
+            if row is not None
+            else None
+        )
+
+    def _sqlite_revoke_person_sessions_locked(
+        self,
+        conn: sqlite3.Connection,
+        person_id: str | None,
+        *,
+        account_id: str | None,
+        actor_user_id: str | None,
+        now: str,
+        audit_event_type: str,
+    ) -> int:
+        """Revoke matching active person sessions and emit one audit row each.
+
+        Exactly one of ``person_id``/``account_id`` scopes the match. Returns
+        the number of sessions revoked. Called inside a _write() transaction.
+        """
+
+        if person_id is not None:
+            match_clause = "person_id = ? AND status = 'active'"
+            params: tuple[Any, ...] = (person_id,)
+        else:
+            assert account_id is not None
+            match_clause = "active_account_id = ? AND status = 'active'"
+            params = (account_id,)
+        rows = conn.execute(
+            f"SELECT id, person_id FROM enterprise_person_login_sessions "
+            f"WHERE {match_clause}",
+            params,
+        ).fetchall()
+        for srow in rows:
+            sid = str(srow["id"])
+            sperson = srow["person_id"]
+            conn.execute(
+                "UPDATE enterprise_person_login_sessions "
+                "SET status = 'revoked', revoked_at = ?, last_seen_at = ? "
+                "WHERE id = ? AND status = 'active'",
+                (now, now, sid),
+            )
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type=audit_event_type,
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person_login_session",
+                    target_id=sid,
+                    metadata={
+                        "person_id": sperson,
+                        "account_id": account_id,
+                    },
+                    created_at=now,
+                ),
+            )
+        return len(rows)
+
+    async def create_person_enrollment_grant_atomic(
+        self,
+        grant: EnterprisePersonEnrollmentGrantRecord,
+        *,
+        actor_user_id: str | None = None,
+    ) -> EnterprisePersonEnrollmentGrantRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterprisePersonEnrollmentGrantRecord:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO enterprise_person_enrollment_grants (
+                        id, account_id, token_hash, status, created_by,
+                        consumed_by_person, expires_at, created_at, updated_at,
+                        consumed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        grant.id,
+                        grant.account_id,
+                        grant.token_hash,
+                        grant.status,
+                        grant.created_by,
+                        grant.consumed_by_person,
+                        grant.expires_at,
+                        grant.created_at,
+                        grant.updated_at,
+                        grant.consumed_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise MetadataConflictError(
+                    "person_enrollment_grant_active",
+                    grant.account_id,
+                    expected={"status": "no active grant"},
+                    current={"error": str(exc)},
+                ) from exc
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_enrollment_grant_created",
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person_enrollment_grant",
+                    target_id=grant.id,
+                    metadata={"account_id": grant.account_id},
+                    created_at=grant.created_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_enrollment_grants WHERE id = ?",
+                (grant.id,),
+            ).fetchone()
+            assert row is not None
+            return EnterprisePersonEnrollmentGrantRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def revoke_person_enrollment_grant_atomic(
+        self,
+        grant_id: str,
+        *,
+        actor_user_id: str | None = None,
+        revoked_at: str | None = None,
+        reason: str | None = None,
+    ) -> EnterprisePersonEnrollmentGrantRecord | None:
+        await self._ensure_initialized()
+
+        def write(
+            conn: sqlite3.Connection,
+        ) -> EnterprisePersonEnrollmentGrantRecord | None:
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_enrollment_grants WHERE id = ?",
+                (grant_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            current = EnterprisePersonEnrollmentGrantRecord.from_row(row)
+            if current.status == "active":
+                now = revoked_at or utc_now_iso()
+                conn.execute(
+                    """
+                    UPDATE enterprise_person_enrollment_grants
+                    SET status = 'revoked', updated_at = ?
+                    WHERE id = ? AND status = 'active'
+                    """,
+                    (now, grant_id),
+                )
+                current = replace(
+                    current, status="revoked", updated_at=now
+                )
+                _insert_audit_event(
+                    conn,
+                    AuditEventRecord(
+                        id=_new_audit_id(),
+                        event_type="person_enrollment_grant_revoked",
+                        actor_user_id=actor_user_id,
+                        actor_tenant_id=None,
+                        target_type="person_enrollment_grant",
+                        target_id=grant_id,
+                        metadata={
+                            "account_id": current.account_id,
+                            "reason": reason,
+                        },
+                        created_at=now,
+                    ),
+                )
+            return current
+
+        return await self._write(write)
+
+    async def consume_enrollment_grant_atomic(
+        self,
+        token_hash: str,
+        *,
+        person_id: str,
+        actor_user_id: str | None = None,
+        consumed_at: str | None = None,
+    ) -> EnterprisePersonEnrollmentGrantRecord:
+        """Atomically consume (active->consumed) an enrollment grant.
+
+        Raises ``MetadataRecordNotFoundError`` if absent and
+        ``MetadataConflictError`` if not active or already expired. Used as a
+        standalone CAS primitive; ``enroll_person_atomic`` inlines the same
+        consumption so the full enroll stays in one transaction.
+        """
+
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterprisePersonEnrollmentGrantRecord:
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_enrollment_grants "
+                "WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+            if row is None:
+                raise MetadataRecordNotFoundError(
+                    "Enrollment grant for token hash not found"
+                )
+            current = EnterprisePersonEnrollmentGrantRecord.from_row(row)
+            now = consumed_at or utc_now_iso()
+            if current.status != "active":
+                raise MetadataConflictError(
+                    "person_enrollment_grant",
+                    current.id,
+                    expected={"status": "active"},
+                    current={"status": current.status},
+                )
+            if current.expires_at <= now:
+                conn.execute(
+                    """
+                    UPDATE enterprise_person_enrollment_grants
+                    SET status = 'expired', updated_at = ?
+                    WHERE id = ? AND status = 'active'
+                    """,
+                    (now, current.id),
+                )
+                raise MetadataConflictError(
+                    "person_enrollment_grant",
+                    current.id,
+                    expected={"status": "active", "not_expired": True},
+                    current={"status": "expired"},
+                )
+            conn.execute(
+                """
+                UPDATE enterprise_person_enrollment_grants
+                SET status = 'consumed', consumed_by_person = ?,
+                    consumed_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (person_id, now, now, current.id),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_enrollment_grants WHERE id = ?",
+                (current.id,),
+            ).fetchone()
+            assert row is not None
+            return EnterprisePersonEnrollmentGrantRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def enroll_person_atomic(
+        self,
+        *,
+        grant_token_hash: str,
+        person: EnterprisePersonRecord,
+        credential: EnterprisePersonCredentialRecord,
+        link: EnterprisePersonAccountLinkRecord,
+        session: EnterprisePersonLoginSessionRecord,
+        actor_user_id: str | None = None,
+    ) -> tuple[
+        EnterprisePersonRecord,
+        EnterprisePersonCredentialRecord,
+        EnterprisePersonAccountLinkRecord,
+        EnterprisePersonLoginSessionRecord,
+    ]:
+        await self._ensure_initialized()
+
+        def write(
+            conn: sqlite3.Connection,
+        ) -> tuple[
+            EnterprisePersonRecord,
+            EnterprisePersonCredentialRecord,
+            EnterprisePersonAccountLinkRecord,
+            EnterprisePersonLoginSessionRecord,
+        ]:
+            now = utc_now_iso()
+            grow = conn.execute(
+                "SELECT * FROM enterprise_person_enrollment_grants "
+                "WHERE token_hash = ?",
+                (grant_token_hash,),
+            ).fetchone()
+            if grow is None:
+                raise MetadataRecordNotFoundError(
+                    "Enrollment grant for token hash not found"
+                )
+            grant_rec = EnterprisePersonEnrollmentGrantRecord.from_row(grow)
+            if grant_rec.status != "active":
+                raise MetadataConflictError(
+                    "person_enrollment_grant",
+                    grant_rec.id,
+                    expected={"status": "active"},
+                    current={"status": grant_rec.status},
+                )
+            if grant_rec.expires_at <= now:
+                raise MetadataConflictError(
+                    "person_enrollment_grant",
+                    grant_rec.id,
+                    expected={"status": "active", "not_expired": True},
+                    current={"status": "expired"},
+                )
+            # Proactive active-link conflict check (clear error in the common
+            # case); the partial unique index is the final concurrency arbiter.
+            clash = conn.execute(
+                "SELECT id FROM enterprise_person_account_links "
+                "WHERE account_id = ? AND status = 'active'",
+                (link.account_id,),
+            ).fetchone()
+            if clash is not None:
+                raise MetadataConflictError(
+                    "person_account_link_active",
+                    link.account_id,
+                    expected={"status": "no active link"},
+                    current={"status": "already_linked"},
+                )
+            # Consume grant first.
+            conn.execute(
+                """
+                UPDATE enterprise_person_enrollment_grants
+                SET status = 'consumed', consumed_by_person = ?,
+                    consumed_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (person.id, now, now, grant_rec.id),
+            )
+            conn.execute(
+                """
+                INSERT INTO enterprise_persons (
+                    id, status, auth_epoch, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    person.id,
+                    person.status,
+                    person.auth_epoch,
+                    _dumps_json(person.metadata),
+                    person.created_at,
+                    person.updated_at,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO enterprise_person_credentials (
+                    id, person_id, credential_type, algorithm, password_hash,
+                    status, failed_count, locked_until, last_used_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    credential.id,
+                    credential.person_id,
+                    credential.credential_type,
+                    credential.algorithm,
+                    credential.password_hash,
+                    credential.status,
+                    credential.failed_count,
+                    credential.locked_until,
+                    credential.last_used_at,
+                    credential.created_at,
+                    credential.updated_at,
+                ),
+            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO enterprise_person_account_links (
+                        id, person_id, account_id, status, bound_by, bound_at,
+                        confirmed_by_person_at, revoked_by, revoked_at, reason,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        link.id,
+                        link.person_id,
+                        link.account_id,
+                        link.status,
+                        link.bound_by,
+                        link.bound_at,
+                        link.confirmed_by_person_at,
+                        link.revoked_by,
+                        link.revoked_at,
+                        link.reason,
+                        link.created_at,
+                        link.updated_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise MetadataConflictError(
+                    "person_account_link_active",
+                    link.account_id,
+                    expected={"status": "no active link"},
+                    current={"error": str(exc)},
+                ) from exc
+            # Snapshot the active account's token_version so v2 account-access
+            # validation can detect a password reset (doc 4.5/6.4).
+            acct_row = conn.execute(
+                "SELECT token_version FROM enterprise_users WHERE id = ?",
+                (link.account_id,),
+            ).fetchone()
+            account_token_version = (
+                int(acct_row["token_version"]) if acct_row is not None else 0
+            )
+            conn.execute(
+                """
+                INSERT INTO enterprise_person_login_sessions (
+                    id, person_id, active_account_id, status, person_epoch,
+                    session_epoch, absolute_expires_at, created_at,
+                    last_seen_at, revoked_at, account_token_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session.id,
+                    session.person_id,
+                    session.active_account_id,
+                    session.status,
+                    session.person_epoch,
+                    session.session_epoch,
+                    session.absolute_expires_at,
+                    session.created_at,
+                    session.last_seen_at,
+                    session.revoked_at,
+                    account_token_version,
+                ),
+            )
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_enrolled",
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person",
+                    target_id=person.id,
+                    metadata={
+                        "person_id": person.id,
+                        "account_id": link.account_id,
+                        "grant_id": grant_rec.id,
+                        "session_id": session.id,
+                    },
+                    created_at=now,
+                ),
+            )
+            prow = conn.execute(
+                "SELECT * FROM enterprise_persons WHERE id = ?", (person.id,)
+            ).fetchone()
+            crow = conn.execute(
+                "SELECT * FROM enterprise_person_credentials WHERE id = ?",
+                (credential.id,),
+            ).fetchone()
+            lrow = conn.execute(
+                "SELECT * FROM enterprise_person_account_links WHERE id = ?",
+                (link.id,),
+            ).fetchone()
+            srow = conn.execute(
+                "SELECT * FROM enterprise_person_login_sessions WHERE id = ?",
+                (session.id,),
+            ).fetchone()
+            assert prow is not None and crow is not None
+            assert lrow is not None and srow is not None
+            return (
+                EnterprisePersonRecord.from_row(prow),
+                EnterprisePersonCredentialRecord.from_row(crow),
+                EnterprisePersonAccountLinkRecord.from_row(lrow),
+                EnterprisePersonLoginSessionRecord.from_row(srow),
+            )
+
+        return await self._write(write)
+
+    async def create_person_session_atomic(
+        self,
+        session: EnterprisePersonLoginSessionRecord,
+        *,
+        expected_person_epoch: int,
+        actor_user_id: str | None = None,
+    ) -> EnterprisePersonLoginSessionRecord:
+        await self._ensure_initialized()
+
+        def write(
+            conn: sqlite3.Connection,
+        ) -> EnterprisePersonLoginSessionRecord:
+            now = session.created_at
+            prow = conn.execute(
+                "SELECT * FROM enterprise_persons WHERE id = ?",
+                (session.person_id,),
+            ).fetchone()
+            if prow is None:
+                raise MetadataRecordNotFoundError(
+                    f"Person '{session.person_id}' not found"
+                )
+            current_person = EnterprisePersonRecord.from_row(prow)
+            if current_person.status != "active":
+                raise MetadataConflictError(
+                    "person",
+                    session.person_id,
+                    expected={"status": "active"},
+                    current={"status": current_person.status},
+                )
+            if current_person.auth_epoch != expected_person_epoch:
+                raise MetadataConflictError(
+                    "person",
+                    session.person_id,
+                    expected={"auth_epoch": expected_person_epoch},
+                    current={"auth_epoch": current_person.auth_epoch},
+                )
+            # Snapshot the active account's token_version (doc 4.5/6.4).
+            account_token_version = 0
+            if session.active_account_id:
+                acct_row = conn.execute(
+                    "SELECT token_version FROM enterprise_users WHERE id = ?",
+                    (session.active_account_id,),
+                ).fetchone()
+                if acct_row is not None:
+                    account_token_version = int(acct_row["token_version"])
+            conn.execute(
+                """
+                INSERT INTO enterprise_person_login_sessions (
+                    id, person_id, active_account_id, status, person_epoch,
+                    session_epoch, absolute_expires_at, created_at,
+                    last_seen_at, revoked_at, account_token_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session.id,
+                    session.person_id,
+                    session.active_account_id,
+                    session.status,
+                    session.person_epoch,
+                    session.session_epoch,
+                    session.absolute_expires_at,
+                    session.created_at,
+                    session.last_seen_at,
+                    session.revoked_at,
+                    account_token_version,
+                ),
+            )
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_login_succeeded",
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person_login_session",
+                    target_id=session.id,
+                    metadata={
+                        "person_id": session.person_id,
+                        "account_id": session.active_account_id,
+                    },
+                    created_at=now,
+                ),
+            )
+            srow = conn.execute(
+                "SELECT * FROM enterprise_person_login_sessions WHERE id = ?",
+                (session.id,),
+            ).fetchone()
+            assert srow is not None
+            return EnterprisePersonLoginSessionRecord.from_row(srow)
+
+        return await self._write(write)
+
+    async def switch_person_session_atomic(
+        self,
+        *,
+        session_id: str,
+        expected_session_epoch: int,
+        target_account_id: str,
+        actor_user_id: str | None = None,
+        switched_at: str | None = None,
+    ) -> EnterprisePersonLoginSessionRecord:
+        await self._ensure_initialized()
+
+        def write(
+            conn: sqlite3.Connection,
+        ) -> EnterprisePersonLoginSessionRecord:
+            now = switched_at or utc_now_iso()
+            srow = conn.execute(
+                "SELECT * FROM enterprise_person_login_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if srow is None:
+                raise MetadataRecordNotFoundError(
+                    f"Person login session '{session_id}' not found"
+                )
+            current = EnterprisePersonLoginSessionRecord.from_row(srow)
+            if current.status != "active":
+                raise MetadataConflictError(
+                    "person_login_session",
+                    session_id,
+                    expected={"status": "active"},
+                    current={"status": current.status},
+                )
+            if current.session_epoch != expected_session_epoch:
+                raise MetadataConflictError(
+                    "person_login_session",
+                    session_id,
+                    expected={"session_epoch": expected_session_epoch},
+                    current={"session_epoch": current.session_epoch},
+                )
+            if current.absolute_expires_at <= now:
+                raise MetadataConflictError(
+                    "person_login_session",
+                    session_id,
+                    expected={"not_expired": True},
+                    current={"status": "expired"},
+                )
+            link_row = conn.execute(
+                "SELECT * FROM enterprise_person_account_links "
+                "WHERE person_id = ? AND account_id = ? AND status = 'active'",
+                (current.person_id, target_account_id),
+            ).fetchone()
+            if link_row is None:
+                raise MetadataRecordNotFoundError(
+                    "Target account is not an active person link"
+                )
+            source_account = current.active_account_id
+            # Snapshot the target account's token_version on switch (doc 4.5).
+            target_acct_row = conn.execute(
+                "SELECT token_version FROM enterprise_users WHERE id = ?",
+                (target_account_id,),
+            ).fetchone()
+            target_token_version = (
+                int(target_acct_row["token_version"])
+                if target_acct_row is not None
+                else 0
+            )
+            conn.execute(
+                """
+                UPDATE enterprise_person_login_sessions
+                SET active_account_id = ?, session_epoch = ?, last_seen_at = ?,
+                    account_token_version = ?
+                WHERE id = ?
+                """,
+                (
+                    target_account_id,
+                    current.session_epoch + 1,
+                    now,
+                    target_token_version,
+                    session_id,
+                ),
+            )
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_account_switched",
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person_login_session",
+                    target_id=session_id,
+                    metadata={
+                        "person_id": current.person_id,
+                        "source_account_id": source_account,
+                        "target_account_id": target_account_id,
+                    },
+                    created_at=now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_login_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            assert row is not None
+            return EnterprisePersonLoginSessionRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def rotate_person_credential_atomic(
+        self,
+        *,
+        person_id: str,
+        new_credential: EnterprisePersonCredentialRecord,
+        actor_user_id: str | None = None,
+    ) -> tuple[EnterprisePersonRecord, EnterprisePersonCredentialRecord]:
+        await self._ensure_initialized()
+
+        def write(
+            conn: sqlite3.Connection,
+        ) -> tuple[EnterprisePersonRecord, EnterprisePersonCredentialRecord]:
+            now = new_credential.updated_at
+            prow = conn.execute(
+                "SELECT * FROM enterprise_persons WHERE id = ?", (person_id,)
+            ).fetchone()
+            if prow is None:
+                raise MetadataRecordNotFoundError(
+                    f"Person '{person_id}' not found"
+                )
+            current_person = EnterprisePersonRecord.from_row(prow)
+            if current_person.status != "active":
+                raise MetadataConflictError(
+                    "person",
+                    person_id,
+                    expected={"status": "active"},
+                    current={"status": current_person.status},
+                )
+            # Per doc 4.2 the UNIQUE(person_id, credential_type) constraint
+            # means rotation UPDATES the existing active row in place (new
+            # bcrypt hash, reset failure counters) rather than inserting a new
+            # row and revoking the old one.
+            existing_cred_row = conn.execute(
+                "SELECT * FROM enterprise_person_credentials "
+                "WHERE person_id = ? AND credential_type = 'password' "
+                "AND status = 'active'",
+                (person_id,),
+            ).fetchone()
+            if existing_cred_row is None:
+                raise MetadataRecordNotFoundError(
+                    f"Active password credential for person '{person_id}' not found"
+                )
+            existing_cred = EnterprisePersonCredentialRecord.from_row(
+                existing_cred_row
+            )
+            conn.execute(
+                """
+                UPDATE enterprise_person_credentials
+                SET algorithm = ?, password_hash = ?, failed_count = 0,
+                    locked_until = NULL, last_used_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    new_credential.algorithm,
+                    new_credential.password_hash,
+                    now,
+                    existing_cred.id,
+                ),
+            )
+            new_epoch = current_person.auth_epoch + 1
+            conn.execute(
+                "UPDATE enterprise_persons SET auth_epoch = ?, updated_at = ? "
+                "WHERE id = ?",
+                (new_epoch, now, person_id),
+            )
+            self._sqlite_revoke_person_sessions_locked(
+                conn,
+                person_id,
+                account_id=None,
+                actor_user_id=actor_user_id,
+                now=now,
+                audit_event_type="person_session_revoked_by_credential_rotation",
+            )
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_credential_rotated",
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person",
+                    target_id=person_id,
+                    metadata={
+                        "person_id": person_id,
+                        "credential_id": existing_cred.id,
+                        "auth_epoch": new_epoch,
+                    },
+                    created_at=now,
+                ),
+            )
+            prow = conn.execute(
+                "SELECT * FROM enterprise_persons WHERE id = ?", (person_id,)
+            ).fetchone()
+            crow = conn.execute(
+                "SELECT * FROM enterprise_person_credentials WHERE id = ?",
+                (existing_cred.id,),
+            ).fetchone()
+            assert prow is not None and crow is not None
+            return (
+                EnterprisePersonRecord.from_row(prow),
+                EnterprisePersonCredentialRecord.from_row(crow),
+            )
+
+        return await self._write(write)
+
+    async def disable_person_atomic(
+        self,
+        *,
+        person_id: str,
+        actor_user_id: str | None = None,
+        reason: str | None = None,
+        disabled_at: str | None = None,
+    ) -> EnterprisePersonRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterprisePersonRecord:
+            now = disabled_at or utc_now_iso()
+            prow = conn.execute(
+                "SELECT * FROM enterprise_persons WHERE id = ?", (person_id,)
+            ).fetchone()
+            if prow is None:
+                raise MetadataRecordNotFoundError(
+                    f"Person '{person_id}' not found"
+                )
+            current_person = EnterprisePersonRecord.from_row(prow)
+            new_epoch = current_person.auth_epoch + 1
+            conn.execute(
+                "UPDATE enterprise_persons SET status = 'disabled', "
+                "auth_epoch = ?, updated_at = ? WHERE id = ?",
+                (new_epoch, now, person_id),
+            )
+            self._sqlite_revoke_person_sessions_locked(
+                conn,
+                person_id,
+                account_id=None,
+                actor_user_id=actor_user_id,
+                now=now,
+                audit_event_type="person_session_revoked_by_person_disable",
+            )
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_disabled",
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person",
+                    target_id=person_id,
+                    metadata={
+                        "person_id": person_id,
+                        "reason": reason,
+                        "auth_epoch": new_epoch,
+                    },
+                    created_at=now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_persons WHERE id = ?", (person_id,)
+            ).fetchone()
+            assert row is not None
+            return EnterprisePersonRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def enable_person_atomic(
+        self,
+        *,
+        person_id: str,
+        actor_user_id: str | None = None,
+        enabled_at: str | None = None,
+    ) -> EnterprisePersonRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterprisePersonRecord:
+            now = enabled_at or utc_now_iso()
+            prow = conn.execute(
+                "SELECT * FROM enterprise_persons WHERE id = ?", (person_id,)
+            ).fetchone()
+            if prow is None:
+                raise MetadataRecordNotFoundError(
+                    f"Person '{person_id}' not found"
+                )
+            conn.execute(
+                "UPDATE enterprise_persons SET status = 'active', "
+                "updated_at = ? WHERE id = ?",
+                (now, person_id),
+            )
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_enabled",
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person",
+                    target_id=person_id,
+                    metadata={"person_id": person_id},
+                    created_at=now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_persons WHERE id = ?", (person_id,)
+            ).fetchone()
+            assert row is not None
+            return EnterprisePersonRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def propose_person_account_link_atomic(
+        self,
+        link: EnterprisePersonAccountLinkRecord,
+        *,
+        actor_user_id: str | None = None,
+    ) -> EnterprisePersonAccountLinkRecord:
+        await self._ensure_initialized()
+
+        def write(
+            conn: sqlite3.Connection,
+        ) -> EnterprisePersonAccountLinkRecord:
+            existing_row = conn.execute(
+                "SELECT * FROM enterprise_person_account_links "
+                "WHERE person_id = ? AND account_id = ?",
+                (link.person_id, link.account_id),
+            ).fetchone()
+            now = link.updated_at
+            if existing_row is not None:
+                existing = EnterprisePersonAccountLinkRecord.from_row(existing_row)
+                if existing.status == "pending":
+                    return existing
+                if existing.status == "active":
+                    raise MetadataConflictError(
+                        "person_account_link",
+                        f"{link.person_id}:{link.account_id}",
+                        expected={"status": "not active"},
+                        current={"status": "active"},
+                    )
+                # Revoked -> re-propose as pending.
+                conn.execute(
+                    """
+                    UPDATE enterprise_person_account_links
+                    SET status = 'pending', bound_by = ?, bound_at = ?,
+                        confirmed_by_person_at = ?, revoked_by = ?,
+                        revoked_at = ?, reason = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        link.bound_by,
+                        link.bound_at,
+                        None,
+                        None,
+                        None,
+                        link.reason,
+                        now,
+                        existing.id,
+                    ),
+                )
+                link_id = existing.id
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO enterprise_person_account_links (
+                        id, person_id, account_id, status, bound_by, bound_at,
+                        confirmed_by_person_at, revoked_by, revoked_at, reason,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        link.id,
+                        link.person_id,
+                        link.account_id,
+                        "pending",
+                        link.bound_by,
+                        link.bound_at,
+                        link.confirmed_by_person_at,
+                        link.revoked_by,
+                        link.revoked_at,
+                        link.reason,
+                        link.created_at,
+                        link.updated_at,
+                    ),
+                )
+                link_id = link.id
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_account_link_proposed",
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person_account_link",
+                    target_id=link_id,
+                    metadata={
+                        "person_id": link.person_id,
+                        "account_id": link.account_id,
+                    },
+                    created_at=now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_account_links WHERE id = ?",
+                (link_id,),
+            ).fetchone()
+            assert row is not None
+            return EnterprisePersonAccountLinkRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def confirm_person_account_link_atomic(
+        self,
+        *,
+        person_id: str,
+        account_id: str,
+        actor_user_id: str | None = None,
+        confirmed_at: str | None = None,
+    ) -> tuple[EnterprisePersonRecord, EnterprisePersonAccountLinkRecord]:
+        await self._ensure_initialized()
+
+        def write(
+            conn: sqlite3.Connection,
+        ) -> tuple[EnterprisePersonRecord, EnterprisePersonAccountLinkRecord]:
+            now = confirmed_at or utc_now_iso()
+            prow = conn.execute(
+                "SELECT * FROM enterprise_persons WHERE id = ?", (person_id,)
+            ).fetchone()
+            if prow is None:
+                raise MetadataRecordNotFoundError(
+                    f"Person '{person_id}' not found"
+                )
+            current_person = EnterprisePersonRecord.from_row(prow)
+            if current_person.status != "active":
+                raise MetadataConflictError(
+                    "person",
+                    person_id,
+                    expected={"status": "active"},
+                    current={"status": current_person.status},
+                )
+            clash = conn.execute(
+                "SELECT id FROM enterprise_person_account_links "
+                "WHERE account_id = ? AND status = 'active'",
+                (account_id,),
+            ).fetchone()
+            if clash is not None:
+                raise MetadataConflictError(
+                    "person_account_link_active",
+                    account_id,
+                    expected={"status": "no active link"},
+                    current={"status": "already_linked"},
+                )
+            lrow = conn.execute(
+                "SELECT * FROM enterprise_person_account_links "
+                "WHERE person_id = ? AND account_id = ?",
+                (person_id, account_id),
+            ).fetchone()
+            if lrow is None:
+                raise MetadataRecordNotFoundError(
+                    "Pending person-account link not found"
+                )
+            current_link = EnterprisePersonAccountLinkRecord.from_row(lrow)
+            if current_link.status != "pending":
+                raise MetadataConflictError(
+                    "person_account_link",
+                    f"{person_id}:{account_id}",
+                    expected={"status": "pending"},
+                    current={"status": current_link.status},
+                )
+            try:
+                conn.execute(
+                    """
+                    UPDATE enterprise_person_account_links
+                    SET status = 'active', confirmed_by_person_at = ?,
+                        updated_at = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (now, now, current_link.id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise MetadataConflictError(
+                    "person_account_link_active",
+                    account_id,
+                    expected={"status": "no active link"},
+                    current={"error": str(exc)},
+                ) from exc
+            new_epoch = current_person.auth_epoch + 1
+            conn.execute(
+                "UPDATE enterprise_persons SET auth_epoch = ?, updated_at = ? "
+                "WHERE id = ?",
+                (new_epoch, now, person_id),
+            )
+            self._sqlite_revoke_person_sessions_locked(
+                conn,
+                person_id,
+                account_id=None,
+                actor_user_id=actor_user_id,
+                now=now,
+                audit_event_type="person_session_revoked_by_link_activation",
+            )
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_account_link_confirmed",
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person_account_link",
+                    target_id=current_link.id,
+                    metadata={
+                        "person_id": person_id,
+                        "account_id": account_id,
+                        "auth_epoch": new_epoch,
+                    },
+                    created_at=now,
+                ),
+            )
+            prow = conn.execute(
+                "SELECT * FROM enterprise_persons WHERE id = ?", (person_id,)
+            ).fetchone()
+            nrow = conn.execute(
+                "SELECT * FROM enterprise_person_account_links WHERE id = ?",
+                (current_link.id,),
+            ).fetchone()
+            assert prow is not None and nrow is not None
+            return (
+                EnterprisePersonRecord.from_row(prow),
+                EnterprisePersonAccountLinkRecord.from_row(nrow),
+            )
+
+        return await self._write(write)
+
+    async def revoke_person_account_link_atomic(
+        self,
+        *,
+        person_id: str,
+        account_id: str,
+        actor_user_id: str | None = None,
+        revoked_at: str | None = None,
+        reason: str | None = None,
+    ) -> tuple[EnterprisePersonAccountLinkRecord, int]:
+        await self._ensure_initialized()
+
+        def write(
+            conn: sqlite3.Connection,
+        ) -> tuple[EnterprisePersonAccountLinkRecord, int]:
+            now = revoked_at or utc_now_iso()
+            lrow = conn.execute(
+                "SELECT * FROM enterprise_person_account_links "
+                "WHERE person_id = ? AND account_id = ?",
+                (person_id, account_id),
+            ).fetchone()
+            if lrow is None:
+                raise MetadataRecordNotFoundError(
+                    "Person-account link not found"
+                )
+            current_link = EnterprisePersonAccountLinkRecord.from_row(lrow)
+            if current_link.status != "active":
+                revoked_sessions = 0
+            else:
+                revoked_sessions = self._sqlite_revoke_person_sessions_locked(
+                    conn,
+                    None,
+                    account_id=account_id,
+                    actor_user_id=actor_user_id,
+                    now=now,
+                    audit_event_type="person_session_revoked_by_account_change",
+                )
+                conn.execute(
+                    """
+                    UPDATE enterprise_person_account_links
+                    SET status = 'revoked', revoked_by = ?, revoked_at = ?,
+                        reason = ?, updated_at = ?
+                    WHERE id = ? AND status = 'active'
+                    """,
+                    (actor_user_id, now, reason, now, current_link.id),
+                )
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_account_unbound",
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person_account_link",
+                    target_id=current_link.id,
+                    metadata={
+                        "person_id": person_id,
+                        "account_id": account_id,
+                        "reason": reason,
+                        "revoked_sessions": revoked_sessions,
+                    },
+                    created_at=now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_account_links WHERE id = ?",
+                (current_link.id,),
+            ).fetchone()
+            assert row is not None
+            return EnterprisePersonAccountLinkRecord.from_row(row), revoked_sessions
+
+        return await self._write(write)
+
+    async def revoke_person_session_atomic(
+        self,
+        session_id: str,
+        *,
+        actor_user_id: str | None = None,
+        revoked_at: str | None = None,
+    ) -> EnterprisePersonLoginSessionRecord | None:
+        await self._ensure_initialized()
+
+        def write(
+            conn: sqlite3.Connection,
+        ) -> EnterprisePersonLoginSessionRecord | None:
+            now = revoked_at or utc_now_iso()
+            cursor = conn.execute(
+                "UPDATE enterprise_person_login_sessions "
+                "SET status = 'revoked', revoked_at = ?, last_seen_at = ? "
+                "WHERE id = ? AND status = 'active'",
+                (now, now, session_id),
+            )
+            if not cursor.rowcount:
+                row = conn.execute(
+                    "SELECT * FROM enterprise_person_login_sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                return (
+                    EnterprisePersonLoginSessionRecord.from_row(row)
+                    if row is not None
+                    else None
+                )
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_session_logout",
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person_login_session",
+                    target_id=session_id,
+                    metadata={"session_id": session_id},
+                    created_at=now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_login_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            assert row is not None
+            return EnterprisePersonLoginSessionRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def revoke_all_person_sessions_atomic(
+        self,
+        person_id: str,
+        *,
+        actor_user_id: str | None = None,
+        revoked_at: str | None = None,
+    ) -> tuple[EnterprisePersonRecord, int]:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> tuple[EnterprisePersonRecord, int]:
+            now = revoked_at or utc_now_iso()
+            prow = conn.execute(
+                "SELECT * FROM enterprise_persons WHERE id = ?", (person_id,)
+            ).fetchone()
+            if prow is None:
+                raise MetadataRecordNotFoundError(
+                    f"Person '{person_id}' not found"
+                )
+            current_person = EnterprisePersonRecord.from_row(prow)
+            new_epoch = current_person.auth_epoch + 1
+            conn.execute(
+                "UPDATE enterprise_persons SET auth_epoch = ?, updated_at = ? "
+                "WHERE id = ?",
+                (new_epoch, now, person_id),
+            )
+            revoked = self._sqlite_revoke_person_sessions_locked(
+                conn,
+                person_id,
+                account_id=None,
+                actor_user_id=actor_user_id,
+                now=now,
+                audit_event_type="person_session_revoked_by_logout_all",
+            )
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_sessions_logout_all",
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person",
+                    target_id=person_id,
+                    metadata={
+                        "person_id": person_id,
+                        "revoked_sessions": revoked,
+                        "auth_epoch": new_epoch,
+                    },
+                    created_at=now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_persons WHERE id = ?", (person_id,)
+            ).fetchone()
+            assert row is not None
+            return EnterprisePersonRecord.from_row(row), revoked
+
+        return await self._write(write)
+
     async def upsert_kb_acl(
         self, acl: KBACLRecord, *, expected_generation: str | None = None
     ) -> KBACLRecord:
@@ -12368,6 +14141,118 @@ class SQLiteMetadataStore:
                 ON enterprise_invitations (status);
             """
         )
+        # Multi-account person identity tables. Idempotent: fresh and existing
+        # databases both converge without altering legacy rows. Created inside
+        # the same schema-initialization transaction so a half-migrated state
+        # cannot persist. See docs/多账号身份关联与切换执行文档.md section 4.
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS enterprise_persons (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                auth_epoch INTEGER NOT NULL DEFAULT 1,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (status IN ('active', 'disabled'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_persons_status
+                ON enterprise_persons (status);
+
+            CREATE TABLE IF NOT EXISTS enterprise_person_credentials (
+                id TEXT PRIMARY KEY,
+                person_id TEXT NOT NULL,
+                credential_type TEXT NOT NULL,
+                algorithm TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                locked_until TEXT,
+                last_used_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (status IN ('active', 'revoked')),
+                CHECK (credential_type IN ('password')),
+                FOREIGN KEY (person_id) REFERENCES enterprise_persons(id),
+                UNIQUE (person_id, credential_type)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_person_credentials_person
+                ON enterprise_person_credentials (person_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_person_enrollment_grants (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                created_by TEXT,
+                consumed_by_person TEXT,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                consumed_at TEXT,
+                CHECK (status IN ('active', 'consumed', 'revoked', 'expired'))
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_person_enrollment_grant_active
+                ON enterprise_person_enrollment_grants (account_id)
+                WHERE status = 'active';
+            CREATE INDEX IF NOT EXISTS idx_enterprise_person_enrollment_grants_account
+                ON enterprise_person_enrollment_grants (account_id);
+
+            CREATE TABLE IF NOT EXISTS enterprise_person_account_links (
+                id TEXT PRIMARY KEY,
+                person_id TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                bound_by TEXT,
+                bound_at TEXT,
+                confirmed_by_person_at TEXT,
+                revoked_by TEXT,
+                revoked_at TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (status IN ('pending', 'active', 'revoked')),
+                FOREIGN KEY (person_id) REFERENCES enterprise_persons(id),
+                FOREIGN KEY (account_id) REFERENCES enterprise_users(id)
+                    ON DELETE CASCADE,
+                UNIQUE (person_id, account_id)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_person_account_active
+                ON enterprise_person_account_links (account_id)
+                WHERE status = 'active';
+            CREATE INDEX IF NOT EXISTS idx_enterprise_person_account_links_person_status
+                ON enterprise_person_account_links (person_id, status);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_person_account_links_account_status
+                ON enterprise_person_account_links (account_id, status);
+
+            CREATE TABLE IF NOT EXISTS enterprise_person_login_sessions (
+                id TEXT PRIMARY KEY,
+                person_id TEXT NOT NULL,
+                active_account_id TEXT,
+                status TEXT NOT NULL,
+                person_epoch INTEGER NOT NULL,
+                session_epoch INTEGER NOT NULL,
+                absolute_expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT,
+                revoked_at TEXT,
+                account_token_version INTEGER NOT NULL DEFAULT 0,
+                CHECK (status IN ('active', 'revoked', 'expired')),
+                FOREIGN KEY (person_id) REFERENCES enterprise_persons(id),
+                FOREIGN KEY (active_account_id) REFERENCES enterprise_users(id)
+                    ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_person_login_sessions_person_status
+                ON enterprise_person_login_sessions (person_id, status);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_person_login_sessions_account_status
+                ON enterprise_person_login_sessions (active_account_id, status);
+            """
+        )
         conn.execute(
             "INSERT OR IGNORE INTO metadata_schema(version, applied_at) VALUES (?, ?)",
             (_SCHEMA_VERSION, utc_now_iso()),
@@ -12395,6 +14280,12 @@ class SQLiteMetadataStore:
                 "can_download_files": "INTEGER NOT NULL DEFAULT 1",
             },
             "enterprise_audit_events": {"actor_tenant_id": "TEXT"},
+            # account_token_version: snapshot for v2 account-access validation.
+            # Sentinel 0 for pre-existing rows; new sessions write the live
+            # account token_version. See docs/多账号身份关联与切换执行文档.md 4.5.
+            "enterprise_person_login_sessions": {
+                "account_token_version": "INTEGER NOT NULL DEFAULT 0",
+            },
             "enterprise_chat_sessions": {
                 "context_rounds": "INTEGER NOT NULL DEFAULT 1",
             },

@@ -114,11 +114,13 @@ from lightrag.api.enterprise_auth import (
     UserAgentWorkflowPromptService,
     UserKBQuerySettingsService,
     UserService,
+    set_active_metadata_store,
 )
 from lightrag.api.routers.chat_routes import create_chat_routes
 from lightrag.api.chat_memory_service import ChatMemoryConfig, ChatMemoryService
 from lightrag.api.chat_memory_worker import ChatMemoryWorker
 from lightrag.api.routers.enterprise_routes import create_enterprise_routes
+from lightrag.api.routers.person_routes import create_person_routes
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -1047,6 +1049,40 @@ def create_app(args):
         if enterprise_enabled
         else None
     )
+    # Multi-account person auth (Phase 3). Only constructed when person auth is
+    # explicitly enabled; the v2 token handler requires an independent signing
+    # secret validated at startup.
+    _person_auth_enabled = bool(
+        enterprise_enabled and getattr(global_args, "person_auth_enabled", False)
+    )
+    person_service = None
+    person_token_handler = None
+    if _person_auth_enabled:
+        from lightrag.api.person_auth import PersonService, PersonTokenHandler
+
+        person_token_handler = PersonTokenHandler()
+        person_service = PersonService(
+            metadata_store,
+            person_token_handler,
+            login_max_attempts=getattr(global_args, "person_login_max_attempts", 5),
+            password_min_length=getattr(global_args, "person_password_min_length", 8),
+            lockout_seconds=getattr(
+                global_args, "person_login_lockout_seconds", 900.0
+            ),
+            enroll_tracker=LoginAttemptTracker(
+                max_attempts=getattr(global_args, "person_enroll_max_attempts", 10),
+                window_seconds=getattr(
+                    global_args, "person_enroll_window_seconds", 300.0
+                ),
+                lockout_seconds=getattr(
+                    global_args, "person_enroll_lockout_seconds", 900.0
+                ),
+            ),
+        )
+    # Register the app-bound metadata store so person-session validation
+    # (invoked from combined_auth before request services exist) can resolve it.
+    if enterprise_enabled:
+        set_active_metadata_store(metadata_store)
     enterprise_limit_service = (
         EnterpriseLimitService(enterprise_audit_service) if enterprise_enabled else None
     )
@@ -1311,6 +1347,10 @@ def create_app(args):
         app.state.enterprise_authorization_service = enterprise_authorization_service
         app.state.enterprise_audit_service = enterprise_audit_service
         app.state.enterprise_registration_tracker = enterprise_registration_tracker
+        # Person auth services (Phase 3). Always initialized to None when
+        # person auth is off; only populated when LIGHTRAG_PERSON_AUTH_ENABLED.
+        app.state.person_service = person_service
+        app.state.person_token_handler = person_token_handler
 
     # Add custom validation error handler for /query/data endpoint
     @app.exception_handler(RequestValidationError)
@@ -2842,6 +2882,11 @@ def create_app(args):
             create_enterprise_routes(api_key=api_key, kb_service=kb_service)
         )
         app.include_router(create_chat_routes(api_key=api_key))
+        # Multi-account person identity routes (Phase 4). Mounted under
+        # enterprise because person auth builds on the enterprise metadata
+        # store + accounts; the routes themselves gate on person_auth_enabled.
+        if _person_auth_enabled:
+            app.include_router(create_person_routes(api_key=api_key))
     app.include_router(create_document_routes(rag, doc_manager, api_key))
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))

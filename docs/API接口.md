@@ -2237,6 +2237,310 @@ GRAPHITI_TELEMETRY_ENABLED=false             # 内网部署关闭 graphiti 匿�
 
 除主开关 `LIGHTRAG_CHAT_MEMORY_ENABLED` 外，本节 namespaced maintenance/worker/rebuild/raw-content/prompt/egress setting 同时接受相应 `MEMORY_*` alias；新部署应使用上面的 `LIGHTRAG_CHAT_MEMORY_*` canonical key。旧 immediate/debounced/watermark backlog 参数仍被 parser 接受，但当前 enterprise server 不用它们承诺可靠性。
 
+### 10.6 多账号身份关联与切换（Person Auth）
+
+**多账号身份关联与切换**（下称 Person Auth）在企业认证之上提供一层"自然人凭据 → 已显式授权账号 → 普通账号作用域 JWT"的薄层，供同一自然人在多个部门账号之间切换。本功能为**纯后端、受控内网**设计，**默认关闭**，不接外网 SSO/OIDC/SAML，不做前端、不做 impersonation。权威契约见 `docs/多账号身份关联与切换执行文档.md`，端点/请求/响应/错误码以下方描述及 `lightrag/api/routers/person_routes.py` 实际实现为准。
+
+核心概念：
+
+- `person` 是自然人身份（`enterprise_persons.id`，形如 `per_<hex>`），一个 person 可关联多个 `enterprise_users` 账号；一个账号在任一时刻最多一个 active person link（部分唯一索引裁决）。
+- **person credential（严格 bcrypt）是跨账号切换的信任根**；账号 `password_hash` 只服务 legacy `/login`，**不能**跨账号。
+- 首次建立自然人身份：super admin 线下核验后签发一次性 enrollment grant（绑定精确 `account_id`）→ 用户凭 grant + 自设自然人密码 enroll。
+- 新部门账号：super admin 创建 `pending` link → person 本人用自然人密码 confirm 才变 `active`；admin 不能直接产生 active link。
+- 切换后 `Principal.user_id` 仍是当前选中的账号 ID（不变量 I-3）；KB/chat/job/ACL/审计按账号隔离，切换不产生数据并集。
+
+#### 10.6.1 配置项
+
+本功能依赖企业认证（`LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true`）。功能开关关闭时 person 路由**不挂载**（端点返回 `404`）；路由内部的 `503 person_auth_unavailable` 为防御性兜底（运行时 flag 与挂载态不一致时触发）。
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `LIGHTRAG_PERSON_AUTH_ENABLED` | `false` | 总开关。开启需先开企业认证 |
+| `LIGHTRAG_PERSON_TOKEN_SECRET` | （必填） | v2 person token 独立签名密钥。启用时**必须显式设置**、非默认值、且**与 `TOKEN_SECRET` 不同**，否则启动失败 |
+| `LIGHTRAG_PERSON_ACCESS_TOKEN_TTL` | `3600` | v2 access token 有效期（秒） |
+| `LIGHTRAG_PERSON_SESSION_TTL` | `28800` | person login session 绝对过期时间（秒，8h）；switch 不延长 |
+| `LIGHTRAG_PERSON_LOGIN_MAX_ATTEMPTS` | `5` | 自然人密码连续失败锁定阈值（login/confirm-link/change-password 共用同一失败计数） |
+| `LIGHTRAG_PERSON_LOGIN_LOCKOUT_SECONDS` | `900` | 自然人密码失败锁定时长（秒） |
+| `LIGHTRAG_PERSON_PASSWORD_MIN_LENGTH` | `8` | 自然人密码最小长度 |
+| `LIGHTRAG_PERSON_ENROLL_MAX_ATTEMPTS` | `10` | 公开 enroll 端点按客户端地址限流阈值（防 grant 猜测；`0` 关闭） |
+| `LIGHTRAG_PERSON_ENROLL_WINDOW_SECONDS` | `300` | enroll 限流计数窗口（秒） |
+| `LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS` | `900` | enroll 限流锁定时长（秒） |
+
+```env
+LIGHTRAG_PERSON_AUTH_ENABLED=true
+LIGHTRAG_PERSON_TOKEN_SECRET=<与 TOKEN_SECRET 不同的非默认强随机值>
+LIGHTRAG_PERSON_ACCESS_TOKEN_TTL=3600
+LIGHTRAG_PERSON_SESSION_TTL=28800
+LIGHTRAG_PERSON_LOGIN_MAX_ATTEMPTS=5
+LIGHTRAG_PERSON_LOGIN_LOCKOUT_SECONDS=900
+LIGHTRAG_PERSON_PASSWORD_MIN_LENGTH=8
+LIGHTRAG_PERSON_ENROLL_MAX_ATTEMPTS=10
+LIGHTRAG_PERSON_ENROLL_WINDOW_SECONDS=300
+LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
+```
+
+#### 10.6.2 信任模型与 token 分派
+
+**v2 person access JWT** 用独立的 `LIGHTRAG_PERSON_TOKEN_SECRET` 签发，不复用 legacy `TOKEN_SECRET`：
+
+- JOSE header：`alg=HS256`、`kid=person-v1`。
+- top-level claims：`iss=lightrag-person-auth`、`aud=lightrag-api`、`typ=person_access`、`jti`（唯一标识/审计，不参与 session 验证）、`sid`（session id）、`person_id`、`user_id`（当前选中账号 ID）、`person_epoch`、`session_epoch`、`iat`、`exp`。`exp` 不超过 session 绝对过期时间。
+
+业务 API 走 `combined_auth`，按 JOSE header `kid` **确定性分派，校验失败不跨路径 fallback**：
+
+| kid | 分派 | 行为 |
+|---|---|---|
+| 缺失 | legacy validator | 用 `TOKEN_SECRET` 校验，无 person claims，按既有账号 JWT 语义 |
+| `person-v1` | v2 validator | 用 `LIGHTRAG_PERSON_TOKEN_SECRET` 校验；person auth 关闭时业务 API 携带 v2 token 直接 `401 person_session_invalid` |
+| 其它值 | 拒绝 | `401 Unknown token kid`，不回退 legacy |
+
+**两类 person 校验依赖**（实现于 `lightrag/api/person_auth.py`）：
+
+- **session-control**（`require_person_session_control`）：服务 `accounts/switch/logout/logout-all/change-password/confirm-link`。校验 v2 签名/kid/typ/iss/aud、person active、session active/未过期、`person_epoch`/`session_epoch` 一致。**不**要求当前账号 active、**不**比较账号 `token_version`、**不**校验 link/membership，也不构建账号 `Principal`——因此当前账号被 disable/reset 后仍可 list/switch/logout。运行时把 person/session 信息放入 `request.state.person_session`，**不**写入 `Principal.metadata`。
+- **account-access**（`person_account_access_validate`，经 `combined_auth` 调用）：服务所有现有业务 API。在 session-control 基础上**额外**校验：账号 active、账号非 `super_admin`（升权后的账号对 person token 立即不可达）、账号 `token_version` 与 session 快照一致、`(person_id, user_id)` active link 存在、`session.active_account_id == token.user_id`，随后按现有逻辑构建普通账号 `Principal`（`auth_method="person_jwt"`）。**交互式等价**：所有按"交互式用户"把关的业务面（chat、chat memory、个人查询设置、个人 agent prompt、`PATCH /auth/me`、`POST /auth/logout` 等）通过 `INTERACTIVE_AUTH_METHODS = {"jwt", "person_jwt"}` 同时接受两种 token——person token 在业务 API 上的行为与该账号自己的 legacy 登录 JWT 完全一致。
+
+#### 10.6.3 端点总览（14 个）
+
+`Authorization: Bearer <v2 person token>` 用于 session-control 端点；admin 端点用 legacy 交互式 super admin JWT（`combined_auth`）。`person`/`account`/`session` 响应对象只含非秘密字段。
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| `POST` | `/auth/person/enroll` | 公开（grant） | 用一次性 enrollment grant 建立自然人身份，建立首个 active link 并签发首 token，`201` |
+| `POST` | `/auth/person/login` | 公开（person 密码） | 用 person 凭据登录并选择一个 active link 账号 |
+| `GET` | `/auth/person/accounts` | session-control | 列出当前 person 可切换的账号 |
+| `POST` | `/auth/person/switch` | session-control | 在 active link 集合内切换账号，签发新 token |
+| `POST` | `/auth/person/logout` | session-control | 撤销当前 person session |
+| `POST` | `/auth/person/logout-all` | session-control | 撤销该 person 全部 session |
+| `POST` | `/auth/person/change-password` | session-control | 轮换自然人密码（撤销全部 session） |
+| `POST` | `/auth/person/links/{account_id}:confirm` | session-control + person 密码 | person 本人确认激活 pending link |
+| `POST` | `/admin/persons/enrollment-grants` | super admin | 签发一次性 enrollment grant，`201` |
+| `DELETE` | `/admin/persons/enrollment-grants/{grant_id}` | super admin | 撤销未消费的 grant |
+| `POST` | `/admin/persons/{person_id}/accounts/{account_id}` | super admin **或目标所属租户的 tenant admin** | 提议 pending link，`201`（权限矩阵见 10.6.6） |
+| `DELETE` | `/admin/persons/{person_id}/accounts/{account_id}` | super admin | 解绑 link |
+| `POST` | `/admin/persons/{person_id}:disable` | super admin | 停用 person（撤销全部 session） |
+| `POST` | `/admin/persons/{person_id}:enable` | super admin | 启用 person（不发 token） |
+
+#### 10.6.4 公共入口：enroll / login
+
+**`POST /auth/person/enroll`** —— 用一次性 grant 建立自然人身份。服务端在单个原子事务内校验 grant、消费 grant（`active→consumed`）、创建 person、写严格 bcrypt credential、创建首个 active link、创建首个 session、写审计；任一步失败整体回滚。
+
+```json
+// 请求
+{"grant_token": "<一次性明文 grant>", "person_password": "自然人密码"}
+```
+
+```json
+// 201 响应（PersonTokenResponse）
+{
+  "access_token": "<v2 person token>",
+  "token_type": "bearer",
+  "expires_in": 3600,
+  "person": {"id": "per_...", "status": "active", "auth_epoch": 1, "metadata": {...}, "created_at": "...", "updated_at": "..."},
+  "active_account": {"account_id": "usr_dept_a", "username": "alice_finance", "status": "active", "system_role": "user", "tenant_id": "tenant_finance"},
+  "session": {"id": "psess_...", "person_id": "per_...", "active_account_id": "usr_dept_a", "status": "active", "person_epoch": 1, "session_epoch": 1, "absolute_expires_at": "...", "created_at": "...", "last_seen_at": null, "revoked_at": null, "account_token_version": 3}
+}
+```
+
+主要错误：`400 person_password_weak`（空/首尾空白/过短/超 1024 UTF-8 字节）、`400 cannot_bind_super_admin`、`401 invalid_grant`（grant 不存在/已消费/已撤销/已过期，**统一返回不区分**）、`403 account_not_active`、`409 account_already_linked`（目标账号已有 active person link）、`429 too_many_attempts`（同一客户端地址无效 grant 尝试达 `LIGHTRAG_PERSON_ENROLL_MAX_ATTEMPTS`，带 `Retry-After`）。
+
+> `expires_in` 为 token 的**实际**剩余有效期：取 `LIGHTRAG_PERSON_ACCESS_TOKEN_TTL` 与 session 绝对过期剩余时间的较小值（与签发时对 `exp` 的 min() 截断一致），临近 session 到期时会小于配置的 TTL。enroll/login/switch 响应同此语义。
+
+**`POST /auth/person/login`** —— 用 person 凭据登录。`account_id` 在只有一个 active link 时可省略；多个 active link 时必须显式提供。服务端只按精确 `person_id + account_id` 查找，不接受 email/姓名/用户名推断。
+
+```json
+// 请求
+{"person_id": "per_...", "person_password": "自然人密码", "account_id": "usr_dept_a"}
+```
+
+```json
+// 200 响应（PersonTokenResponse，与 enroll 同构）
+{"access_token": "...", "token_type": "bearer", "expires_in": 3600,
+ "person": {...}, "active_account": {...}, "session": {...}}
+```
+
+主要错误：`401 invalid_person_credentials`（person/密码/credential 不匹配，**统一返回**；不存在 person 执行 dummy bcrypt 平滑时序）、`403 person_disabled`、`403 account_not_active`、`404 account_not_linked`（无 active link 或指定账号非 active link）、`409 account_selection_required`（多个 active link 未提供 `account_id`）、`429 too_many_attempts`（带 `Retry-After`，连续失败达 `LIGHTRAG_PERSON_LOGIN_MAX_ATTEMPTS` 锁定 900s）。
+
+#### 10.6.5 session-control 端点
+
+> 以下端点均需 `Authorization: Bearer <v2 person token>`，走 `require_person_session_control`：不要求当前账号 active，不比较账号 `token_version`，故账号 reset/disable 后仍可调用。
+
+**`GET /auth/person/accounts`** —— 列出可切换账号。
+
+```json
+{"person": {"person_id": "per_...", "status": "active"},
+ "active_account_id": "usr_dept_a",
+ "accounts": [
+   {"account_id": "usr_dept_a", "username": "alice_finance", "status": "active", "system_role": "user", "tenant_id": "tenant_finance"},
+   {"account_id": "usr_dept_b", "username": "alice_legal", "status": "active", "system_role": "user", "tenant_id": "tenant_legal"}
+ ]}
+```
+
+**`POST /auth/person/switch`** —— 切换账号。目标必须是该 person 的 active link 且账号 active；不要求输入目标账号密码。原子事务内 CAS session_epoch、更新 `active_account_id`、签发新 token（旧 token 因 epoch 不一致立即失效）。响应为 `PersonTokenResponse`，其中 `person` 字段省略（person 不变）。
+
+```json
+// 请求
+{"account_id": "usr_dept_b"}
+```
+
+主要错误：`403 account_not_active`、`404 account_not_linked`、`409 session_epoch_conflict`（并发切换/登出导致 CAS 失败，请重试）。
+
+**`POST /auth/person/logout`** —— 仅撤销当前 session。
+
+```json
+{"status": "logged_out", "session_id": "psess_..."}
+```
+
+**`POST /auth/person/logout-all`** —— 撤销该 person 全部 session（递增 `auth_epoch`）。
+
+```json
+{"status": "logged_out_all", "revoked_sessions": 2}
+```
+
+**`POST /auth/person/change-password`** —— 轮换自然人密码。校验当前密码 → 写新严格 bcrypt → 递增 `auth_epoch` → 撤销全部 session。本端点**不**返回新 token，需重新 login。
+
+```json
+// 请求
+{"current_person_password": "旧密码", "new_person_password": "新密码"}
+// 200 响应
+{"status": "password_changed"}
+```
+
+主要错误：`401 invalid_current_password`、`400 person_password_weak`、`404 person_not_found`。
+
+**`POST /auth/person/links/{account_id}:confirm`** —— person 本人确认激活 super admin 提议的 pending link。二次确认：v2 token + 当前自然人密码。原子事务内 pending→active（由 active 部分唯一索引裁决并发）、递增 `auth_epoch`、撤销该 person 全部旧 session（激活后必须重新 login 才能使用新账号）。
+
+```json
+// 请求
+{"person_password": "自然人密码"}
+// 200 响应（PersonLinkSummary）
+{"link": {"id": "plink_...", "person_id": "per_...", "account_id": "usr_dept_b", "status": "active", "bound_by": "...", "bound_at": "...", "confirmed_by_person_at": "...", "revoked_by": null, "revoked_at": null, "reason": "...", "created_at": "...", "updated_at": "..."}}
+```
+
+主要错误：`401 invalid_person_password`、`404 link_not_found`（无 pending link）、`409 account_already_linked`（已被另一 person 抢占 active）、`409 link_state_conflict`。
+
+#### 10.6.6 super admin 管理端点
+
+> 以下端点走 `combined_auth`（交互式 JWT），API key / service key 返回 `403 interactive_jwt_required`。除"提议 pending link"外均要求 active `super_admin`（非 super admin 返回 `403 super_admin_required`）。tenant_admin **无权**裁决跨 tenant 自然人身份：grant 签发、解绑、person 停用/启用始终仅限 super admin。
+
+**`POST /admin/persons/enrollment-grants`** —— 签发一次性 grant，绑定精确 `account_id`。明文 grant token 仅返回一次，服务端只存 SHA-256 hash。`ttl_seconds` 下限 60s。
+
+```json
+// 请求
+{"account_id": "usr_dept_a", "ttl_seconds": 900, "reason": "线下核验后建立自然人身份"}
+// 201 响应
+{"grant_id": "pgrant_...", "grant_token": "<一次性明文，仅此一次>", "account_id": "usr_dept_a", "expires_at": "2026-07-30T12:15:00Z"}
+```
+
+主要错误：`400 cannot_bind_super_admin`、`404 account_not_found`、`409 active_grant_exists`（该账号已有未消费 active grant）。
+
+**`DELETE /admin/persons/enrollment-grants/{grant_id}`** —— 撤销未消费 grant。
+
+```json
+{"status": "revoked", "grant_id": "pgrant_...", "current_status": "revoked"}
+```
+
+不存在返回 `404 grant_not_found`。
+
+**`POST /admin/persons/{person_id}/accounts/{account_id}`** —— 提议 pending link（**不能**直接产生 active link；无论谁提议，都必须由 person 本人用自然人密码 confirm 才激活）。
+
+**权限矩阵**：
+
+| 提议者 | 目标账号 | 结果 |
+|---|---|---|
+| super admin | 任意非 super-admin 账号 | 允许 |
+| 目标所属租户的 tenant admin（含 owner） | 本租户**普通成员**账号 | 允许（部门管理员为本部门成员发起绑定） |
+| 目标所属租户的 tenant admin | 本租户 **tenant admin/owner** 账号 | `403 super_admin_required`（管理员账号的绑定是平台级裁决） |
+| tenant admin | 其它租户 / 无租户账号 | `404 account_not_found`（防跨租户账号探测） |
+| 普通成员 / 非管理员 | 任意 | `403 admin_required` |
+
+```json
+// 请求（body 可选）
+{"reason": "新部门账号，待本人确认"}
+// 201 响应（PersonLinkSummary，status=pending；link.bound_by=提议者账号 ID）
+{"link": {...}}
+```
+
+主要错误：`400 cannot_bind_super_admin`、`403 admin_required`、`403 super_admin_required`、`404 account_not_found`、`404 person_not_found`、`409 link_state_conflict`（该 (person, account) 已是 active link）。
+
+**`DELETE /admin/persons/{person_id}/accounts/{account_id}`** —— 解绑 link。link `active→revoked`，以该账号为 `active_account_id` 的 session 同事务撤销/置空；不删除账号、tenant、KB、chat、ACL 或审计数据。
+
+```json
+{"status": "unlinked", "person_id": "per_...", "account_id": "usr_dept_b", "revoked_sessions": 1}
+```
+
+不存在返回 `404 link_not_found`。注意：解绑不是禁用账号，该账号的 legacy JWT 原则上仍有效（除非另行递增账号 `token_version`）；要彻底阻止访问应 disable 账号或 unlink。
+
+**`POST /admin/persons/{person_id}:disable`** / **`:enable`** —— 停用/启用 person。`disable` 递增 `auth_epoch`、撤销全部 session，**不**隐式禁用业务账号；`enable` 恢复 active，不发 token。`disable` body 可选 `{"reason": "..."}`。
+
+```json
+{"person_id": "per_...", "status": "disabled"}
+```
+
+不存在返回 `404 person_not_found`。
+
+#### 10.6.7 错误码
+
+| HTTP | `error_code` | 使用场景 |
+|---:|---|---|
+| 400 | `person_password_weak` / `cannot_bind_super_admin` | 密码策略不满足；绑定目标为 super admin 账号 |
+| 401 | `authentication_required` | session-control 端点缺少 Bearer token |
+| 401 | `invalid_grant` | enroll：grant 不存在/已消费/已撤销/已过期（统一） |
+| 401 | `invalid_person_credentials` | login：person/密码/credential 不匹配（统一） |
+| 401 | `invalid_current_password` | change-password：当前密码错误 |
+| 401 | `invalid_person_password` | confirm-link：person 密码错误 |
+| 401 | `person_session_invalid` | v2 校验失败：person/session 非法、epoch 不一致、session revoked/expired、账号不存在/未 active、`token_version` 快照不一致、link 失效、`active_account_id` 不匹配；或功能关闭时业务 API 携带 v2 token |
+| 401 | （无 `error_code`，`Invalid token` / `Invalid person token` / `Unknown token kid`） | `combined_auth` / v2 validator：签名/claims 校验失败、kid 未知、token 格式错误 |
+| 403 | `person_session_required` | session-control 端点在运行时 flag 关闭时被调用（防御性） |
+| 403 | `interactive_jwt_required` / `super_admin_required` | admin 端点用 API key 调用 / 需要 super admin（含 tenant admin 试图提议管理员账号的 link） |
+| 403 | `admin_required` | 提议 link：调用者既非 super admin 也非任何租户的 tenant admin |
+| 403 | `person_disabled` | person 已停用 |
+| 403 | `account_not_active` | 目标账号未 active（enroll/login/switch） |
+| 404 | `person_not_found` / `account_not_found` / `account_not_linked` / `grant_not_found` / `link_not_found` | 资源不存在或无有效关联（tenant admin 提议跨租户目标时也返回 `account_not_found`） |
+| 409 | `account_already_linked` / `account_selection_required` / `session_epoch_conflict` / `active_grant_exists` / `link_state_conflict` | 并发、重复（含对已 active 的 pair 重复提议）或需明确选择 |
+| 429 | `too_many_attempts` | 自然人密码失败达阈值（login/confirm-link/change-password 共用计数）或 enroll 触发地址限流，带 `Retry-After` |
+| 503 | `person_auth_unavailable` | 路由已挂载但运行时 flag 关闭（防御性兜底） |
+
+#### 10.6.8 生命周期与不变量
+
+**关键失效语义**（与 legacy `/login` 互不干扰）：
+
+| 操作 | account-access token（业务 API） | session-control（accounts/switch/logout） | person credential/link |
+|---|---|---|---|
+| 账号 reset password | 失效（`token_version` 快照不一致） | 继续有效，可 list/switch/logout | 不变 |
+| 账号 disable | 该账号 access 拒绝 | 继续有效，可切换其它账号 | link 保留但不可切入 |
+| 账号 delete | 立即失效 | `active_account_id` SET NULL，可切换其它或退出 | link CASCADE 删除，其它账号不变 |
+| 解绑 unlink | 该 link 的 access 失效 | active 在该账号的 session 撤销/置空 | link revoked，其它账号不变 |
+| person 改密 / disable / logout-all | 全部失效（`auth_epoch` 变） | 全部失效，需重新 login | credential 轮换 / person disabled |
+| 新 link confirm 激活 | 旧 session 不自动获新账号 | 旧 session 全部撤销，需重新 login | pending→active，`auth_epoch` 递增 |
+
+**核心不变量**：
+
+- `enterprise_users` 仍是账号真源；`account_id` 永远等于 `enterprise_users.id`，person 表不复制账号权限。
+- `Principal.user_id` 始终是当前选中账号 ID（单值）；`person_id` 只放 `request.state.person_session`，不进 `Principal.metadata`。
+- 业务数据（KB/chat/job/memory/ACL/审计）按账号隔离，切换不产生并集。
+- person credential 严格 bcrypt（SHA-256 预哈希再 bcrypt，规避 72 字节截断），不复用 `passwords.py` 的明文回退路径；不存在 person 登录执行 dummy bcrypt。
+- 一个账号最多一个 active person link（部分唯一索引裁决并发）；激活新 link 递增 `auth_epoch` 并撤销全部旧 session。
+- super admin 目标账号在**每个环节**被拒绝：grant 签发、enroll 消费、propose、confirm、switch、account-access 均复查 `system_role`——账号在绑定后被提升为 super_admin 时，person token 对它立即不可达。
+- 自然人密码的所有再认证入口（login / confirm-link / change-password）共用同一失败计数与锁定；失败写 `person_login_failed`（达阈值另写 `person_login_locked`）审计，计数在 SQL 侧原子自增，失败事件不伪造 actor。
+- 安全状态变更（enroll/login/switch/confirm/unbind/change-password/disable/enable/grant create/revoke）与审计写入在同一原子事务内完成；person 身份事件 `actor_tenant_id=None`，仅 super admin 审计可见，不进 tenant 审计。
+
+#### 10.6.9 与 legacy `/login` 的兼容关系
+
+- 旧 `POST /login`、旧账号 JWT（无 `kid`）、`/auth/logout`、账号 `token_version` 语义保持不变；旧客户端无需感知 person。
+- v2 person token 用独立密钥签名，旧 validator 无该密钥无法验证；v2 校验失败不回退 legacy，未知 kid 直接拒绝。
+- 账号密码变更/禁用递增账号 `token_version`，使该账号 legacy JWT 与 account-access 类 person token 同时失效；但 **reset password 不撤销 person link**。要彻底阻止 person 进入某账号应 disable 账号或 unlink，其它关联账号 session 不受影响。
+- 普通账号密码**不能**作为 person login/accounts/switch/enroll 的凭据；person login 只接受 person 严格 bcrypt，服务端不遍历关联账号密码。
+
+#### 10.6.10 安全边界（明确不做）
+
+- 不接外网 IdP/SSO：不做 OIDC/SAML/LDAP/OAuth 社交登录/自动目录同步/外部身份映射。
+- 不做前端：不修改 Web UI/登录页/路由跳转；客户端只按本文后端契约调用。
+- 不做 impersonation：不提供"以某账号身份执行"的代入能力，不接受 `X-User-Id`/query/隐藏字段伪造 `user_id`。
+- 不自动关联：不按 email/姓名/手机号/用户名/域名/相似度匹配绑定；无"发现后自动绑定"。
+- 不合并数据：不迁移/合并/复制不同账号的 KB/chat/job/memory/ACL/审计。
+- 不扩大 super admin 面：目标为 `super_admin` 的账号默认禁止绑定。
+- 不存储可恢复秘密：不存明文 person password、明文 grant token、raw JWT；grant 只存 hash，明文仅创建时返回一次；错误/审计/日志不输出这些值。
+
 ---
 
 ## 十一、状态机与字段说明

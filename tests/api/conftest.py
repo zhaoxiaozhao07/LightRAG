@@ -39,6 +39,13 @@ import sys
 import pytest
 
 os.environ["LIGHTRAG_CHAT_MEMORY_ENABLED"] = "false"
+# Same failure mode as chat memory: parse_args() runs
+# validate_auth_configuration(), which RAISES when a leaked
+# LIGHTRAG_PERSON_AUTH_ENABLED=true meets a hermetic test env (person auth
+# demands enterprise auth plus a distinct LIGHTRAG_PERSON_TOKEN_SECRET). Pin
+# it off before any lazy parse; person tests enable the feature by replacing
+# global_args inside their own bodies, which happens after both layers.
+os.environ["LIGHTRAG_PERSON_AUTH_ENABLED"] = "false"
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +56,7 @@ def _disable_leaked_enterprise_auth(monkeypatch):
     # directly), and do it BEFORE touching global_args: the touch itself can
     # trigger parse_args() -> validate_chat_memory_configuration().
     monkeypatch.setenv("LIGHTRAG_CHAT_MEMORY_ENABLED", "false")
+    monkeypatch.setenv("LIGHTRAG_PERSON_AUTH_ENABLED", "false")
 
     saved_argv = sys.argv
     sys.argv = [saved_argv[0]]
@@ -67,6 +75,15 @@ def _disable_leaked_enterprise_auth(monkeypatch):
             monkeypatch.setattr(
                 api_config.global_args,
                 "chat_memory_enabled",
+                False,
+                raising=False,
+            )
+        # Person auth piggybacks on enterprise auth; a leaked/parsed-on flag
+        # would flip person_auth_enabled() for unrelated tests. Same treatment.
+        if getattr(api_config.global_args, "person_auth_enabled", False):
+            monkeypatch.setattr(
+                api_config.global_args,
+                "person_auth_enabled",
                 False,
                 raising=False,
             )

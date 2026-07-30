@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -369,6 +370,13 @@ async def test_rebuild_action_background_task_holds_shared_guard_until_complete(
 
         async def update_job_progress(self, *_args, **_kwargs):
             return job
+
+        async def get_persisted_job(self, _job):
+            return job
+
+        @asynccontextmanager
+        async def job_execution_guard(self, _job_id: str, *, wait: bool = True):
+            yield True
 
     class FakeRegistry:
         async def get(self, _kb_id: str):

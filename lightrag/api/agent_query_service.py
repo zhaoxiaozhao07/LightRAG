@@ -18,6 +18,7 @@ from lightrag.api.bilingual_query_service import (
 from lightrag.api.chat_memory_routing import ChatMemoryScope, memory_audit_fields
 from lightrag.api.chat_memory_service import CHAT_MEMORY_AGENT_POLICY_SUFFIX
 from lightrag.api.enterprise_auth import (
+    INTERACTIVE_AUTH_METHODS,
     agent_max_rounds,
     agent_query_enabled,
     append_enterprise_audit_event,
@@ -970,7 +971,7 @@ class AgentQueryService:
             )
         user_prompt = ""
         principal = get_request_principal(request)
-        if principal is not None and principal.auth_method == "jwt":
+        if principal is not None and principal.auth_method in INTERACTIVE_AUTH_METHODS:
             user_prompt = await get_enterprise_user_agent_workflow_prompt_service(
                 request
             ).get_prompt(principal.user_id)

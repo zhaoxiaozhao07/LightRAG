@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from lightrag.api.auth import auth_handler
 from lightrag.api.enterprise_auth import (
     Principal,
+    INTERACTIVE_AUTH_METHODS,
     KB_ROLE_ADMIN,
     KB_ROLE_EDITOR,
     KB_ROLE_OWNER,
@@ -541,7 +542,7 @@ def create_enterprise_routes(
 
     def require_interactive_user_principal(request: Request) -> Principal:
         principal = require_principal(request)
-        if principal.auth_method != "jwt":
+        if principal.auth_method not in INTERACTIVE_AUTH_METHODS:
             raise HTTPException(
                 status_code=403,
                 detail="Only available for interactive users",

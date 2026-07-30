@@ -28,6 +28,7 @@ from lightrag.api.chat_memory_service import (
     AuthorizedChatMemoryHandle,
 )
 from lightrag.api.enterprise_auth import (
+    INTERACTIVE_AUTH_METHODS,
     get_enterprise_chat_memory_service,
     get_request_principal,
 )
@@ -85,7 +86,7 @@ async def authorize_memory_context(
     principal = get_request_principal(request)
     if principal is None:
         raise HTTPException(status_code=401, detail="Login required")
-    if principal.auth_method != "jwt":
+    if principal.auth_method not in INTERACTIVE_AUTH_METHODS:
         raise HTTPException(
             status_code=403,
             detail="Chat memory requires an interactive user",
@@ -144,7 +145,7 @@ async def resolve_memory_injection(
     principal = get_request_principal(request)
     if principal is None:
         raise HTTPException(status_code=401, detail="Login required")
-    if principal.auth_method != "jwt":
+    if principal.auth_method not in INTERACTIVE_AUTH_METHODS:
         raise HTTPException(
             status_code=403,
             detail="Chat memory requires an interactive user",

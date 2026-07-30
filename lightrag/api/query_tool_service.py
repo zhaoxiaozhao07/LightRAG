@@ -17,6 +17,7 @@ from lightrag.api.config_version_service import (
 )
 from lightrag.api.document_lifecycle_service import DocumentLifecycleService
 from lightrag.api.enterprise_auth import (
+    INTERACTIVE_AUTH_METHODS,
     KB_ROLE_VIEWER,
     UserKBQuerySettingsService,
     enterprise_auth_enabled,
@@ -119,7 +120,7 @@ async def _merge_user_query_defaults(
     if not enterprise_auth_enabled():
         return defaults
     principal = get_request_principal(request)
-    if principal is None or principal.auth_method != "jwt":
+    if principal is None or principal.auth_method not in INTERACTIVE_AUTH_METHODS:
         return defaults
     service = getattr(request.app.state, "enterprise_user_kb_query_settings_service", None)
     if not isinstance(service, UserKBQuerySettingsService):
