@@ -127,19 +127,33 @@ class UnbindLinkResponse(BaseModel):
     revoked_sessions: int
 
 
+class PersonKBShareRequest(BaseModel):
+    target_account_id: str = Field(..., min_length=1)
+    # Role the person's target account receives on the shared KB.
+    role: str = "kb_editor"
+    reason: str | None = None
+
+
+class PersonKBShareResponse(BaseModel):
+    share: dict[str, Any]
+
+
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
 
-def create_person_routes(api_key: str | None = None) -> APIRouter:
+def create_person_routes(
+    api_key: str | None = None, kb_service: Any | None = None
+) -> APIRouter:
     """Build the person-identity APIRouter.
 
     ``api_key`` is forwarded to ``combined_auth`` so the super-admin management
     endpoints honor the same API-key/legacy-JWT gating as the enterprise
     routes. The self-service session-control endpoints bypass ``combined_auth``
     entirely (they consume the v2 person token via
-    ``require_person_session_control``).
+    ``require_person_session_control``). ``kb_service`` backs the person-KB
+    share endpoints; when omitted it is resolved from ``app.state.kb_service``.
     """
 
     router = APIRouter(tags=["person-auth"])
@@ -458,5 +472,91 @@ def create_person_routes(api_key: str | None = None) -> APIRouter:
         _require_interactive_super_admin(request)
         service = _person_service(request)
         return await service.enable_person(person_id=person_id)
+
+    # ------------------------------------------------------------------
+    # Person KB shares: expose a personal KB to the SAME person's account in
+    # another department (zero-copy; the KB is not rebuilt or duplicated).
+    # Sharing into a department implies its tenant admins gain the configured
+    # oversight floor role on the KB.
+    # ------------------------------------------------------------------
+
+    async def _kb_record(request: Request, kb_id: str):
+        from lightrag.api.kb_service import (
+            KnowledgeBaseNotFoundError,
+            KnowledgeBaseService,
+        )
+
+        service = kb_service or getattr(request.app.state, "kb_service", None)
+        if not isinstance(service, KnowledgeBaseService):
+            raise HTTPException(
+                status_code=500, detail="Knowledge base service unavailable"
+            )
+        try:
+            record = await service.get(kb_id)
+        except KnowledgeBaseNotFoundError as exc:
+            raise HTTPException(
+                status_code=404, detail="Knowledge base not found"
+            ) from exc
+        if record.status != "active":
+            raise HTTPException(status_code=404, detail="Knowledge base not found")
+        return record
+
+    @router.post(
+        "/kbs/{kb_id}/person-shares",
+        response_model=PersonKBShareResponse,
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def create_person_kb_share(
+        request: Request, kb_id: str, body: PersonKBShareRequest
+    ):
+        _require_person_enabled()
+        principal = _require_interactive_principal(request)
+        record = await _kb_record(request, kb_id)
+        service = _person_service(request)
+        return await service.share_kb(
+            kb_record=record,
+            requester=principal,
+            target_account_id=body.target_account_id,
+            role=body.role,
+            reason=body.reason,
+        )
+
+    @router.get(
+        "/kbs/{kb_id}/person-shares",
+        dependencies=[Depends(combined_auth)],
+    )
+    async def list_person_kb_shares(request: Request, kb_id: str):
+        _require_person_enabled()
+        principal = _require_interactive_principal(request)
+        record = await _kb_record(request, kb_id)
+        service = _person_service(request)
+        return await service.list_kb_shares(kb_record=record, requester=principal)
+
+    @router.delete(
+        "/kbs/{kb_id}/person-shares/{target_account_id}",
+        dependencies=[Depends(combined_auth)],
+    )
+    async def revoke_person_kb_share(
+        request: Request, kb_id: str, target_account_id: str
+    ):
+        _require_person_enabled()
+        principal = _require_interactive_principal(request)
+        record = await _kb_record(request, kb_id)
+        service = _person_service(request)
+        return await service.unshare_kb(
+            kb_record=record,
+            requester=principal,
+            target_account_id=target_account_id,
+        )
+
+    @router.get("/auth/person/kb-shares")
+    async def list_my_person_kb_shares(
+        request: Request,
+        session: PersonSessionContext = Depends(require_person_session_control),
+    ):
+        _require_person_enabled()
+        service = _person_service(request)
+        return await service.list_my_kb_shares(person_id=session.person.id)
 
     return router

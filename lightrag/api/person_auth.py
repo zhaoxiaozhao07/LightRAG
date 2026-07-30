@@ -50,9 +50,11 @@ from lightrag.api.metadata_store import (
     EnterprisePersonAccountLinkRecord,
     EnterprisePersonCredentialRecord,
     EnterprisePersonEnrollmentGrantRecord,
+    EnterprisePersonKBShareRecord,
     EnterprisePersonLoginSessionRecord,
     EnterprisePersonRecord,
     EnterpriseUserRecord,
+    KBLifecycleConflictError,
     MetadataConflictError,
     MetadataRecordNotFoundError,
 )
@@ -1158,6 +1160,178 @@ class PersonService:
                 detail={"error_code": "person_not_found", "message": "Person not found"},
             ) from exc
         return {"person_id": person.id, "status": person.status}
+
+    # -- person KB shares (cross-department personal KB usage) -------------
+
+    _KB_SHARE_ROLES = frozenset({"kb_viewer", "kb_editor", "kb_admin"})
+
+    async def _require_share_manager(
+        self, *, kb_record: Any, requester: Principal
+    ) -> EnterprisePersonRecord:
+        """Common gate for share create/list/revoke on one KB.
+
+        Only personal KBs (non-tenant origin, with an owner account) can be
+        person-shared; the requester must be that owner (or super admin), and
+        the owner account must belong to an enrolled person — the share target
+        set is that person's other active-link accounts, never arbitrary users.
+        """
+
+        if kb_record.origin == "tenant" or not kb_record.owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error_code": "person_share_requires_personal_kb",
+                    "message": "Only personal KBs can be person-shared",
+                },
+            )
+        if not requester.is_super_admin and requester.user_id != kb_record.owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error_code": "kb_owner_required",
+                    "message": "Only the KB owner can manage person shares",
+                },
+            )
+        owner_link = await self._store.get_active_person_link_for_account(
+            kb_record.owner_id
+        )
+        if owner_link is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error_code": "person_identity_required",
+                    "message": "The KB owner account is not linked to a person",
+                },
+            )
+        person = await self._store.get_person_by_id(owner_link.person_id)
+        if person is None or person.status != "active":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"error_code": "person_disabled", "message": "Person is disabled"},
+            )
+        return person
+
+    async def share_kb(
+        self,
+        *,
+        kb_record: Any,
+        requester: Principal,
+        target_account_id: str,
+        role: str = "kb_editor",
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        person = await self._require_share_manager(
+            kb_record=kb_record, requester=requester
+        )
+        normalized_role = (role or "kb_editor").strip()
+        if normalized_role not in self._KB_SHARE_ROLES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error_code": "validation_error",
+                    "message": "role must be one of kb_viewer/kb_editor/kb_admin",
+                },
+            )
+        if target_account_id == kb_record.owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error_code": "validation_error",
+                    "message": "Cannot share a KB to its owner account",
+                },
+            )
+        target_link = await self._store.get_person_account_link(
+            person.id, target_account_id
+        )
+        if target_link is None or target_link.status != "active":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error_code": "account_not_linked",
+                    "message": "Target account is not an active link of this person",
+                },
+            )
+        target_account = await self._store.get_enterprise_user_by_id(
+            target_account_id
+        )
+        if target_account is None or target_account.status != USER_STATUS_ACTIVE:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"error_code": "account_not_active", "message": "Account is not active"},
+            )
+        now = utc_now_iso()
+        share = EnterprisePersonKBShareRecord(
+            id=f"pkbs_{secrets.token_hex(12)}",
+            kb_id=kb_record.id,
+            person_id=person.id,
+            owner_account_id=kb_record.owner_id,
+            target_account_id=target_account_id,
+            target_tenant_id=target_account.tenant_id,
+            role=normalized_role,
+            status="active",
+            created_by=requester.user_id,
+            revoked_by=None,
+            reason=reason,
+            created_at=now,
+            updated_at=now,
+            revoked_at=None,
+        )
+        try:
+            saved = await self._store.create_person_kb_share_atomic(
+                share,
+                expected_generation=kb_record.generation,
+                actor_user_id=requester.user_id,
+            )
+        except KBLifecycleConflictError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error_code": "kb_lifecycle_conflict",
+                    "message": "Knowledge base changed; retry the request",
+                },
+            ) from exc
+        return {"share": saved.to_dict()}
+
+    async def unshare_kb(
+        self,
+        *,
+        kb_record: Any,
+        requester: Principal,
+        target_account_id: str,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        await self._require_share_manager(kb_record=kb_record, requester=requester)
+        share, revoked = await self._store.revoke_person_kb_share_atomic(
+            kb_record.id,
+            target_account_id,
+            revoked_by=requester.user_id,
+            reason=reason,
+        )
+        if share is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error_code": "share_not_found", "message": "Share not found"},
+            )
+        return {
+            "status": "unshared",
+            "kb_id": kb_record.id,
+            "target_account_id": target_account_id,
+            "revoked": revoked,
+            "share": share.to_dict(),
+        }
+
+    async def list_kb_shares(
+        self, *, kb_record: Any, requester: Principal
+    ) -> dict[str, Any]:
+        await self._require_share_manager(kb_record=kb_record, requester=requester)
+        shares = await self._store.list_person_kb_shares(kb_id=kb_record.id)
+        return {"kb_id": kb_record.id, "shares": [s.to_dict() for s in shares]}
+
+    async def list_my_kb_shares(self, *, person_id: str) -> dict[str, Any]:
+        shares = await self._store.list_person_kb_shares(
+            person_id=person_id, only_active=True
+        )
+        return {"shares": [s.to_dict() for s in shares]}
 
 
 def _account_summary(user: EnterpriseUserRecord) -> dict[str, Any]:

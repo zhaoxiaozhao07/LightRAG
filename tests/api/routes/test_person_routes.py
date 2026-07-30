@@ -162,6 +162,7 @@ def _build_client(monkeypatch, tmp_path: Path):
 
     app = FastAPI()
     app.state.enterprise_enabled = True
+    app.state.kb_service = kb_service
     app.state.metadata_store = metadata_store
     app.state.enterprise_user_service = user_service
     app.state.enterprise_settings_service = settings_service
@@ -177,7 +178,7 @@ def _build_client(monkeypatch, tmp_path: Path):
     app.include_router(
         create_enterprise_routes(api_key=_API_KEY, kb_service=kb_service)
     )
-    app.include_router(create_person_routes(api_key=_API_KEY))
+    app.include_router(create_person_routes(api_key=_API_KEY, kb_service=kb_service))
 
     client = TestClient(app)
     return (
@@ -957,3 +958,240 @@ def test_cross_tenant_switch_isolates_business_writes(monkeypatch, tmp_path):
     assert accounts.status_code == 200
     tenants = {a["tenant_id"] for a in accounts.json()["accounts"]}
     assert tenants == {"tenant-fin", "tenant-legal"}
+
+
+# ---------------------------------------------------------------------------
+# person KB shares: cross-department personal KB usage
+# ---------------------------------------------------------------------------
+
+
+def test_person_kb_share_flow_and_department_admin_oversight(monkeypatch, tmp_path):
+    """The target user scenario end-to-end: alice (tenant-fin) shares her
+    personal KB to her own legal-department account (bob). Zero-copy: bob's
+    account gets a direct ACL on the SAME kb_id; tenant-legal's admin gains
+    the configured oversight floor; other principals gain nothing; revoking
+    the share cuts both immediately."""
+
+    (
+        client,
+        user_service,
+        person_service,
+        metadata_store,
+        admin,
+        alice,
+        bob,
+    ) = _build_client(monkeypatch, tmp_path)
+    authz = client.app.state.enterprise_authorization_service
+    kb_service = client.app.state.kb_service
+
+    from lightrag.api.enterprise_auth import principal_from_user
+
+    async def _seed():
+        legal_admin = await user_service.create_user(
+            username="legal_admin", password="legal-admin-pass"
+        )
+        carol = await user_service.create_user(
+            username="carol", password="carol-pass"
+        )
+        await authz.grant_tenant_membership(
+            "tenant-fin", alice.id, "tenant_member", granted_by=admin.id
+        )
+        await authz.grant_tenant_membership(
+            "tenant-legal", bob.id, "tenant_member", granted_by=admin.id
+        )
+        await authz.grant_tenant_membership(
+            "tenant-legal", legal_admin.id, "tenant_admin", granted_by=admin.id
+        )
+        await authz.grant_tenant_membership(
+            "tenant-legal", carol.id, "tenant_member", granted_by=admin.id
+        )
+        record = await kb_service.create(
+            name="alice-personal", owner_id=alice.id, visibility="private"
+        )
+        # The real KB-create route grants the creator an owner ACL; mirror it.
+        await authz.grant_kb_role(
+            record.id, alice.id, "kb_owner", granted_by=admin.id
+        )
+        refreshed = {}
+        for user in (alice, bob, legal_admin, carol):
+            refreshed[user.username] = await user_service.get_user_or_404(user.id)
+        return record, refreshed
+
+    record, users = asyncio.run(_seed())
+    alice_r, bob_r = users["alice"], users["bob"]
+    legal_admin_r, carol_r = users["legal_admin"], users["carol"]
+
+    async def _resolve(user):
+        memberships = await metadata_store.list_user_tenant_memberships(user.id)
+        principal = principal_from_user(
+            user, auth_method="jwt", memberships=memberships
+        )
+        return await authz.resolve_kb_access(principal, record)
+
+    # Enroll alice's person and confirm bob as a second link.
+    person_id, person_token = _enroll_person_token(
+        client, user_service, admin, alice_r
+    )
+    headers_person = {"Authorization": f"Bearer {person_token}"}
+    propose = client.post(
+        f"/admin/persons/{person_id}/accounts/{bob_r.id}",
+        json={"reason": "legal dept"},
+        headers=_admin_headers(user_service, admin),
+    )
+    assert propose.status_code == 201, propose.text
+    confirm = client.post(
+        f"/auth/person/links/{bob_r.id}:confirm",
+        json={"person_password": "RightPass-1"},
+        headers=headers_person,
+    )
+    assert confirm.status_code == 200, confirm.text
+
+    # Before sharing: bob and legal admin have no access to alice's KB.
+    assert asyncio.run(_resolve(bob_r)).effective_role is None
+    assert asyncio.run(_resolve(legal_admin_r)).effective_role is None
+
+    # Alice shares her KB to her own legal-department account.
+    alice_headers = {
+        "Authorization": f"Bearer {_legacy_token(user_service, alice_r)}"
+    }
+    share = client.post(
+        f"/kbs/{record.id}/person-shares",
+        json={"target_account_id": bob_r.id, "role": "kb_editor"},
+        headers=alice_headers,
+    )
+    assert share.status_code == 201, share.text
+    assert share.json()["share"]["status"] == "active"
+    assert share.json()["share"]["target_tenant_id"] == "tenant-legal"
+
+    # Target account: direct editor access to the SAME kb (no rebuild).
+    bob_decision = asyncio.run(_resolve(bob_r))
+    assert bob_decision.effective_role == "kb_editor"
+    assert "direct" in bob_decision.sources
+
+    # Department admin: oversight floor, via the person-share signal.
+    admin_decision = asyncio.run(_resolve(legal_admin_r))
+    assert admin_decision.effective_role == "kb_viewer"
+    assert "person_share_oversight" in admin_decision.sources
+    # The KB shows up in the legal admin's listing.
+    async def _filtered(user):
+        memberships = await metadata_store.list_user_tenant_memberships(user.id)
+        principal = principal_from_user(
+            user, auth_method="jwt", memberships=memberships
+        )
+        return await authz.filter_kbs_for_principal(principal, [record])
+
+    assert asyncio.run(_filtered(legal_admin_r)) == [record]
+
+    # Ordinary legal member: nothing (sharing exposes to the admin, not the
+    # whole department).
+    assert asyncio.run(_resolve(carol_r)).effective_role is None
+
+    # Person-level listing shows the share.
+    mine = client.get("/auth/person/kb-shares", headers=headers_person)
+    if mine.status_code == 401:
+        # confirm revoked the person session; re-login.
+        relogin = client.post(
+            "/auth/person/login",
+            json={
+                "person_id": person_id,
+                "person_password": "RightPass-1",
+                "account_id": alice_r.id,
+            },
+        ).json()
+        headers_person = {"Authorization": f"Bearer {relogin['access_token']}"}
+        mine = client.get("/auth/person/kb-shares", headers=headers_person)
+    assert mine.status_code == 200, mine.text
+    assert any(s["kb_id"] == record.id for s in mine.json()["shares"])
+
+    # Owner listing on the KB.
+    listing = client.get(
+        f"/kbs/{record.id}/person-shares", headers=alice_headers
+    )
+    assert listing.status_code == 200, listing.text
+    assert len(listing.json()["shares"]) == 1
+
+    # Revoke: both the target account and the department admin lose access.
+    revoke = client.delete(
+        f"/kbs/{record.id}/person-shares/{bob_r.id}", headers=alice_headers
+    )
+    assert revoke.status_code == 200, revoke.text
+    assert revoke.json()["status"] == "unshared"
+    assert asyncio.run(_resolve(bob_r)).effective_role is None
+    assert asyncio.run(_resolve(legal_admin_r)).effective_role is None
+
+
+def test_person_kb_share_rejections(monkeypatch, tmp_path):
+    (
+        client,
+        user_service,
+        person_service,
+        metadata_store,
+        admin,
+        alice,
+        bob,
+    ) = _build_client(monkeypatch, tmp_path)
+    kb_service = client.app.state.kb_service
+
+    async def _seed():
+        carol = await user_service.create_user(
+            username="carol", password="carol-pass"
+        )
+        personal = await kb_service.create(
+            name="alice-personal", owner_id=alice.id, visibility="private"
+        )
+        tenant_kb = await kb_service.create(
+            name="dept-kb",
+            owner_id=alice.id,
+            tenant_id="tenant-fin",
+            origin="tenant",
+        )
+        authz = client.app.state.enterprise_authorization_service
+        await authz.grant_kb_role(
+            personal.id, alice.id, "kb_owner", granted_by=admin.id
+        )
+        await authz.grant_kb_role(
+            tenant_kb.id, alice.id, "kb_owner", granted_by=admin.id
+        )
+        return carol, personal, tenant_kb
+
+    carol, personal, tenant_kb = asyncio.run(_seed())
+
+    person_id, _token = _enroll_person_token(client, user_service, admin, alice)
+    alice_headers = {"Authorization": f"Bearer {_legacy_token(user_service, alice)}"}
+    bob_headers = {"Authorization": f"Bearer {_legacy_token(user_service, bob)}"}
+
+    # Non-owner cannot share someone else's KB.
+    resp = client.post(
+        f"/kbs/{personal.id}/person-shares",
+        json={"target_account_id": bob.id},
+        headers=bob_headers,
+    )
+    # The KB-write middleware rejects the outsider before the handler's
+    # owner check (plain-string detail); either layer is a valid 403 here.
+    assert resp.status_code == 403, resp.text
+
+    # Target must be an active link of the SAME person (carol is not).
+    resp = client.post(
+        f"/kbs/{personal.id}/person-shares",
+        json={"target_account_id": carol.id},
+        headers=alice_headers,
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"]["error_code"] == "account_not_linked"
+
+    # Tenant-origin KBs cannot be person-shared.
+    resp = client.post(
+        f"/kbs/{tenant_kb.id}/person-shares",
+        json={"target_account_id": bob.id},
+        headers=alice_headers,
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["error_code"] == "person_share_requires_personal_kb"
+
+    # Sharing to the owner account itself is a validation error.
+    resp = client.post(
+        f"/kbs/{personal.id}/person-shares",
+        json={"target_account_id": alice.id},
+        headers=alice_headers,
+    )
+    assert resp.status_code == 400, resp.text

@@ -35,6 +35,7 @@ from lightrag.api.metadata_store import (
     EnterprisePersonAccountLinkRecord,
     EnterprisePersonCredentialRecord,
     EnterprisePersonEnrollmentGrantRecord,
+    EnterprisePersonKBShareRecord,
     EnterprisePersonLoginSessionRecord,
     EnterprisePersonRecord,
     EnterpriseUserKBQuerySettingsRecord,
@@ -744,6 +745,43 @@ class EnterpriseMetadataStore(Protocol):
         actor_user_id: str | None = None,
         revoked_at: str | None = None,
     ) -> tuple[EnterprisePersonRecord, int]: ...
+
+    # -- person KB shares (cross-department personal KB sharing) -------
+
+    async def create_person_kb_share_atomic(
+        self,
+        share: EnterprisePersonKBShareRecord,
+        *,
+        expected_generation: str | None = None,
+        actor_user_id: str | None = None,
+    ) -> EnterprisePersonKBShareRecord: ...
+
+    async def revoke_person_kb_share_atomic(
+        self,
+        kb_id: str,
+        target_account_id: str,
+        *,
+        revoked_by: str | None = None,
+        reason: str | None = None,
+        revoked_at: str | None = None,
+    ) -> tuple[EnterprisePersonKBShareRecord | None, int]: ...
+
+    async def get_person_kb_share(
+        self, kb_id: str, target_account_id: str
+    ) -> EnterprisePersonKBShareRecord | None: ...
+
+    async def list_person_kb_shares(
+        self,
+        *,
+        kb_id: str | None = None,
+        person_id: str | None = None,
+        target_account_id: str | None = None,
+        only_active: bool = False,
+    ) -> list[EnterprisePersonKBShareRecord]: ...
+
+    async def kb_has_active_person_share_for_tenant(
+        self, kb_id: str, tenant_id: str
+    ) -> bool: ...
 
 
 def _user_write_conflict(exc: MetadataConflictError) -> HTTPException:
@@ -3998,6 +4036,24 @@ class AuthorizationService:
                 tenant_source = "tenant_override_capped"
             # A deny, malformed override, or override without a current tenant
             # ACL contributes no tenant access.
+
+        if (
+            tenant_role is None
+            and tenant_id is not None
+            and _tenant_role_rank(primary_tenant_role)
+            >= _TENANT_ROLE_RANK[TENANT_ROLE_ADMIN]
+            and await self._metadata_store.kb_has_active_person_share_for_tenant(
+                kb_id, tenant_id
+            )
+        ):
+            # A personal KB shared INTO this department via a person-KB share
+            # makes the department's tenant admins oversight-eligible (sharing
+            # into a department implies its admins can see and operate on the
+            # KB at the configured oversight floor). The predicate re-checks
+            # the target account's current canonical tenant, so the signal
+            # goes dark the moment the account leaves the department.
+            tenant_role = enterprise_tenant_admin_oversight_role()
+            tenant_source = "person_share_oversight"
 
         effective_role = _max_kb_role(platform_role, tenant_role)
         sources = tuple(

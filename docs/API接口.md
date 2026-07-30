@@ -2299,7 +2299,7 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
 - **session-control**（`require_person_session_control`）：服务 `accounts/switch/logout/logout-all/change-password/confirm-link`。校验 v2 签名/kid/typ/iss/aud、person active、session active/未过期、`person_epoch`/`session_epoch` 一致。**不**要求当前账号 active、**不**比较账号 `token_version`、**不**校验 link/membership，也不构建账号 `Principal`——因此当前账号被 disable/reset 后仍可 list/switch/logout。运行时把 person/session 信息放入 `request.state.person_session`，**不**写入 `Principal.metadata`。
 - **account-access**（`person_account_access_validate`，经 `combined_auth` 调用）：服务所有现有业务 API。在 session-control 基础上**额外**校验：账号 active、账号非 `super_admin`（升权后的账号对 person token 立即不可达）、账号 `token_version` 与 session 快照一致、`(person_id, user_id)` active link 存在、`session.active_account_id == token.user_id`，随后按现有逻辑构建普通账号 `Principal`（`auth_method="person_jwt"`）。**交互式等价**：所有按"交互式用户"把关的业务面（chat、chat memory、个人查询设置、个人 agent prompt、`PATCH /auth/me`、`POST /auth/logout` 等）通过 `INTERACTIVE_AUTH_METHODS = {"jwt", "person_jwt"}` 同时接受两种 token——person token 在业务 API 上的行为与该账号自己的 legacy 登录 JWT 完全一致。
 
-#### 10.6.3 端点总览（14 个）
+#### 10.6.3 端点总览（19 个）
 
 `Authorization: Bearer <v2 person token>` 用于 session-control 端点；admin 端点用 legacy 交互式 super admin JWT（`combined_auth`）。`person`/`account`/`session` 响应对象只含非秘密字段。
 
@@ -2319,6 +2319,10 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
 | `DELETE` | `/admin/persons/{person_id}/accounts/{account_id}` | super admin | 解绑 link |
 | `POST` | `/admin/persons/{person_id}:disable` | super admin | 停用 person（撤销全部 session） |
 | `POST` | `/admin/persons/{person_id}:enable` | super admin | 启用 person（不发 token） |
+| `POST` | `/kbs/{kb_id}/person-shares` | KB owner（或 super admin） | 把个人 KB 共享给本人其他部门账号（零拷贝），`201` |
+| `GET` | `/kbs/{kb_id}/person-shares` | KB owner（或 super admin） | 列出该 KB 的 person 共享 |
+| `DELETE` | `/kbs/{kb_id}/person-shares/{target_account_id}` | KB owner（或 super admin） | 撤销共享（同事务移除目标账号 ACL） |
+| `GET` | `/auth/person/kb-shares` | session-control | 列出我（person）名下全部 active 共享 |
 
 #### 10.6.4 公共入口：enroll / login
 
@@ -2540,6 +2544,45 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
 - 不合并数据：不迁移/合并/复制不同账号的 KB/chat/job/memory/ACL/审计。
 - 不扩大 super admin 面：目标为 `super_admin` 的账号默认禁止绑定。
 - 不存储可恢复秘密：不存明文 person password、明文 grant token、raw JWT；grant 只存 hash，明文仅创建时返回一次；错误/审计/日志不输出这些值。
+
+#### 10.6.11 个人 KB 跨部门共享（person KB share）
+
+同一自然人在多个部门有账号时，可把**自己名下的个人 KB**（`origin=platform` 且有 `owner_id`）开放给**本人在其他部门的账号**使用。实现方式为**共享授权**而非复制或软链接：KB 实体（`kb_id`/workspace/全部构建产物）只有一份，**不需要重新构建**，归属（`owner_id`）不变；共享在同一事务内物化为目标账号的一条直接 `enterprise_kb_acl` 记录，撤销共享即删除该记录、立即生效。
+
+**为什么不用 copy / 软链接**：copy 会使存储与构建产物翻倍且从复制那一刻起数据漂移；KB 数据主体在 PostgreSQL（KV/向量/图按 workspace 隔离）而非文件系统，软链接无从谈起，且两个 kb_id 指向同一 workspace 会破坏按 kb_id 的操作栅栏与生命周期。共享授权是零成本、单一归属、可即时撤销的正确原语。
+
+**规则**：
+
+- 只能共享给**同一 person 的其他 active link 账号**（`404 account_not_linked`），不能共享给任意用户（任意用户走常规 KB ACL 面）；不能共享给 owner 自己（400）。
+- 只有 KB owner 本人（或 super admin）可创建/查看/撤销共享；owner 账号必须已 enroll（`403 person_identity_required`）。租户 KB（`origin=tenant`）不可 person 共享（`403 person_share_requires_personal_kb`）。
+- `role` 指定目标账号获得的角色：`kb_viewer`/`kb_editor`/`kb_admin`（默认 `kb_editor`，不允许 `kb_owner`——归属不转移）。重复共享同一目标幂等更新角色。
+- **部门管理员联动（强制）**：KB 共享进某部门（`target_tenant_id` = 目标账号的 canonical tenant）后，该部门的 tenant admin/owner 自动获得监察保底角色（`LIGHTRAG_ENTERPRISE_TENANT_ADMIN_OVERSIGHT_ROLE`，授权来源 `person_share_oversight`），在其 KB 列表中可见并可按该角色操作；**部门普通成员不获得任何访问**。谓词实时校验目标账号当前 canonical tenant，账号离开部门即失效。
+- 共享期间该 `(kb_id, 目标账号)` 的 ACL 行由共享机制持有：创建/撤销共享会覆盖/删除同键的手工直接 ACL。
+
+**请求/响应**：
+
+```json
+// POST /kbs/{kb_id}/person-shares
+{"target_account_id": "usr_dept_b", "role": "kb_editor", "reason": "法务部也要用"}
+// 201 → {"share": {"id": "pkbs_...", "kb_id": "...", "person_id": "per_...",
+//         "owner_account_id": "...", "target_account_id": "...",
+//         "target_tenant_id": "tenant-legal", "role": "kb_editor", "status": "active", ...}}
+
+// DELETE /kbs/{kb_id}/person-shares/{target_account_id}
+// 200 → {"status": "unshared", "kb_id": "...", "target_account_id": "...", "revoked": 1, "share": {...}}
+```
+
+**生命周期联动**（同事务、含审计 `person_kb_share_created` / `person_kb_share_revoked` / `person_kb_share_revoked_by_account_change`，平台级 `actor_tenant_id=None`）：
+
+| 事件 | 效果 |
+|---|---|
+| person link 解绑（owner 或目标任一侧） | 相关共享撤销 + 目标 ACL 删除 |
+| 目标账号变更 canonical tenant | 该账号作为目标的共享全部撤销（共享是部门作用域的；可在新部门重新共享） |
+| 账号删除（两条删除路径） | 双向共享撤销 + ACL 清理 |
+| KB 硬删除（purge） | 共享行随 KB 元数据清除 |
+| KB 软删除 | `resolve_kb_access` 对非 active KB fail closed，共享自然不可用 |
+
+**错误码补充**：`403 kb_owner_required` / `person_share_requires_personal_kb` / `person_identity_required`、`404 share_not_found`、`409 kb_lifecycle_conflict`（KB 代际变更，重试）。
 
 ---
 

@@ -2359,6 +2359,56 @@ class EnterprisePersonLoginSessionRecord:
         return asdict(self)
 
 
+@dataclass(slots=True)
+class EnterprisePersonKBShareRecord:
+    """A personal KB shared to another department account of the SAME person.
+
+    Zero-copy sharing: the KB entity (id/workspace/build artifacts) stays
+    single-owner; the share materializes as a direct ``enterprise_kb_acl`` row
+    for the target account (written in the same transaction) plus a
+    department-admin oversight signal keyed by ``target_tenant_id``. Sharing
+    into a department implies that department's tenant admins gain the
+    configured oversight floor role on the KB.
+    """
+
+    id: str
+    kb_id: str
+    person_id: str
+    owner_account_id: str
+    target_account_id: str
+    target_tenant_id: str | None
+    role: str
+    status: str
+    created_by: str | None
+    revoked_by: str | None
+    reason: str | None
+    created_at: str
+    updated_at: str
+    revoked_at: str | None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "EnterprisePersonKBShareRecord":
+        return cls(
+            id=str(row["id"]),
+            kb_id=str(row["kb_id"]),
+            person_id=str(row["person_id"]),
+            owner_account_id=str(row["owner_account_id"]),
+            target_account_id=str(row["target_account_id"]),
+            target_tenant_id=row["target_tenant_id"],
+            role=str(row["role"]),
+            status=str(row["status"]),
+            created_by=row["created_by"],
+            revoked_by=row["revoked_by"],
+            reason=row["reason"],
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+            revoked_at=row["revoked_at"],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def _dumps_json(value: dict[str, Any] | None) -> str:
     return json.dumps(value or {}, ensure_ascii=False, sort_keys=True)
 
@@ -4337,6 +4387,14 @@ class SQLiteMetadataStore:
                 now=now,
                 audit_event_type="person_session_revoked_by_account_change",
             )
+            self._revoke_person_kb_shares_locked(
+                conn,
+                either_side_account_id=user_id,
+                actor_user_id=None,
+                now=now,
+                audit_event_type="person_kb_share_revoked_by_account_change",
+                reason="account_deleted",
+            )
             conn.execute(
                 "DELETE FROM enterprise_person_account_links WHERE account_id = ?",
                 (user_id,),
@@ -5715,6 +5773,14 @@ class SQLiteMetadataStore:
                 actor_user_id=actor_user_id,
                 now=now,
                 audit_event_type="person_session_revoked_by_account_change",
+            )
+            self._revoke_person_kb_shares_locked(
+                conn,
+                either_side_account_id=user_id,
+                actor_user_id=actor_user_id,
+                now=now,
+                audit_event_type="person_kb_share_revoked_by_account_change",
+                reason="account_deleted",
             )
             conn.execute(
                 "DELETE FROM enterprise_person_account_links WHERE account_id = ?",
@@ -11663,6 +11729,16 @@ class SQLiteMetadataStore:
                     now=now,
                     audit_event_type="person_session_revoked_by_account_change",
                 )
+                # The account no longer belongs to this person: person-KB
+                # shares involving it (either side) lose their basis.
+                self._revoke_person_kb_shares_locked(
+                    conn,
+                    either_side_account_id=account_id,
+                    actor_user_id=actor_user_id,
+                    now=now,
+                    audit_event_type="person_kb_share_revoked_by_account_change",
+                    reason="person_link_revoked",
+                )
                 conn.execute(
                     """
                     UPDATE enterprise_person_account_links
@@ -11807,6 +11883,291 @@ class SQLiteMetadataStore:
             return EnterprisePersonRecord.from_row(row), revoked
 
         return await self._write(write)
+
+    # ------------------------------------------------------------------
+    # Person KB shares: one natural person exposing a personal KB to their
+    # OWN account in another department. Zero-copy: the share materializes a
+    # direct kb_acl row for the target account (same transaction) and flags
+    # the target department for tenant-admin oversight. While a share is
+    # active it owns the (kb_id, target_account_id) ACL row.
+    # ------------------------------------------------------------------
+
+    def _revoke_person_kb_shares_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        kb_id: str | None = None,
+        target_account_id: str | None = None,
+        either_side_account_id: str | None = None,
+        target_only_account_id: str | None = None,
+        actor_user_id: str | None,
+        now: str,
+        audit_event_type: str,
+        reason: str | None,
+    ) -> int:
+        """Revoke matching ACTIVE shares plus their materialized kb_acl rows.
+
+        Exactly one filter shape: (kb_id + target_account_id) for a single
+        share, ``either_side_account_id`` for unlink/account-delete (the
+        account may be owner or target), or ``target_only_account_id`` for a
+        canonical-tenant move (department-scoped target grants die; shares the
+        account OWNS are not departmental and survive). One audit row per
+        revoked share, same transaction.
+        """
+
+        if kb_id is not None and target_account_id is not None:
+            where = "kb_id = ? AND target_account_id = ? AND status = 'active'"
+            params: tuple[Any, ...] = (kb_id, target_account_id)
+        elif either_side_account_id is not None:
+            where = (
+                "(owner_account_id = ? OR target_account_id = ?) "
+                "AND status = 'active'"
+            )
+            params = (either_side_account_id, either_side_account_id)
+        else:
+            assert target_only_account_id is not None
+            where = "target_account_id = ? AND status = 'active'"
+            params = (target_only_account_id,)
+        rows = conn.execute(
+            f"SELECT * FROM enterprise_person_kb_shares WHERE {where}", params
+        ).fetchall()
+        for row in rows:
+            share = EnterprisePersonKBShareRecord.from_row(row)
+            conn.execute(
+                """
+                UPDATE enterprise_person_kb_shares
+                SET status = 'revoked', revoked_by = ?, revoked_at = ?,
+                    reason = COALESCE(?, reason), updated_at = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (actor_user_id, now, reason, now, share.id),
+            )
+            conn.execute(
+                "DELETE FROM enterprise_kb_acl WHERE kb_id = ? AND user_id = ?",
+                (share.kb_id, share.target_account_id),
+            )
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type=audit_event_type,
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person_kb_share",
+                    target_id=share.id,
+                    metadata={
+                        "kb_id": share.kb_id,
+                        "person_id": share.person_id,
+                        "owner_account_id": share.owner_account_id,
+                        "target_account_id": share.target_account_id,
+                        "target_tenant_id": share.target_tenant_id,
+                        "reason": reason,
+                    },
+                    created_at=now,
+                ),
+            )
+        return len(rows)
+
+    async def create_person_kb_share_atomic(
+        self,
+        share: EnterprisePersonKBShareRecord,
+        *,
+        expected_generation: str | None = None,
+        actor_user_id: str | None = None,
+    ) -> EnterprisePersonKBShareRecord:
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterprisePersonKBShareRecord:
+            self._assert_kb_generation(conn, share.kb_id, expected_generation)
+            conn.execute(
+                """
+                INSERT INTO enterprise_person_kb_shares (
+                    id, kb_id, person_id, owner_account_id, target_account_id,
+                    target_tenant_id, role, status, created_by, revoked_by,
+                    reason, created_at, updated_at, revoked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, NULL, ?, ?, ?, NULL)
+                ON CONFLICT(kb_id, target_account_id) DO UPDATE SET
+                    person_id = excluded.person_id,
+                    owner_account_id = excluded.owner_account_id,
+                    target_tenant_id = excluded.target_tenant_id,
+                    role = excluded.role,
+                    status = 'active',
+                    created_by = excluded.created_by,
+                    revoked_by = NULL,
+                    reason = excluded.reason,
+                    updated_at = excluded.updated_at,
+                    revoked_at = NULL
+                """,
+                (
+                    share.id,
+                    share.kb_id,
+                    share.person_id,
+                    share.owner_account_id,
+                    share.target_account_id,
+                    share.target_tenant_id,
+                    share.role,
+                    share.created_by,
+                    share.reason,
+                    share.created_at,
+                    share.updated_at,
+                ),
+            )
+            # Materialize the grant as a direct ACL so resolve_kb_access needs
+            # no extra lookups for the target account.
+            conn.execute(
+                """
+                INSERT INTO enterprise_kb_acl (
+                    kb_id, user_id, role, granted_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(kb_id, user_id) DO UPDATE SET
+                    role = excluded.role,
+                    granted_by = excluded.granted_by,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    share.kb_id,
+                    share.target_account_id,
+                    share.role,
+                    share.created_by,
+                    share.created_at,
+                    share.updated_at,
+                ),
+            )
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_kb_share_created",
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person_kb_share",
+                    target_id=share.id,
+                    metadata={
+                        "kb_id": share.kb_id,
+                        "person_id": share.person_id,
+                        "owner_account_id": share.owner_account_id,
+                        "target_account_id": share.target_account_id,
+                        "target_tenant_id": share.target_tenant_id,
+                        "role": share.role,
+                    },
+                    created_at=share.created_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_kb_shares "
+                "WHERE kb_id = ? AND target_account_id = ?",
+                (share.kb_id, share.target_account_id),
+            ).fetchone()
+            assert row is not None
+            return EnterprisePersonKBShareRecord.from_row(row)
+
+        return await self._write(write)
+
+    async def revoke_person_kb_share_atomic(
+        self,
+        kb_id: str,
+        target_account_id: str,
+        *,
+        revoked_by: str | None = None,
+        reason: str | None = None,
+        revoked_at: str | None = None,
+    ) -> tuple[EnterprisePersonKBShareRecord | None, int]:
+        await self._ensure_initialized()
+
+        def write(
+            conn: sqlite3.Connection,
+        ) -> tuple[EnterprisePersonKBShareRecord | None, int]:
+            now = revoked_at or utc_now_iso()
+            revoked = self._revoke_person_kb_shares_locked(
+                conn,
+                kb_id=kb_id,
+                target_account_id=target_account_id,
+                actor_user_id=revoked_by,
+                now=now,
+                audit_event_type="person_kb_share_revoked",
+                reason=reason,
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_kb_shares "
+                "WHERE kb_id = ? AND target_account_id = ?",
+                (kb_id, target_account_id),
+            ).fetchone()
+            return (
+                EnterprisePersonKBShareRecord.from_row(row)
+                if row is not None
+                else None
+            ), revoked
+
+        return await self._write(write)
+
+    async def get_person_kb_share(
+        self, kb_id: str, target_account_id: str
+    ) -> EnterprisePersonKBShareRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_person_kb_shares "
+                "WHERE kb_id = ? AND target_account_id = ?",
+                (kb_id, target_account_id),
+            ).fetchone()
+        return (
+            EnterprisePersonKBShareRecord.from_row(row) if row is not None else None
+        )
+
+    async def list_person_kb_shares(
+        self,
+        *,
+        kb_id: str | None = None,
+        person_id: str | None = None,
+        target_account_id: str | None = None,
+        only_active: bool = False,
+    ) -> list[EnterprisePersonKBShareRecord]:
+        await self._ensure_initialized()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if kb_id is not None:
+            clauses.append("kb_id = ?")
+            params.append(kb_id)
+        if person_id is not None:
+            clauses.append("person_id = ?")
+            params.append(person_id)
+        if target_account_id is not None:
+            clauses.append("target_account_id = ?")
+            params.append(target_account_id)
+        if only_active:
+            clauses.append("status = 'active'")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM enterprise_person_kb_shares "
+                f"{where} ORDER BY created_at ASC, id ASC",
+                tuple(params),
+            ).fetchall()
+        return [EnterprisePersonKBShareRecord.from_row(row) for row in rows]
+
+    async def kb_has_active_person_share_for_tenant(
+        self, kb_id: str, tenant_id: str
+    ) -> bool:
+        """Oversight predicate for the target department's tenant admins.
+
+        The JOIN re-checks the target account's CURRENT canonical tenant so a
+        share goes dark for the old department the moment the account moves
+        (the tenant-move hook also revokes it; this is the fail-closed read).
+        """
+
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM enterprise_person_kb_shares s
+                JOIN enterprise_users u ON u.id = s.target_account_id
+                WHERE s.kb_id = ? AND s.status = 'active'
+                    AND s.target_tenant_id = ? AND u.tenant_id = ?
+                LIMIT 1
+                """,
+                (kb_id, tenant_id, tenant_id),
+            ).fetchone()
+        return row is not None
 
     async def upsert_kb_acl(
         self, acl: KBACLRecord, *, expected_generation: str | None = None
@@ -12704,6 +13065,7 @@ class SQLiteMetadataStore:
                 "document_artifacts",
                 "document_source_keys",
                 "enterprise_kb_acl",
+                "enterprise_person_kb_shares",
                 "enterprise_tenant_kb_acl",
                 "enterprise_tenant_user_kb_overrides",
                 "enterprise_user_kb_query_settings",
@@ -13148,6 +13510,20 @@ class SQLiteMetadataStore:
                 user.updated_at,
             ),
         )
+        if current_user is not None and current_user.tenant_id != canonical_tenant:
+            # Canonical tenant changed: person-KB shares that granted this
+            # account access were scoped to the OLD department (the department
+            # admins' oversight was tied to it). They lose their basis; the
+            # person can re-share into the new department explicitly. Shares
+            # this account OWNS are not departmental and survive.
+            self._revoke_person_kb_shares_locked(
+                conn,
+                target_only_account_id=user.id,
+                actor_user_id=None,
+                now=user.updated_at,
+                audit_event_type="person_kb_share_revoked_by_account_change",
+                reason="tenant_changed",
+            )
         if canonical_tenant is None:
             conn.execute(
                 "DELETE FROM enterprise_tenant_memberships WHERE user_id = ?",
@@ -14251,6 +14627,38 @@ class SQLiteMetadataStore:
                 ON enterprise_person_login_sessions (person_id, status);
             CREATE INDEX IF NOT EXISTS idx_enterprise_person_login_sessions_account_status
                 ON enterprise_person_login_sessions (active_account_id, status);
+
+            CREATE TABLE IF NOT EXISTS enterprise_person_kb_shares (
+                id TEXT PRIMARY KEY,
+                kb_id TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                owner_account_id TEXT NOT NULL,
+                target_account_id TEXT NOT NULL,
+                target_tenant_id TEXT,
+                role TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_by TEXT,
+                revoked_by TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                revoked_at TEXT,
+                CHECK (status IN ('active', 'revoked')),
+                CHECK (role IN ('kb_viewer', 'kb_editor', 'kb_admin')),
+                FOREIGN KEY (person_id) REFERENCES enterprise_persons(id),
+                FOREIGN KEY (target_account_id) REFERENCES enterprise_users(id)
+                    ON DELETE CASCADE,
+                UNIQUE (kb_id, target_account_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_enterprise_person_kb_shares_kb_status
+                ON enterprise_person_kb_shares (kb_id, status);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_person_kb_shares_person_status
+                ON enterprise_person_kb_shares (person_id, status);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_person_kb_shares_target_status
+                ON enterprise_person_kb_shares (target_account_id, status);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_person_kb_shares_tenant_status
+                ON enterprise_person_kb_shares (target_tenant_id, status);
             """
         )
         conn.execute(

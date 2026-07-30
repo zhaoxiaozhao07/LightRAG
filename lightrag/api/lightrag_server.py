@@ -2886,7 +2886,9 @@ def create_app(args):
         # enterprise because person auth builds on the enterprise metadata
         # store + accounts; the routes themselves gate on person_auth_enabled.
         if _person_auth_enabled:
-            app.include_router(create_person_routes(api_key=api_key))
+            app.include_router(
+                create_person_routes(api_key=api_key, kb_service=kb_service)
+            )
     app.include_router(create_document_routes(rag, doc_manager, api_key))
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))

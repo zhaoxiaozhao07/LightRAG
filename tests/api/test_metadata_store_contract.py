@@ -52,6 +52,7 @@ from lightrag.api.metadata_store import (
     EnterprisePersonAccountLinkRecord,
     EnterprisePersonCredentialRecord,
     EnterprisePersonEnrollmentGrantRecord,
+    EnterprisePersonKBShareRecord,
     EnterprisePersonLoginSessionRecord,
     EnterprisePersonRecord,
     EnterpriseUserRecord,
@@ -5521,3 +5522,181 @@ async def test_concurrent_switch_and_logout_all_leave_no_live_session(store):
     final_person = await store.get_person_by_id(person.id)
     assert final_person is not None
     assert final_person.auth_epoch == pre_epoch + 1
+
+
+def _person_kb_share(
+    kb_id: str,
+    person_id: str,
+    owner_account_id: str,
+    target_account_id: str,
+    *,
+    target_tenant_id: str | None = None,
+    role: str = "kb_editor",
+) -> EnterprisePersonKBShareRecord:
+    now = utc_now_iso()
+    return EnterprisePersonKBShareRecord(
+        id=f"pkbs_{uuid.uuid4().hex[:12]}",
+        kb_id=kb_id,
+        person_id=person_id,
+        owner_account_id=owner_account_id,
+        target_account_id=target_account_id,
+        target_tenant_id=target_tenant_id,
+        role=role,
+        status="active",
+        created_by=owner_account_id,
+        revoked_by=None,
+        reason=None,
+        created_at=now,
+        updated_at=now,
+        revoked_at=None,
+    )
+
+
+async def _enroll_with_second_link(store, *, owner_tenant=None, target_tenant=None):
+    """Person enrolled on account A with a confirmed second link to account B."""
+
+    account_a = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    account_b = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    if owner_tenant is not None:
+        await store.upsert_tenant_membership(_membership(account_a.id, owner_tenant))
+        account_a = await store.get_enterprise_user_by_id(account_a.id)
+    if target_tenant is not None:
+        await store.upsert_tenant_membership(_membership(account_b.id, target_tenant))
+        account_b = await store.get_enterprise_user_by_id(account_b.id)
+    person, _, _, _, _ = await _enroll(store, account_id=account_a.id)
+    await store.propose_person_account_link_atomic(
+        _person_link(person.id, account_b.id, status="pending")
+    )
+    await store.confirm_person_account_link_atomic(
+        person_id=person.id, account_id=account_b.id
+    )
+    return person, account_a, account_b
+
+
+async def test_person_kb_share_materializes_and_revokes_acl(store):
+    """create share -> direct ACL exists (same txn); re-share updates role in
+    place; revoke -> share revoked + ACL removed; audit rows platform-level."""
+
+    person, account_a, account_b = await _enroll_with_second_link(store)
+    kb_id = f"kb_{uuid.uuid4().hex[:10]}"
+
+    share = _person_kb_share(kb_id, person.id, account_a.id, account_b.id)
+    saved = await store.create_person_kb_share_atomic(
+        share, actor_user_id=account_a.id
+    )
+    assert saved.status == "active"
+    assert await store.get_kb_acl_role(kb_id, account_b.id) == "kb_editor"
+
+    # Re-share with a different role: same row (same id), role updated.
+    reshared = await store.create_person_kb_share_atomic(
+        _person_kb_share(
+            kb_id, person.id, account_a.id, account_b.id, role="kb_viewer"
+        ),
+        actor_user_id=account_a.id,
+    )
+    assert reshared.id == saved.id
+    assert reshared.role == "kb_viewer"
+    assert await store.get_kb_acl_role(kb_id, account_b.id) == "kb_viewer"
+
+    revoked_share, revoked = await store.revoke_person_kb_share_atomic(
+        kb_id, account_b.id, revoked_by=account_a.id
+    )
+    assert revoked == 1
+    assert revoked_share is not None and revoked_share.status == "revoked"
+    assert await store.get_kb_acl_role(kb_id, account_b.id) is None
+    # Idempotent second revoke.
+    again, count = await store.revoke_person_kb_share_atomic(kb_id, account_b.id)
+    assert count == 0 and again is not None and again.status == "revoked"
+
+    for event_type in ("person_kb_share_created", "person_kb_share_revoked"):
+        events = await store.list_audit_events(event_type=event_type, limit=20)
+        mine = [e for e in events if e.metadata.get("kb_id") == kb_id]
+        assert mine, event_type
+        assert all(e.actor_tenant_id is None for e in mine)
+
+
+async def test_person_kb_share_revoked_on_unlink_either_side(store):
+    """Unlinking the person from either the owner or the target account kills
+    the share and its materialized ACL in the same transaction."""
+
+    # Target-side unlink.
+    person, account_a, account_b = await _enroll_with_second_link(store)
+    kb_id = f"kb_{uuid.uuid4().hex[:10]}"
+    await store.create_person_kb_share_atomic(
+        _person_kb_share(kb_id, person.id, account_a.id, account_b.id)
+    )
+    await store.revoke_person_account_link_atomic(
+        person_id=person.id, account_id=account_b.id
+    )
+    share = await store.get_person_kb_share(kb_id, account_b.id)
+    assert share is not None and share.status == "revoked"
+    assert await store.get_kb_acl_role(kb_id, account_b.id) is None
+
+    # Owner-side unlink.
+    person2, acc_c, acc_d = await _enroll_with_second_link(store)
+    kb2 = f"kb_{uuid.uuid4().hex[:10]}"
+    await store.create_person_kb_share_atomic(
+        _person_kb_share(kb2, person2.id, acc_c.id, acc_d.id)
+    )
+    await store.revoke_person_account_link_atomic(
+        person_id=person2.id, account_id=acc_c.id
+    )
+    share2 = await store.get_person_kb_share(kb2, acc_d.id)
+    assert share2 is not None and share2.status == "revoked"
+    assert await store.get_kb_acl_role(kb2, acc_d.id) is None
+
+
+async def test_person_kb_share_revoked_on_target_tenant_move(store):
+    """Shares are department-scoped on the target side: moving the target
+    account to another canonical tenant revokes them (and the oversight
+    predicate goes dark)."""
+
+    person, account_a, account_b = await _enroll_with_second_link(
+        store, target_tenant=f"tenant_{uuid.uuid4().hex[:8]}"
+    )
+    old_tenant = account_b.tenant_id
+    assert old_tenant is not None
+    kb_id = f"kb_{uuid.uuid4().hex[:10]}"
+    await store.create_person_kb_share_atomic(
+        _person_kb_share(
+            kb_id,
+            person.id,
+            account_a.id,
+            account_b.id,
+            target_tenant_id=old_tenant,
+        )
+    )
+    assert await store.kb_has_active_person_share_for_tenant(kb_id, old_tenant)
+
+    new_tenant = f"tenant_{uuid.uuid4().hex[:8]}"
+    await store.upsert_tenant_membership(_membership(account_b.id, new_tenant))
+
+    share = await store.get_person_kb_share(kb_id, account_b.id)
+    assert share is not None and share.status == "revoked"
+    assert share.reason == "tenant_changed"
+    assert await store.get_kb_acl_role(kb_id, account_b.id) is None
+    assert not await store.kb_has_active_person_share_for_tenant(kb_id, old_tenant)
+    assert not await store.kb_has_active_person_share_for_tenant(kb_id, new_tenant)
+
+
+async def test_person_kb_share_removed_on_account_delete_and_purge(store):
+    """Account deletion (owner side) revokes shares + target ACLs; KB purge
+    drops the share rows."""
+
+    person, account_a, account_b = await _enroll_with_second_link(store)
+    kb_id = f"kb_{uuid.uuid4().hex[:10]}"
+    await store.create_person_kb_share_atomic(
+        _person_kb_share(kb_id, person.id, account_a.id, account_b.id)
+    )
+    assert await store.delete_enterprise_user(account_a.id) is True
+    share = await store.get_person_kb_share(kb_id, account_b.id)
+    assert share is not None and share.status == "revoked"
+    assert await store.get_kb_acl_role(kb_id, account_b.id) is None
+
+    counts = await store.purge_kb_metadata(kb_id)
+    assert counts.get("enterprise_person_kb_shares", 0) >= 1
+    assert await store.get_person_kb_share(kb_id, account_b.id) is None
