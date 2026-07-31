@@ -18,6 +18,46 @@ from dotenv import load_dotenv
 # the OS environment variables take precedence over the .env file
 load_dotenv(dotenv_path=".env", override=False)
 
+# Default per-document token budget when chunking for rerank.
+# 4096 matches Cohere rerank-v3.5; smaller models (e.g. ColBERT, 512-token limit)
+# should override this to leave margin below their hard limit.
+DEFAULT_RERANK_MAX_TOKENS_PER_DOC = 4096
+
+# Practical lower bound for a rerank chunk window. Below this the loop still
+# terminates (guaranteed by the max_tokens >= 1 guard and the overlap clamp), but
+# every document explodes into many tiny, low-signal chunks — inflating the request
+# payload and the number of scores to aggregate. Configured values below this are
+# accepted but warned about at startup rather than silently degrading query latency.
+MIN_PRACTICAL_RERANK_MAX_TOKENS = 64
+
+
+def _normalize_rerank_result(
+    result: Any, max_index: int
+) -> tuple[dict[str, int | float] | None, str | None]:
+    """Validate one provider result and return the public rerank shape.
+
+    Providers and compatible proxies occasionally return mixed ``results`` lists.
+    Keeping the validation here lets the HTTP boundary and chunk aggregation reject
+    the same malformed entries without leaking invalid indices or non-finite scores
+    into callers.
+    """
+    if not isinstance(result, dict):
+        return None, "not an object"
+
+    index = result.get("index")
+    if isinstance(index, bool) or not isinstance(index, int):
+        return None, "invalid index"
+    if not 0 <= index < max_index:
+        return None, "index out of range"
+
+    try:
+        score = float(result.get("relevance_score"))
+    except (TypeError, ValueError, OverflowError):
+        return None, "invalid relevance score"
+    if not isfinite(score):
+        return None, "non-finite relevance score"
+
+    return {"index": index, "relevance_score": score}, None
 
 def chunk_documents_for_rerank(
     documents: List[str],
