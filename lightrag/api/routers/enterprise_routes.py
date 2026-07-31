@@ -1669,7 +1669,12 @@ def create_enterprise_routes(
         principal = require_principal(request)
         authz_service = get_enterprise_authorization_service(request)
         await authz_service.get_tenant_or_404(tenant_id)
-        # No cascade: refuse while anything still references the tenant.
+        # Refuse only while STRUCTURAL references remain (members, users whose
+        # canonical tenant is this one, tenant-owned KBs). Revocable grants TO
+        # the tenant (tenant KB ACLs, per-user overrides, person-KB share
+        # oversight) are not containment: deleting the tenant revokes them in
+        # the same store transaction. Stale grant rows — e.g. an ACL whose KB
+        # was deleted later — must never wedge tenant deletion.
         member_count = len(await authz_service.list_tenant_memberships(tenant_id))
         acl_kb_ids = await authz_service.list_kb_ids_for_tenants([tenant_id])
         kb_count = sum(
@@ -1683,7 +1688,7 @@ def create_enterprise_routes(
         user_count = sum(
             1 for user in await user_service.list_users() if user.tenant_id == tenant_id
         )
-        if member_count or kb_count or user_count or acl_kb_ids:
+        if member_count or kb_count or user_count:
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -1702,7 +1707,7 @@ def create_enterprise_routes(
             actor_user_id=principal.user_id,
             actor_tenant_id=principal.tenant_id,
         )
-        return {"deleted": deleted}
+        return {"deleted": deleted, "removed_tenant_kb_acls": len(acl_kb_ids)}
 
     @router.get(
         "/admin/tenants/{tenant_id}/kbs",

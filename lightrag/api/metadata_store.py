@@ -11900,6 +11900,7 @@ class SQLiteMetadataStore:
         target_account_id: str | None = None,
         either_side_account_id: str | None = None,
         target_only_account_id: str | None = None,
+        target_tenant_id: str | None = None,
         actor_user_id: str | None,
         now: str,
         audit_event_type: str,
@@ -11909,10 +11910,11 @@ class SQLiteMetadataStore:
 
         Exactly one filter shape: (kb_id + target_account_id) for a single
         share, ``either_side_account_id`` for unlink/account-delete (the
-        account may be owner or target), or ``target_only_account_id`` for a
+        account may be owner or target), ``target_only_account_id`` for a
         canonical-tenant move (department-scoped target grants die; shares the
-        account OWNS are not departmental and survive). One audit row per
-        revoked share, same transaction.
+        account OWNS are not departmental and survive), or ``target_tenant_id``
+        when the department itself is deleted. One audit row per revoked
+        share, same transaction.
         """
 
         if kb_id is not None and target_account_id is not None:
@@ -11924,6 +11926,9 @@ class SQLiteMetadataStore:
                 "AND status = 'active'"
             )
             params = (either_side_account_id, either_side_account_id)
+        elif target_tenant_id is not None:
+            where = "target_tenant_id = ? AND status = 'active'"
+            params = (target_tenant_id,)
         else:
             assert target_only_account_id is not None
             where = "target_account_id = ? AND status = 'active'"
@@ -12335,6 +12340,18 @@ class SQLiteMetadataStore:
             ):
                 return False
             now = utc_now_iso()
+            # Departments are deleted only once structurally empty, so any
+            # share still targeting this tenant is a straggler (its target
+            # account was detached through a path that bypassed the move
+            # hook). Revoke defensively before dropping the grant tables.
+            self._revoke_person_kb_shares_locked(
+                conn,
+                target_tenant_id=tenant_id,
+                actor_user_id=None,
+                now=now,
+                audit_event_type="person_kb_share_revoked_by_account_change",
+                reason="tenant_deleted",
+            )
             conn.execute(
                 """
                 UPDATE enterprise_users

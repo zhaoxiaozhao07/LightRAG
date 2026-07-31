@@ -6540,3 +6540,54 @@ def test_enterprise_tenant_admin_oversight_extends_to_soft_deleted_kbs(
     assert (
         authz.has_tenant_lifecycle_oversight(alice_owner, deleted_record) is True
     )
+
+
+def test_admin_tenant_delete_cascades_stale_kb_grants(monkeypatch, tmp_path):
+    """Regression for the field-reported wedge: a tenant whose only remaining
+    reference is a tenant-KB ACL row (its KB deleted long ago, or the grant
+    simply left behind) must delete cleanly — revocable grants TO the tenant
+    are cascaded, not treated as containment."""
+
+    from lightrag.api.metadata_store import EnterpriseTenantKBACLRecord
+    from lightrag.api.kb_service import utc_now_iso
+
+    client, user_service, _authz, admin, _alice, _bob, _probe = _build_enterprise_client(
+        monkeypatch, tmp_path
+    )
+    admin_headers = {"Authorization": f"Bearer {_token(user_service, admin)}"}
+    store = client.app.state.metadata_store
+
+    created = client.post(
+        "/admin/tenants",
+        json={"name": "Stale", "tenant_id": "t-stale"},
+        headers=admin_headers,
+    )
+    assert created.status_code in (200, 201), created.text
+
+    # Simulate the residue: a grant pointing at a KB that no longer exists.
+    now = utc_now_iso()
+    asyncio.run(
+        store.upsert_tenant_kb_acl(
+            EnterpriseTenantKBACLRecord(
+                tenant_id="t-stale",
+                kb_id="kb_ghost",
+                role="kb_viewer",
+                granted_by=admin.id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    )
+    assert asyncio.run(store.list_kb_ids_for_tenants(["t-stale"])) == ["kb_ghost"]
+
+    # Previously: 409 tenant_not_empty with tenant_kb_acl_count=1. Now: 200,
+    # the grant is cascaded away with the tenant.
+    deleted = client.delete("/admin/tenants/t-stale", headers=admin_headers)
+    assert deleted.status_code == 200, deleted.text
+    body = deleted.json()
+    assert body["deleted"] is True
+    assert body["removed_tenant_kb_acls"] == 1
+    assert asyncio.run(store.list_kb_ids_for_tenants(["t-stale"])) == []
+    assert (
+        client.get("/admin/tenants/t-stale", headers=admin_headers).status_code == 404
+    )

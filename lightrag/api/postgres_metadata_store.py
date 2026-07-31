@@ -9886,6 +9886,7 @@ class PostgresMetadataStore:
         target_account_id: str | None = None,
         either_side_account_id: str | None = None,
         target_only_account_id: str | None = None,
+        target_tenant_id: str | None = None,
         actor_user_id: str | None,
         now: str,
         audit_event_type: str,
@@ -9905,6 +9906,12 @@ class PostgresMetadataStore:
                 "WHERE (owner_account_id = $1 OR target_account_id = $1) "
                 "AND status = 'active' FOR UPDATE",
                 either_side_account_id,
+            )
+        elif target_tenant_id is not None:
+            rows = await conn.fetch(
+                "SELECT * FROM enterprise_person_kb_shares "
+                "WHERE target_tenant_id = $1 AND status = 'active' FOR UPDATE",
+                target_tenant_id,
             )
         else:
             assert target_only_account_id is not None
@@ -10315,6 +10322,17 @@ class PostgresMetadataStore:
             if exists is None:
                 return False
             now = utc_now_iso()
+            # Departments are deleted only once structurally empty, so any
+            # share still targeting this tenant is a straggler. Revoke
+            # defensively before dropping the grant tables.
+            await self._pg_revoke_person_kb_shares_locked(
+                conn,
+                target_tenant_id=tenant_id,
+                actor_user_id=None,
+                now=now,
+                audit_event_type="person_kb_share_revoked_by_account_change",
+                reason="tenant_deleted",
+            )
             await conn.execute(
                 """
                 UPDATE enterprise_users

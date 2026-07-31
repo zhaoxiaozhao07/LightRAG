@@ -1755,7 +1755,7 @@ username=admin&password=change-me
 | `GET` | `/admin/tenants` | 列出所有租户 |
 | `GET` | `/admin/tenants/{tenant_id}` | 租户详情 + 总览（含 `member_count` / `kb_count`）；`kb_count` 是 active 的 tenant-owned KB 与 super admin 通过 tenant ACL 下发 KB 的去重并集；本 tenant admin/owner 也可读取 |
 | `PATCH` | `/admin/tenants/{tenant_id}` | 更新租户 `name`/`description`/`status`（`active`/`disabled`） |
-| `DELETE` | `/admin/tenants/{tenant_id}` | 删除租户实体；仅当无任何引用（成员/租户内 KB/归属用户/tenant-KB ACL）时允许，否则 `409`（不级联） |
+| `DELETE` | `/admin/tenants/{tenant_id}` | 删除租户实体；仅当无**结构性引用**（成员/租户内 KB/归属用户）时允许，否则 `409 tenant_not_empty`。指向该租户的**可撤销授权**（tenant-KB ACL、per-user override、person 共享的部门监察）不阻塞：随删除在同一事务内级联清除并审计（响应含 `removed_tenant_kb_acls`）。KB 已删而残留的 stale ACL 不会再卡住删除 |
 | `GET` | `/admin/tenants/{tenant_id}/kbs` | 列出该租户下的 KB（`id`/`name`/`status`/`visibility`/`owner_id`） |
 | `GET` | `/admin/tenants/{tenant_id}/members` | 列出 tenant 成员与 tenant role；每条 membership 附带解析后的 `username` / `display_name` / `user_status` |
 | `PUT` | `/admin/tenants/{tenant_id}/members/{user_id}` | 写入/更新 tenant membership，body：`{"role":"tenant_member"}`；响应同样附带 `username` / `display_name` / `user_status` |
@@ -2578,6 +2578,7 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
 |---|---|
 | person link 解绑（owner 或目标任一侧） | 相关共享撤销 + 目标 ACL 删除 |
 | 目标账号变更 canonical tenant | 该账号作为目标的共享全部撤销（共享是部门作用域的；可在新部门重新共享） |
+| 部门（租户）删除 | 删除前置条件已保证成员全部脱离（脱离时即联动撤销）；`delete_enterprise_tenant` 事务内仍兜底撤销任何残余 active 共享（reason=`tenant_deleted`），历史已撤销记录保留作审计 |
 | 账号删除（两条删除路径） | 双向共享撤销 + ACL 清理 |
 | KB 硬删除（purge） | 共享行随 KB 元数据清除 |
 | KB 软删除 | `resolve_kb_access` 对非 active KB fail closed，共享自然不可用 |

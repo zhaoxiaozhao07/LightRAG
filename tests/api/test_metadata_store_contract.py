@@ -5700,3 +5700,64 @@ async def test_person_kb_share_removed_on_account_delete_and_purge(store):
     counts = await store.purge_kb_metadata(kb_id)
     assert counts.get("enterprise_person_kb_shares", 0) >= 1
     assert await store.get_person_kb_share(kb_id, account_b.id) is None
+
+
+async def test_delete_enterprise_tenant_cascades_grants_and_shares(store):
+    """Tenant deletion revokes grants TO the tenant in one transaction:
+    tenant KB ACLs, per-user overrides, and any straggler active person-KB
+    share targeting the tenant (belt for paths that bypass the move hook)."""
+
+    tenant_id = f"tenant_{uuid.uuid4().hex[:8]}"
+    now = utc_now_iso()
+    await store.upsert_enterprise_tenant(
+        EnterpriseTenantRecord(
+            id=tenant_id,
+            name="doomed",
+            description=None,
+            status="active",
+            metadata={},
+            created_by="usr_admin",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    person, account_a, account_b = await _enroll_with_second_link(
+        store, target_tenant=tenant_id
+    )
+    kb_id = f"kb_{uuid.uuid4().hex[:10]}"
+    await store.create_person_kb_share_atomic(
+        _person_kb_share(
+            kb_id,
+            person.id,
+            account_a.id,
+            account_b.id,
+            target_tenant_id=tenant_id,
+        )
+    )
+    # A stale tenant-level grant (its KB may or may not exist anymore).
+    await store.upsert_tenant_kb_acl(
+        EnterpriseTenantKBACLRecord(
+            tenant_id=tenant_id,
+            kb_id="kb_ghost_deleted_long_ago",
+            role="kb_viewer",
+            granted_by="usr_admin",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    assert await store.kb_has_active_person_share_for_tenant(kb_id, tenant_id)
+
+    assert await store.delete_enterprise_tenant(tenant_id) is True
+
+    share = await store.get_person_kb_share(kb_id, account_b.id)
+    assert share is not None and share.status == "revoked"
+    assert share.reason == "tenant_deleted"
+    assert await store.get_kb_acl_role(kb_id, account_b.id) is None
+    assert not await store.kb_has_active_person_share_for_tenant(kb_id, tenant_id)
+    assert (
+        await store.get_tenant_kb_acl_role(tenant_id, "kb_ghost_deleted_long_ago")
+        is None
+    )
+    refreshed_b = await store.get_enterprise_user_by_id(account_b.id)
+    assert refreshed_b.tenant_id is None
+    assert await store.list_tenant_memberships(tenant_id) == []
