@@ -46,6 +46,10 @@ os.environ["LIGHTRAG_CHAT_MEMORY_ENABLED"] = "false"
 # it off before any lazy parse; person tests enable the feature by replacing
 # global_args inside their own bodies, which happens after both layers.
 os.environ["LIGHTRAG_PERSON_AUTH_ENABLED"] = "false"
+# Keep unrelated API tests on the backward-compatible Phase-1 default even if
+# a developer .env enables the object-mode startup gate.
+os.environ["LIGHTRAG_ARTIFACT_STORAGE_MODE"] = "local"
+os.environ["LIGHTRAG_OBJECT_STORAGE"] = "local"
 
 
 @pytest.fixture(autouse=True)

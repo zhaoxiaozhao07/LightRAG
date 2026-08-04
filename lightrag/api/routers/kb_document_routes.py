@@ -6,11 +6,12 @@ import hashlib
 import io
 import ipaddress
 import json
+import re
 import socket
 import zipfile
 from email.message import Message
 from pathlib import Path
-from typing import Any, Literal, Optional, Sequence, cast
+from typing import Any, Awaitable, Callable, Literal, Optional, Sequence, cast
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
@@ -27,17 +28,30 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+from starlette.background import BackgroundTask
 
-from lightrag.api.config import global_args
+from lightrag.api.commit_reconciliation import MetadataCommitOutcomeUnknownError
+from lightrag.api.config import (
+    OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED,
+    global_args,
+    load_object_route_policy_from_env,
+    object_route_policy_allows,
+)
 from lightrag.api.document_lifecycle_service import (
+    DocumentCowCommitOutcomeUnknownError,
+    DocumentCowEngineDeleteError,
+    DocumentCowRetryableError,
+    DocumentLifecycleError,
     DocumentLifecycleService,
     DocumentReplacementSource,
     DocumentSourceInput,
     build_text_source,
 )
 from lightrag.api.index_build_service import (
+    IndexBuildExecution,
     IndexBuildPlan,
     IndexBuildService,
+    PipelineBuildPreflight,
 )
 from lightrag.api.job_service import JobService
 from lightrag.api.kb_service import KnowledgeBaseNotFoundError, utc_now_iso
@@ -47,9 +61,12 @@ from lightrag.api.metadata_store import (
     ActiveDocumentDeleteJobError,
     ActiveDocumentParseJobError,
     ActiveDocumentReplaceJobError,
+    ArtifactPointerConflictError,
     ArtifactRecord,
+    DocumentAttemptOwnershipError,
     DocumentNotParsedError,
     DocumentRecord,
+    DocumentSnapshotConflictError,
     DuplicateDocumentSourceKeyError,
     IdempotencyKeyConflictError,
     InvalidJobTransitionError,
@@ -92,6 +109,109 @@ _PREVIEW_TEXT_MEDIA_TYPES = {
 }
 _PREVIEW_BINARY_MEDIA_TYPES = {"application/pdf"}
 _PREVIEW_BLOCKED_MEDIA_TYPES = {"image/svg+xml"}
+_SCRATCH_REFERENCE_RE = re.compile(
+    r"(?:file://)?[^\s\"']*\.lightrag-scratch[/\\][^\s\"']+"
+)
+
+
+def _redact_scratch_references(value: object) -> str:
+    return _SCRATCH_REFERENCE_RE.sub("<artifact-materialization>", str(value)).replace(
+        ".lightrag-scratch", "artifact-materialization"
+    )
+
+
+def _object_lifecycle_capability_enabled() -> bool:
+    """Return the object-authoritative lifecycle capability constant.
+
+    Thin indirection so route-policy enforcement tests can exercise the
+    allowlist branch without mutating the frozen config constant. The constant
+    itself (``OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED``) stays ``False``
+    until Gate 3; this helper is the only place the routes layer reads it.
+    """
+
+    return OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED
+
+
+def _require_destructive_lifecycle(
+    document_service: DocumentLifecycleService,
+    operation: str,
+    *,
+    kb_id: str | None = None,
+    route_operation: str | None = None,
+) -> None:
+    """Admission gate for destructive document routes.
+
+    Three-state policy:
+
+    1. Local mode (``not document_service.object_authoritative``): proceed. All
+       routes are allowed regardless of the allowlist.
+    2. Object mode while the capability constant is still ``False`` (Phase 3.2
+       today): preserve the existing 503 behavior via
+       ``assert_destructive_operation_supported``. The route allowlist is not
+       reachable in production yet.
+    3. Object mode once the capability constant flips ``True`` (post-Gate-3):
+       enforce the per-KB object-route allowlist. If ``route_operation`` is
+       allowlisted for this KB, proceed; otherwise raise 403.
+    """
+
+    if not document_service.object_authoritative:
+        return
+    if not _object_lifecycle_capability_enabled():
+        try:
+            document_service.assert_destructive_operation_supported(operation)
+        except DocumentLifecycleError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return
+    # Capability gate has flipped True (future, post-Gate-3). Enforce the
+    # per-KB object-route allowlist.
+    if route_operation is None or not object_route_policy_allows(
+        load_object_route_policy_from_env(), kb_id, route_operation
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"{operation} is not enabled in object mode"
+                + (f" for KB {kb_id!r}" if kb_id is not None else "")
+                + (
+                    f": route allowlist does not include {route_operation!r}"
+                    if route_operation is not None
+                    else ": route is not allowlistable in object mode"
+                )
+            ),
+        )
+
+
+def _reject_legacy_route_in_object_mode(
+    document_service: DocumentLifecycleService, route_label: str
+) -> None:
+    """Block legacy local-path mutation routes in object mode permanently.
+
+    ``documents:import``, ``documents:scan``, ``documents:texts`` and
+    ``documents:urls`` are durable local-path authority routes and must never
+    run in object mode. They can NEVER appear in the route allowlist.
+
+    While the capability gate is closed (Phase 3.2 today) the response is 503
+    to stay consistent with the destructive-lifecycle admission gate; once the
+    capability gate flips True the response becomes a permanent 403.
+    """
+
+    if not document_service.object_authoritative:
+        return
+    if not _object_lifecycle_capability_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"{route_label} is a legacy local-path route and is not "
+                "supported in object artifact mode"
+            ),
+        )
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"{route_label} is a legacy local-path route and is permanently "
+            "disabled in object artifact mode"
+        ),
+    )
 
 
 def _stream_directory_as_zip(artifact_file: Any) -> StreamingResponse:
@@ -102,38 +222,41 @@ def _stream_directory_as_zip(artifact_file: Any) -> StreamingResponse:
     typically a few MB. Anything beyond ``_MAX_DIRECTORY_ARTIFACT_BYTES``
     raises ``413 Payload Too Large`` rather than streaming partially.
     """
-    root: Path = artifact_file.path
-    buffer = io.BytesIO()
-    total_uncompressed = 0
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for entry in sorted(root.rglob("*")):
-            if entry.is_dir():
-                continue
-            try:
-                relative = entry.relative_to(root)
-            except ValueError:
-                continue
-            try:
-                size = entry.stat().st_size
-            except OSError:
-                continue
-            total_uncompressed += size
-            if total_uncompressed > _MAX_DIRECTORY_ARTIFACT_BYTES:
-                raise HTTPException(
-                    status_code=413,
-                    detail=(
-                        "Directory artifact exceeds maximum download size of "
-                        f"{_MAX_DIRECTORY_ARTIFACT_BYTES // (1024 * 1024)}MB"
-                    ),
-                )
-            archive.write(entry, arcname=str(relative).replace("\\", "/"))
-    buffer.seek(0)
-    zip_name = artifact_file.filename
-    return StreamingResponse(
-        iter([buffer.getvalue()]),
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
-    )
+    try:
+        root: Path = artifact_file.path
+        buffer = io.BytesIO()
+        total_uncompressed = 0
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for entry in sorted(root.rglob("*")):
+                if entry.is_dir():
+                    continue
+                try:
+                    relative = entry.relative_to(root)
+                except ValueError:
+                    continue
+                try:
+                    size = entry.stat().st_size
+                except OSError:
+                    continue
+                total_uncompressed += size
+                if total_uncompressed > _MAX_DIRECTORY_ARTIFACT_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            "Directory artifact exceeds maximum download size of "
+                            f"{_MAX_DIRECTORY_ARTIFACT_BYTES // (1024 * 1024)}MB"
+                        ),
+                    )
+                archive.write(entry, arcname=str(relative).replace("\\", "/"))
+        buffer.seek(0)
+        zip_name = artifact_file.filename
+        return StreamingResponse(
+            iter([buffer.getvalue()]),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+        )
+    finally:
+        artifact_file.cleanup()
 
 
 def _artifact_audit_metadata(artifact: ArtifactRecord, **extra: Any) -> dict[str, Any]:
@@ -258,38 +381,47 @@ def _is_previewable_media_type(media_type: str) -> bool:
 
 
 def _artifact_preview_response(artifact_file: Any) -> FileResponse:
-    if artifact_file.is_directory or artifact_file.path.is_dir():
-        raise HTTPException(status_code=400, detail="Directory artifacts cannot be previewed")
-    media_type = artifact_file.media_type
-    if not _is_previewable_media_type(media_type):
-        raise HTTPException(
-            status_code=415,
-            detail=f"Artifact media type is not supported for preview: {media_type}",
-        )
     try:
-        size = artifact_file.path.stat().st_size
-    except OSError as exc:
-        raise FileNotFoundError(f"Artifact file not found: {artifact_file.path}") from exc
-    if size > _MAX_ARTIFACT_PREVIEW_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                "Artifact preview exceeds maximum size of "
-                f"{_MAX_ARTIFACT_PREVIEW_BYTES // (1024 * 1024)}MB"
-            ),
+        if artifact_file.is_directory or artifact_file.path.is_dir():
+            raise HTTPException(
+                status_code=400, detail="Directory artifacts cannot be previewed"
+            )
+        media_type = artifact_file.media_type
+        if not _is_previewable_media_type(media_type):
+            raise HTTPException(
+                status_code=415,
+                detail=f"Artifact media type is not supported for preview: {media_type}",
+            )
+        try:
+            size = artifact_file.path.stat().st_size
+        except OSError as exc:
+            raise FileNotFoundError(
+                f"Artifact file not found: {artifact_file.path}"
+            ) from exc
+        if size > _MAX_ARTIFACT_PREVIEW_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Artifact preview exceeds maximum size of "
+                    f"{_MAX_ARTIFACT_PREVIEW_BYTES // (1024 * 1024)}MB"
+                ),
+            )
+        headers = {"X-Content-Type-Options": "nosniff"}
+        if media_type.split(";", 1)[0].lower() == "text/html":
+            headers["Content-Security-Policy"] = (
+                "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'"
+            )
+        return FileResponse(
+            artifact_file.path,
+            media_type=media_type,
+            filename=artifact_file.filename,
+            content_disposition_type="inline",
+            headers=headers,
+            background=BackgroundTask(artifact_file.cleanup),
         )
-    headers = {"X-Content-Type-Options": "nosniff"}
-    if media_type.split(";", 1)[0].lower() == "text/html":
-        headers["Content-Security-Policy"] = (
-            "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'"
-        )
-    return FileResponse(
-        artifact_file.path,
-        media_type=media_type,
-        filename=artifact_file.filename,
-        content_disposition_type="inline",
-        headers=headers,
-    )
+    except BaseException:
+        artifact_file.cleanup()
+        raise
 
 
 _RESERVED_DOCUMENT_METADATA_KEYS = {
@@ -334,6 +466,18 @@ _RESERVED_DOCUMENT_METADATA_KEYS = {
     "last_synced_at",
 }
 
+
+def _artifact_download_file_response(artifact_file: Any) -> FileResponse:
+    try:
+        return FileResponse(
+            artifact_file.path,
+            media_type=artifact_file.media_type,
+            filename=artifact_file.filename,
+            background=BackgroundTask(artifact_file.cleanup),
+        )
+    except BaseException:
+        artifact_file.cleanup()
+        raise
 
 class DocumentResponse(BaseModel):
     id: str
@@ -1284,14 +1428,31 @@ def _sync_failure_message(failed_items: int, total_items: int) -> str:
 def _parse_plan_payload(plan: Any) -> dict[str, Any]:
     return {
         "document_id": plan.document.id,
-        "source_uri": str(plan.source_path),
+        "source_name": plan.source_name,
+        "source_object_uri": plan.source_object_uri,
         "source_hash": plan.document.source_hash,
         "parser_engine": plan.parser_engine,
         "process_options": plan.process_options,
         "parser_hash": plan.parser_hash,
         "lightrag_doc_id": plan.lightrag_doc_id,
+        "raw_object_refs": [
+            {
+                "artifact_id": ref.artifact_id,
+                "object_prefix_uri": ref.object_prefix_uri,
+                "directory_name": ref.directory_name,
+            }
+            for ref in plan.raw_object_refs
+        ],
+        "force_reparse": plan.force_reparse,
+        "auto_index": plan.auto_index,
     }
 
+
+def _durable_parse_error_message(execution: Any, error: object) -> str:
+    sanitizer = getattr(execution, "durable_error_message", None)
+    if callable(sanitizer):
+        return str(sanitizer(error))
+    return _redact_scratch_references(error)
 
 async def _job_is_cancelling(
     job_service: "JobService | None", kb_id: str, job_id: str
@@ -1320,17 +1481,27 @@ async def _cancel_parse_item(
     job_id: str,
     plan: Any,
 ) -> dict[str, Any]:
-    """Release a parse claim when cancelled at a checkpoint (doc -> parse_failed,
-    recoverable via :retry)."""
+    """Release a parse claim at a producer-safe cancellation boundary."""
     try:
-        await document_service.fail_parse(
-            kb_id,
-            plan.document.id,
-            job_id=job_id,
-            plan=plan,
-            error_code="cancelled_by_user",
-            error_message="Parse cancelled before execution",
-        )
+        release = getattr(document_service, "release_parse_if_owned", None)
+        if callable(release):
+            await release(
+                kb_id,
+                plan.document.id,
+                job_id=job_id,
+                plan=plan,
+                error_code="cancelled_by_user",
+                error_message="Parse cancelled by user",
+            )
+        else:
+            await document_service.fail_parse(
+                kb_id,
+                plan.document.id,
+                job_id=job_id,
+                plan=plan,
+                error_code="cancelled_by_user",
+                error_message="Parse cancelled by user",
+            )
     except Exception as exc:  # noqa: BLE001
         logger.error(
             "Failed to release parse claim for cancelled doc '%s': %s",
@@ -1341,7 +1512,7 @@ async def _cancel_parse_item(
         "document_id": plan.document.id,
         "status": "cancelled",
         "error_code": "cancelled_by_user",
-        "error_message": "Parse cancelled before execution",
+        "error_message": "Parse cancelled by user",
     }
 
 
@@ -1352,16 +1523,26 @@ async def _cancel_build_item(
     job_id: str,
     plan: IndexBuildPlan,
 ) -> dict[str, Any]:
-    """Release a build claim when cancelled at a checkpoint (doc -> build_failed,
-    recoverable via :retry)."""
+    """Release a build claim at a producer-safe cancellation boundary."""
     try:
-        await index_service.fail_build(
-            kb_id,
-            plan.document.id,
-            job_id=job_id,
-            error_code="cancelled_by_user",
-            error_message="Build cancelled before execution",
-        )
+        release = getattr(index_service, "release_build_if_owned", None)
+        if callable(release):
+            await release(
+                kb_id,
+                plan.document.id,
+                job_id=job_id,
+                plan=plan,
+                error_code="cancelled_by_user",
+                error_message="Build cancelled by user",
+            )
+        else:
+            await index_service.fail_build(
+                kb_id,
+                plan.document.id,
+                job_id=job_id,
+                error_code="cancelled_by_user",
+                error_message="Build cancelled by user",
+            )
     except Exception as exc:  # noqa: BLE001
         logger.error(
             "Failed to release build claim for cancelled doc '%s': %s",
@@ -1372,8 +1553,33 @@ async def _cancel_build_item(
         "document_id": plan.document.id,
         "status": "cancelled",
         "error_code": "cancelled_by_user",
-        "error_message": "Build cancelled before execution",
+        "error_message": "Build cancelled by user",
     }
+
+
+class _LogicalParseCancellation(Exception):
+    """Job cancellation observed while the parse producer remains in flight."""
+
+    def __init__(
+        self,
+        parsed_data: dict[str, Any] | None = None,
+        producer_error: BaseException | None = None,
+    ) -> None:
+        super().__init__("Parse producer reached terminal after logical cancellation")
+        self.parsed_data = parsed_data
+        self.producer_error = producer_error
+
+
+def _observe_background_parse_task(task: asyncio.Task[dict[str, Any]]) -> None:
+    """Consume a producer result after its owning worker task was cancelled."""
+
+    def consume_result(done: asyncio.Task[dict[str, Any]]) -> None:
+        if done.cancelled():
+            return
+        with contextlib.suppress(BaseException):
+            done.result()
+
+    task.add_done_callback(consume_result)
 
 
 async def _run_parse_with_forced_cancel(
@@ -1383,52 +1589,64 @@ async def _run_parse_with_forced_cancel(
     kb_id: str,
     job_id: str,
     plan: Any,
+    execution: Any,
     rag: Any,
     poll_interval: float = 0.25,
 ) -> dict[str, Any]:
-    """Run the parse (MinerU/native/docling) await, force-cancellable mid-flight.
+    """Wait for the real parse producer while applying logical cancellation.
 
-    The parse stage is the one long single ``await`` in the document pipeline
-    (a MinerU/Docling call can run for minutes). Stage-boundary cooperative
-    cancellation cannot interrupt it once entered. Here we run ``run_parse`` as
-    its own ``asyncio.Task`` and concurrently poll the job status; when the job
-    flips to ``cancelling`` we ``cancel()`` the in-flight task and stop.
-
-    This is **safe for the parse stage specifically** because parse is
-    idempotent: it writes a MinerU/Docling raw bundle + sidecar that a re-run
-    simply overwrites, and on cancel we reset the document to ``parse_failed``
-    (recoverable via ``:retry``). It is deliberately NOT applied to the
-    KG-build / vector-upsert stages, where a mid-``await`` interrupt could leave
-    a half-merged graph or partially-written vectors. Returns the parsed-data
-    dict on success; raises :class:`asyncio.CancelledError` when force-cancelled.
-
-    When ``job_service`` is None (no way to observe cancellation) it degrades to
-    a plain ``await`` with no polling overhead.
+    Cancelling an asyncio wrapper around ``asyncio.to_thread`` does not stop the
+    underlying producer. A job-level cancel therefore only records intent: the
+    attempt owner and materialization lease remain live until the producer is
+    observably terminal. Outer worker/process cancellation is different; it
+    defers the lease and leaves the shielded producer for process-death recovery.
     """
-    if job_service is None:
-        return await document_service.run_parse(rag, plan)
+    parse_task = asyncio.create_task(
+        document_service.run_parse(rag, plan, execution)
+    )
+    with contextlib.suppress(AttributeError, TypeError):
+        execution.producer_task = parse_task
+    logical_cancel_requested = False
+    timeout = None if job_service is None else max(0.01, poll_interval)
 
-    parse_task = asyncio.ensure_future(document_service.run_parse(rag, plan))
-    try:
-        while True:
-            done, _pending = await asyncio.wait({parse_task}, timeout=poll_interval)
-            if parse_task in done:
-                return parse_task.result()
-            if await _job_is_cancelling(job_service, kb_id, job_id):
-                parse_task.cancel()
-                try:
-                    await parse_task
-                except asyncio.CancelledError:
-                    pass
-                raise asyncio.CancelledError()
-    except asyncio.CancelledError:
-        if not parse_task.done():
-            parse_task.cancel()
-            try:
-                await parse_task
-            except asyncio.CancelledError:
-                pass
-        raise
+    async def job_cancel_requested() -> bool:
+        try:
+            return await _job_is_cancelling(job_service, kb_id, job_id)
+        except asyncio.CancelledError:
+            execution.defer_cleanup()
+            if not parse_task.done():
+                _observe_background_parse_task(parse_task)
+            raise
+
+    while True:
+        try:
+            parsed_data = await asyncio.wait_for(
+                asyncio.shield(parse_task), timeout=timeout
+            )
+        except TimeoutError:
+            if not logical_cancel_requested and await job_cancel_requested():
+                logical_cancel_requested = True
+            continue
+        except asyncio.CancelledError:
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
+                execution.defer_cleanup()
+                if not parse_task.done():
+                    _observe_background_parse_task(parse_task)
+                raise
+            if logical_cancel_requested or await job_cancel_requested():
+                raise _LogicalParseCancellation() from None
+            raise RuntimeError("Parse producer task was cancelled unexpectedly") from None
+        except Exception as producer_error:
+            if logical_cancel_requested or await job_cancel_requested():
+                raise _LogicalParseCancellation(
+                    producer_error=producer_error
+                ) from producer_error
+            raise
+
+        if logical_cancel_requested or await job_cancel_requested():
+            raise _LogicalParseCancellation(parsed_data=parsed_data)
+        return parsed_data
 
 
 async def _execute_parse_plan(
@@ -1440,14 +1658,28 @@ async def _execute_parse_plan(
     rag: Any,
     job_service: "JobService | None" = None,
 ) -> dict[str, Any]:
+    execution: Any | None = None
+    parsed_data: dict[str, Any] | None = None
     try:
         if await _job_is_cancelling(job_service, kb_id, job_id):
             return await _cancel_parse_item(
                 document_service, kb_id=kb_id, job_id=job_id, plan=plan
             )
-        await document_service.mark_parse_running(
-            kb_id, plan.document.id, job_id=job_id
-        )
+        try:
+            await document_service.mark_parse_running(
+                kb_id,
+                plan.document.id,
+                job_id=job_id,
+                claim_token=getattr(plan, "claim_token", None),
+                plan=plan,
+            )
+        except TypeError as exc:
+            if "unexpected keyword" not in str(exc):
+                raise
+            await document_service.mark_parse_running(
+                kb_id, plan.document.id, job_id=job_id
+            )
+        execution = await document_service.materialize_parse_execution(plan)
         try:
             parsed_data = await _run_parse_with_forced_cancel(
                 document_service=document_service,
@@ -1455,21 +1687,50 @@ async def _execute_parse_plan(
                 kb_id=kb_id,
                 job_id=job_id,
                 plan=plan,
+                execution=execution,
                 rag=rag,
             )
-        except asyncio.CancelledError:
-            # Force-cancelled mid-parse: release the claim as a recoverable
-            # parse_failed and report a cancelled item (not a hard failure).
+        except _LogicalParseCancellation as cancelled:
+            parsed_data = cancelled.parsed_data
+            try:
+                await document_service.finalize_parse_runtime_references(
+                    rag, plan, execution, parsed_data
+                )
+            except Exception as scrub_error:  # noqa: BLE001
+                logger.warning(
+                    "Failed to scrub cancelled parse runtime references for '%s': %s",
+                    plan.document.id,
+                    _durable_parse_error_message(execution, scrub_error),
+                )
             return await _cancel_parse_item(
                 document_service, kb_id=kb_id, job_id=job_id, plan=plan
             )
+        await document_service.finalize_parse_runtime_references(
+            rag, plan, execution, parsed_data
+        )
         result = await document_service.complete_parse(
             kb_id,
             plan.document.id,
             job_id=job_id,
             plan=plan,
+            execution=execution,
             parsed_data=parsed_data,
         )
+        try:
+            await document_service.commit_parse_artifact_binding(rag, plan, result)
+        except Exception as exc:  # noqa: BLE001 - durable patch is an explicit fault
+            error_message = _durable_parse_error_message(execution, exc)
+            logger.error(
+                "Failed to commit parse artifact binding for document '%s': %s",
+                plan.document.id,
+                error_message,
+            )
+            return {
+                "document_id": plan.document.id,
+                "status": "failed",
+                "error_code": "artifact_binding_commit_failed",
+                "error_message": error_message,
+            }
         return {
             "document_id": result.document.id,
             "status": "succeeded",
@@ -1477,12 +1738,48 @@ async def _execute_parse_plan(
             "lightrag_doc_id": result.document.lightrag_doc_id,
             "artifact_count": len(result.artifacts),
         }
+    except asyncio.CancelledError:
+        if execution is not None:
+            execution.defer_cleanup()
+        raise
+    except (DocumentSnapshotConflictError, DocumentAttemptOwnershipError) as exc:
+        error_message = _durable_parse_error_message(execution, exc)
+        with contextlib.suppress(Exception):
+            await document_service.release_parse_if_owned(
+                kb_id,
+                plan.document.id,
+                job_id=job_id,
+                plan=plan,
+                error_code=_attempt_conflict_error_code(exc),
+                error_message=error_message,
+            )
+        return _attempt_conflict_item(plan.document.id, exc)
+    except MetadataCommitOutcomeUnknownError as exc:
+        error_message = _durable_parse_error_message(execution, exc)
+        return {
+            "document_id": plan.document.id,
+            "status": "failed",
+            "error_code": "metadata_commit_outcome_unknown",
+            "error_message": error_message,
+        }
     except Exception as exc:
+        error_message = _durable_parse_error_message(execution, exc)
+        if execution is not None:
+            try:
+                await document_service.finalize_parse_runtime_references(
+                    rag, plan, execution, parsed_data
+                )
+            except Exception as scrub_error:  # noqa: BLE001
+                logger.warning(
+                    "Failed to scrub parse runtime references for '%s': %s",
+                    plan.document.id,
+                    _durable_parse_error_message(execution, scrub_error),
+                )
         logger.error(
             "Failed to parse document '%s' for KB '%s': %s",
             plan.document.id,
             kb_id,
-            exc,
+            error_message,
         )
         try:
             await document_service.fail_parse(
@@ -1491,7 +1788,7 @@ async def _execute_parse_plan(
                 job_id=job_id,
                 plan=plan,
                 error_code="parse_failed",
-                error_message=str(exc),
+                error_message=error_message,
             )
         except Exception as transition_exc:
             logger.error(
@@ -1504,8 +1801,11 @@ async def _execute_parse_plan(
             "document_id": plan.document.id,
             "status": "failed",
             "error_code": "parse_failed",
-            "error_message": str(exc),
+            "error_message": error_message,
         }
+    finally:
+        if execution is not None:
+            execution.cleanup()
 
 
 async def _run_auto_parse_batch(
@@ -1641,10 +1941,9 @@ async def _run_auto_parse_batch(
                     build_plan = await index_service.create_build_plan(
                         kb_id, doc_id, rag=rag
                     )
-                    if not build_plan.skipped:
-                        await index_service.claim_build_queued(
-                            kb_id, job_id=job.id, plan=build_plan
-                        )
+                    await index_service.claim_build_queued(
+                        kb_id, job_id=job.id, plan=build_plan
+                    )
                 except Exception as exc:  # noqa: BLE001 — per-item plan failure
                     item["status"] = "failed"
                     item["error_code"] = "build_failed"
@@ -1809,17 +2108,103 @@ def _build_plan_payload(plan: IndexBuildPlan) -> dict[str, Any]:
     return {
         "document_id": plan.document.id,
         "lightrag_doc_id": plan.document.lightrag_doc_id,
+        "kb_generation": plan.kb_generation,
         "parser_hash": plan.parser_hash,
         "index_hash": plan.index_hash,
-        "sidecar_uri": plan.sidecar_uri,
-        "blocks_path": plan.blocks_path,
-        "process_options": plan.process_options,
+        "source_hash": plan.document.source_hash,
+        "sidecar_artifact_id": (
+            plan.sidecar_artifact.id if plan.sidecar_artifact is not None else None
+        ),
+        "blocks_artifact_id": (
+            plan.blocks_artifact.id if plan.blocks_artifact is not None else None
+        ),
         "force_rechunk": plan.force_rechunk,
         "force_extract": plan.force_extract,
         "force_embedding": plan.force_embedding,
         "skipped": plan.skipped,
         "skip_reason": plan.skip_reason,
+        "expected_snapshot": plan.expected_snapshot,
     }
+
+
+def _durable_build_error_message(
+    execution: IndexBuildExecution | PipelineBuildPreflight | None,
+    error: object,
+) -> str:
+    if execution is not None:
+        return _redact_scratch_references(execution.durable_error_message(error))
+    return _redact_scratch_references(error)
+
+
+def _validate_object_build_preflight(
+    index_service: IndexBuildService,
+    plan: IndexBuildPlan,
+    preflight: PipelineBuildPreflight,
+) -> None:
+    """Validate the exact short-lived runtime before closing its lease."""
+
+    if preflight.plan is not plan:
+        raise DocumentLifecycleError("Build preflight plan identity mismatch")
+    if preflight.binding != index_service.build_artifact_binding(plan):
+        raise DocumentLifecycleError("Build preflight artifact binding mismatch")
+    sidecar_dir = preflight.runtime_sidecar_dir.resolve(strict=True)
+    blocks_path = preflight.runtime_blocks_path.resolve(strict=True)
+    if not sidecar_dir.is_dir():
+        raise DocumentLifecycleError("Build preflight sidecar is not a directory")
+    if not blocks_path.is_file() or not blocks_path.is_relative_to(sidecar_dir):
+        raise DocumentLifecycleError(
+            "Build preflight blocks file is outside the sidecar directory"
+        )
+
+
+async def _materialize_object_build_preflight(
+    index_service: IndexBuildService, plan: IndexBuildPlan
+) -> PipelineBuildPreflight:
+    """Finish an in-progress open on cancellation so its lease can be closed."""
+
+    materialize_task = asyncio.create_task(
+        index_service.materialize_build_preflight(plan)
+    )
+    try:
+        return await asyncio.shield(materialize_task)
+    except asyncio.CancelledError:
+        try:
+            preflight = await materialize_task
+        except BaseException:
+            pass
+        else:
+            with contextlib.suppress(BaseException):
+                await preflight.cleanup()
+        raise
+
+
+def _confirmed_object_build_document(
+    plan: IndexBuildPlan, run_result: dict[str, Any]
+) -> DocumentRecord:
+    result = run_result.get("_confirmed_document")
+    if not isinstance(result, DocumentRecord):
+        raise DocumentLifecycleError(
+            "Object build completed without a confirmed durable document"
+        )
+    if result.kb_id != plan.document.kb_id or result.id != plan.document.id:
+        raise DocumentLifecycleError(
+            "Object build confirmed a different durable document"
+        )
+    return result
+
+
+async def _hold_unobservable_object_build(
+    *, document_id: str, error_message: str
+) -> None:
+    """Keep an object build owner inflight until worker/process shutdown."""
+
+    logger.error(
+        "Object build outcome for '%s' is unobservable; retaining attempt owner "
+        "until process-death recovery: %s",
+        document_id,
+        error_message,
+    )
+    await asyncio.Future()
 
 
 async def _execute_build_plan(
@@ -1831,21 +2216,119 @@ async def _execute_build_plan(
     rag: Any,
     job_service: "JobService | None" = None,
 ) -> dict[str, Any]:
+    execution: IndexBuildExecution | None = None
+    preflight: PipelineBuildPreflight | None = None
+    object_drain_started = False
     try:
         if await _job_is_cancelling(job_service, kb_id, job_id):
             return await _cancel_build_item(
                 index_service, kb_id=kb_id, job_id=job_id, plan=plan
             )
-        if not plan.skipped:
-            await index_service.mark_building(kb_id, plan.document.id, job_id=job_id)
-        run_result = await index_service.run_build(rag, plan)
-        result = await index_service.complete_build(
+        await index_service.mark_building(
             kb_id,
             plan.document.id,
             job_id=job_id,
+            claim_token=plan.claim_token,
             plan=plan,
-            run_result=run_result,
         )
+        if not plan.skipped:
+            if index_service.object_authoritative:
+                preflight = await _materialize_object_build_preflight(
+                    index_service, plan
+                )
+                try:
+                    _validate_object_build_preflight(index_service, plan, preflight)
+                finally:
+                    await preflight.cleanup()
+            else:
+                execution = await index_service.materialize_build_execution(plan)
+        if index_service.object_authoritative:
+            object_drain_started = not plan.skipped
+            run_result = await index_service.run_build(rag, plan, None)
+        else:
+            run_result = await index_service.run_build(rag, plan, execution)
+        if run_result.get("outcome_unknown"):
+            if execution is not None:
+                execution.defer_cleanup()
+            error_message = _durable_build_error_message(
+                execution or preflight,
+                run_result.get("error_message") or "Build outcome is unknown",
+            )
+            if index_service.object_authoritative:
+                await _hold_unobservable_object_build(
+                    document_id=plan.document.id,
+                    error_message=error_message,
+                )
+            await index_service.fail_build(
+                kb_id,
+                plan.document.id,
+                job_id=job_id,
+                error_code="build_outcome_unknown",
+                error_message=error_message,
+                plan=plan,
+            )
+            return {
+                "document_id": plan.document.id,
+                "status": "failed",
+                "error_code": "build_outcome_unknown",
+                "error_message": error_message,
+            }
+        if execution is not None and execution.terminal:
+            await index_service.finalize_build_runtime_references(rag, plan, execution)
+        if not index_service.object_authoritative and await _job_is_cancelling(
+            job_service, kb_id, job_id
+        ):
+            return await _cancel_build_item(
+                index_service, kb_id=kb_id, job_id=job_id, plan=plan
+            )
+        if run_result.get("cancelled"):
+            if index_service.object_authoritative and run_result.get(
+                "owner_terminalized"
+            ):
+                return {
+                    "document_id": plan.document.id,
+                    "status": "cancelled",
+                    "error_code": "cancelled_by_user",
+                    "error_message": "Build cancelled by user",
+                }
+            return await _cancel_build_item(
+                index_service, kb_id=kb_id, job_id=job_id, plan=plan
+            )
+        if "error_code" in run_result:
+            error_code = str(run_result.get("error_code") or "build_failed")
+            error_message = _durable_build_error_message(
+                execution or preflight,
+                run_result.get("error_message") or "Build failed",
+            )
+            if not (
+                index_service.object_authoritative
+                and run_result.get("owner_terminalized")
+            ):
+                await index_service.fail_build(
+                    kb_id,
+                    plan.document.id,
+                    job_id=job_id,
+                    error_code=error_code,
+                    error_message=error_message,
+                    plan=plan,
+                )
+            return {
+                "document_id": plan.document.id,
+                "status": "failed",
+                "error_code": error_code,
+                "error_message": error_message,
+            }
+        if index_service.object_authoritative and not plan.skipped:
+            result = _confirmed_object_build_document(plan, run_result)
+        else:
+            result = await index_service.complete_build(
+                kb_id,
+                plan.document.id,
+                job_id=job_id,
+                plan=plan,
+                execution=execution,
+                run_result=run_result,
+            )
         return {
             "document_id": result.id,
             "status": "succeeded",
@@ -1856,12 +2339,85 @@ async def _execute_build_plan(
             "entity_count": result.entity_count,
             "relation_count": result.relation_count,
         }
+    except asyncio.CancelledError:
+        if execution is not None:
+            execution.defer_cleanup()
+        raise
+    except (DocumentSnapshotConflictError, DocumentAttemptOwnershipError) as exc:
+        error_message = _durable_build_error_message(execution or preflight, exc)
+        with contextlib.suppress(Exception):
+            await index_service.release_build_if_owned(
+                kb_id,
+                plan.document.id,
+                job_id=job_id,
+                plan=plan,
+                error_code=_attempt_conflict_error_code(exc),
+                error_message=error_message,
+            )
+        return _attempt_conflict_item(plan.document.id, exc)
+    except ArtifactPointerConflictError as exc:
+        error_message = _durable_build_error_message(execution or preflight, exc)
+        try:
+            await index_service.release_build_if_owned(
+                kb_id,
+                plan.document.id,
+                job_id=job_id,
+                plan=plan,
+                error_code="artifact_pointer_conflict",
+                error_message=error_message,
+            )
+        except Exception as release_exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to CAS-release pointer loser for document '%s': %s",
+                plan.document.id,
+                release_exc,
+            )
+        logger.warning(
+            "Lost build artifact pointer CAS for document '%s' (KB '%s'): %s",
+            plan.document.id,
+            kb_id,
+            error_message,
+        )
+        return {
+            "document_id": plan.document.id,
+            "status": "failed",
+            "error_code": "artifact_pointer_conflict",
+            "error_message": error_message,
+        }
+    except MetadataCommitOutcomeUnknownError as exc:
+        return {
+            "document_id": plan.document.id,
+            "status": "failed",
+            "error_code": "metadata_commit_outcome_unknown",
+            "error_message": _durable_build_error_message(execution or preflight, exc),
+        }
     except Exception as exc:  # noqa: BLE001 — surface and persist
+        if execution is not None:
+            if execution.pipeline_started and not execution.terminal:
+                execution.defer_cleanup()
+            elif execution.terminal:
+                try:
+                    await index_service.finalize_build_runtime_references(
+                        rag, plan, execution
+                    )
+                except Exception as scrub_error:  # noqa: BLE001
+                    execution.defer_cleanup()
+                    logger.warning(
+                        "Failed to scrub build runtime references for '%s': %s",
+                        plan.document.id,
+                        _durable_build_error_message(execution, scrub_error),
+                    )
+        error_message = _durable_build_error_message(execution or preflight, exc)
+        if index_service.object_authoritative and object_drain_started:
+            await _hold_unobservable_object_build(
+                document_id=plan.document.id,
+                error_message=error_message,
+            )
         logger.error(
             "Failed to build KG for document '%s' (KB '%s'): %s",
             plan.document.id,
             kb_id,
-            exc,
+            error_message,
         )
         try:
             await index_service.fail_build(
@@ -1869,7 +2425,8 @@ async def _execute_build_plan(
                 plan.document.id,
                 job_id=job_id,
                 error_code="build_failed",
-                error_message=str(exc),
+                error_message=error_message,
+                plan=plan,
             )
         except Exception as transition_exc:
             logger.error(
@@ -1881,8 +2438,11 @@ async def _execute_build_plan(
             "document_id": plan.document.id,
             "status": "failed",
             "error_code": "build_failed",
-            "error_message": str(exc),
+            "error_message": error_message,
         }
+    finally:
+        if execution is not None:
+            execution.cleanup()
 
 
 @contextlib.asynccontextmanager
@@ -1922,7 +2482,7 @@ async def _mirror_pipeline_progress(
             try:
                 ps = await get_namespace_data("pipeline_status", workspace=workspace)
                 latest = ps.get("latest_message")
-                message = str(latest) if latest else None
+                message = _redact_scratch_references(latest) if latest else None
                 if message and message != last_message:
                     last_message = message
                     await job_service.update_job_progress(
@@ -1963,28 +2523,7 @@ async def _execute_build_plan_batch(
     plans: list[IndexBuildPlan],
     job_service: "JobService | None" = None,
 ) -> dict[str, dict[str, Any]]:
-    """Run :meth:`IndexBuildService.run_build_batch` and finalize each doc.
-
-    This is the batched counterpart of :func:`_execute_build_plan`. It:
-
-    1. Honors a job-level ``cancelling`` request by marking every plan as
-       cancelled and returning early — same semantics as the single-doc helper.
-    2. Marks each non-skipped plan ``building`` (the single-drain pipeline call
-       does not do this itself).
-    3. Bulk-enqueues every non-skipped plan into the LightRAG pipeline through
-       ``IndexBuildService.run_build_batch`` so the three worker layers
-       (parse / analyze / process) can overlap documents instead of being
-       serialized per-document.
-    4. Per doc, calls ``complete_build`` on success or ``fail_build`` on
-       per-doc failure, then assembles the same ``build_result`` shape that
-       :func:`_execute_build_plan` produces. Returns a
-       ``{kb_document_id: build_result}`` mapping.
-
-    Failures during ``run_build_batch`` itself (e.g. a pipeline-level crash)
-    fail every plan in the batch; per-doc failures surfaced by
-    ``run_build_batch`` (missing sidecar, ``doc_status`` read errors, etc.)
-    fail only that doc.
-    """
+    """Materialize claimed inputs, bulk-drain, finalize, then release leases."""
     if not plans:
         return {}
 
@@ -1996,64 +2535,72 @@ async def _execute_build_plan_batch(
             )
         return results
 
-    # Mark every non-skipped plan ``building``. A failure here is per-doc and
-    # excludes that plan from the bulk enqueue.
     runnable: list[IndexBuildPlan] = []
-    for plan in plans:
-        if plan.skipped:
-            runnable.append(plan)
-            continue
-        try:
-            await index_service.mark_building(kb_id, plan.document.id, job_id=job_id)
-        except Exception as exc:  # noqa: BLE001 — record per-doc failure
-            logger.error(
-                "Failed to mark document '%s' building (KB '%s'): %s",
-                plan.document.id,
-                kb_id,
-                exc,
-            )
+    executions: dict[str, IndexBuildExecution] = {}
+    preflights: dict[str, PipelineBuildPreflight] = {}
+    object_drain_started = False
+    try:
+        for plan in plans:
+            preflight: PipelineBuildPreflight | None = None
             try:
-                await index_service.fail_build(
+                await index_service.mark_building(
                     kb_id,
                     plan.document.id,
                     job_id=job_id,
-                    error_code="build_failed",
-                    error_message=str(exc),
+                    claim_token=plan.claim_token,
+                    plan=plan,
                 )
-            except Exception:  # noqa: BLE001
-                pass
-            results[plan.document.id] = {
-                "document_id": plan.document.id,
-                "status": "failed",
-                "error_code": "build_failed",
-                "error_message": str(exc),
-            }
-            continue
-        runnable.append(plan)
-
-    if runnable:
-        try:
-            async with _mirror_pipeline_progress(
-                job_service=job_service, kb_id=kb_id, job_id=job_id, rag=rag
-            ):
-                run_results = await index_service.run_build_batch(
-                    rag, runnable, job_id=job_id
+                if not plan.skipped:
+                    if index_service.object_authoritative:
+                        preflight = await _materialize_object_build_preflight(
+                            index_service, plan
+                        )
+                        try:
+                            _validate_object_build_preflight(
+                                index_service, plan, preflight
+                            )
+                        finally:
+                            await preflight.cleanup()
+                        preflights[plan.document.id] = preflight
+                    else:
+                        execution = await index_service.materialize_build_execution(
+                            plan
+                        )
+                        executions[plan.document.id] = execution
+            except (
+                DocumentSnapshotConflictError,
+                DocumentAttemptOwnershipError,
+            ) as exc:
+                error_message = _durable_build_error_message(preflight, exc)
+                with contextlib.suppress(Exception):
+                    await index_service.release_build_if_owned(
+                        kb_id,
+                        plan.document.id,
+                        job_id=job_id,
+                        plan=plan,
+                        error_code=_attempt_conflict_error_code(exc),
+                        error_message=error_message,
+                    )
+                results[plan.document.id] = _attempt_conflict_item(
+                    plan.document.id, exc
                 )
-        except Exception as exc:  # noqa: BLE001 — batch-level failure
-            logger.error(
-                "KG build batch failed for KB '%s' (job '%s'): %s",
-                kb_id,
-                job_id,
-                exc,
-            )
-            for plan in runnable:
+                continue
+            except Exception as exc:  # noqa: BLE001 — record per-doc failure
+                error_message = _durable_build_error_message(preflight, exc)
+                logger.error(
+                    "Failed to prepare document '%s' for build (KB '%s'): %s",
+                    plan.document.id,
+                    kb_id,
+                    error_message,
+                )
                 try:
                     await index_service.fail_build(
                         kb_id,
                         plan.document.id,
                         job_id=job_id,
                         error_code="build_failed",
-                        error_message=str(exc),
+                        error_message=error_message,
+                        plan=plan,
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -2061,14 +2608,92 @@ async def _execute_build_plan_batch(
                     "document_id": plan.document.id,
                     "status": "failed",
                     "error_code": "build_failed",
-                    "error_message": str(exc),
+                    "error_message": error_message,
+                }
+                continue
+            runnable.append(plan)
+
+        if not runnable:
+            return results
+        try:
+            async with _mirror_pipeline_progress(
+                job_service=job_service, kb_id=kb_id, job_id=job_id, rag=rag
+            ):
+                object_drain_started = index_service.object_authoritative and any(
+                    not plan.skipped for plan in runnable
+                )
+                run_results = await index_service.run_build_batch(
+                    rag, runnable, executions, job_id=job_id
+                )
+        except asyncio.CancelledError:
+            for execution in executions.values():
+                if execution.pipeline_started and not execution.terminal:
+                    execution.defer_cleanup()
+            raise
+        except Exception as exc:  # noqa: BLE001 — batch-level failure
+            if index_service.object_authoritative and object_drain_started:
+                await asyncio.gather(
+                    *(
+                        _hold_unobservable_object_build(
+                            document_id=plan.document.id,
+                            error_message=_durable_build_error_message(
+                                preflights.get(plan.document.id), exc
+                            ),
+                        )
+                        for plan in runnable
+                    )
+                )
+            for plan in runnable:
+                execution = executions.get(plan.document.id)
+                if execution is not None:
+                    if execution.pipeline_started and not execution.terminal:
+                        execution.defer_cleanup()
+                    elif execution.terminal:
+                        with contextlib.suppress(Exception):
+                            await index_service.finalize_build_runtime_references(
+                                rag, plan, execution
+                            )
+                error_message = _durable_build_error_message(
+                    execution or preflights.get(plan.document.id), exc
+                )
+                logger.error(
+                    "KG build batch failed for document '%s' (KB '%s'): %s",
+                    plan.document.id,
+                    kb_id,
+                    error_message,
+                )
+                try:
+                    await index_service.fail_build(
+                        kb_id,
+                        plan.document.id,
+                        job_id=job_id,
+                        error_code="build_failed",
+                        error_message=error_message,
+                        plan=plan,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                results[plan.document.id] = {
+                    "document_id": plan.document.id,
+                    "status": "failed",
+                    "error_code": "build_failed",
+                    "error_message": error_message,
                 }
             return results
 
         for plan in runnable:
             run_result = run_results.get(plan.document.id)
+            execution = executions.get(plan.document.id)
+            preflight = preflights.get(plan.document.id)
             if run_result is None:
                 msg = "Build result missing from pipeline drain"
+                if execution is not None and execution.pipeline_started:
+                    execution.defer_cleanup()
+                if index_service.object_authoritative and not plan.skipped:
+                    await _hold_unobservable_object_build(
+                        document_id=plan.document.id,
+                        error_message=msg,
+                    )
                 try:
                     await index_service.fail_build(
                         kb_id,
@@ -2076,6 +2701,7 @@ async def _execute_build_plan_batch(
                         job_id=job_id,
                         error_code="build_failed",
                         error_message=msg,
+                        plan=plan,
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -2086,28 +2712,93 @@ async def _execute_build_plan_batch(
                     "error_message": msg,
                 }
                 continue
-            if run_result.get("cancelled"):
-                # The pipeline marked this doc failed with a user-cancellation
-                # marker mid-drain. Release the claim and report it as a clean
-                # cancellation (status='cancelled') rather than build_failed,
-                # matching the per-doc _execute_build_plan checkpoint behavior.
-                results[plan.document.id] = await _cancel_build_item(
-                    index_service, kb_id=kb_id, job_id=job_id, plan=plan
+            if run_result.get("outcome_unknown"):
+                if execution is not None:
+                    execution.defer_cleanup()
+                err_msg = _durable_build_error_message(
+                    execution or preflight,
+                    run_result.get("error_message") or "Build outcome is unknown",
                 )
-                continue
-            if "error_code" in run_result:
-                err_code = str(run_result.get("error_code") or "build_failed")
-                err_msg = str(run_result.get("error_message") or "")
+                if index_service.object_authoritative and not plan.skipped:
+                    await _hold_unobservable_object_build(
+                        document_id=plan.document.id,
+                        error_message=err_msg,
+                    )
                 try:
                     await index_service.fail_build(
                         kb_id,
                         plan.document.id,
                         job_id=job_id,
-                        error_code=err_code,
+                        error_code="build_outcome_unknown",
                         error_message=err_msg,
+                        plan=plan,
                     )
                 except Exception:  # noqa: BLE001
                     pass
+                results[plan.document.id] = {
+                    "document_id": plan.document.id,
+                    "status": "failed",
+                    "error_code": "build_outcome_unknown",
+                    "error_message": err_msg,
+                }
+                continue
+            if execution is not None and execution.terminal:
+                try:
+                    await index_service.finalize_build_runtime_references(
+                        rag, plan, execution
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    execution.defer_cleanup()
+                    run_result = {
+                        "error_code": "build_failed",
+                        "error_message": _durable_build_error_message(execution, exc),
+                    }
+            if not index_service.object_authoritative and await _job_is_cancelling(
+                job_service, kb_id, job_id
+            ):
+                results[plan.document.id] = await _cancel_build_item(
+                    index_service, kb_id=kb_id, job_id=job_id, plan=plan
+                )
+                continue
+            if run_result.get("cancelled"):
+                # The pipeline marked this doc failed with a user-cancellation
+                # marker mid-drain. Report it as a clean cancellation rather
+                # than build_failed; object-mode ownership was already closed
+                # by the processing owner and must not be released twice.
+                if index_service.object_authoritative and run_result.get(
+                    "owner_terminalized"
+                ):
+                    results[plan.document.id] = {
+                        "document_id": plan.document.id,
+                        "status": "cancelled",
+                        "error_code": "cancelled_by_user",
+                        "error_message": "Build cancelled by user",
+                    }
+                else:
+                    results[plan.document.id] = await _cancel_build_item(
+                        index_service, kb_id=kb_id, job_id=job_id, plan=plan
+                    )
+                continue
+            if "error_code" in run_result:
+                err_code = str(run_result.get("error_code") or "build_failed")
+                err_msg = _durable_build_error_message(
+                    execution or preflight, run_result.get("error_message") or ""
+                )
+                if not (
+                    index_service.object_authoritative
+                    and run_result.get("owner_terminalized")
+                ):
+                    try:
+                        await index_service.fail_build(
+                            kb_id,
+                            plan.document.id,
+                            job_id=job_id,
+                            error_code=err_code,
+                            error_message=err_msg,
+                            plan=plan,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                 results[plan.document.id] = {
                     "document_id": plan.document.id,
                     "status": "failed",
@@ -2116,13 +2807,17 @@ async def _execute_build_plan_batch(
                 }
                 continue
             try:
-                result_record = await index_service.complete_build(
-                    kb_id,
-                    plan.document.id,
-                    job_id=job_id,
-                    plan=plan,
-                    run_result=run_result,
-                )
+                if index_service.object_authoritative and not plan.skipped:
+                    result_record = _confirmed_object_build_document(plan, run_result)
+                else:
+                    result_record = await index_service.complete_build(
+                        kb_id,
+                        plan.document.id,
+                        job_id=job_id,
+                        plan=plan,
+                        execution=execution,
+                        run_result=run_result,
+                    )
                 results[plan.document.id] = {
                     "document_id": result_record.id,
                     "status": "succeeded",
@@ -2133,12 +2828,64 @@ async def _execute_build_plan_batch(
                     "entity_count": result_record.entity_count,
                     "relation_count": result_record.relation_count,
                 }
+            except (
+                DocumentSnapshotConflictError,
+                DocumentAttemptOwnershipError,
+            ) as exc:
+                error_message = _durable_build_error_message(
+                    execution or preflight, exc
+                )
+                with contextlib.suppress(Exception):
+                    await index_service.release_build_if_owned(
+                        kb_id,
+                        plan.document.id,
+                        job_id=job_id,
+                        plan=plan,
+                        error_code=_attempt_conflict_error_code(exc),
+                        error_message=error_message,
+                    )
+                results[plan.document.id] = _attempt_conflict_item(
+                    plan.document.id, exc
+                )
+            except ArtifactPointerConflictError as exc:
+                error_message = _durable_build_error_message(
+                    execution or preflight, exc
+                )
+                try:
+                    await index_service.release_build_if_owned(
+                        kb_id,
+                        plan.document.id,
+                        job_id=job_id,
+                        plan=plan,
+                        error_code="artifact_pointer_conflict",
+                        error_message=error_message,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                results[plan.document.id] = {
+                    "document_id": plan.document.id,
+                    "status": "failed",
+                    "error_code": "artifact_pointer_conflict",
+                    "error_message": error_message,
+                }
+            except MetadataCommitOutcomeUnknownError as exc:
+                results[plan.document.id] = {
+                    "document_id": plan.document.id,
+                    "status": "failed",
+                    "error_code": "metadata_commit_outcome_unknown",
+                    "error_message": _durable_build_error_message(
+                        execution or preflight, exc
+                    ),
+                }
             except Exception as exc:  # noqa: BLE001 — per-doc complete failure
+                error_message = _durable_build_error_message(
+                    execution or preflight, exc
+                )
                 logger.error(
                     "Failed to finalize build for document '%s' (KB '%s'): %s",
                     plan.document.id,
                     kb_id,
-                    exc,
+                    error_message,
                 )
                 try:
                     await index_service.fail_build(
@@ -2146,7 +2893,8 @@ async def _execute_build_plan_batch(
                         plan.document.id,
                         job_id=job_id,
                         error_code="build_failed",
-                        error_message=str(exc),
+                        error_message=error_message,
+                        plan=plan,
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -2154,9 +2902,144 @@ async def _execute_build_plan_batch(
                     "document_id": plan.document.id,
                     "status": "failed",
                     "error_code": "build_failed",
-                    "error_message": str(exc),
+                    "error_message": error_message,
                 }
-    return results
+        return results
+    except asyncio.CancelledError:
+        for execution in executions.values():
+            execution.defer_cleanup()
+        raise
+    finally:
+        for execution in executions.values():
+            execution.cleanup()
+
+
+async def _execute_delete_document_object(
+    *,
+    document_service: DocumentLifecycleService,
+    kb_id: str,
+    job_id: str,
+    document: DocumentRecord,
+    active_registry: LightRAGInstanceRegistry,
+    delete_source_file: bool,
+    delete_artifacts: bool,
+    delete_llm_cache: bool,
+    job_service: Any | None = None,
+    job: JobRecord | None = None,
+) -> dict[str, Any]:
+    """Object-authoritative delete branch.
+
+    Delegates to the frozen Core Writer B1 state machine
+    (``execute_document_delete_cow``) which reverses the unsafe local-mode
+    ordering: pre-engine recheck → engine delete → atomic tombstone + manifest
+    commit.  No direct object/local byte cleanup is performed; exact cleanup
+    manifests are committed atomically with the tombstone.
+    """
+
+    kb_record = await document_service.kb_service.get(kb_id)
+    kb_generation = kb_record.generation
+    payload = (job.payload if job is not None else None) or {}
+    claim_token = _object_attempt_token_from_payload(payload, document.id)
+    engine_delete = await _build_object_engine_delete_callback(
+        active_registry=active_registry,
+        kb_id=kb_id,
+        delete_llm_cache=delete_llm_cache,
+    )
+    try:
+        result = await document_service.execute_document_delete_cow(
+            kb_id,
+            document.id,
+            job_id=job_id,
+            kb_generation=kb_generation,
+            engine_delete=engine_delete,
+            claim_token=claim_token,
+            delete_source_file=delete_source_file,
+            delete_artifacts=delete_artifacts,
+        )
+    except DocumentCowCommitOutcomeUnknownError as exc:
+        token = exc.attempt_token or claim_token or ""
+        await _persist_object_attempt_token(
+            job_service, kb_id, job_id, document.id, token, payload=payload
+        )
+        return {
+            "document_id": document.id,
+            "status": "failed",
+            "error_code": "delete_commit_unknown",
+            "error_message": str(exc),
+            "lightrag_doc_id": document.lightrag_doc_id,
+            "lightrag_delete_result": {
+                "status": "skipped",
+                "message": "Commit outcome unknown",
+            },
+            "file_delete_result": _file_result_payload(None),
+        }
+    except DocumentCowRetryableError as exc:
+        token = exc.attempt_token or claim_token or ""
+        await _persist_object_attempt_token(
+            job_service, kb_id, job_id, document.id, token, payload=payload
+        )
+        return {
+            "document_id": document.id,
+            "status": "failed",
+            "error_code": "delete_retryable",
+            "error_message": str(exc),
+            "lightrag_doc_id": document.lightrag_doc_id,
+            "lightrag_delete_result": {
+                "status": "skipped",
+                "message": "Rolled back; safe to retry",
+            },
+            "file_delete_result": _file_result_payload(None),
+        }
+    except DocumentCowEngineDeleteError as exc:
+        token = exc.result.attempt_token if exc.result is not None else (claim_token or "")
+        await _persist_object_attempt_token(
+            job_service, kb_id, job_id, document.id, token, payload=payload
+        )
+        return {
+            "document_id": document.id,
+            "status": "failed",
+            "error_code": "delete_engine_failed",
+            "error_message": str(exc),
+            "lightrag_doc_id": document.lightrag_doc_id,
+            "lightrag_delete_result": {
+                "status": "skipped",
+                "message": "Engine cleanup failed; bytes preserved",
+            },
+            "file_delete_result": _file_result_payload(None),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Object-mode delete failed for document '%s' KB '%s': %s",
+            document.id,
+            kb_id,
+            exc,
+        )
+        return {
+            "document_id": document.id,
+            "status": "failed",
+            "error_code": "delete_failed",
+            "error_message": str(exc),
+            "lightrag_doc_id": document.lightrag_doc_id,
+            "lightrag_delete_result": _deletion_result_payload(None),
+            "file_delete_result": _file_result_payload(None),
+        }
+
+    await _persist_object_attempt_token(
+        job_service, kb_id, job_id, document.id, result.attempt_token, payload=payload
+    )
+    return {
+        "document_id": document.id,
+        "status": "succeeded",
+        "lightrag_doc_id": document.lightrag_doc_id,
+        "lightrag_delete_result": result.document.metadata.get(
+            "lightrag_delete_result"
+        )
+        or _deletion_result_payload(None),
+        "file_delete_result": _file_result_payload(None),
+        "cleanup_pending_count": result.cleanup_pending_count,
+        "cleanup_retained_count": result.cleanup_retained_count,
+        "cleanup_blocked_count": result.cleanup_blocked_count,
+    }
 
 
 async def _execute_delete_document_impl(
@@ -2169,7 +3052,24 @@ async def _execute_delete_document_impl(
     delete_source_file: bool,
     delete_artifacts: bool,
     delete_llm_cache: bool,
+    job_service: Any | None = None,
+    job: JobRecord | None = None,
 ) -> dict[str, Any]:
+    # Object-authoritative COW branch: delegate to the frozen Core Writer B1
+    # state machine. Local mode behavior below is byte-for-byte unchanged.
+    if document_service.object_authoritative:
+        return await _execute_delete_document_object(
+            document_service=document_service,
+            kb_id=kb_id,
+            job_id=job_id,
+            document=document,
+            active_registry=active_registry,
+            delete_source_file=delete_source_file,
+            delete_artifacts=delete_artifacts,
+            delete_llm_cache=delete_llm_cache,
+            job_service=job_service,
+            job=job,
+        )
     try:
         lightrag_result = None
         if document.lightrag_doc_id:
@@ -2403,10 +3303,9 @@ async def _run_conservative_kb_rebuild(
                 force_extract=True,
                 force_embedding=True,
             )
-            if not plan.skipped:
-                await index_service.claim_build_queued(
-                    kb_id, job_id=f"rebuild_kb::{document_id}", plan=plan
-                )
+            await index_service.claim_build_queued(
+                kb_id, job_id=f"rebuild_kb::{document_id}", plan=plan
+            )
             item = await _execute_build_plan(
                 index_service=index_service,
                 kb_id=kb_id,
@@ -2630,10 +3529,9 @@ async def _run_subgraph_rebuild(
                 force_extract=True,
                 force_embedding=True,
             )
-            if not plan.skipped:
-                await index_service.claim_build_queued(
-                    kb_id, job_id=f"rebuild_subgraph::{document_id}", plan=plan
-                )
+            await index_service.claim_build_queued(
+                kb_id, job_id=f"rebuild_subgraph::{document_id}", plan=plan
+            )
             item = await _execute_build_plan(
                 index_service=index_service,
                 kb_id=kb_id,
@@ -2690,6 +3588,39 @@ def _active_job_conflict_detail(
         "document_id": exc.document_id,
         "existing_job_id": exc.existing_job_id,
         "message": str(exc),
+    }
+
+
+def _attempt_conflict_error_code(
+    exc: DocumentSnapshotConflictError | DocumentAttemptOwnershipError,
+) -> str:
+    if isinstance(exc, DocumentSnapshotConflictError):
+        return "document_snapshot_conflict"
+    return "document_attempt_ownership_conflict"
+
+
+def _attempt_conflict_detail(
+    exc: DocumentSnapshotConflictError | DocumentAttemptOwnershipError,
+) -> dict[str, Any]:
+    return {
+        "error_code": _attempt_conflict_error_code(exc),
+        "entity_type": exc.entity_type,
+        "entity_id": exc.entity_id,
+        "expected": exc.expected,
+        "current": exc.current,
+        "message": str(exc),
+    }
+
+
+def _attempt_conflict_item(
+    document_id: str,
+    exc: DocumentSnapshotConflictError | DocumentAttemptOwnershipError,
+) -> dict[str, Any]:
+    return {
+        "document_id": document_id,
+        "status": "failed",
+        "error_code": _attempt_conflict_error_code(exc),
+        "error_message": str(exc),
     }
 
 
@@ -2819,6 +3750,338 @@ async def _run_sync_followups(
     return item, rag
 
 
+def _object_attempt_token_from_payload(
+    payload: dict[str, Any] | None, document_id: str
+) -> str | None:
+    """Read one document's persisted COW claim token from a job payload."""
+
+    if not payload:
+        return None
+    tokens = payload.get("attempt_tokens")
+    if not isinstance(tokens, dict):
+        return None
+    token = tokens.get(document_id)
+    if isinstance(token, str) and token:
+        return token
+    return None
+
+
+async def _persist_object_attempt_token(
+    job_service: Any | None,
+    kb_id: str,
+    job_id: str,
+    document_id: str,
+    token: str,
+    *,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Best-effort persist one document's COW claim token into the job payload.
+
+    The authoritative fence is the document metadata + Store A; the persisted
+    payload token is a durable-resume optimization. Returns the updated
+    ``attempt_tokens`` map (or the input payload's map when no write occurred).
+    """
+
+    if job_service is None or not token:
+        existing = (payload or {}).get("attempt_tokens")
+        return existing if isinstance(existing, dict) else {}
+    base = payload or {}
+    existing = base.get("attempt_tokens")
+    if not isinstance(existing, dict):
+        existing = {}
+    if existing.get(document_id) == token:
+        return existing
+    updated = {**existing, document_id: token}
+    try:
+        updated_job = await job_service.update_job_payload_patch(
+            kb_id, job_id, payload_patch={"attempt_tokens": updated}
+        )
+        result = updated_job.payload or {}
+        tokens = result.get("attempt_tokens")
+        return tokens if isinstance(tokens, dict) else updated
+    except Exception:  # noqa: BLE001 — payload persistence is best-effort
+        return updated
+
+
+async def _build_object_engine_delete_callback(
+    *,
+    active_registry: LightRAGInstanceRegistry,
+    kb_id: str,
+    delete_llm_cache: bool,
+) -> Callable[
+    [str, str, str | None, str],
+    Awaitable[dict[str, Any] | None],
+]:
+    """Build the idempotent engine_delete callback for B1 COW execution.
+
+    Wraps ``rag.adelete_by_doc_id(previous_lightrag_doc_id)`` so it is safe to
+    re-invoke on re-drive: ``not_found`` is treated as success (the previous
+    attempt already deleted it). Uses the same rag instance the routes hold.
+    """
+
+    rag = cast(Any, await active_registry.get(kb_id))
+    if rag is None:
+        raise RuntimeError(f"LightRAG instance unavailable for KB {kb_id}")
+
+    async def _callback(
+        kb_id_arg: str,
+        document_id_arg: str,
+        previous_lightrag_doc_id: str | None,
+        engine_identity: str,
+    ) -> dict[str, Any] | None:
+        if not previous_lightrag_doc_id:
+            return None
+        result = await rag.adelete_by_doc_id(
+            previous_lightrag_doc_id,
+            delete_llm_cache=delete_llm_cache,
+        )
+        status = getattr(result, "status", None)
+        if status not in {"success", "not_found"}:
+            raise RuntimeError(
+                getattr(result, "message", None)
+                or f"LightRAG deletion failed for {previous_lightrag_doc_id}"
+            )
+        return _deletion_result_payload(result)
+
+    return _callback
+
+
+async def _execute_replace_document_object(
+    *,
+    document_service: DocumentLifecycleService,
+    kb_id: str,
+    job: JobRecord,
+    document: DocumentRecord,
+    replacement: DocumentReplacementSource,
+    active_registry: LightRAGInstanceRegistry,
+    active_index_service: IndexBuildService | None,
+    delete_source_file: bool,
+    delete_artifacts: bool,
+    delete_llm_cache: bool,
+    auto_parse: bool,
+    auto_index: bool,
+    parser_engine: str | None,
+    process_options: str | None,
+    force_reparse: bool,
+    job_service: Any | None = None,
+) -> dict[str, Any]:
+    """Object-authoritative replace branch.
+
+    Delegates to the frozen Core Writer B1 state machine
+    (``execute_document_replace_cow``) which guarantees the new source pointer
+    and exact cleanup manifest group commit atomically BEFORE the previous
+    LightRAG document is deleted.  Translates B1 results/errors into the
+    existing route response shape so callers (route background task, durable
+    worker, sync-item path) all see the same item dict.
+    """
+
+    kb_record = await document_service.kb_service.get(kb_id)
+    kb_generation = kb_record.generation
+    payload = job.payload or {}
+    claim_token = _object_attempt_token_from_payload(payload, document.id)
+    engine_delete = await _build_object_engine_delete_callback(
+        active_registry=active_registry,
+        kb_id=kb_id,
+        delete_llm_cache=delete_llm_cache,
+    )
+    try:
+        result = await document_service.execute_document_replace_cow(
+            kb_id,
+            document.id,
+            job_id=job.id,
+            kb_generation=kb_generation,
+            new_source_type=replacement.source_type,
+            new_source_name=replacement.source_name,
+            new_source_uri="",
+            new_source_hash=replacement.source_hash,
+            new_content_type=replacement.content_type,
+            new_size_bytes=replacement.size_bytes,
+            replacement_content=replacement.content,
+            engine_delete=engine_delete,
+            claim_token=claim_token,
+            retain_source=not delete_source_file,
+            retain_artifacts=not delete_artifacts,
+        )
+    except DocumentCowEngineDeleteError as exc:
+        # Pointer+manifest committed; engine cleanup did not finish.
+        # Persist the token so a durable worker re-drive resumes the same
+        # attempt instead of creating a new claim.
+        token = exc.result.attempt_token if exc.result is not None else (claim_token or "")
+        await _persist_object_attempt_token(
+            job_service, kb_id, job.id, document.id, token, payload=payload
+        )
+        return {
+            "document_id": document.id,
+            "status": "failed",
+            "error_code": "replace_engine_cleanup_pending",
+            "error_message": str(exc),
+            "source_name": replacement.source_name,
+            "source_hash": replacement.source_hash,
+            "previous_lightrag_doc_id": document.lightrag_doc_id,
+            "lightrag_delete_result": {
+                "status": "skipped",
+                "message": "Engine cleanup pending",
+            },
+            "file_replace_result": _file_result_payload(None),
+        }
+    except DocumentCowCommitOutcomeUnknownError as exc:
+        # UNKNOWN: never compensate, never generic fail/delete; surface for retry.
+        token = exc.attempt_token or claim_token or ""
+        await _persist_object_attempt_token(
+            job_service, kb_id, job.id, document.id, token, payload=payload
+        )
+        return {
+            "document_id": document.id,
+            "status": "failed",
+            "error_code": "replace_commit_unknown",
+            "error_message": str(exc),
+            "source_name": replacement.source_name,
+            "source_hash": replacement.source_hash,
+            "previous_lightrag_doc_id": document.lightrag_doc_id,
+            "lightrag_delete_result": {
+                "status": "skipped",
+                "message": "Commit outcome unknown",
+            },
+            "file_replace_result": _file_result_payload(None),
+        }
+    except DocumentCowRetryableError as exc:
+        # ROLLED_BACK: safe to retry. Rotate the token so the next attempt
+        # does not collide with the rolled-back claim.
+        token = exc.attempt_token or claim_token or ""
+        await _persist_object_attempt_token(
+            job_service, kb_id, job.id, document.id, token, payload=payload
+        )
+        return {
+            "document_id": document.id,
+            "status": "failed",
+            "error_code": "replace_retryable",
+            "error_message": str(exc),
+            "source_name": replacement.source_name,
+            "source_hash": replacement.source_hash,
+            "previous_lightrag_doc_id": document.lightrag_doc_id,
+            "lightrag_delete_result": {
+                "status": "skipped",
+                "message": "Rolled back; safe to retry",
+            },
+            "file_replace_result": _file_result_payload(None),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Object-mode replace failed for document '%s' KB '%s': %s",
+            document.id,
+            kb_id,
+            exc,
+        )
+        return {
+            "document_id": document.id,
+            "status": "failed",
+            "error_code": "replace_failed",
+            "error_message": str(exc),
+            "source_name": replacement.source_name,
+            "source_hash": replacement.source_hash,
+            "previous_lightrag_doc_id": document.lightrag_doc_id,
+            "lightrag_delete_result": {
+                "status": "skipped",
+                "message": "Document was not indexed",
+            },
+            "file_replace_result": _file_result_payload(None),
+        }
+
+    # Persist the attempt token for durable resume.
+    await _persist_object_attempt_token(
+        job_service, kb_id, job.id, document.id, result.attempt_token, payload=payload
+    )
+
+    item: dict[str, Any] = {
+        "document_id": result.document.id,
+        "status": "succeeded",
+        "source_name": result.document.source_name,
+        "source_uri": result.document.source_uri,
+        "source_hash": result.document.source_hash,
+        "previous_lightrag_doc_id": document.lightrag_doc_id,
+        "lightrag_delete_result": result.document.metadata.get(
+            "lightrag_delete_result"
+        )
+        or _deletion_result_payload(None),
+        "file_replace_result": _file_result_payload(None),
+        "cleanup_pending_count": result.cleanup_pending_count,
+        "cleanup_retained_count": result.cleanup_retained_count,
+        "cleanup_blocked_count": result.cleanup_blocked_count,
+    }
+
+    # Optional auto_parse / auto_index follow-up (shared with local mode;
+    # these calls are object-mode-safe because Phase 2 materialization handles
+    # object-backed reads).
+    if auto_parse:
+        rag = cast(Any, await active_registry.get(kb_id))
+        parse_plan = await document_service.create_parse_plan(
+            kb_id,
+            result.document.id,
+            parser_engine=parser_engine,
+            process_options=process_options,
+            force_reparse=force_reparse,
+            auto_index=auto_index,
+        )
+        await document_service.mark_parse_queued(
+            kb_id,
+            result.document.id,
+            job=job,
+            plan=parse_plan,
+        )
+        parse_item = await _execute_parse_plan(
+            document_service=document_service,
+            kb_id=kb_id,
+            job_id=job.id,
+            plan=parse_plan,
+            rag=rag,
+        )
+        item["parse_result"] = parse_item
+        if parse_item["status"] != "succeeded":
+            item.update(
+                {
+                    "status": "failed",
+                    "error_code": parse_item.get("error_code", "parse_failed"),
+                    "error_message": parse_item.get(
+                        "error_message", "Replacement parse failed"
+                    ),
+                }
+            )
+            return item
+
+        if auto_index:
+            if active_index_service is None:
+                raise RuntimeError("KB index build service is not configured")
+            build_plan = await active_index_service.create_build_plan(
+                kb_id,
+                result.document.id,
+                rag=rag,
+            )
+            await active_index_service.claim_build_queued(
+                kb_id, job_id=job.id, plan=build_plan
+            )
+            build_item = await _execute_build_plan(
+                index_service=active_index_service,
+                kb_id=kb_id,
+                job_id=job.id,
+                plan=build_plan,
+                rag=rag,
+            )
+            item["build_result"] = build_item
+            if build_item["status"] != "succeeded":
+                item.update(
+                    {
+                        "status": "failed",
+                        "error_code": build_item.get(
+                            "error_code", "build_failed"
+                        ),
+                        "error_message": build_item.get(
+                            "error_message", "Replacement build failed"
+                        ),
+                    }
+                )
+    return item
+
+
 async def _execute_replace_document(
     *,
     document_service: DocumentLifecycleService,
@@ -2836,7 +4099,29 @@ async def _execute_replace_document(
     parser_engine: str | None,
     process_options: str | None,
     force_reparse: bool,
+    job_service: Any | None = None,
 ) -> dict[str, Any]:
+    # Object-authoritative COW branch: delegate to the frozen Core Writer B1
+    # state machine. Local mode behavior below is byte-for-byte unchanged.
+    if document_service.object_authoritative:
+        return await _execute_replace_document_object(
+            document_service=document_service,
+            kb_id=kb_id,
+            job=job,
+            document=document,
+            replacement=replacement,
+            active_registry=active_registry,
+            active_index_service=active_index_service,
+            delete_source_file=delete_source_file,
+            delete_artifacts=delete_artifacts,
+            delete_llm_cache=delete_llm_cache,
+            auto_parse=auto_parse,
+            auto_index=auto_index,
+            parser_engine=parser_engine,
+            process_options=process_options,
+            force_reparse=force_reparse,
+            job_service=job_service,
+        )
     replace_completed = False
     old_index_deleted = False
     lightrag_result = None
@@ -3018,6 +4303,7 @@ async def _execute_sync_item(
     delete_artifacts: bool,
     delete_llm_cache: bool,
     defer_build: bool = False,
+    job_service: Any | None = None,
 ) -> tuple[dict[str, Any], Any | None]:
     source_key = str(prepared["source_key"])
     source = cast(DocumentSourceInput, prepared["source"])
@@ -3087,38 +4373,76 @@ async def _execute_sync_item(
                 defer_build=defer_build,
             )
         else:
-            replacement = document_service.prepare_replacement_source(source)
-            claimed = await document_service.claim_replace(
-                kb_id,
-                existing.id,
-                job=job,
-                replacement=replacement,
-                delete_source_file=delete_source_file,
-                delete_artifacts=delete_artifacts,
-                delete_llm_cache=delete_llm_cache,
-                auto_parse=auto_parse,
-                auto_index=auto_index,
-                parser_engine=parser_engine,
-                process_options=process_options,
-                force_reparse=force_reparse,
-            )
-            replace_item = await _execute_replace_document(
-                document_service=document_service,
-                kb_id=kb_id,
-                job=job,
-                document=claimed,
-                replacement=replacement,
-                active_registry=active_registry,
-                active_index_service=active_index_service,
-                delete_source_file=delete_source_file,
-                delete_artifacts=delete_artifacts,
-                delete_llm_cache=delete_llm_cache,
-                auto_parse=auto_parse,
-                auto_index=auto_index,
-                parser_engine=parser_engine,
-                process_options=process_options,
-                force_reparse=force_reparse,
-            )
+            if document_service.object_authoritative:
+                # Object mode: B1 claims internally via Store A; skip the
+                # local-mode claim_replace (which is gated). Store A binds
+                # the commit to the matched sync item's exact source_key and
+                # checksum, so pass the prepared source_hash from the item.
+                # Build the replacement directly: prepare_replacement_source
+                # validates non-empty content, but object-mode resume from
+                # engine_cleanup_pending does not need the original bytes.
+                replacement = DocumentReplacementSource(
+                    source_name=source.source_name,
+                    content=source.content,
+                    source_type=source.source_type,
+                    source_hash=source_hash,
+                    content_type=source.content_type,
+                    size_bytes=len(source.content)
+                    if source.content
+                    else int(prepared.get("size_bytes") or 0),
+                )
+                replace_item = await _execute_replace_document(
+                    document_service=document_service,
+                    kb_id=kb_id,
+                    job=job,
+                    document=existing,
+                    replacement=replacement,
+                    active_registry=active_registry,
+                    active_index_service=active_index_service,
+                    delete_source_file=delete_source_file,
+                    delete_artifacts=delete_artifacts,
+                    delete_llm_cache=delete_llm_cache,
+                    auto_parse=auto_parse,
+                    auto_index=auto_index,
+                    parser_engine=parser_engine,
+                    process_options=process_options,
+                    force_reparse=force_reparse,
+                    job_service=job_service,
+                )
+            else:
+                replacement = document_service.prepare_replacement_source(source)
+                claimed = await document_service.claim_replace(
+                    kb_id,
+                    existing.id,
+                    job=job,
+                    replacement=replacement,
+                    delete_source_file=delete_source_file,
+                    delete_artifacts=delete_artifacts,
+                    delete_llm_cache=delete_llm_cache,
+                    auto_parse=auto_parse,
+                    auto_index=auto_index,
+                    parser_engine=parser_engine,
+                    process_options=process_options,
+                    force_reparse=force_reparse,
+                )
+                replace_item = await _execute_replace_document(
+                    document_service=document_service,
+                    kb_id=kb_id,
+                    job=job,
+                    document=claimed,
+                    replacement=replacement,
+                    active_registry=active_registry,
+                    active_index_service=active_index_service,
+                    delete_source_file=delete_source_file,
+                    delete_artifacts=delete_artifacts,
+                    delete_llm_cache=delete_llm_cache,
+                    auto_parse=auto_parse,
+                    auto_index=auto_index,
+                    parser_engine=parser_engine,
+                    process_options=process_options,
+                    force_reparse=force_reparse,
+                    job_service=job_service,
+                )
             item.update(replace_item)
             item["action"] = "replaced"
 
@@ -3331,6 +4655,7 @@ def create_kb_document_routes(
         http_request: Request,
         request: TextDocumentsRequest,
     ):
+        _reject_legacy_route_in_object_mode(document_service, "documents:texts")
         try:
             _validate_text_document_sizes(request.documents)
             sources = [
@@ -3407,6 +4732,7 @@ def create_kb_document_routes(
         http_request: Request,
         request: UrlDocumentsRequest,
     ):
+        _reject_legacy_route_in_object_mode(document_service, "documents:urls")
         try:
             max_upload_size = _required_upload_limit()
             total_bytes = 0
@@ -3492,6 +4818,7 @@ def create_kb_document_routes(
         http_request: Request,
         request: LocalImportDocumentsRequest,
     ):
+        _reject_legacy_route_in_object_mode(document_service, "documents:import")
         try:
             source_root = _source_root_resolved(document_service)
             max_upload_size = _required_upload_limit()
@@ -3598,6 +4925,7 @@ def create_kb_document_routes(
         http_request: Request,
         request: LocalScanDocumentsRequest,
     ):
+        _reject_legacy_route_in_object_mode(document_service, "documents:scan")
         try:
             source_root = _source_root_resolved(document_service)
             if _requested_path_resolves_to_root(source_root, request.directory):
@@ -4027,6 +5355,12 @@ def create_kb_document_routes(
         delete_llm_cache: bool = False,
         idempotency_key: Optional[str] = None,
     ):
+        _require_destructive_lifecycle(
+            document_service,
+            "Document sync",
+            kb_id=kb_id,
+            route_operation="sync",
+        )
         if auto_index and not auto_parse:
             raise HTTPException(
                 status_code=400,
@@ -4104,14 +5438,30 @@ def create_kb_document_routes(
 
             async with document_service.kb_write_guard(kb_id):
                 batch_id = generate_track_id("batch")
+                # Phase 3.2 object mode: stage each source to an immutable
+                # object so a durable worker can resume after request-process
+                # death without a local filesystem (moved-root safe). The
+                # per-item URIs are persisted metadata-only in the job payload.
+                object_staging_uris: dict[str, str] = {}
                 for item_index, prepared in enumerate(prepared_sources):
-                    await document_service.stage_sync_source_bytes(
-                        kb_id,
-                        batch_id=batch_id,
-                        item_index=item_index,
-                        source=cast(DocumentSourceInput, prepared["source"]),
-                    )
-                    sync_staged = True
+                    prepared_source = cast(DocumentSourceInput, prepared["source"])
+                    if document_service.object_authoritative:
+                        staging_uri = await document_service.stage_sync_source_object(
+                            kb_id,
+                            batch_id=batch_id,
+                            item_index=item_index,
+                            source=prepared_source,
+                        )
+                        object_staging_uris[str(prepared["source_key"])] = staging_uri
+                        sync_staged = True
+                    else:
+                        await document_service.stage_sync_source_bytes(
+                            kb_id,
+                            batch_id=batch_id,
+                            item_index=item_index,
+                            source=prepared_source,
+                        )
+                        sync_staged = True
                 fingerprint_payload = {
                     "items": [
                         {
@@ -4141,10 +5491,21 @@ def create_kb_document_routes(
                     **fingerprint_payload,
                     "batch_id": batch_id,
                     "source_keys": normalized_keys,
+                    # Per-document COW attempt-token map ({document_id: token}).
+                    # Aggregate sync retries use per-document attempt tokens,
+                    # never one shared destructive token. Manifest groups are
+                    # per-document (group id includes document_id).
+                    "attempt_tokens": {},
                     "idempotency_fingerprint": _idempotency_fingerprint(
                         fingerprint_payload
                     ),
                 }
+                if object_staging_uris:
+                    # Phase 3.2 object-backed sync staging: per-item
+                    # ({source_key: object_uri}) map. Metadata-only — never a
+                    # local path. A durable worker downloads each item from its
+                    # URI to re-drive the per-item sync helper.
+                    payload["staging_object_uris"] = object_staging_uris
                 job, created_job = await job_service.create_job_once(
                     kb_id,
                     job_type="sync",
@@ -4247,6 +5608,7 @@ def create_kb_document_routes(
                                 delete_artifacts=delete_artifacts,
                                 delete_llm_cache=delete_llm_cache,
                                 defer_build=True,
+                                job_service=job_service,
                             )
                         parsed_count += 1
                         done = parsed_count
@@ -4480,6 +5842,12 @@ def create_kb_document_routes(
         delete_llm_cache: bool = False,
         idempotency_key: Optional[str] = None,
     ):
+        _require_destructive_lifecycle(
+            document_service,
+            "Document replace",
+            kb_id=kb_id,
+            route_operation="replace",
+        )
         if registry is None:
             raise HTTPException(
                 status_code=503, detail="KB replace service is not configured"
@@ -4558,15 +5926,51 @@ def create_kb_document_routes(
                     process_options=process_options,
                     force_reparse=force_reparse,
                 )
-                # Stage the replacement bytes to disk so a durable worker can
-                # resume this replace from disk after a crash (orphan recovery
+                # Stage the replacement bytes so a durable worker can resume
+                # this replace after a request-process crash (orphan recovery
                 # → replace_failed → :retry → queued → worker re-drive).
-                await document_service.stage_replacement_bytes(
-                    kb_id,
-                    document_id,
-                    job_id=job.id,
-                    replacement=replacement,
-                )
+                if document_service.object_authoritative:
+                    # Object mode (Phase 3.2): stage the bytes to the
+                    # deterministic COW candidate object so worker resume does
+                    # not depend on a local filesystem (moved-root safe). Issue
+                    # the COW attempt token up front and persist it so the
+                    # in-process execution and any worker resume share one
+                    # deterministic candidate key — the COW commit's
+                    # upload_file_if_absent is then idempotent (created=False).
+                    (
+                        attempt_token,
+                        source_generation_id,
+                    ) = await document_service.prepare_object_replace_staging(
+                        kb_id,
+                        document_id,
+                        job_id=job.id,
+                        source_hash=replacement.source_hash,
+                    )
+                    staging_object_uri = (
+                        await document_service.stage_replacement_object(
+                            kb_id,
+                            document_id,
+                            job_id=job.id,
+                            source_generation_id=source_generation_id,
+                            replacement=replacement,
+                        )
+                    )
+                    job = await job_service.update_job_payload_patch(
+                        kb_id,
+                        job.id,
+                        payload_patch={
+                            "staging_object_uri": staging_object_uri,
+                            "attempt_tokens": {document_id: attempt_token},
+                        },
+                    )
+                else:
+                    # Local mode: stage to disk (unchanged).
+                    await document_service.stage_replacement_bytes(
+                        kb_id,
+                        document_id,
+                        job_id=job.id,
+                        replacement=replacement,
+                    )
             except (
                 ActiveDocumentParseJobError,
                 ActiveDocumentBuildJobError,
@@ -4587,7 +5991,6 @@ def create_kb_document_routes(
                     status_code=409,
                     detail=_active_job_conflict_detail(exc),
                 ) from exc
-
             await _append_kb_document_audit_event(
                 http_request,
                 "document_replace_queued",
@@ -4630,6 +6033,7 @@ def create_kb_document_routes(
                         parser_engine=parser_engine,
                         process_options=process_options,
                         force_reparse=force_reparse,
+                        job_service=job_service,
                     )
                     replace_claim_released = True
                     if item["status"] == "succeeded":
@@ -4734,6 +6138,8 @@ def create_kb_document_routes(
         delete_source_file: bool,
         delete_artifacts: bool,
         delete_llm_cache: bool,
+        job_service_arg: Any | None = None,
+        job: JobRecord | None = None,
     ) -> dict[str, Any]:
         # Delegates to the module-level executor so the durable job worker can
         # reuse the same delete logic when re-driving a queued delete job.
@@ -4746,6 +6152,8 @@ def create_kb_document_routes(
             delete_source_file=delete_source_file,
             delete_artifacts=delete_artifacts,
             delete_llm_cache=delete_llm_cache,
+            job_service=job_service_arg,
+            job=job,
         )
 
     @router.delete(
@@ -4766,6 +6174,12 @@ def create_kb_document_routes(
         strategy: Literal["safe", "rebuild_doc_scope", "rebuild_kb", "rebuild_subgraph"] = "safe",
         idempotency_key: Optional[str] = None,
     ):
+        _require_destructive_lifecycle(
+            document_service,
+            "Document delete",
+            kb_id=kb_id,
+            route_operation="delete",
+        )
         if registry is None:
             raise HTTPException(
                 status_code=503, detail="KB delete service is not configured"
@@ -4850,7 +6264,6 @@ def create_kb_document_routes(
                     status_code=409,
                     detail=_active_job_conflict_detail(exc),
                 ) from exc
-
             await _append_kb_document_audit_event(
                 http_request,
                 "document_delete_queued",
@@ -4904,6 +6317,8 @@ def create_kb_document_routes(
                         delete_source_file=delete_source_file,
                         delete_artifacts=delete_artifacts,
                         delete_llm_cache=delete_llm_cache,
+                        job_service_arg=job_service,
+                        job=job,
                     )
                     if item["status"] == "succeeded":
                         rebuild_summary = None
@@ -4998,6 +6413,12 @@ def create_kb_document_routes(
         http_request: Request,
         request: BatchDeleteDocumentsRequest,
     ):
+        _require_destructive_lifecycle(
+            document_service,
+            "Batch document delete",
+            kb_id=kb_id,
+            route_operation="batch_delete",
+        )
         if registry is None:
             raise HTTPException(
                 status_code=503, detail="KB delete service is not configured"
@@ -5156,6 +6577,8 @@ def create_kb_document_routes(
                             delete_source_file=request.delete_source_file,
                             delete_artifacts=request.delete_artifacts,
                             delete_llm_cache=request.delete_llm_cache,
+                            job_service_arg=job_service,
+                            job=job,
                         )
                         item_results.append(item)
                         if item["status"] == "succeeded":
@@ -5560,8 +6983,17 @@ def create_kb_document_routes(
                 lightrag_doc_id=plan.lightrag_doc_id,
                 parser_engine=plan.parser_engine,
                 process_options=plan.process_options,
-                source_uri=str(plan.source_path),
                 source_hash=plan.document.source_hash,
+                source_name=plan.source_name,
+                source_object_uri=plan.source_object_uri,
+                raw_object_refs=[
+                    {
+                        "artifact_id": ref.artifact_id,
+                        "object_prefix_uri": ref.object_prefix_uri,
+                        "directory_name": ref.directory_name,
+                    }
+                    for ref in plan.raw_object_refs
+                ],
                 force_reparse=plan.force_reparse,
                 auto_index=plan.auto_index,
                 idempotency_key=request.idempotency_key,
@@ -5591,6 +7023,24 @@ def create_kb_document_routes(
                 raise HTTPException(
                     status_code=409,
                     detail=_active_job_conflict_detail(exc),
+                ) from exc
+            except (
+                DocumentSnapshotConflictError,
+                DocumentAttemptOwnershipError,
+            ) as exc:
+                error_code = _attempt_conflict_error_code(exc)
+                await job_service.transition_job(
+                    kb_id,
+                    job.id,
+                    status="failed",
+                    progress=1.0,
+                    failed_items=1,
+                    error_code=error_code,
+                    error_message=str(exc),
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=_attempt_conflict_detail(exc),
                 ) from exc
 
             await _append_kb_document_audit_event(
@@ -5696,6 +7146,8 @@ def create_kb_document_routes(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except DocumentLifecycleError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -5737,9 +7189,12 @@ def create_kb_document_routes(
             index_hash=plan.index_hash,
             source_hash=plan.document.source_hash,
             lightrag_doc_id=plan.document.lightrag_doc_id or "",
-            sidecar_uri=plan.sidecar_uri,
-            blocks_path=plan.blocks_path,
-            process_options=plan.process_options,
+            sidecar_artifact_id=(
+                plan.sidecar_artifact.id if plan.sidecar_artifact is not None else None
+            ),
+            blocks_artifact_id=(
+                plan.blocks_artifact.id if plan.blocks_artifact is not None else None
+            ),
             force_rechunk=force_rechunk,
             force_extract=force_extract,
             force_embedding=force_embedding,
@@ -5772,14 +7227,36 @@ def create_kb_document_routes(
                 status_code=409,
                 detail=_active_job_conflict_detail(exc),
             ) from exc
+        except (
+            DocumentSnapshotConflictError,
+            DocumentAttemptOwnershipError,
+        ) as exc:
+            error_code = _attempt_conflict_error_code(exc)
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                failed_items=1,
+                error_code=error_code,
+                error_message=str(exc),
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=_attempt_conflict_detail(exc),
+            ) from exc
 
         await _append_kb_document_audit_event(
             http_request,
-            "document_reindex_queued" if job_type == "reindex" else "document_build_queued",
+            "document_reindex_queued"
+            if job_type == "reindex"
+            else "document_build_queued",
             kb_id,
             _document_audit_metadata(
                 job=job,
-                operation="reindex_document" if job_type == "reindex" else "build_document_kg",
+                operation="reindex_document"
+                if job_type == "reindex"
+                else "build_document_kg",
                 document_ids=[document_id],
                 parser_hash=plan.parser_hash,
                 index_hash=plan.index_hash,
@@ -5799,15 +7276,59 @@ def create_kb_document_routes(
                 progress=0.5,
             )
             try:
+                await active_index_service.mark_building(
+                    kb_id,
+                    document_id,
+                    job_id=job.id,
+                    claim_token=plan.claim_token,
+                    plan=plan,
+                )
                 run_result = await active_index_service.run_build(rag, plan)
                 document = await active_index_service.complete_build(
                     kb_id,
                     document_id,
                     job_id=job.id,
                     plan=plan,
+                    execution=None,
                     run_result=run_result,
                 )
+            except (
+                DocumentSnapshotConflictError,
+                DocumentAttemptOwnershipError,
+            ) as exc:
+                error_code = _attempt_conflict_error_code(exc)
+                with contextlib.suppress(Exception):
+                    await active_index_service.release_build_if_owned(
+                        kb_id,
+                        document_id,
+                        job_id=job.id,
+                        plan=plan,
+                        error_code=error_code,
+                        error_message=str(exc),
+                    )
+                await job_service.transition_job(
+                    kb_id,
+                    job.id,
+                    status="failed",
+                    progress=1.0,
+                    failed_items=1,
+                    error_code=error_code,
+                    error_message=str(exc),
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=_attempt_conflict_detail(exc),
+                ) from exc
             except Exception as exc:  # noqa: BLE001
+                with contextlib.suppress(Exception):
+                    await active_index_service.fail_build(
+                        kb_id,
+                        document_id,
+                        job_id=job.id,
+                        error_code="build_failed",
+                        error_message=str(exc),
+                        plan=plan,
+                    )
                 await job_service.transition_job(
                     kb_id,
                     job.id,
@@ -5906,6 +7427,7 @@ def create_kb_document_routes(
                         job_id=job.id,
                         error_code="build_failed",
                         error_message=str(exc),
+                        plan=plan,
                     )
                     await job_service.transition_job(
                         kb_id,
@@ -5924,9 +7446,7 @@ def create_kb_document_routes(
                     )
 
         async def _build_task() -> None:
-            async with job_service.job_execution_guard(
-                job.id, wait=False
-            ) as acquired:
+            async with job_service.job_execution_guard(job.id, wait=False) as acquired:
                 if not acquired:
                     return
                 try:
@@ -5984,6 +7504,8 @@ def create_kb_document_routes(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except DocumentLifecycleError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -6142,7 +7664,11 @@ def create_kb_document_routes(
             _document_audit_metadata(
                 job=job,
                 operation=audit_operation
-                or ("batch_reindex_documents" if job_type == "reindex" else "batch_build_documents"),
+                or (
+                    "batch_reindex_documents"
+                    if job_type == "reindex"
+                    else "batch_build_documents"
+                ),
                 document_ids=[document.id for document in queued_documents],
                 document_count=len(request_ids),
                 batch_id=job.batch_id or batch_plan.batch_id,
@@ -6254,7 +7780,7 @@ def create_kb_document_routes(
                     exc,
                 )
                 processed_ids = {item["document_id"] for item in item_results}
-                for plan in execution_plans:
+                for plan in [*skipped_plans, *execution_plans]:
                     if plan.document.id in processed_ids:
                         continue
                     item_results.append(
@@ -6273,6 +7799,7 @@ def create_kb_document_routes(
                             job_id=job.id,
                             error_code="build_failed",
                             error_message=str(exc),
+                            plan=plan,
                         )
                     except Exception as transition_exc:
                         logger.error(
@@ -6299,9 +7826,7 @@ def create_kb_document_routes(
                 )
 
         async def _batch_build_task() -> None:
-            async with job_service.job_execution_guard(
-                job.id, wait=False
-            ) as acquired:
+            async with job_service.job_execution_guard(job.id, wait=False) as acquired:
                 if not acquired:
                     return
                 try:
@@ -6611,29 +8136,31 @@ def create_kb_document_routes(
             artifact_file = await document_service.get_document_artifact_file(
                 kb_id, document_id, artifact_id
             )
-            await append_enterprise_audit_event(
-                request,
-                "artifact_downloaded",
-                target_type="kb",
-                target_id=kb_id,
-                metadata=_artifact_audit_metadata(
-                    artifact_file.artifact,
-                    is_directory=artifact_file.is_directory,
-                    filename=artifact_file.filename,
-                    media_type=artifact_file.media_type,
-                ),
-            )
+            try:
+                await append_enterprise_audit_event(
+                    request,
+                    "artifact_downloaded",
+                    target_type="kb",
+                    target_id=kb_id,
+                    metadata=_artifact_audit_metadata(
+                        artifact_file.artifact,
+                        is_directory=artifact_file.is_directory,
+                        filename=artifact_file.filename,
+                        media_type=artifact_file.media_type,
+                    ),
+                )
+            except BaseException:
+                artifact_file.cleanup()
+                raise
             if artifact_file.is_directory:
                 return _stream_directory_as_zip(artifact_file)
-            return FileResponse(
-                artifact_file.path,
-                media_type=artifact_file.media_type,
-                filename=artifact_file.filename,
-            )
+            return _artifact_download_file_response(artifact_file)
         except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except DocumentLifecycleError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -6655,22 +8182,28 @@ def create_kb_document_routes(
             artifact_file = await document_service.get_document_artifact_file(
                 kb_id, document_id, artifact_id
             )
-            await append_enterprise_audit_event(
-                request,
-                "artifact_previewed",
-                target_type="kb",
-                target_id=kb_id,
-                metadata=_artifact_audit_metadata(
-                    artifact_file.artifact,
-                    filename=artifact_file.filename,
-                    media_type=artifact_file.media_type,
-                ),
-            )
+            try:
+                await append_enterprise_audit_event(
+                    request,
+                    "artifact_previewed",
+                    target_type="kb",
+                    target_id=kb_id,
+                    metadata=_artifact_audit_metadata(
+                        artifact_file.artifact,
+                        filename=artifact_file.filename,
+                        media_type=artifact_file.media_type,
+                    ),
+                )
+            except BaseException:
+                artifact_file.cleanup()
+                raise
             return _artifact_preview_response(artifact_file)
         except (KnowledgeBaseNotFoundError, MetadataRecordNotFoundError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except DocumentLifecycleError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

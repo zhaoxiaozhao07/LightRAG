@@ -8,6 +8,17 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _reset_canonical_input_root():
+    """Give every test-tree branch a fresh containment-root snapshot."""
+
+    from lightrag.utils_pipeline import reset_canonical_input_root_for_tests
+
+    reset_canonical_input_root_for_tests()
+    yield
+    reset_canonical_input_root_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_mineru_env(monkeypatch):
     """Make every test start with parser-routing env vars in their unset state.
 

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import os
+from collections.abc import Mapping
 from typing import Any, Union, final
 
 from lightrag.base import (
@@ -16,6 +17,11 @@ from lightrag.utils import (
     get_pinyin_sort_key,
 )
 from lightrag.exceptions import StorageNotInitializedError
+from .json_kv_impl import (
+    PipelineAttemptRowKind,
+    _compare_and_commit_json_pipeline_attempt,
+    _JsonWriterFileLock,
+)
 from .shared_storage import (
     get_namespace_data,
     get_namespace_lock,
@@ -239,20 +245,41 @@ class JsonDocStatusStorage(DocStatusStorage):
                     f"[{self.workspace}] Process {os.getpid()} doc status writting {len(data_dict)} records to {self.namespace}"
                 )
 
-                # Write JSON and check if sanitization was applied
-                needs_reload = write_json(data_dict, self._file_name)
+                with _JsonWriterFileLock(self._file_name):
+                    # Write JSON and check if sanitization was applied
+                    needs_reload = write_json(data_dict, self._file_name)
 
-                # If data was sanitized, reload cleaned data to update shared memory
-                if needs_reload:
-                    logger.info(
-                        f"[{self.workspace}] Reloading sanitized data into shared memory for {self.namespace}"
-                    )
-                    cleaned_data = load_json(self._file_name)
-                    if cleaned_data is not None:
-                        self._data.clear()
-                        self._data.update(cleaned_data)
+                    # If data was sanitized, reload cleaned data to update shared memory
+                    if needs_reload:
+                        logger.info(
+                            f"[{self.workspace}] Reloading sanitized data into shared memory for {self.namespace}"
+                        )
+                        cleaned_data = load_json(self._file_name)
+                        if cleaned_data is not None:
+                            self._data.clear()
+                            self._data.update(cleaned_data)
 
                 await clear_all_update_flags(self.namespace, workspace=self.workspace)
+
+    async def compare_and_commit_pipeline_attempt(
+        self,
+        key: str,
+        payload: Mapping[str, Any],
+        *,
+        expected_attempt_token: str,
+        row_kind: PipelineAttemptRowKind,
+    ) -> bool:
+        """Atomically replace and durably publish an attempt-owned status row."""
+
+        return await _compare_and_commit_json_pipeline_attempt(
+            self,
+            key,
+            payload,
+            expected_attempt_token=expected_attempt_token,
+            row_kind=row_kind,
+            load_json_fn=load_json,
+            write_json_fn=write_json,
+        )
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         """Insert/update doc-status records and **persist immediately**.

@@ -2,16 +2,60 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+import secrets
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Sequence, TypeVar
 
+from lightrag.api.artifact_lifecycle import (
+    ARTIFACT_CLEANUP_MIN_AUDIT_RETENTION_DAYS,
+    ARTIFACT_LIFECYCLE_MAX_COUNT,
+    ARTIFACT_LIFECYCLE_MAX_PAGE_SIZE,
+    ARTIFACT_RECOVERY_MAX_PAGE_SIZE,
+    ArtifactCleanupDisposition,
+    ArtifactCleanupManifestRecord,
+    ArtifactCleanupReason,
+    ArtifactCleanupStatus,
+    ArtifactCleanupTargetNamespace,
+    ArtifactLifecycleConflictError,
+    ArtifactLifecycleLeaseError,
+    ArtifactLifecycleNotFoundError,
+    ArtifactLifecycleStateError,
+    ArtifactMaintenanceItemRecord,
+    ArtifactMaintenanceItemState,
+    ArtifactMaintenanceMetadataBackend,
+    ArtifactMaintenanceRunKind,
+    ArtifactMaintenanceRunMode,
+    ArtifactMaintenanceRunRecord,
+    ArtifactMaintenanceRunStatus,
+    ArtifactRecoveryCursorRecord,
+    ArtifactRecoveryGenerationError,
+    canonical_safe_json,
+    normalize_artifact_target_uri,
+    normalize_artifact_target_uri_digest,
+    normalize_utc_datetime,
+    sanitize_artifact_lifecycle_error_code,
+)
+from lightrag.api.commit_reconciliation import (
+    MetadataCommitOutcome,
+    MetadataCommitReconciliation,
+)
 from lightrag.api.kb_service import utc_now_iso
 from lightrag.api.metadata_store import (
     _AGGREGATE_RESUMABLE_JOB_TYPES,
+    _artifact_bounded_limit,
+    _artifact_bounded_offset,
+    _artifact_identifier,
+    _artifact_lease_expiry,
+    _artifact_lifecycle_timestamp,
+    _artifact_maintenance_item_upgrade_record,
+    _artifact_maintenance_run_upgrade_record,
+    _assert_maintenance_item_transition,
+    _assert_maintenance_run_lease,
+    _assert_maintenance_run_transition,
     _chat_memory_append_batch_id,
     _chat_memory_canonical_episode_payload,
     _chat_memory_existing_graph_store_fingerprint,
@@ -25,7 +69,10 @@ from lightrag.api.metadata_store import (
     _ORPHANED_DOCUMENT_STATUS_TARGETS,
     _ORPHANED_JOB_STATUSES,
     _REPLACE_DERIVED_METADATA_KEYS,
+    _DOCUMENT_MUTATION_COMMIT_JOB_STATUSES,
+    _DOCUMENT_MUTATION_RECONCILE_JOB_STATUSES,
     _allowed_next_job_statuses,
+    _assert_document_snapshot,
     _assert_enterprise_user_membership_precondition,
     _assert_enterprise_user_write_preconditions,
     _assert_tenant_user_kb_override_target_preconditions,
@@ -35,7 +82,44 @@ from lightrag.api.metadata_store import (
     _missing_kb_lifecycle_conflict,
     _metadata_source_key,
     _document_job_ids,
+    _document_attempt_mark_is_legacy_compatible,
+    _document_delete_lineage_matches,
+    _document_mutation_claim_failure,
+    _document_mutation_commit_result,
+    _document_replace_lineage_matches,
+    _document_pending_claim_is_idempotent,
+    _apply_document_delete_commit,
+    _apply_document_mutation_precommit_failure,
+    _apply_document_replace_commit,
+    _apply_document_replace_final,
+    _apply_replace_engine_cleanup_failure,
+    _assert_document_mutation_job,
+    _assert_document_mutation_precommit,
+    _assert_document_replace_final_fence,
+    _assert_replace_engine_cleanup_failure_fence,
+    _manifest_records_match_candidates,
+    _prepare_document_mutation_claim,
+    _reconcile_document_delete_state,
+    _reconcile_document_replace_state,
+    _replace_final_is_idempotent,
+    _validate_document_attempt_token,
+    _validate_document_mutation_manifest_group,
+    _validate_document_mutation_manifest_replay_input,
+    _validate_document_mutation_metadata_patch,
+    _validate_document_mutation_snapshot_digest,
+    _validate_new_document_source_authority,
+    _validated_document_mutation_manifests,
+    _prepare_document_claim_metadata,
+    _prepare_document_attempt_mark_metadata,
+    _prepare_document_attempt_terminal_metadata,
+    _resolve_document_attempt_identity,
+    _resolve_document_attempt_release_identity,
+    _unpack_document_claim,
     _job_recovery_document_ids,
+    _cleanup_enqueue_matches,
+    _increment_capped_artifact_attempt,
+    _maintenance_eligible_statuses,
+    _manifest_filter_statuses,
     _new_chat_memory_claim_token,
     _normalize_chat_memory_group_ids,
     _normalize_chat_memory_event_types,
@@ -45,6 +129,7 @@ from lightrag.api.metadata_store import (
     _should_requeue_orphaned_clear_job,
     _TENANT_MEMBERSHIP_ROLES,
     _validate_job_execution_id,
+    _validate_max_artifact_attempt_count,
     _validate_delete_job_id,
     _validate_kb_lifecycle_identity,
     _validate_chat_memory_fingerprint,
@@ -57,6 +142,7 @@ from lightrag.api.metadata_store import (
     ActiveDocumentDeleteJobError,
     ActiveDocumentParseJobError,
     ActiveDocumentReplaceJobError,
+    ArtifactPointerConflictError,
     ArtifactRecord,
     AuditEventRecord,
     CHAT_MEMORY_DEFAULT_INGEST_MAX_CHARS,
@@ -81,7 +167,12 @@ from lightrag.api.metadata_store import (
     ChatProjectRecord,
     ChatSessionRecord,
     ConfigVersionRecord,
+    DocumentAttemptClaimInput,
+    DocumentMutationClaimResult,
+    DocumentMutationCommitResult,
+    DocumentMutationOperation,
     DocumentNotParsedError,
+    DocumentSnapshotConflictError,
     DocumentRecord,
     DuplicateDocumentSourceKeyError,
     EnterpriseUserRecord,
@@ -111,9 +202,12 @@ from lightrag.api.metadata_store import (
     chat_memory_graph_group_id,
     chat_memory_legacy_graph_group_id,
     chat_memory_logical_group_id,
+    document_mutation_manifest_group_id,
+    document_source_generation_id,
 )
 
 _T = TypeVar("_T")
+_POSTGRES_ARTIFACT_LIFECYCLE_SCHEMA_VERSION = 6
 
 
 @dataclass(slots=True)
@@ -136,7 +230,9 @@ _OPERATION_SESSION_STATES: ContextVar[dict[int, _OperationSessionState] | None] 
 def _load_asyncpg() -> Any:
     try:
         import asyncpg
-    except ImportError as exc:  # pragma: no cover - exercised only without optional deps
+    except (
+        ImportError
+    ) as exc:  # pragma: no cover - exercised only without optional deps
         raise RuntimeError(
             "PostgreSQL KB metadata backend requires asyncpg. "
             "Install LightRAG with the api/offline-storage extras or install asyncpg."
@@ -191,6 +287,33 @@ def _job_from_row(row: Any) -> JobRecord:
 def _artifact_from_row(row: Any) -> ArtifactRecord:
     data = _loads_json_object(row["data_json"])
     return ArtifactRecord(**data)
+
+
+def _artifact_cleanup_manifest_from_row(
+    row: Any,
+) -> ArtifactCleanupManifestRecord:
+    data = dict(row)
+    data.pop("initial_disposition", None)
+    data.pop("initial_audit_retain_until", None)
+    return ArtifactCleanupManifestRecord.from_mapping(data)
+
+
+def _artifact_maintenance_run_from_row(
+    row: Any,
+) -> ArtifactMaintenanceRunRecord:
+    return ArtifactMaintenanceRunRecord.from_mapping(dict(row))
+
+
+def _artifact_maintenance_item_from_row(
+    row: Any,
+) -> ArtifactMaintenanceItemRecord:
+    return ArtifactMaintenanceItemRecord.from_mapping(dict(row))
+
+
+def _artifact_recovery_cursor_from_row(
+    row: Any,
+) -> ArtifactRecoveryCursorRecord:
+    return ArtifactRecoveryCursorRecord.from_mapping(dict(row))
 
 
 def _config_from_row(row: Any) -> ConfigVersionRecord:
@@ -286,9 +409,7 @@ def _chat_message_from_row(row: Any) -> ChatMessageRecord:
             else None
         )
     if "memory_reference_time" in projection_keys:
-        data["memory_reference_time"] = _iso_timestamp(
-            row["memory_reference_time"]
-        )
+        data["memory_reference_time"] = _iso_timestamp(row["memory_reference_time"])
     return ChatMessageRecord(**data)
 
 
@@ -309,14 +430,10 @@ def _chat_memory_episode_from_row(row: Any) -> ChatMemoryEpisodeRecord:
             else None
         ),
         graph_group_id=(
-            row["graph_group_id"]
-            if "graph_group_id" in projection_keys
-            else None
+            row["graph_group_id"] if "graph_group_id" in projection_keys else None
         ),
         append_batch_id=(
-            row["append_batch_id"]
-            if "append_batch_id" in projection_keys
-            else None
+            row["append_batch_id"] if "append_batch_id" in projection_keys else None
         ),
         project_event_seq=(
             int(row["project_event_seq"])
@@ -377,9 +494,7 @@ def _chat_memory_generation_from_row(row: Any) -> ChatMemoryGenerationRecord:
         config_fingerprint=str(row["config_fingerprint"]),
         state=str(row["state"]),  # type: ignore[arg-type]
         snapshot_cutoff=(
-            int(row["snapshot_cutoff"])
-            if row["snapshot_cutoff"] is not None
-            else None
+            int(row["snapshot_cutoff"]) if row["snapshot_cutoff"] is not None else None
         ),
         replay_batch_count=(
             int(row["replay_batch_count"])
@@ -406,9 +521,7 @@ def _chat_memory_generation_from_row(row: Any) -> ChatMemoryGenerationRecord:
         last_error_message=row["last_error_message"],
         last_error_at=_iso_timestamp(row["last_error_at"]),
         snapshot_digest=(
-            row["snapshot_digest"]
-            if "snapshot_digest" in projection_keys
-            else None
+            row["snapshot_digest"] if "snapshot_digest" in projection_keys else None
         ),
         record_version=int(row["record_version"]),
         graph_store_fingerprint=(
@@ -441,9 +554,7 @@ def _chat_memory_event_from_row(row: Any) -> ChatMemoryOutboxEventRecord:
         first_seq=(int(row["first_seq"]) if row["first_seq"] is not None else None),
         last_seq=(int(row["last_seq"]) if row["last_seq"] is not None else None),
         snapshot_cutoff=(
-            int(row["snapshot_cutoff"])
-            if row["snapshot_cutoff"] is not None
-            else None
+            int(row["snapshot_cutoff"]) if row["snapshot_cutoff"] is not None else None
         ),
         snapshot_batch_count=(
             int(row["snapshot_batch_count"])
@@ -461,9 +572,7 @@ def _chat_memory_event_from_row(row: Any) -> ChatMemoryOutboxEventRecord:
             else None
         ),
         snapshot_digest=(
-            row["snapshot_digest"]
-            if "snapshot_digest" in projection_keys
-            else None
+            row["snapshot_digest"] if "snapshot_digest" in projection_keys else None
         ),
         claim_token=row["claim_token"],
         claimed_by=row["claimed_by"],
@@ -766,7 +875,9 @@ class PostgresMetadataStore:
             "database": database,
         }
         self._connect_kwargs = {
-            key: value for key, value in self._connect_kwargs.items() if value is not None
+            key: value
+            for key, value in self._connect_kwargs.items()
+            if value is not None
         }
         self._min_size = min_size
         self._max_size = max_size
@@ -831,6 +942,1830 @@ class PostgresMetadataStore:
         finally:
             if pool is not None and pool is not operation_lock_pool:
                 await pool.close()
+
+    async def enqueue_artifact_cleanup_manifest(
+        self, manifest: ArtifactCleanupManifestRecord
+    ) -> ArtifactCleanupManifestRecord:
+        records = await self.enqueue_artifact_cleanup_manifests([manifest])
+        return records[0]
+
+    async def enqueue_artifact_cleanup_manifests(
+        self, manifests: Sequence[ArtifactCleanupManifestRecord]
+    ) -> list[ArtifactCleanupManifestRecord]:
+        await self._ensure_initialized()
+        if len(manifests) > ARTIFACT_LIFECYCLE_MAX_PAGE_SIZE:
+            raise ValueError("Cleanup manifest batch exceeds the bounded write size")
+        validated = [
+            ArtifactCleanupManifestRecord.from_mapping(manifest.to_dict())
+            for manifest in manifests
+        ]
+        if any(
+            manifest.status not in {"retained", "pending"} for manifest in validated
+        ):
+            raise ArtifactLifecycleStateError("artifact cleanup manifest enqueue")
+        if not validated:
+            return []
+
+        async def write(conn: Any) -> list[ArtifactCleanupManifestRecord]:
+            return await self._enqueue_artifact_cleanup_manifests_in_tx(
+                conn,
+                validated,
+            )
+
+        return await self._write(write)
+
+    async def get_artifact_cleanup_manifest(
+        self, manifest_id: str
+    ) -> ArtifactCleanupManifestRecord:
+        await self._ensure_initialized()
+        _artifact_identifier(manifest_id, "manifest_id")
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM kb_artifact_cleanup_manifests WHERE id = $1",
+                manifest_id,
+            )
+        if row is None:
+            raise ArtifactLifecycleNotFoundError("artifact cleanup manifest")
+        return _artifact_cleanup_manifest_from_row(row)
+
+    async def get_artifact_cleanup_manifest_by_idempotency_key(
+        self, idempotency_key: str
+    ) -> ArtifactCleanupManifestRecord | None:
+        await self._ensure_initialized()
+        _artifact_identifier(idempotency_key, "idempotency_key")
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM kb_artifact_cleanup_manifests
+                WHERE idempotency_key = $1
+                """,
+                idempotency_key,
+            )
+        return _artifact_cleanup_manifest_from_row(row) if row is not None else None
+
+    @staticmethod
+    def _postgres_manifest_where(
+        *,
+        kb_id: str | None = None,
+        kb_generation: str | None = None,
+        manifest_group_id: str | None = None,
+        document_id: str | None = None,
+        artifact_id: str | None = None,
+        source_generation_id: str | None = None,
+        target_uri: str | None = None,
+        status: ArtifactCleanupStatus | None = None,
+        statuses: Sequence[ArtifactCleanupStatus] | None = None,
+        reason: ArtifactCleanupReason | None = None,
+        target_namespace: ArtifactCleanupTargetNamespace | None = None,
+        disposition: ArtifactCleanupDisposition | None = None,
+        manifest_ids: Sequence[str] | None = None,
+        due_before: str | datetime | None = None,
+    ) -> tuple[str, list[Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        def add(column: str, value: Any) -> None:
+            params.append(value)
+            clauses.append(f"{column} = ${len(params)}")
+
+        normalized_target_uri = (
+            None if target_uri is None else normalize_artifact_target_uri(target_uri)
+        )
+        for column, value in (
+            ("kb_id", kb_id),
+            ("kb_generation", kb_generation),
+            ("manifest_group_id", manifest_group_id),
+            ("document_id", document_id),
+            ("artifact_id", artifact_id),
+            ("source_generation_id", source_generation_id),
+            ("target_uri", normalized_target_uri),
+            ("reason", reason),
+            ("target_namespace", target_namespace),
+            ("disposition", disposition),
+        ):
+            if value is not None:
+                add(column, value)
+        selected_statuses = _manifest_filter_statuses(status, statuses)
+        if selected_statuses:
+            params.append(list(selected_statuses))
+            clauses.append(f"status = ANY(${len(params)}::text[])")
+        if manifest_ids is not None:
+            ordered_ids = list(dict.fromkeys(manifest_ids))
+            if len(ordered_ids) > ARTIFACT_LIFECYCLE_MAX_PAGE_SIZE:
+                raise ValueError("manifest_ids exceeds the bounded query size")
+            if not ordered_ids:
+                clauses.append("FALSE")
+            else:
+                for manifest_id in ordered_ids:
+                    _artifact_identifier(manifest_id, "manifest_id")
+                params.append(ordered_ids)
+                clauses.append(f"id = ANY(${len(params)}::text[])")
+        if due_before is not None:
+            normalized_due = _artifact_lifecycle_timestamp(due_before)
+            params.append(normalized_due)
+            clauses.extend(
+                [
+                    "status = 'pending'",
+                    f"delete_after <= ${len(params)}",
+                    f"next_attempt_at <= ${len(params)}",
+                ]
+            )
+        return (" AND ".join(clauses) if clauses else "TRUE"), params
+
+    async def list_artifact_cleanup_manifests(
+        self,
+        *,
+        kb_id: str | None = None,
+        kb_generation: str | None = None,
+        manifest_group_id: str | None = None,
+        document_id: str | None = None,
+        artifact_id: str | None = None,
+        source_generation_id: str | None = None,
+        target_uri: str | None = None,
+        status: ArtifactCleanupStatus | None = None,
+        statuses: Sequence[ArtifactCleanupStatus] | None = None,
+        reason: ArtifactCleanupReason | None = None,
+        target_namespace: ArtifactCleanupTargetNamespace | None = None,
+        disposition: ArtifactCleanupDisposition | None = None,
+        manifest_ids: Sequence[str] | None = None,
+        due_before: str | datetime | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[ArtifactCleanupManifestRecord], int]:
+        await self._ensure_initialized()
+        limit = _artifact_bounded_limit(limit, maximum=ARTIFACT_LIFECYCLE_MAX_PAGE_SIZE)
+        offset = _artifact_bounded_offset(offset)
+        where, params = self._postgres_manifest_where(
+            kb_id=kb_id,
+            kb_generation=kb_generation,
+            manifest_group_id=manifest_group_id,
+            document_id=document_id,
+            artifact_id=artifact_id,
+            source_generation_id=source_generation_id,
+            target_uri=target_uri,
+            status=status,
+            statuses=statuses,
+            reason=reason,
+            target_namespace=target_namespace,
+            disposition=disposition,
+            manifest_ids=manifest_ids,
+            due_before=due_before,
+        )
+        limit_index = len(params) + 1
+        offset_index = len(params) + 2
+        async with self._pool_or_raise().acquire() as conn:
+            total = await conn.fetchval(
+                f"SELECT COUNT(*) FROM kb_artifact_cleanup_manifests WHERE {where}",
+                *params,
+            )
+            rows = await conn.fetch(
+                f"""
+                SELECT * FROM kb_artifact_cleanup_manifests
+                WHERE {where}
+                ORDER BY created_at ASC, id ASC
+                LIMIT ${limit_index} OFFSET ${offset_index}
+                """,
+                *params,
+                limit,
+                offset,
+            )
+        return [_artifact_cleanup_manifest_from_row(row) for row in rows], int(
+            total or 0
+        )
+
+    async def count_artifact_cleanup_manifests(
+        self,
+        *,
+        kb_id: str | None = None,
+        kb_generation: str | None = None,
+        manifest_group_id: str | None = None,
+        document_id: str | None = None,
+        artifact_id: str | None = None,
+        source_generation_id: str | None = None,
+        target_uri: str | None = None,
+        status: ArtifactCleanupStatus | None = None,
+        statuses: Sequence[ArtifactCleanupStatus] | None = None,
+        reason: ArtifactCleanupReason | None = None,
+        target_namespace: ArtifactCleanupTargetNamespace | None = None,
+        disposition: ArtifactCleanupDisposition | None = None,
+        manifest_ids: Sequence[str] | None = None,
+        due_before: str | datetime | None = None,
+    ) -> int:
+        await self._ensure_initialized()
+        where, params = self._postgres_manifest_where(
+            kb_id=kb_id,
+            kb_generation=kb_generation,
+            manifest_group_id=manifest_group_id,
+            document_id=document_id,
+            artifact_id=artifact_id,
+            source_generation_id=source_generation_id,
+            target_uri=target_uri,
+            status=status,
+            statuses=statuses,
+            reason=reason,
+            target_namespace=target_namespace,
+            disposition=disposition,
+            manifest_ids=manifest_ids,
+            due_before=due_before,
+        )
+        async with self._pool_or_raise().acquire() as conn:
+            total = await conn.fetchval(
+                f"SELECT COUNT(*) FROM kb_artifact_cleanup_manifests WHERE {where}",
+                *params,
+            )
+        return int(total or 0)
+
+    async def aggregate_artifact_cleanup_manifests(
+        self,
+        *,
+        kb_id: str | None = None,
+        kb_generation: str | None = None,
+        now: str | datetime | None = None,
+    ) -> dict[str, int]:
+        await self._ensure_initialized()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if kb_id is not None:
+            params.append(kb_id)
+            clauses.append(f"kb_id = ${len(params)}")
+        if kb_generation is not None:
+            params.append(kb_generation)
+            clauses.append(f"kb_generation = ${len(params)}")
+        reference = _artifact_lifecycle_timestamp(now)
+        params.append(reference)
+        ref_index = len(params)
+        where = " AND ".join(clauses) if clauses else "TRUE"
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE status = 'retained') AS retained,
+                    COUNT(*) FILTER (WHERE status = 'pending') AS pending,
+                    COUNT(*) FILTER (WHERE status = 'leased') AS leased,
+                    COUNT(*) FILTER (WHERE status = 'blocked') AS blocked,
+                    COUNT(*) FILTER (WHERE status = 'succeeded') AS succeeded,
+                    COUNT(*) FILTER (
+                        WHERE status = 'pending'
+                          AND delete_after <= ${ref_index}
+                          AND next_attempt_at <= ${ref_index}
+                    ) AS due_pending,
+                    COUNT(*) FILTER (
+                        WHERE status = 'leased'
+                          AND lease_expires_at <= ${ref_index}
+                    ) AS expired_leases,
+                    COUNT(*) FILTER (
+                        WHERE status IN ('pending', 'leased', 'blocked')
+                          AND cleanup_deadline_at <= ${ref_index}
+                    ) AS cleanup_deadline_overdue,
+                    MIN(delete_after) FILTER (
+                        WHERE status IN ('pending', 'leased')
+                    ) AS oldest_due_at
+                FROM kb_artifact_cleanup_manifests
+                WHERE {where}
+                """,
+                *params,
+            )
+        assert row is not None
+        aggregate: dict[str, Any] = {
+            key: int(row[key] or 0)
+            for key in (
+                "total",
+                "retained",
+                "pending",
+                "leased",
+                "blocked",
+                "succeeded",
+                "due_pending",
+                "expired_leases",
+                "cleanup_deadline_overdue",
+            )
+        }
+        # ``oldest_due_at`` is a MIN(delete_after) timestamp string (or None
+        # when no pending/leased row exists). Reported additively for health;
+        # existing integer-only assertions are unaffected.
+        aggregate["oldest_due_at"] = row["oldest_due_at"]
+        return aggregate
+
+    async def count_unresolved_commit_unknown_jobs(self) -> int:
+        """Bounded indexed count of jobs whose metadata commit is unresolved.
+
+        A job is ``metadata_commit_outcome_unknown`` when its durable
+        ``error_code`` (stored inside the ``data_json`` JSONB row) is exactly
+        that sentinel — the same classification used by
+        :mod:`orphan_reconcile_service` and the cleanup blocker. The query is
+        a single COUNT and never lists or downloads job payloads.
+        """
+
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            value = await conn.fetchval(
+                "SELECT COUNT(*) FROM kb_jobs "
+                "WHERE data_json->>'error_code' = 'metadata_commit_outcome_unknown'"
+            )
+        return int(value or 0)
+
+    async def count_stale_artifact_recovery_cursors(
+        self,
+        *,
+        stale_before: str | datetime,
+    ) -> int:
+        """Bounded count of recovery cursors whose ``updated_at`` precedes a cutoff.
+
+        Used by /health to surface an idle/in-flight artifact recovery sweep
+        without listing cursors or KBs. ``stale_before`` is an ISO UTC
+        timestamp; any cursor not advanced past it is considered stale.
+        """
+
+        await self._ensure_initialized()
+        cutoff = _artifact_lifecycle_timestamp(stale_before)
+        async with self._pool_or_raise().acquire() as conn:
+            value = await conn.fetchval(
+                "SELECT COUNT(*) FROM kb_artifact_recovery_cursors "
+                "WHERE updated_at < $1",
+                cutoff,
+            )
+        return int(value or 0)
+
+    async def claim_due_artifact_cleanup_manifests(
+        self,
+        *,
+        lease_owner: str,
+        lease_duration_seconds: float = 60.0,
+        limit: int = 100,
+        now: str | datetime | None = None,
+        kb_id: str | None = None,
+        kb_generation: str | None = None,
+    ) -> list[ArtifactCleanupManifestRecord]:
+        await self._ensure_initialized()
+        owner = _artifact_identifier(lease_owner, "lease_owner")
+        limit = _artifact_bounded_limit(limit, maximum=ARTIFACT_LIFECYCLE_MAX_PAGE_SIZE)
+        reference = _artifact_lifecycle_timestamp(now)
+        expires_at = _artifact_lease_expiry(reference, lease_duration_seconds)
+
+        async def write(conn: Any) -> list[ArtifactCleanupManifestRecord]:
+            clauses = [
+                "status = 'pending'",
+                "disposition = 'delete'",
+                "delete_after <= $1",
+                "next_attempt_at <= $1",
+            ]
+            params: list[Any] = [reference]
+            if kb_id is not None:
+                params.append(kb_id)
+                clauses.append(f"kb_id = ${len(params)}")
+            if kb_generation is not None:
+                params.append(kb_generation)
+                clauses.append(f"kb_generation = ${len(params)}")
+            params.append(limit)
+            rows = await conn.fetch(
+                f"""
+                SELECT * FROM kb_artifact_cleanup_manifests
+                WHERE {" AND ".join(clauses)}
+                ORDER BY next_attempt_at ASC, created_at ASC, id ASC
+                LIMIT ${len(params)}
+                FOR UPDATE SKIP LOCKED
+                """,
+                *params,
+            )
+            claimed: list[ArtifactCleanupManifestRecord] = []
+            for row in rows:
+                lease_token = f"acl_{secrets.token_urlsafe(24)}"
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE kb_artifact_cleanup_manifests
+                    SET status = 'leased', lease_owner = $2, lease_token = $3,
+                        lease_expires_at = $4, updated_at = $5
+                    WHERE id = $1 AND status = 'pending' AND disposition = 'delete'
+                    RETURNING *
+                    """,
+                    row["id"],
+                    owner,
+                    lease_token,
+                    expires_at,
+                    reference,
+                )
+                if updated is not None:
+                    claimed.append(_artifact_cleanup_manifest_from_row(updated))
+            return claimed
+
+        return await self._write(write)
+
+    async def renew_artifact_cleanup_manifest_lease(
+        self,
+        manifest_id: str,
+        *,
+        lease_owner: str,
+        lease_token: str,
+        lease_duration_seconds: float = 60.0,
+        now: str | datetime | None = None,
+    ) -> ArtifactCleanupManifestRecord:
+        await self._ensure_initialized()
+        owner = _artifact_identifier(lease_owner, "lease_owner")
+        token = _artifact_identifier(lease_token, "lease_token")
+        reference = _artifact_lifecycle_timestamp(now)
+        expires_at = _artifact_lease_expiry(reference, lease_duration_seconds)
+
+        async def write(conn: Any) -> ArtifactCleanupManifestRecord:
+            await self._assert_postgres_manifest_lease(
+                conn,
+                manifest_id,
+                lease_owner=owner,
+                lease_token=token,
+                now=reference,
+            )
+            row = await conn.fetchrow(
+                """
+                UPDATE kb_artifact_cleanup_manifests
+                SET lease_expires_at = $4, updated_at = $5
+                WHERE id = $1 AND status = 'leased'
+                  AND lease_owner = $2 AND lease_token = $3
+                RETURNING *
+                """,
+                manifest_id,
+                owner,
+                token,
+                expires_at,
+                reference,
+            )
+            assert row is not None
+            return _artifact_cleanup_manifest_from_row(row)
+
+        return await self._write(write)
+
+    async def complete_artifact_cleanup_manifest(
+        self,
+        manifest_id: str,
+        *,
+        lease_owner: str,
+        lease_token: str,
+        checked_at: str | datetime | None = None,
+    ) -> ArtifactCleanupManifestRecord:
+        await self._ensure_initialized()
+        owner = _artifact_identifier(lease_owner, "lease_owner")
+        token = _artifact_identifier(lease_token, "lease_token")
+        completed_at = _artifact_lifecycle_timestamp(checked_at)
+        minimum_audit_retain_until = normalize_utc_datetime(
+            datetime.fromisoformat(completed_at)
+            + timedelta(days=ARTIFACT_CLEANUP_MIN_AUDIT_RETENTION_DAYS),
+            field_name="audit_retain_until",
+        )
+
+        async def write(conn: Any) -> ArtifactCleanupManifestRecord:
+            await self._assert_postgres_manifest_lease(
+                conn,
+                manifest_id,
+                lease_owner=owner,
+                lease_token=token,
+                now=completed_at,
+            )
+            row = await conn.fetchrow(
+                """
+                UPDATE kb_artifact_cleanup_manifests
+                SET status = 'succeeded', lease_owner = NULL, lease_token = NULL,
+                    lease_expires_at = NULL, last_error_code = NULL,
+                    last_checked_at = $4, completed_at = $4, updated_at = $4,
+                    audit_retain_until = GREATEST(audit_retain_until, $5)
+                WHERE id = $1 AND status = 'leased'
+                  AND lease_owner = $2 AND lease_token = $3
+                RETURNING *
+                """,
+                manifest_id,
+                owner,
+                token,
+                completed_at,
+                minimum_audit_retain_until,
+            )
+            assert row is not None
+            return _artifact_cleanup_manifest_from_row(row)
+
+        return await self._write(write)
+
+    async def succeed_artifact_cleanup_manifest(
+        self,
+        manifest_id: str,
+        *,
+        lease_owner: str,
+        lease_token: str,
+        checked_at: str | datetime | None = None,
+    ) -> ArtifactCleanupManifestRecord:
+        return await self.complete_artifact_cleanup_manifest(
+            manifest_id,
+            lease_owner=lease_owner,
+            lease_token=lease_token,
+            checked_at=checked_at,
+        )
+
+    async def retry_artifact_cleanup_manifest(
+        self,
+        manifest_id: str,
+        *,
+        lease_owner: str,
+        lease_token: str,
+        next_attempt_at: str | datetime,
+        error_code: str,
+        checked_at: str | datetime | None = None,
+        max_attempt_count: int = ARTIFACT_LIFECYCLE_MAX_COUNT,
+    ) -> ArtifactCleanupManifestRecord:
+        await self._ensure_initialized()
+        owner = _artifact_identifier(lease_owner, "lease_owner")
+        token = _artifact_identifier(lease_token, "lease_token")
+        retry_at = _artifact_lifecycle_timestamp(next_attempt_at)
+        reference = _artifact_lifecycle_timestamp(checked_at)
+        safe_error = sanitize_artifact_lifecycle_error_code(error_code)
+        assert safe_error is not None
+        _validate_max_artifact_attempt_count(max_attempt_count)
+
+        async def write(conn: Any) -> ArtifactCleanupManifestRecord:
+            current = await self._assert_postgres_manifest_lease(
+                conn,
+                manifest_id,
+                lease_owner=owner,
+                lease_token=token,
+                now=reference,
+            )
+            row = await conn.fetchrow(
+                """
+                UPDATE kb_artifact_cleanup_manifests
+                SET status = 'pending', attempt_count = $4,
+                    next_attempt_at = $5, lease_owner = NULL,
+                    lease_token = NULL, lease_expires_at = NULL,
+                    last_error_code = $6, last_checked_at = $7,
+                    completed_at = NULL, updated_at = $7
+                WHERE id = $1 AND status = 'leased'
+                  AND lease_owner = $2 AND lease_token = $3
+                RETURNING *
+                """,
+                manifest_id,
+                owner,
+                token,
+                _increment_capped_artifact_attempt(
+                    current.attempt_count, max_attempt_count
+                ),
+                retry_at,
+                safe_error,
+                reference,
+            )
+            assert row is not None
+            return _artifact_cleanup_manifest_from_row(row)
+
+        return await self._write(write)
+
+    async def block_artifact_cleanup_manifest(
+        self,
+        manifest_id: str,
+        *,
+        lease_owner: str,
+        lease_token: str,
+        error_code: str,
+        checked_at: str | datetime | None = None,
+        max_attempt_count: int = ARTIFACT_LIFECYCLE_MAX_COUNT,
+    ) -> ArtifactCleanupManifestRecord:
+        await self._ensure_initialized()
+        owner = _artifact_identifier(lease_owner, "lease_owner")
+        token = _artifact_identifier(lease_token, "lease_token")
+        reference = _artifact_lifecycle_timestamp(checked_at)
+        safe_error = sanitize_artifact_lifecycle_error_code(error_code)
+        assert safe_error is not None
+        _validate_max_artifact_attempt_count(max_attempt_count)
+
+        async def write(conn: Any) -> ArtifactCleanupManifestRecord:
+            current = await self._assert_postgres_manifest_lease(
+                conn,
+                manifest_id,
+                lease_owner=owner,
+                lease_token=token,
+                now=reference,
+            )
+            row = await conn.fetchrow(
+                """
+                UPDATE kb_artifact_cleanup_manifests
+                SET status = 'blocked', attempt_count = $4,
+                    lease_owner = NULL, lease_token = NULL,
+                    lease_expires_at = NULL, last_error_code = $5,
+                    last_checked_at = $6, completed_at = NULL, updated_at = $6
+                WHERE id = $1 AND status = 'leased'
+                  AND lease_owner = $2 AND lease_token = $3
+                RETURNING *
+                """,
+                manifest_id,
+                owner,
+                token,
+                _increment_capped_artifact_attempt(
+                    current.attempt_count, max_attempt_count
+                ),
+                safe_error,
+                reference,
+            )
+            assert row is not None
+            return _artifact_cleanup_manifest_from_row(row)
+
+        return await self._write(write)
+
+    async def recover_expired_artifact_cleanup_manifest_leases(
+        self,
+        *,
+        now: str | datetime | None = None,
+        next_attempt_at: str | datetime | None = None,
+        limit: int = 500,
+        max_attempt_count: int = ARTIFACT_LIFECYCLE_MAX_COUNT,
+    ) -> list[ArtifactCleanupManifestRecord]:
+        await self._ensure_initialized()
+        reference = _artifact_lifecycle_timestamp(now)
+        retry_at = _artifact_lifecycle_timestamp(next_attempt_at or reference)
+        limit = _artifact_bounded_limit(limit, maximum=ARTIFACT_LIFECYCLE_MAX_PAGE_SIZE)
+        _validate_max_artifact_attempt_count(max_attempt_count)
+
+        async def write(conn: Any) -> list[ArtifactCleanupManifestRecord]:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM kb_artifact_cleanup_manifests
+                WHERE status = 'leased' AND lease_expires_at <= $1
+                ORDER BY lease_expires_at ASC, id ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+                """,
+                reference,
+                limit,
+            )
+            recovered: list[ArtifactCleanupManifestRecord] = []
+            for raw in rows:
+                current = _artifact_cleanup_manifest_from_row(raw)
+                row = await conn.fetchrow(
+                    """
+                    UPDATE kb_artifact_cleanup_manifests
+                    SET status = 'pending', attempt_count = $2,
+                        next_attempt_at = $3, lease_owner = NULL,
+                        lease_token = NULL, lease_expires_at = NULL,
+                        last_error_code = 'lease_expired',
+                        last_checked_at = $4, completed_at = NULL, updated_at = $4
+                    WHERE id = $1 AND status = 'leased'
+                    RETURNING *
+                    """,
+                    current.id,
+                    _increment_capped_artifact_attempt(
+                        current.attempt_count, max_attempt_count
+                    ),
+                    retry_at,
+                    reference,
+                )
+                assert row is not None
+                recovered.append(_artifact_cleanup_manifest_from_row(row))
+            return recovered
+
+        return await self._write(write)
+
+    async def release_retained_artifact_cleanup_manifests(
+        self,
+        kb_id: str,
+        kb_generation: str,
+        manifest_group_id: str,
+        manifest_ids: Sequence[str],
+        *,
+        released_at: str | datetime | None = None,
+    ) -> list[ArtifactCleanupManifestRecord]:
+        await self._ensure_initialized()
+        _artifact_identifier(kb_id, "kb_id")
+        _artifact_identifier(kb_generation, "kb_generation")
+        _artifact_identifier(manifest_group_id, "manifest_group_id")
+        ordered_ids = list(dict.fromkeys(manifest_ids))
+        if not ordered_ids:
+            return []
+        if len(ordered_ids) > ARTIFACT_LIFECYCLE_MAX_PAGE_SIZE:
+            raise ValueError("manifest_ids exceeds the bounded release size")
+        for manifest_id in ordered_ids:
+            _artifact_identifier(manifest_id, "manifest_id")
+        reference = _artifact_lifecycle_timestamp(released_at)
+
+        async def write(conn: Any) -> list[ArtifactCleanupManifestRecord]:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM kb_artifact_cleanup_manifests
+                WHERE id = ANY($1::text[])
+                ORDER BY id
+                FOR UPDATE
+                """,
+                ordered_ids,
+            )
+            by_id = {
+                record.id: record
+                for record in (_artifact_cleanup_manifest_from_row(row) for row in rows)
+            }
+            if set(by_id) != set(ordered_ids):
+                raise ArtifactLifecycleNotFoundError("artifact cleanup manifest")
+            for manifest_id in ordered_ids:
+                current = by_id[manifest_id]
+                if (
+                    current.kb_id != kb_id
+                    or current.kb_generation != kb_generation
+                    or current.manifest_group_id != manifest_group_id
+                ):
+                    raise ArtifactLifecycleConflictError(
+                        "artifact cleanup manifest release scope"
+                    )
+                if current.disposition == "delete" and current.status != "retained":
+                    continue
+                if current.status != "retained" or current.disposition != "retain":
+                    raise ArtifactLifecycleStateError("artifact cleanup manifest")
+                await conn.execute(
+                    """
+                    UPDATE kb_artifact_cleanup_manifests
+                    SET disposition = 'delete', status = 'pending',
+                        next_attempt_at = GREATEST(delete_after, $2),
+                        last_error_code = NULL, updated_at = $2
+                    WHERE id = $1 AND status = 'retained' AND disposition = 'retain'
+                    """,
+                    manifest_id,
+                    reference,
+                )
+            refreshed = await conn.fetch(
+                """
+                SELECT * FROM kb_artifact_cleanup_manifests
+                WHERE id = ANY($1::text[])
+                """,
+                ordered_ids,
+            )
+            refreshed_by_id = {
+                str(row["id"]): _artifact_cleanup_manifest_from_row(row)
+                for row in refreshed
+            }
+            return [refreshed_by_id[manifest_id] for manifest_id in ordered_ids]
+
+        return await self._write(write)
+
+    async def prune_succeeded_artifact_cleanup_manifests(
+        self,
+        *,
+        now: str | datetime | None = None,
+        limit: int = 500,
+    ) -> int:
+        await self._ensure_initialized()
+        reference = _artifact_lifecycle_timestamp(now)
+        limit = _artifact_bounded_limit(limit, maximum=ARTIFACT_LIFECYCLE_MAX_PAGE_SIZE)
+
+        async def write(conn: Any) -> int:
+            rows = await conn.fetch(
+                """
+                SELECT id FROM kb_artifact_cleanup_manifests
+                WHERE status = 'succeeded' AND audit_retain_until <= $1
+                ORDER BY audit_retain_until ASC, id ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+                """,
+                reference,
+                limit,
+            )
+            ids = [str(row["id"]) for row in rows]
+            if not ids:
+                return 0
+            status = await conn.execute(
+                """
+                DELETE FROM kb_artifact_cleanup_manifests
+                WHERE status = 'succeeded' AND audit_retain_until <= $1
+                  AND id = ANY($2::text[])
+                """,
+                reference,
+                ids,
+            )
+            return _rowcount(status)
+
+        return await self._write(write)
+
+    async def prune_artifact_cleanup_manifests(
+        self,
+        *,
+        now: str | datetime | None = None,
+        limit: int = 500,
+    ) -> int:
+        return await self.prune_succeeded_artifact_cleanup_manifests(
+            now=now, limit=limit
+        )
+
+    async def _insert_postgres_artifact_manifest(
+        self,
+        conn: Any,
+        manifest: ArtifactCleanupManifestRecord,
+        *,
+        ignore_conflict: bool,
+    ) -> ArtifactCleanupManifestRecord | None:
+        data = {
+            "initial_disposition": manifest.disposition,
+            "initial_audit_retain_until": manifest.audit_retain_until,
+            **manifest.to_dict(),
+        }
+        columns = tuple(data)
+        conflict = "ON CONFLICT DO NOTHING" if ignore_conflict else ""
+        row = await conn.fetchrow(
+            f"INSERT INTO kb_artifact_cleanup_manifests "
+            f"({', '.join(columns)}) VALUES "
+            f"({', '.join(f'${index}' for index in range(1, len(columns) + 1))}) "
+            f"{conflict} RETURNING *",
+            *(data[column] for column in columns),
+        )
+        return _artifact_cleanup_manifest_from_row(row) if row is not None else None
+
+    async def _enqueue_artifact_cleanup_manifests_in_tx(
+        self,
+        conn: Any,
+        manifests: Sequence[ArtifactCleanupManifestRecord],
+    ) -> list[ArtifactCleanupManifestRecord]:
+        """Connection-level enqueue used by composite document transactions."""
+
+        persisted: list[ArtifactCleanupManifestRecord] = []
+        for manifest in manifests:
+            inserted = await self._insert_postgres_artifact_manifest(
+                conn,
+                manifest,
+                ignore_conflict=True,
+            )
+            if inserted is not None:
+                persisted.append(inserted)
+                continue
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM kb_artifact_cleanup_manifests
+                WHERE idempotency_key = $1 OR id = $2
+                FOR UPDATE
+                """,
+                manifest.idempotency_key,
+                manifest.id,
+            )
+            if row is None:
+                raise ArtifactLifecycleConflictError("artifact cleanup manifest")
+            existing = _artifact_cleanup_manifest_from_row(row)
+            if (
+                existing.idempotency_key != manifest.idempotency_key
+                or not _cleanup_enqueue_matches(
+                    existing,
+                    manifest,
+                    initial_disposition=str(row["initial_disposition"]),
+                    initial_audit_retain_until=str(row["initial_audit_retain_until"]),
+                )
+            ):
+                raise ArtifactLifecycleConflictError("artifact cleanup manifest")
+            persisted.append(existing)
+        return persisted
+
+    async def _get_postgres_artifact_manifest(
+        self, conn: Any, manifest_id: str, *, for_update: bool = False
+    ) -> ArtifactCleanupManifestRecord:
+        suffix = " FOR UPDATE" if for_update else ""
+        row = await conn.fetchrow(
+            f"SELECT * FROM kb_artifact_cleanup_manifests WHERE id = $1{suffix}",
+            manifest_id,
+        )
+        if row is None:
+            raise ArtifactLifecycleNotFoundError("artifact cleanup manifest")
+        return _artifact_cleanup_manifest_from_row(row)
+
+    async def _assert_postgres_manifest_lease(
+        self,
+        conn: Any,
+        manifest_id: str,
+        *,
+        lease_owner: str,
+        lease_token: str,
+        now: str | None = None,
+    ) -> ArtifactCleanupManifestRecord:
+        current = await self._get_postgres_artifact_manifest(
+            conn, manifest_id, for_update=True
+        )
+        if (
+            current.status != "leased"
+            or current.lease_owner != lease_owner
+            or current.lease_token != lease_token
+            or (
+                now is not None
+                and (
+                    current.lease_expires_at is None
+                    or str(current.lease_expires_at) <= now
+                )
+            )
+        ):
+            raise ArtifactLifecycleLeaseError("artifact cleanup manifest")
+        return current
+
+    async def create_artifact_maintenance_run(
+        self, run: ArtifactMaintenanceRunRecord
+    ) -> ArtifactMaintenanceRunRecord:
+        await self._ensure_initialized()
+        validated = ArtifactMaintenanceRunRecord.from_mapping(run.to_dict())
+
+        async def write(conn: Any) -> ArtifactMaintenanceRunRecord:
+            if validated.mode == "apply":
+                await self._assert_postgres_maintenance_parent(conn, validated)
+            inserted = await self._insert_postgres_maintenance_run(
+                conn, validated, ignore_conflict=True
+            )
+            if inserted is not None:
+                return inserted
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM kb_artifact_maintenance_runs
+                WHERE idempotency_key = $1 OR id = $2
+                FOR UPDATE
+                """,
+                validated.idempotency_key,
+                validated.id,
+            )
+            if row is None:
+                raise ArtifactLifecycleConflictError("artifact maintenance run")
+            existing = _artifact_maintenance_run_from_row(row)
+            if (
+                existing.idempotency_key != validated.idempotency_key
+                or existing.operation_payload() != validated.operation_payload()
+            ):
+                raise ArtifactLifecycleConflictError("artifact maintenance run")
+            return existing
+
+        return await self._write(write)
+
+    async def get_artifact_maintenance_run(
+        self, run_id: str
+    ) -> ArtifactMaintenanceRunRecord:
+        await self._ensure_initialized()
+        _artifact_identifier(run_id, "run_id")
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM kb_artifact_maintenance_runs WHERE id = $1",
+                run_id,
+            )
+        if row is None:
+            raise ArtifactLifecycleNotFoundError("artifact maintenance run")
+        return _artifact_maintenance_run_from_row(row)
+
+    async def list_artifact_maintenance_runs(
+        self,
+        *,
+        kind: ArtifactMaintenanceRunKind | None = None,
+        mode: ArtifactMaintenanceRunMode | None = None,
+        metadata_backend: ArtifactMaintenanceMetadataBackend | None = None,
+        status: ArtifactMaintenanceRunStatus | None = None,
+        parent_plan_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[ArtifactMaintenanceRunRecord], int]:
+        await self._ensure_initialized()
+        limit = _artifact_bounded_limit(limit, maximum=ARTIFACT_LIFECYCLE_MAX_PAGE_SIZE)
+        offset = _artifact_bounded_offset(offset)
+        if metadata_backend is not None and metadata_backend not in {
+            "sqlite",
+            "postgres",
+        }:
+            raise ValueError("Unsupported artifact maintenance metadata backend")
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("kind", kind),
+            ("mode", mode),
+            ("metadata_backend", metadata_backend),
+            ("status", status),
+            ("parent_plan_id", parent_plan_id),
+        ):
+            if value is not None:
+                params.append(value)
+                clauses.append(f"{column} = ${len(params)}")
+        where = " AND ".join(clauses) if clauses else "TRUE"
+        limit_index = len(params) + 1
+        offset_index = len(params) + 2
+        async with self._pool_or_raise().acquire() as conn:
+            total = await conn.fetchval(
+                f"SELECT COUNT(*) FROM kb_artifact_maintenance_runs WHERE {where}",
+                *params,
+            )
+            rows = await conn.fetch(
+                f"""
+                SELECT * FROM kb_artifact_maintenance_runs
+                WHERE {where}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ${limit_index} OFFSET ${offset_index}
+                """,
+                *params,
+                limit,
+                offset,
+            )
+        return [_artifact_maintenance_run_from_row(row) for row in rows], int(
+            total or 0
+        )
+
+    async def claim_artifact_maintenance_run(
+        self,
+        run_id: str,
+        *,
+        lease_owner: str,
+        lease_duration_seconds: float = 300.0,
+        eligible_statuses: Sequence[ArtifactMaintenanceRunStatus] = (
+            "planned",
+            "failed",
+        ),
+        now: str | datetime | None = None,
+    ) -> ArtifactMaintenanceRunRecord:
+        await self._ensure_initialized()
+        _artifact_identifier(run_id, "run_id")
+        owner = _artifact_identifier(lease_owner, "lease_owner")
+        eligible = _maintenance_eligible_statuses(eligible_statuses)
+        reference = _artifact_lifecycle_timestamp(now)
+        expires_at = _artifact_lease_expiry(reference, lease_duration_seconds)
+
+        async def write(conn: Any) -> ArtifactMaintenanceRunRecord:
+            current = await self._get_postgres_maintenance_run(
+                conn, run_id, for_update=True
+            )
+            if current.status not in eligible:
+                raise ArtifactLifecycleStateError("artifact maintenance run")
+            claimed = replace(
+                current,
+                status="running",
+                lease_owner=owner,
+                lease_token=f"aml_{secrets.token_urlsafe(24)}",
+                lease_expires_at=expires_at,
+                started_at=current.started_at or reference,
+                completed_at=None,
+                last_error_code=None,
+                updated_at=reference,
+            )
+            await self._save_postgres_maintenance_run(conn, claimed)
+            return claimed
+
+        return await self._write(write)
+
+    async def claim_next_artifact_maintenance_run(
+        self,
+        *,
+        lease_owner: str,
+        lease_duration_seconds: float = 300.0,
+        kinds: Sequence[ArtifactMaintenanceRunKind] | None = None,
+        modes: Sequence[ArtifactMaintenanceRunMode] | None = None,
+        eligible_statuses: Sequence[ArtifactMaintenanceRunStatus] = (
+            "planned",
+            "failed",
+        ),
+        now: str | datetime | None = None,
+    ) -> ArtifactMaintenanceRunRecord | None:
+        await self._ensure_initialized()
+        owner = _artifact_identifier(lease_owner, "lease_owner")
+        eligible = _maintenance_eligible_statuses(eligible_statuses)
+        reference = _artifact_lifecycle_timestamp(now)
+        expires_at = _artifact_lease_expiry(reference, lease_duration_seconds)
+
+        async def write(conn: Any) -> ArtifactMaintenanceRunRecord | None:
+            params: list[Any] = [list(eligible)]
+            clauses = ["status = ANY($1::text[])"]
+            if kinds:
+                params.append(list(kinds))
+                clauses.append(f"kind = ANY(${len(params)}::text[])")
+            if modes:
+                params.append(list(modes))
+                clauses.append(f"mode = ANY(${len(params)}::text[])")
+            row = await conn.fetchrow(
+                f"""
+                SELECT * FROM kb_artifact_maintenance_runs
+                WHERE {" AND ".join(clauses)}
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+                """,
+                *params,
+            )
+            if row is None:
+                return None
+            current = _artifact_maintenance_run_from_row(row)
+            claimed = replace(
+                current,
+                status="running",
+                lease_owner=owner,
+                lease_token=f"aml_{secrets.token_urlsafe(24)}",
+                lease_expires_at=expires_at,
+                started_at=current.started_at or reference,
+                completed_at=None,
+                last_error_code=None,
+                updated_at=reference,
+            )
+            await self._save_postgres_maintenance_run(conn, claimed)
+            return claimed
+
+        return await self._write(write)
+
+    async def renew_artifact_maintenance_run_lease(
+        self,
+        run_id: str,
+        *,
+        lease_owner: str,
+        lease_token: str,
+        lease_duration_seconds: float = 300.0,
+        now: str | datetime | None = None,
+    ) -> ArtifactMaintenanceRunRecord:
+        await self._ensure_initialized()
+        owner = _artifact_identifier(lease_owner, "lease_owner")
+        token = _artifact_identifier(lease_token, "lease_token")
+        reference = _artifact_lifecycle_timestamp(now)
+        expires_at = _artifact_lease_expiry(reference, lease_duration_seconds)
+
+        async def write(conn: Any) -> ArtifactMaintenanceRunRecord:
+            current = await self._get_postgres_maintenance_run(
+                conn, run_id, for_update=True
+            )
+            _assert_maintenance_run_lease(
+                current,
+                lease_owner=owner,
+                lease_token=token,
+                now=reference,
+            )
+            updated = replace(
+                current, lease_expires_at=expires_at, updated_at=reference
+            )
+            await self._save_postgres_maintenance_run(conn, updated)
+            return updated
+
+        return await self._write(write)
+
+    async def recover_expired_artifact_maintenance_run_leases(
+        self,
+        *,
+        now: str | datetime | None = None,
+        limit: int = 100,
+    ) -> list[ArtifactMaintenanceRunRecord]:
+        await self._ensure_initialized()
+        reference = _artifact_lifecycle_timestamp(now)
+        limit = _artifact_bounded_limit(limit, maximum=ARTIFACT_LIFECYCLE_MAX_PAGE_SIZE)
+
+        async def write(conn: Any) -> list[ArtifactMaintenanceRunRecord]:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM kb_artifact_maintenance_runs
+                WHERE status = 'running' AND lease_expires_at <= $1
+                ORDER BY lease_expires_at ASC, id ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+                """,
+                reference,
+                limit,
+            )
+            recovered: list[ArtifactMaintenanceRunRecord] = []
+            for row in rows:
+                current = _artifact_maintenance_run_from_row(row)
+                failed = replace(
+                    current,
+                    status="failed",
+                    lease_owner=None,
+                    lease_token=None,
+                    lease_expires_at=None,
+                    completed_at=reference,
+                    last_error_code="lease_expired",
+                    updated_at=reference,
+                )
+                await self._save_postgres_maintenance_run(conn, failed)
+                recovered.append(failed)
+            return recovered
+
+        return await self._write(write)
+
+    async def update_artifact_maintenance_run(
+        self,
+        run: ArtifactMaintenanceRunRecord,
+        *,
+        expected_status: ArtifactMaintenanceRunStatus,
+        expected_updated_at: str | datetime | None = None,
+        expected_lease_token: str | None = None,
+    ) -> ArtifactMaintenanceRunRecord:
+        await self._ensure_initialized()
+        candidate = ArtifactMaintenanceRunRecord.from_mapping(run.to_dict())
+        expected_timestamp = (
+            None
+            if expected_updated_at is None
+            else _artifact_lifecycle_timestamp(expected_updated_at)
+        )
+
+        async def write(conn: Any) -> ArtifactMaintenanceRunRecord:
+            current = await self._get_postgres_maintenance_run(
+                conn, candidate.id, for_update=True
+            )
+            if current.status != expected_status or (
+                expected_timestamp is not None
+                and current.updated_at != expected_timestamp
+            ):
+                raise ArtifactLifecycleStateError("artifact maintenance run")
+            if expected_lease_token is not None and (
+                current.lease_token != expected_lease_token
+            ):
+                raise ArtifactLifecycleLeaseError("artifact maintenance run")
+            if current.status == "running":
+                if expected_lease_token is None:
+                    raise ArtifactLifecycleLeaseError("artifact maintenance run")
+                _assert_maintenance_run_lease(
+                    current,
+                    lease_owner=current.lease_owner or "",
+                    lease_token=expected_lease_token,
+                    now=str(candidate.updated_at),
+                )
+            if (
+                current.operation_payload() != candidate.operation_payload()
+                or current.idempotency_key != candidate.idempotency_key
+            ):
+                raise ArtifactLifecycleConflictError("artifact maintenance run")
+            _assert_maintenance_run_transition(current.status, candidate.status)
+            await self._save_postgres_maintenance_run(conn, candidate)
+            return candidate
+
+        return await self._write(write)
+
+    async def transition_artifact_maintenance_run(
+        self,
+        run_id: str,
+        *,
+        expected_status: ArtifactMaintenanceRunStatus,
+        new_status: ArtifactMaintenanceRunStatus,
+        lease_owner: str | None = None,
+        lease_token: str | None = None,
+        cursor_json: str | Mapping[str, Any] | Sequence[Any] | None = None,
+        counters: Mapping[str, int] | None = None,
+        error_code: str | None = None,
+        now: str | datetime | None = None,
+    ) -> ArtifactMaintenanceRunRecord:
+        await self._ensure_initialized()
+        reference = _artifact_lifecycle_timestamp(now)
+
+        async def write(conn: Any) -> ArtifactMaintenanceRunRecord:
+            current = await self._get_postgres_maintenance_run(
+                conn, run_id, for_update=True
+            )
+            if current.status != expected_status:
+                raise ArtifactLifecycleStateError("artifact maintenance run")
+            if current.status == "running":
+                _assert_maintenance_run_lease(
+                    current,
+                    lease_owner=_artifact_identifier(lease_owner or "", "lease_owner"),
+                    lease_token=_artifact_identifier(lease_token or "", "lease_token"),
+                    now=reference,
+                )
+            _assert_maintenance_run_transition(current.status, new_status)
+            changes: dict[str, Any] = {
+                "status": new_status,
+                "updated_at": reference,
+            }
+            if cursor_json is not None:
+                changes["cursor_json"] = canonical_safe_json(
+                    cursor_json, field_name="cursor_json"
+                )
+            allowed_counters = {
+                "total_items",
+                "planned_items",
+                "uploaded_items",
+                "applied_items",
+                "verified_items",
+                "skipped_items",
+                "blocked_items",
+                "failed_items",
+            }
+            for key, value in (counters or {}).items():
+                if key not in allowed_counters:
+                    raise ValueError("Unsupported maintenance counter")
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                    or value > ARTIFACT_LIFECYCLE_MAX_COUNT
+                ):
+                    raise ValueError("Maintenance counters must be bounded")
+                changes[key] = value
+            if new_status == "running":
+                changes.update(
+                    {
+                        "lease_owner": current.lease_owner,
+                        "lease_token": current.lease_token,
+                        "lease_expires_at": current.lease_expires_at,
+                        "completed_at": None,
+                    }
+                )
+            else:
+                changes.update(
+                    {
+                        "lease_owner": None,
+                        "lease_token": None,
+                        "lease_expires_at": None,
+                    }
+                )
+            changes["completed_at"] = (
+                reference
+                if new_status in {"succeeded", "failed", "cancelled"}
+                else None
+            )
+            changes["last_error_code"] = (
+                sanitize_artifact_lifecycle_error_code(error_code)
+                if error_code is not None
+                else None
+            )
+            candidate = replace(current, **changes)
+            await self._save_postgres_maintenance_run(conn, candidate)
+            return candidate
+
+        return await self._write(write)
+
+    async def create_artifact_maintenance_item(
+        self, item: ArtifactMaintenanceItemRecord
+    ) -> ArtifactMaintenanceItemRecord:
+        items = await self.create_artifact_maintenance_items([item])
+        return items[0]
+
+    async def create_artifact_maintenance_items(
+        self, items: Sequence[ArtifactMaintenanceItemRecord]
+    ) -> list[ArtifactMaintenanceItemRecord]:
+        await self._ensure_initialized()
+        if len(items) > ARTIFACT_LIFECYCLE_MAX_PAGE_SIZE:
+            raise ValueError("Maintenance item batch exceeds the bounded write size")
+        validated = [
+            ArtifactMaintenanceItemRecord.from_mapping(item.to_dict()) for item in items
+        ]
+        if not validated:
+            return []
+
+        async def write(conn: Any) -> list[ArtifactMaintenanceItemRecord]:
+            for run_id in {item.run_id for item in validated}:
+                await self._get_postgres_maintenance_run(conn, run_id)
+            persisted: list[ArtifactMaintenanceItemRecord] = []
+            for item in validated:
+                inserted = await self._insert_postgres_maintenance_item(
+                    conn, item, ignore_conflict=True
+                )
+                if inserted is not None:
+                    persisted.append(inserted)
+                    continue
+                row = await conn.fetchrow(
+                    """
+                    SELECT * FROM kb_artifact_maintenance_items
+                    WHERE (run_id = $1 AND item_key = $2) OR id = $3
+                    FOR UPDATE
+                    """,
+                    item.run_id,
+                    item.item_key,
+                    item.id,
+                )
+                if row is None:
+                    raise ArtifactLifecycleConflictError("artifact maintenance item")
+                existing = _artifact_maintenance_item_from_row(row)
+                if existing.operation_payload() != item.operation_payload():
+                    raise ArtifactLifecycleConflictError("artifact maintenance item")
+                persisted.append(existing)
+            return persisted
+
+        return await self._write(write)
+
+    async def get_artifact_maintenance_item(
+        self, run_id: str, item_key: str
+    ) -> ArtifactMaintenanceItemRecord:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM kb_artifact_maintenance_items
+                WHERE run_id = $1 AND item_key = $2
+                """,
+                run_id,
+                item_key,
+            )
+        if row is None:
+            raise ArtifactLifecycleNotFoundError("artifact maintenance item")
+        return _artifact_maintenance_item_from_row(row)
+
+    async def list_artifact_maintenance_items(
+        self,
+        run_id: str,
+        *,
+        kb_id: str | None = None,
+        kb_generation: str | None = None,
+        workspace: str | None = None,
+        document_id: str | None = None,
+        artifact_id: str | None = None,
+        logical_group_id: str | None = None,
+        target_uri_digest: str | None = None,
+        state: ArtifactMaintenanceItemState | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[ArtifactMaintenanceItemRecord], int]:
+        await self._ensure_initialized()
+        limit = _artifact_bounded_limit(limit, maximum=ARTIFACT_LIFECYCLE_MAX_PAGE_SIZE)
+        offset = _artifact_bounded_offset(offset)
+        if target_uri_digest is not None:
+            target_uri_digest = normalize_artifact_target_uri_digest(target_uri_digest)
+        params: list[Any] = [run_id]
+        where = "run_id = $1"
+        for column, value in (
+            ("kb_id", kb_id),
+            ("kb_generation", kb_generation),
+            ("workspace", workspace),
+            ("document_id", document_id),
+            ("artifact_id", artifact_id),
+            ("logical_group_id", logical_group_id),
+            ("target_uri_digest", target_uri_digest),
+            ("state", state),
+        ):
+            if value is not None:
+                _artifact_identifier(value, column)
+                params.append(value)
+                where += f" AND {column} = ${len(params)}"
+        limit_index = len(params) + 1
+        offset_index = len(params) + 2
+        async with self._pool_or_raise().acquire() as conn:
+            total = await conn.fetchval(
+                f"SELECT COUNT(*) FROM kb_artifact_maintenance_items WHERE {where}",
+                *params,
+            )
+            rows = await conn.fetch(
+                f"""
+                SELECT * FROM kb_artifact_maintenance_items
+                WHERE {where}
+                ORDER BY ordinal ASC, item_key ASC
+                LIMIT ${limit_index} OFFSET ${offset_index}
+                """,
+                *params,
+                limit,
+                offset,
+            )
+        return [_artifact_maintenance_item_from_row(row) for row in rows], int(
+            total or 0
+        )
+
+    async def transition_artifact_maintenance_item(
+        self,
+        run_id: str,
+        item_key: str,
+        *,
+        expected_state: ArtifactMaintenanceItemState,
+        new_state: ArtifactMaintenanceItemState,
+        expected_updated_at: str | datetime | None = None,
+        run_lease_token: str | None = None,
+        error_code: str | None = None,
+        increment_attempt: bool = False,
+        now: str | datetime | None = None,
+    ) -> ArtifactMaintenanceItemRecord:
+        await self._ensure_initialized()
+        reference = _artifact_lifecycle_timestamp(now)
+        expected_timestamp = (
+            None
+            if expected_updated_at is None
+            else _artifact_lifecycle_timestamp(expected_updated_at)
+        )
+
+        async def write(conn: Any) -> ArtifactMaintenanceItemRecord:
+            run = await self._get_postgres_maintenance_run(
+                conn, run_id, for_update=True
+            )
+            if (
+                run_lease_token is None
+                or run.status != "running"
+                or run.lease_token != run_lease_token
+                or run.lease_expires_at is None
+                or str(run.lease_expires_at) <= reference
+            ):
+                raise ArtifactLifecycleLeaseError("artifact maintenance run")
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM kb_artifact_maintenance_items
+                WHERE run_id = $1 AND item_key = $2
+                FOR UPDATE
+                """,
+                run_id,
+                item_key,
+            )
+            if row is None:
+                raise ArtifactLifecycleNotFoundError("artifact maintenance item")
+            current = _artifact_maintenance_item_from_row(row)
+            if current.state != expected_state or (
+                expected_timestamp is not None
+                and current.updated_at != expected_timestamp
+            ):
+                raise ArtifactLifecycleStateError("artifact maintenance item")
+            _assert_maintenance_item_transition(current.state, new_state)
+            safe_error = (
+                sanitize_artifact_lifecycle_error_code(error_code)
+                if error_code is not None
+                else (
+                    current.last_error_code
+                    if new_state in {"blocked", "failed"}
+                    else None
+                )
+            )
+            candidate = replace(
+                current,
+                state=new_state,
+                attempt_count=min(
+                    current.attempt_count + (1 if increment_attempt else 0),
+                    ARTIFACT_LIFECYCLE_MAX_COUNT,
+                ),
+                completed_at=(
+                    current.completed_at or reference
+                    if new_state in {"verified", "skipped", "blocked", "failed"}
+                    else None
+                ),
+                last_error_code=safe_error,
+                updated_at=reference,
+            )
+            await self._save_postgres_maintenance_item(conn, candidate)
+            return candidate
+
+        return await self._write(write)
+
+    async def aggregate_artifact_maintenance_items(self, run_id: str) -> dict[str, int]:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT state, COUNT(*) AS item_count
+                FROM kb_artifact_maintenance_items
+                WHERE run_id = $1
+                GROUP BY state
+                """,
+                run_id,
+            )
+        counts = {
+            "planned": 0,
+            "uploaded": 0,
+            "applied": 0,
+            "verified": 0,
+            "skipped": 0,
+            "blocked": 0,
+            "failed": 0,
+        }
+        for row in rows:
+            counts[str(row["state"])] = int(row["item_count"])
+        counts["total"] = sum(counts.values())
+        return counts
+
+    async def get_artifact_recovery_cursor(
+        self, kb_id: str, kb_generation: str
+    ) -> ArtifactRecoveryCursorRecord | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM kb_artifact_recovery_cursors
+                WHERE kb_id = $1 AND kb_generation = $2
+                """,
+                kb_id,
+                kb_generation,
+            )
+        return _artifact_recovery_cursor_from_row(row) if row is not None else None
+
+    async def reserve_pipeline_artifact_recovery_page(
+        self,
+        kb_id: str,
+        kb_generation: str,
+        limit: int,
+    ) -> list[DocumentRecord]:
+        await self._ensure_initialized()
+        _artifact_identifier(kb_id, "kb_id")
+        _artifact_identifier(kb_generation, "kb_generation")
+        limit = _artifact_bounded_limit(limit, maximum=ARTIFACT_RECOVERY_MAX_PAGE_SIZE)
+
+        async def write(conn: Any) -> list[DocumentRecord]:
+            lifecycle = await self._lock_kb_lifecycle(conn, kb_id)
+            if lifecycle is not None:
+                if lifecycle.state != "active" or lifecycle.generation != kb_generation:
+                    raise ArtifactRecoveryGenerationError()
+            else:
+                stale = await conn.fetchval(
+                    """
+                    SELECT 1 FROM kb_artifact_recovery_cursors
+                    WHERE kb_id = $1 AND kb_generation <> $2
+                    LIMIT 1
+                    """,
+                    kb_id,
+                    kb_generation,
+                )
+                if stale is not None:
+                    raise ArtifactRecoveryGenerationError()
+            now = _artifact_lifecycle_timestamp()
+            await conn.execute(
+                """
+                INSERT INTO kb_artifact_recovery_cursors (
+                    kb_id, kb_generation, status, last_created_at,
+                    last_document_id, sweep, version, updated_at
+                ) VALUES ($1, $2, 'parsed', NULL, NULL, 0, 1, $3)
+                ON CONFLICT (kb_id, kb_generation) DO NOTHING
+                """,
+                kb_id,
+                kb_generation,
+                now,
+            )
+            cursor_row = await conn.fetchrow(
+                """
+                SELECT * FROM kb_artifact_recovery_cursors
+                WHERE kb_id = $1 AND kb_generation = $2
+                FOR UPDATE
+                """,
+                kb_id,
+                kb_generation,
+            )
+            assert cursor_row is not None
+            cursor = _artifact_recovery_cursor_from_row(cursor_row)
+            status = cursor.status
+            last_created_at = cursor.last_created_at
+            last_document_id = cursor.last_document_id
+            sweep = cursor.sweep
+            remaining = limit
+            selected: list[DocumentRecord] = []
+            while remaining > 0:
+                params: list[Any] = [kb_id, status]
+                keyset = ""
+                if last_created_at is not None and last_document_id is not None:
+                    params.extend([last_created_at, last_document_id])
+                    keyset = "AND (created_at > $3 OR (created_at = $3 AND id > $4))"
+                params.append(remaining + 1)
+                rows = await conn.fetch(
+                    f"""
+                    SELECT id, created_at, data_json FROM kb_documents
+                    WHERE kb_id = $1 AND status = $2 AND deleted_at IS NULL
+                        {keyset}
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT ${len(params)}
+                    FOR SHARE
+                    """,
+                    *params,
+                )
+                has_more = len(rows) > remaining
+                page_rows = rows[:remaining]
+                selected.extend(_document_from_row(row) for row in page_rows)
+                if page_rows:
+                    last_created_at = str(page_rows[-1]["created_at"])
+                    last_document_id = str(page_rows[-1]["id"])
+                    remaining -= len(page_rows)
+                if has_more:
+                    break
+                if status == "parsed":
+                    status = "ready"
+                    last_created_at = None
+                    last_document_id = None
+                    continue
+                status = "parsed"
+                last_created_at = None
+                last_document_id = None
+                sweep += 1
+                break
+            updated_cursor = ArtifactRecoveryCursorRecord(
+                kb_id=kb_id,
+                kb_generation=kb_generation,
+                status=status,
+                last_created_at=last_created_at,
+                last_document_id=last_document_id,
+                sweep=sweep,
+                version=min(cursor.version + 1, ARTIFACT_LIFECYCLE_MAX_COUNT),
+                updated_at=now,
+            )
+            update_status = await conn.execute(
+                """
+                UPDATE kb_artifact_recovery_cursors
+                SET status = $3, last_created_at = $4, last_document_id = $5,
+                    sweep = $6, version = $7, updated_at = $8
+                WHERE kb_id = $1 AND kb_generation = $2 AND version = $9
+                """,
+                kb_id,
+                kb_generation,
+                updated_cursor.status,
+                updated_cursor.last_created_at,
+                updated_cursor.last_document_id,
+                updated_cursor.sweep,
+                updated_cursor.version,
+                updated_cursor.updated_at,
+                cursor.version,
+            )
+            if _rowcount(update_status) != 1:
+                raise ArtifactLifecycleStateError("artifact recovery cursor")
+            return selected
+
+        return await self._write(write)
+
+    async def reserve_artifact_recovery_page(
+        self, kb_id: str, kb_generation: str, limit: int
+    ) -> list[DocumentRecord]:
+        return await self.reserve_pipeline_artifact_recovery_page(
+            kb_id, kb_generation, limit
+        )
+
+    async def delete_artifact_recovery_cursor(
+        self, kb_id: str, kb_generation: str
+    ) -> bool:
+        """Delete the durable recovery cursor row for ``(kb_id, kb_generation)``.
+
+        Returns ``True`` if a row was removed, ``False`` if no cursor existed.
+        Idempotent: calling when no cursor exists returns ``False`` without
+        raising. Does not require any specific KB lifecycle state; the cursor
+        may be removed after hard-delete drain regardless of the current
+        lifecycle.
+        """
+
+        await self._ensure_initialized()
+        _validate_kb_lifecycle_identity(kb_id, kb_generation)
+
+        async def write(conn: Any) -> bool:
+            status = await conn.execute(
+                """
+                DELETE FROM kb_artifact_recovery_cursors
+                WHERE kb_id = $1 AND kb_generation = $2
+                """,
+                kb_id,
+                kb_generation,
+            )
+            return _rowcount(status) > 0
+
+        return await self._write(write)
+
+    async def _insert_postgres_maintenance_run(
+        self,
+        conn: Any,
+        run: ArtifactMaintenanceRunRecord,
+        *,
+        ignore_conflict: bool,
+    ) -> ArtifactMaintenanceRunRecord | None:
+        data = run.to_dict()
+        columns = tuple(data)
+        conflict = "ON CONFLICT DO NOTHING" if ignore_conflict else ""
+        row = await conn.fetchrow(
+            f"INSERT INTO kb_artifact_maintenance_runs "
+            f"({', '.join(columns)}) VALUES "
+            f"({', '.join(f'${index}' for index in range(1, len(columns) + 1))}) "
+            f"{conflict} RETURNING *",
+            *(data[column] for column in columns),
+        )
+        return _artifact_maintenance_run_from_row(row) if row is not None else None
+
+    async def _save_postgres_maintenance_run(
+        self, conn: Any, run: ArtifactMaintenanceRunRecord
+    ) -> None:
+        data = run.to_dict()
+        columns = [column for column in data if column != "id"]
+        status = await conn.execute(
+            f"UPDATE kb_artifact_maintenance_runs SET "
+            f"{', '.join(f'{column} = ${index}' for index, column in enumerate(columns, 1))} "
+            f"WHERE id = ${len(columns) + 1}",
+            *(data[column] for column in columns),
+            run.id,
+        )
+        if _rowcount(status) != 1:
+            raise ArtifactLifecycleNotFoundError("artifact maintenance run")
+
+    async def _get_postgres_maintenance_run(
+        self, conn: Any, run_id: str, *, for_update: bool = False
+    ) -> ArtifactMaintenanceRunRecord:
+        suffix = " FOR UPDATE" if for_update else ""
+        row = await conn.fetchrow(
+            f"SELECT * FROM kb_artifact_maintenance_runs WHERE id = $1{suffix}",
+            run_id,
+        )
+        if row is None:
+            raise ArtifactLifecycleNotFoundError("artifact maintenance run")
+        return _artifact_maintenance_run_from_row(row)
+
+    async def _assert_postgres_maintenance_parent(
+        self, conn: Any, run: ArtifactMaintenanceRunRecord
+    ) -> None:
+        assert run.parent_plan_id is not None
+        parent = await self._get_postgres_maintenance_run(
+            conn, run.parent_plan_id, for_update=True
+        )
+        if (
+            parent.mode != "dry_run"
+            or parent.status != "succeeded"
+            or parent.kind != run.kind
+            or parent.metadata_backend != run.metadata_backend
+            or parent.backend_fingerprint != run.backend_fingerprint
+            or parent.scope_fingerprint != run.scope_fingerprint
+            or parent.config_fingerprint != run.config_fingerprint
+        ):
+            raise ArtifactLifecycleConflictError("artifact maintenance parent plan")
+
+    async def _insert_postgres_maintenance_item(
+        self,
+        conn: Any,
+        item: ArtifactMaintenanceItemRecord,
+        *,
+        ignore_conflict: bool,
+    ) -> ArtifactMaintenanceItemRecord | None:
+        data = item.to_dict()
+        columns = tuple(data)
+        conflict = "ON CONFLICT DO NOTHING" if ignore_conflict else ""
+        row = await conn.fetchrow(
+            f"INSERT INTO kb_artifact_maintenance_items "
+            f"({', '.join(columns)}) VALUES "
+            f"({', '.join(f'${index}' for index in range(1, len(columns) + 1))}) "
+            f"{conflict} RETURNING *",
+            *(data[column] for column in columns),
+        )
+        return _artifact_maintenance_item_from_row(row) if row is not None else None
+
+    async def _save_postgres_maintenance_item(
+        self, conn: Any, item: ArtifactMaintenanceItemRecord
+    ) -> None:
+        data = item.to_dict()
+        columns = [column for column in data if column != "id"]
+        status = await conn.execute(
+            f"UPDATE kb_artifact_maintenance_items SET "
+            f"{', '.join(f'{column} = ${index}' for index, column in enumerate(columns, 1))} "
+            f"WHERE id = ${len(columns) + 1}",
+            *(data[column] for column in columns),
+            item.id,
+        )
+        if _rowcount(status) != 1:
+            raise ArtifactLifecycleNotFoundError("artifact maintenance item")
 
     async def create_documents_and_job(
         self, documents: Sequence[DocumentRecord], job: JobRecord
@@ -950,10 +2885,8 @@ class PostgresMetadataStore:
                     graph_fingerprint,
                     generation_state="building",
                 )
-                bound_graph_fingerprint = (
-                    _chat_memory_existing_graph_store_fingerprint(
-                        group, graph_fingerprint
-                    )
+                bound_graph_fingerprint = _chat_memory_existing_graph_store_fingerprint(
+                    group, graph_fingerprint
                 )
                 await self._enqueue_postgres_chat_memory_rebuild(
                     conn,
@@ -1058,10 +2991,8 @@ class PostgresMetadataStore:
                     graph_fingerprint,
                     generation_state="building",
                 )
-                bound_graph_fingerprint = (
-                    _chat_memory_existing_graph_store_fingerprint(
-                        group, graph_fingerprint
-                    )
+                bound_graph_fingerprint = _chat_memory_existing_graph_store_fingerprint(
+                    group, graph_fingerprint
                 )
                 await self._enqueue_postgres_chat_memory_rebuild(
                     conn,
@@ -1185,7 +3116,9 @@ class PostgresMetadataStore:
             clauses.append(f"source_name ILIKE ${len(params)} ESCAPE '\\'")
         where = " AND ".join(clauses)
         async with self._pool_or_raise().acquire() as conn:
-            total = await conn.fetchval(f"SELECT COUNT(*) FROM kb_documents WHERE {where}", *params)
+            total = await conn.fetchval(
+                f"SELECT COUNT(*) FROM kb_documents WHERE {where}", *params
+            )
             rows = await conn.fetch(
                 f"""
                 SELECT data_json FROM kb_documents
@@ -1205,6 +3138,20 @@ class PostgresMetadataStore:
             document = await self._get_document(conn, kb_id, document_id)
         return document
 
+    async def get_document_lifecycle(
+        self, kb_id: str, document_id: str
+    ) -> DocumentRecord | None:
+        """Read an exact document row, including a logical-delete tombstone."""
+
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT data_json FROM kb_documents WHERE kb_id = $1 AND id = $2",
+                kb_id,
+                document_id,
+            )
+        return _document_from_row(row) if row is not None else None
+
     async def get_documents_by_ids(
         self, kb_id: str, document_ids: Sequence[str]
     ) -> list[DocumentRecord]:
@@ -1221,8 +3168,58 @@ class PostgresMetadataStore:
                 kb_id,
                 ordered_ids,
             )
-        by_id = {row["data_json"]["id"] if isinstance(row["data_json"], dict) else _loads_json_object(row["data_json"])["id"]: _document_from_row(row) for row in rows}
-        return [by_id[document_id] for document_id in document_ids if document_id in by_id]
+        by_id = {
+            row["data_json"]["id"]
+            if isinstance(row["data_json"], dict)
+            else _loads_json_object(row["data_json"])["id"]: _document_from_row(row)
+            for row in rows
+        }
+        return [
+            by_id[document_id] for document_id in document_ids if document_id in by_id
+        ]
+
+    async def get_documents_and_job_by_ids(
+        self,
+        kb_id: str,
+        document_ids: Sequence[str],
+        job_id: str,
+    ) -> tuple[list[DocumentRecord], JobRecord | None]:
+        """Read candidate documents and job from one reconciliation snapshot."""
+
+        await self._ensure_initialized()
+        ordered_ids = list(dict.fromkeys(document_ids))
+        async with self._pool_or_raise().acquire() as conn:
+            async with conn.transaction(isolation="repeatable_read", readonly=True):
+                rows = (
+                    await conn.fetch(
+                        """
+                        SELECT data_json FROM kb_documents
+                        WHERE kb_id = $1 AND id = ANY($2::text[])
+                            AND deleted_at IS NULL
+                        """,
+                        kb_id,
+                        ordered_ids,
+                    )
+                    if ordered_ids
+                    else []
+                )
+                job_row = await conn.fetchrow(
+                    """
+                    SELECT data_json FROM kb_jobs
+                    WHERE kb_id = $1 AND id = $2
+                    """,
+                    kb_id,
+                    job_id,
+                )
+        by_id = {
+            document.id: document
+            for document in (_document_from_row(row) for row in rows)
+        }
+        documents = [
+            by_id[document_id] for document_id in ordered_ids if document_id in by_id
+        ]
+        job = _job_from_row(job_row) if job_row is not None else None
+        return documents, job
 
     async def get_documents_by_source_keys(
         self, kb_id: str, source_keys: Sequence[str]
@@ -1277,7 +3274,9 @@ class PostgresMetadataStore:
         await self._ensure_initialized()
 
         async def write(conn: Any) -> DocumentRecord:
-            document = await self._get_document(conn, kb_id, document_id, for_update=True)
+            document = await self._get_document(
+                conn, kb_id, document_id, for_update=True
+            )
             metadata = dict(document.metadata)
             if metadata_patch:
                 metadata.update(metadata_patch)
@@ -1293,7 +3292,13 @@ class PostgresMetadataStore:
         return await self._write(write)
 
     async def mark_document_parse_queued(
-        self, kb_id: str, document_id: str, *, metadata_patch: dict[str, Any]
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        metadata_patch: dict[str, Any],
+        expected_snapshot: dict[str, Any] | None = None,
+        claim_token: str | None = None,
     ) -> DocumentRecord:
         await self._ensure_initialized()
         return await self._write(
@@ -1302,19 +3307,29 @@ class PostgresMetadataStore:
                 kb_id,
                 document_id,
                 metadata_patch=metadata_patch,
+                expected_snapshot=expected_snapshot,
+                claim_token=claim_token,
                 raise_on_active=True,
             )
         )
 
     async def claim_documents_parse_queued(
-        self, kb_id: str, claims: Sequence[tuple[str, dict[str, Any]]]
+        self,
+        kb_id: str,
+        claims: Sequence[DocumentAttemptClaimInput],
     ) -> tuple[list[DocumentRecord], list[dict[str, Any]]]:
         await self._ensure_initialized()
 
         async def write(conn: Any) -> tuple[list[DocumentRecord], list[dict[str, Any]]]:
             documents: list[DocumentRecord] = []
             failures: list[dict[str, Any]] = []
-            for document_id, metadata_patch in claims:
+            for raw_claim in claims:
+                (
+                    document_id,
+                    metadata_patch,
+                    expected_snapshot,
+                    claim_token,
+                ) = _unpack_document_claim(raw_claim)
                 try:
                     documents.append(
                         await self._claim_document_parse_queued(
@@ -1322,17 +3337,27 @@ class PostgresMetadataStore:
                             kb_id,
                             document_id,
                             metadata_patch=metadata_patch,
+                            expected_snapshot=expected_snapshot,
+                            claim_token=claim_token,
                             raise_on_active=True,
                         )
                     )
                 except ActiveDocumentParseJobError as exc:
-                    failures.append(_active_failure(document_id, "parse_job_active", exc))
+                    failures.append(
+                        _active_failure(document_id, "parse_job_active", exc)
+                    )
                 except ActiveDocumentBuildJobError as exc:
-                    failures.append(_active_failure(document_id, "build_job_active", exc))
+                    failures.append(
+                        _active_failure(document_id, "build_job_active", exc)
+                    )
                 except ActiveDocumentDeleteJobError as exc:
-                    failures.append(_active_failure(document_id, "delete_job_active", exc))
+                    failures.append(
+                        _active_failure(document_id, "delete_job_active", exc)
+                    )
                 except ActiveDocumentReplaceJobError as exc:
-                    failures.append(_active_failure(document_id, "replace_job_active", exc))
+                    failures.append(
+                        _active_failure(document_id, "replace_job_active", exc)
+                    )
                 except MetadataRecordNotFoundError as exc:
                     failures.append(
                         {
@@ -1342,24 +3367,69 @@ class PostgresMetadataStore:
                             "error_message": str(exc),
                         }
                     )
+                except DocumentSnapshotConflictError as exc:
+                    failures.append(
+                        {
+                            "document_id": document_id,
+                            "status": "failed",
+                            "error_code": "document_snapshot_conflict",
+                            "error_message": str(exc),
+                            "expected_snapshot": exc.expected,
+                            "current_snapshot": exc.current,
+                        }
+                    )
             return documents, failures
 
         return await self._write(write)
 
     async def mark_document_parsing(
-        self, kb_id: str, document_id: str, *, metadata_patch: dict[str, Any]
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        metadata_patch: dict[str, Any],
+        job_id: str | None = None,
+        claim_token: str | None = None,
     ) -> DocumentRecord:
         await self._ensure_initialized()
-        return await self._write(
-            lambda conn: self._update_document_parse_state(
+
+        async def write(conn: Any) -> DocumentRecord:
+            document = await self._get_document(
+                conn, kb_id, document_id, for_update=True
+            )
+            legacy_compatible = _document_attempt_mark_is_legacy_compatible(
+                document,
+                "parse",
+                metadata_patch=metadata_patch,
+                claim_token=claim_token,
+            )
+            resolved_job_id, resolved_claim_token = _resolve_document_attempt_identity(
+                document,
+                operation="parse",
+                phase="pending",
+                job_id=job_id,
+                claim_token=claim_token,
+                metadata_patch=metadata_patch,
+                allow_legacy_start=True,
+            )
+            patch = _prepare_document_attempt_mark_metadata(
+                document,
+                "parse",
+                metadata_patch,
+                job_id=resolved_job_id,
+                claim_token=resolved_claim_token,
+                legacy_compatible=legacy_compatible,
+            )
+            return await self._update_document_parse_state(
                 conn,
                 kb_id,
                 document_id,
                 status="parsing",
-                metadata_patch=metadata_patch,
+                metadata_patch=patch,
                 clear_error=True,
             )
-        )
+
+        return await self._write(write)
 
     async def complete_document_parse(
         self,
@@ -1370,25 +3440,54 @@ class PostgresMetadataStore:
         lightrag_doc_id: str,
         metadata_patch: dict[str, Any],
         artifacts: Sequence[ArtifactRecord],
+        retain_previous_artifacts: bool = False,
+        job_id: str | None = None,
+        claim_token: str | None = None,
+        expected_snapshot: dict[str, Any] | None = None,
     ) -> tuple[DocumentRecord, list[ArtifactRecord]]:
         await self._ensure_initialized()
 
         async def write(conn: Any) -> tuple[DocumentRecord, list[ArtifactRecord]]:
+            current = await self._get_document(
+                conn, kb_id, document_id, for_update=True
+            )
+            _resolved_job_id, resolved_claim_token = _resolve_document_attempt_identity(
+                current,
+                operation="parse",
+                phase="current",
+                job_id=job_id,
+                claim_token=claim_token,
+                metadata_patch=metadata_patch,
+                allow_legacy_start=True,
+            )
+            if expected_snapshot is not None:
+                _assert_document_snapshot(
+                    current, expected_snapshot, include_status=False
+                )
+            patch = _prepare_document_attempt_terminal_metadata(
+                current,
+                "parse",
+                metadata_patch,
+                claim_token=resolved_claim_token,
+                successful=True,
+            )
             document = await self._update_document_parse_state(
                 conn,
                 kb_id,
                 document_id,
                 status="parsed",
-                metadata_patch=metadata_patch,
+                metadata_patch=patch,
                 parser_hash=parser_hash,
                 lightrag_doc_id=lightrag_doc_id,
                 clear_error=True,
             )
-            await conn.execute(
-                "DELETE FROM kb_document_artifacts WHERE kb_id = $1 AND document_id = $2",
-                kb_id,
-                document_id,
-            )
+            if not retain_previous_artifacts:
+                await conn.execute(
+                    "DELETE FROM kb_document_artifacts "
+                    "WHERE kb_id = $1 AND document_id = $2",
+                    kb_id,
+                    document_id,
+                )
             for artifact in artifacts:
                 await self._insert_artifact(conn, artifact)
             return document, list(artifacts)
@@ -1403,19 +3502,87 @@ class PostgresMetadataStore:
         error_code: str,
         error_message: str,
         metadata_patch: dict[str, Any],
+        job_id: str | None = None,
+        claim_token: str | None = None,
     ) -> DocumentRecord:
         await self._ensure_initialized()
-        return await self._write(
-            lambda conn: self._update_document_parse_state(
+
+        async def write(conn: Any) -> DocumentRecord:
+            document = await self._get_document(
+                conn, kb_id, document_id, for_update=True
+            )
+            _resolved_job_id, resolved_claim_token = _resolve_document_attempt_identity(
+                document,
+                operation="parse",
+                phase="current",
+                job_id=job_id,
+                claim_token=claim_token,
+                metadata_patch=metadata_patch,
+                allow_legacy_start=True,
+            )
+            patch = _prepare_document_attempt_terminal_metadata(
+                document,
+                "parse",
+                metadata_patch,
+                claim_token=resolved_claim_token,
+                successful=False,
+            )
+            return await self._update_document_parse_state(
                 conn,
                 kb_id,
                 document_id,
                 status="parse_failed",
-                metadata_patch=metadata_patch,
+                metadata_patch=patch,
                 error_code=error_code,
                 error_message=error_message,
             )
-        )
+
+        return await self._write(write)
+
+    async def release_document_parse_if_owned(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        job_id: str,
+        claim_token: str | None = None,
+        error_code: str,
+        error_message: str,
+        metadata_patch: dict[str, Any] | None = None,
+    ) -> DocumentRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> DocumentRecord:
+            document = await self._get_document(
+                conn, kb_id, document_id, for_update=True
+            )
+            resolved_owner = _resolve_document_attempt_release_identity(
+                document,
+                operation="parse",
+                job_id=job_id,
+                claim_token=claim_token,
+            )
+            if resolved_owner is None:
+                return document
+            _resolved_job_id, resolved_claim_token = resolved_owner
+            patch = _prepare_document_attempt_terminal_metadata(
+                document,
+                "parse",
+                metadata_patch,
+                claim_token=resolved_claim_token,
+                successful=False,
+            )
+            return await self._update_document_parse_state(
+                conn,
+                kb_id,
+                document_id,
+                status="parse_failed",
+                metadata_patch=patch,
+                error_code=error_code,
+                error_message=error_message,
+            )
+
+        return await self._write(write)
 
     async def claim_document_build_queued(
         self,
@@ -1423,6 +3590,8 @@ class PostgresMetadataStore:
         document_id: str,
         *,
         metadata_patch: dict[str, Any],
+        expected_snapshot: dict[str, Any] | None = None,
+        claim_token: str | None = None,
         require_parsed: bool = True,
     ) -> DocumentRecord:
         await self._ensure_initialized()
@@ -1432,6 +3601,8 @@ class PostgresMetadataStore:
                 kb_id,
                 document_id,
                 metadata_patch=metadata_patch,
+                expected_snapshot=expected_snapshot,
+                claim_token=claim_token,
                 require_parsed=require_parsed,
             )
         )
@@ -1439,7 +3610,7 @@ class PostgresMetadataStore:
     async def claim_documents_build_queued(
         self,
         kb_id: str,
-        claims: Sequence[tuple[str, dict[str, Any]]],
+        claims: Sequence[DocumentAttemptClaimInput],
         *,
         require_parsed: bool = True,
     ) -> tuple[list[DocumentRecord], list[dict[str, Any]]]:
@@ -1448,7 +3619,13 @@ class PostgresMetadataStore:
         async def write(conn: Any) -> tuple[list[DocumentRecord], list[dict[str, Any]]]:
             documents: list[DocumentRecord] = []
             failures: list[dict[str, Any]] = []
-            for document_id, metadata_patch in claims:
+            for raw_claim in claims:
+                (
+                    document_id,
+                    metadata_patch,
+                    expected_snapshot,
+                    claim_token,
+                ) = _unpack_document_claim(raw_claim)
                 try:
                     documents.append(
                         await self._claim_document_build_queued(
@@ -1456,15 +3633,23 @@ class PostgresMetadataStore:
                             kb_id,
                             document_id,
                             metadata_patch=metadata_patch,
+                            expected_snapshot=expected_snapshot,
+                            claim_token=claim_token,
                             require_parsed=require_parsed,
                         )
                     )
                 except ActiveDocumentBuildJobError as exc:
-                    failures.append(_active_failure(document_id, "build_job_active", exc))
+                    failures.append(
+                        _active_failure(document_id, "build_job_active", exc)
+                    )
                 except ActiveDocumentDeleteJobError as exc:
-                    failures.append(_active_failure(document_id, "delete_job_active", exc))
+                    failures.append(
+                        _active_failure(document_id, "delete_job_active", exc)
+                    )
                 except ActiveDocumentReplaceJobError as exc:
-                    failures.append(_active_failure(document_id, "replace_job_active", exc))
+                    failures.append(
+                        _active_failure(document_id, "replace_job_active", exc)
+                    )
                 except DocumentNotParsedError as exc:
                     failures.append(
                         {
@@ -1484,24 +3669,69 @@ class PostgresMetadataStore:
                             "error_message": str(exc),
                         }
                     )
+                except DocumentSnapshotConflictError as exc:
+                    failures.append(
+                        {
+                            "document_id": document_id,
+                            "status": "failed",
+                            "error_code": "document_snapshot_conflict",
+                            "error_message": str(exc),
+                            "expected_snapshot": exc.expected,
+                            "current_snapshot": exc.current,
+                        }
+                    )
             return documents, failures
 
         return await self._write(write)
 
     async def mark_document_building(
-        self, kb_id: str, document_id: str, *, metadata_patch: dict[str, Any]
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        metadata_patch: dict[str, Any],
+        job_id: str | None = None,
+        claim_token: str | None = None,
     ) -> DocumentRecord:
         await self._ensure_initialized()
-        return await self._write(
-            lambda conn: self._update_document_parse_state(
+
+        async def write(conn: Any) -> DocumentRecord:
+            document = await self._get_document(
+                conn, kb_id, document_id, for_update=True
+            )
+            legacy_compatible = _document_attempt_mark_is_legacy_compatible(
+                document,
+                "build",
+                metadata_patch=metadata_patch,
+                claim_token=claim_token,
+            )
+            resolved_job_id, resolved_claim_token = _resolve_document_attempt_identity(
+                document,
+                operation="build",
+                phase="pending",
+                job_id=job_id,
+                claim_token=claim_token,
+                metadata_patch=metadata_patch,
+                allow_legacy_start=True,
+            )
+            patch = _prepare_document_attempt_mark_metadata(
+                document,
+                "build",
+                metadata_patch,
+                job_id=resolved_job_id,
+                claim_token=resolved_claim_token,
+                legacy_compatible=legacy_compatible,
+            )
+            return await self._update_document_parse_state(
                 conn,
                 kb_id,
                 document_id,
                 status="building",
-                metadata_patch=metadata_patch,
+                metadata_patch=patch,
                 clear_error=True,
             )
-        )
+
+        return await self._write(write)
 
     async def complete_document_build(
         self,
@@ -1513,12 +3743,38 @@ class PostgresMetadataStore:
         entity_count: int | None = None,
         relation_count: int | None = None,
         metadata_patch: dict[str, Any],
+        job_id: str | None = None,
+        claim_token: str | None = None,
+        expected_snapshot: dict[str, Any] | None = None,
     ) -> DocumentRecord:
         await self._ensure_initialized()
 
         async def write(conn: Any) -> DocumentRecord:
-            document = await self._get_document(conn, kb_id, document_id, for_update=True)
-            document.metadata.update(metadata_patch)
+            document = await self._get_document(
+                conn, kb_id, document_id, for_update=True
+            )
+            _resolved_job_id, resolved_claim_token = _resolve_document_attempt_identity(
+                document,
+                operation="build",
+                phase="current",
+                job_id=job_id,
+                claim_token=claim_token,
+                metadata_patch=metadata_patch,
+                allow_legacy_start=True,
+            )
+            if expected_snapshot is not None:
+                _assert_document_snapshot(
+                    document, expected_snapshot, include_status=False
+                )
+            document.metadata.update(
+                _prepare_document_attempt_terminal_metadata(
+                    document,
+                    "build",
+                    metadata_patch,
+                    claim_token=resolved_claim_token,
+                    successful=True,
+                )
+            )
             document.status = "ready"
             document.index_hash = index_hash
             if chunks_count is not None:
@@ -1535,6 +3791,105 @@ class PostgresMetadataStore:
 
         return await self._write(write)
 
+    async def complete_document_build_with_artifact_promotion(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        index_hash: str,
+        expected_current_sidecar_artifact_id: str | None,
+        expected_current_blocks_artifact_id: str | None,
+        current_sidecar_artifact_id: str,
+        current_blocks_artifact_id: str | None,
+        artifacts: Sequence[ArtifactRecord],
+        chunks_count: int | None = None,
+        entity_count: int | None = None,
+        relation_count: int | None = None,
+        metadata_patch: dict[str, Any],
+        job_id: str | None = None,
+        claim_token: str | None = None,
+        expected_snapshot: dict[str, Any] | None = None,
+    ) -> tuple[DocumentRecord, list[ArtifactRecord]]:
+        """CAS-swap immutable build artifact generations with build completion."""
+
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> tuple[DocumentRecord, list[ArtifactRecord]]:
+            document = await self._get_document(
+                conn, kb_id, document_id, for_update=True
+            )
+            _resolved_job_id, resolved_claim_token = _resolve_document_attempt_identity(
+                document,
+                operation="build",
+                phase="current",
+                job_id=job_id,
+                claim_token=claim_token,
+                metadata_patch=metadata_patch,
+                allow_legacy_start=True,
+            )
+            if expected_snapshot is not None:
+                snapshot_without_pointers = dict(expected_snapshot or {})
+                snapshot_without_pointers.pop("current_sidecar_artifact_id", None)
+                snapshot_without_pointers.pop("current_blocks_artifact_id", None)
+                _assert_document_snapshot(
+                    document,
+                    snapshot_without_pointers,
+                    include_status=False,
+                )
+            expected = {
+                "current_sidecar_artifact_id": expected_current_sidecar_artifact_id,
+                "current_blocks_artifact_id": expected_current_blocks_artifact_id,
+            }
+            current = {
+                "current_sidecar_artifact_id": document.metadata.get(
+                    "current_sidecar_artifact_id"
+                ),
+                "current_blocks_artifact_id": document.metadata.get(
+                    "current_blocks_artifact_id"
+                ),
+            }
+            if current != expected:
+                raise ArtifactPointerConflictError(
+                    "document_artifact_pointer",
+                    document_id,
+                    expected=expected,
+                    current=current,
+                )
+            for artifact in artifacts:
+                if artifact.kb_id != kb_id or artifact.document_id != document_id:
+                    raise ValueError(
+                        "Promoted artifact ownership does not match the document"
+                    )
+                await self._insert_artifact(conn, artifact)
+            document.metadata.update(
+                _prepare_document_attempt_terminal_metadata(
+                    document,
+                    "build",
+                    metadata_patch,
+                    claim_token=resolved_claim_token,
+                    successful=True,
+                )
+            )
+            document.metadata["current_sidecar_artifact_id"] = (
+                current_sidecar_artifact_id
+            )
+            document.metadata["current_blocks_artifact_id"] = current_blocks_artifact_id
+            document.status = "ready"
+            document.index_hash = index_hash
+            if chunks_count is not None:
+                document.chunks_count = chunks_count
+            if entity_count is not None:
+                document.entity_count = entity_count
+            if relation_count is not None:
+                document.relation_count = relation_count
+            document.error_code = None
+            document.error_message = None
+            document.updated_at = utc_now_iso()
+            await self._save_document(conn, document)
+            return document, list(artifacts)
+
+        return await self._write(write)
+
     async def fail_document_build(
         self,
         kb_id: str,
@@ -1543,19 +3898,87 @@ class PostgresMetadataStore:
         error_code: str,
         error_message: str,
         metadata_patch: dict[str, Any],
+        job_id: str | None = None,
+        claim_token: str | None = None,
     ) -> DocumentRecord:
         await self._ensure_initialized()
-        return await self._write(
-            lambda conn: self._update_document_parse_state(
+
+        async def write(conn: Any) -> DocumentRecord:
+            document = await self._get_document(
+                conn, kb_id, document_id, for_update=True
+            )
+            _resolved_job_id, resolved_claim_token = _resolve_document_attempt_identity(
+                document,
+                operation="build",
+                phase="current",
+                job_id=job_id,
+                claim_token=claim_token,
+                metadata_patch=metadata_patch,
+                allow_legacy_start=True,
+            )
+            patch = _prepare_document_attempt_terminal_metadata(
+                document,
+                "build",
+                metadata_patch,
+                claim_token=resolved_claim_token,
+                successful=False,
+            )
+            return await self._update_document_parse_state(
                 conn,
                 kb_id,
                 document_id,
                 status="build_failed",
-                metadata_patch=metadata_patch,
+                metadata_patch=patch,
                 error_code=error_code,
                 error_message=error_message,
             )
-        )
+
+        return await self._write(write)
+
+    async def release_document_build_if_owned(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        job_id: str,
+        claim_token: str | None = None,
+        error_code: str,
+        error_message: str,
+        metadata_patch: dict[str, Any] | None = None,
+    ) -> DocumentRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> DocumentRecord:
+            document = await self._get_document(
+                conn, kb_id, document_id, for_update=True
+            )
+            resolved_owner = _resolve_document_attempt_release_identity(
+                document,
+                operation="build",
+                job_id=job_id,
+                claim_token=claim_token,
+            )
+            if resolved_owner is None:
+                return document
+            _resolved_job_id, resolved_claim_token = resolved_owner
+            patch = _prepare_document_attempt_terminal_metadata(
+                document,
+                "build",
+                metadata_patch,
+                claim_token=resolved_claim_token,
+                successful=False,
+            )
+            return await self._update_document_parse_state(
+                conn,
+                kb_id,
+                document_id,
+                status="build_failed",
+                metadata_patch=patch,
+                error_code=error_code,
+                error_message=error_message,
+            )
+
+        return await self._write(write)
 
     async def claim_document_deleting(
         self, kb_id: str, document_id: str, *, metadata_patch: dict[str, Any]
@@ -1583,13 +4006,21 @@ class PostgresMetadataStore:
                         )
                     )
                 except ActiveDocumentParseJobError as exc:
-                    failures.append(_active_failure(document_id, "parse_job_active", exc))
+                    failures.append(
+                        _active_failure(document_id, "parse_job_active", exc)
+                    )
                 except ActiveDocumentBuildJobError as exc:
-                    failures.append(_active_failure(document_id, "build_job_active", exc))
+                    failures.append(
+                        _active_failure(document_id, "build_job_active", exc)
+                    )
                 except ActiveDocumentDeleteJobError as exc:
-                    failures.append(_active_failure(document_id, "delete_job_active", exc))
+                    failures.append(
+                        _active_failure(document_id, "delete_job_active", exc)
+                    )
                 except ActiveDocumentReplaceJobError as exc:
-                    failures.append(_active_failure(document_id, "replace_job_active", exc))
+                    failures.append(
+                        _active_failure(document_id, "replace_job_active", exc)
+                    )
                 except MetadataRecordNotFoundError as exc:
                     failures.append(
                         {
@@ -1609,7 +4040,9 @@ class PostgresMetadataStore:
         await self._ensure_initialized()
 
         async def write(conn: Any) -> DocumentRecord:
-            document = await self._get_document(conn, kb_id, document_id, for_update=True)
+            document = await self._get_document(
+                conn, kb_id, document_id, for_update=True
+            )
             document.metadata.update(metadata_patch)
             now = utc_now_iso()
             await conn.execute(
@@ -1677,7 +4110,9 @@ class PostgresMetadataStore:
         await self._ensure_initialized()
 
         async def write(conn: Any) -> DocumentRecord:
-            document = await self._get_document(conn, kb_id, document_id, for_update=True)
+            document = await self._get_document(
+                conn, kb_id, document_id, for_update=True
+            )
             metadata = dict(document.metadata)
             for key in _REPLACE_DERIVED_METADATA_KEYS:
                 metadata.pop(key, None)
@@ -1734,6 +4169,1037 @@ class PostgresMetadataStore:
             )
         )
 
+    async def claim_document_replacing_cow(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        kb_generation: str,
+        job_id: str,
+        claim_token: str | None = None,
+        expected_snapshot: str | None = None,
+        metadata_patch: dict[str, Any] | None = None,
+    ) -> DocumentMutationClaimResult:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> DocumentMutationClaimResult:
+            return await self._claim_document_mutation_cow_in_tx(
+                conn,
+                kb_id,
+                document_id,
+                operation="replace",
+                kb_generation=kb_generation,
+                job_id=job_id,
+                claim_token=claim_token,
+                expected_snapshot=expected_snapshot,
+                metadata_patch=metadata_patch,
+            )
+
+        return await self._write(write)
+
+    async def claim_document_deleting_cow(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        kb_generation: str,
+        job_id: str,
+        claim_token: str | None = None,
+        expected_snapshot: str | None = None,
+        metadata_patch: dict[str, Any] | None = None,
+    ) -> DocumentMutationClaimResult:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> DocumentMutationClaimResult:
+            return await self._claim_document_mutation_cow_in_tx(
+                conn,
+                kb_id,
+                document_id,
+                operation="delete",
+                kb_generation=kb_generation,
+                job_id=job_id,
+                claim_token=claim_token,
+                expected_snapshot=expected_snapshot,
+                metadata_patch=metadata_patch,
+            )
+
+        return await self._write(write)
+
+    async def claim_documents_deleting_cow(
+        self,
+        kb_id: str,
+        document_ids: Sequence[str],
+        *,
+        kb_generation: str,
+        job_id: str,
+        claim_tokens: Mapping[str, str] | None = None,
+        expected_snapshots: Mapping[str, str] | None = None,
+        metadata_patches: Mapping[str, dict[str, Any]] | None = None,
+    ) -> tuple[list[DocumentMutationClaimResult], list[dict[str, Any]]]:
+        await self._ensure_initialized()
+        ordered_ids = list(dict.fromkeys(document_ids))
+        if len(ordered_ids) != len(document_ids):
+            raise ValueError("Batch document mutation ids must be unique")
+        if len(ordered_ids) > ARTIFACT_LIFECYCLE_MAX_PAGE_SIZE:
+            raise ValueError("Batch document mutation claim exceeds the bounded size")
+        token_map = dict(claim_tokens or {})
+        snapshot_map = dict(expected_snapshots or {})
+        patch_map = dict(metadata_patches or {})
+        if (
+            not set(token_map).issubset(ordered_ids)
+            or not set(snapshot_map).issubset(ordered_ids)
+            or not set(patch_map).issubset(ordered_ids)
+        ):
+            raise ValueError("Batch document mutation maps contain unknown ids")
+
+        async def write(
+            conn: Any,
+        ) -> tuple[list[DocumentMutationClaimResult], list[dict[str, Any]]]:
+            lifecycle = await self._assert_kb_generation(
+                conn,
+                kb_id,
+                kb_generation,
+            )
+            if lifecycle is None:
+                raise _missing_kb_lifecycle_conflict(
+                    kb_id,
+                    kb_generation,
+                    expected_state="active",
+                )
+            results: list[DocumentMutationClaimResult] = []
+            failures: list[dict[str, Any]] = []
+            for document_id in ordered_ids:
+                try:
+                    async with conn.transaction():
+                        result = await self._claim_document_mutation_cow_in_tx(
+                            conn,
+                            kb_id,
+                            document_id,
+                            operation="delete",
+                            kb_generation=kb_generation,
+                            job_id=job_id,
+                            claim_token=token_map.get(document_id),
+                            expected_snapshot=snapshot_map.get(document_id),
+                            metadata_patch=patch_map.get(document_id),
+                            lifecycle_already_checked=True,
+                        )
+                except (MetadataStoreError, ValueError) as exc:
+                    failures.append(_document_mutation_claim_failure(document_id, exc))
+                else:
+                    results.append(result)
+            return results, failures
+
+        return await self._write(write)
+
+    async def _claim_document_mutation_cow_in_tx(
+        self,
+        conn: Any,
+        kb_id: str,
+        document_id: str,
+        *,
+        operation: DocumentMutationOperation,
+        kb_generation: str,
+        job_id: str,
+        claim_token: str | None,
+        expected_snapshot: str | None,
+        metadata_patch: Mapping[str, Any] | None,
+        lifecycle_already_checked: bool = False,
+    ) -> DocumentMutationClaimResult:
+        if not lifecycle_already_checked:
+            lifecycle = await self._assert_kb_generation(
+                conn,
+                kb_id,
+                kb_generation,
+            )
+            if lifecycle is None:
+                raise _missing_kb_lifecycle_conflict(
+                    kb_id,
+                    kb_generation,
+                    expected_state="active",
+                )
+        job = await self._get_job(conn, kb_id, job_id, for_update=True)
+        document = await self._get_document(
+            conn,
+            kb_id,
+            document_id,
+            for_update=True,
+        )
+        artifact_rows = await conn.fetch(
+            """
+            SELECT data_json FROM kb_document_artifacts
+            WHERE kb_id = $1 AND document_id = $2
+            ORDER BY id ASC
+            FOR UPDATE
+            """,
+            kb_id,
+            document_id,
+        )
+        result = _prepare_document_mutation_claim(
+            document,
+            job,
+            [_artifact_from_row(row) for row in artifact_rows],
+            operation=operation,
+            claim_token=claim_token,
+            expected_snapshot=expected_snapshot,
+            metadata_patch=metadata_patch,
+            now=utc_now_iso(),
+        )
+        await self._save_document(conn, result.document)
+        return result
+
+    async def commit_document_replace_cow(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        kb_generation: str,
+        job_id: str,
+        attempt_token: str,
+        expected_snapshot: str,
+        new_source_type: str,
+        new_source_name: str,
+        new_source_uri: str,
+        new_source_hash: str,
+        new_content_type: str | None,
+        new_size_bytes: int,
+        new_source_object_uri: str,
+        new_source_generation_id: str,
+        metadata_patch: dict[str, Any] | None,
+        manifests: Sequence[ArtifactCleanupManifestRecord],
+    ) -> DocumentMutationCommitResult:
+        await self._ensure_initialized()
+        _validate_document_mutation_snapshot_digest(expected_snapshot)
+        _validate_document_attempt_token(attempt_token)
+        _validate_document_mutation_metadata_patch(metadata_patch)
+
+        async def write(conn: Any) -> DocumentMutationCommitResult:
+            lifecycle = await self._assert_kb_generation(
+                conn,
+                kb_id,
+                kb_generation,
+            )
+            if lifecycle is None:
+                raise _missing_kb_lifecycle_conflict(
+                    kb_id,
+                    kb_generation,
+                    expected_state="active",
+                )
+            document = await self._get_document(
+                conn,
+                kb_id,
+                document_id,
+                for_update=True,
+            )
+            job = await self._get_job(conn, kb_id, job_id, for_update=True)
+            normalized_source_uri, generation_id = (
+                _validate_new_document_source_authority(
+                    document=document,
+                    kb_generation=kb_generation,
+                    job_id=job_id,
+                    attempt_token=attempt_token,
+                    new_source_hash=new_source_hash,
+                    new_source_object_uri=new_source_object_uri,
+                    new_source_generation_id=new_source_generation_id,
+                )
+            )
+            group_id, candidate_manifests = (
+                _validate_document_mutation_manifest_replay_input(
+                    document,
+                    manifests,
+                    operation="replace",
+                    kb_generation=kb_generation,
+                    job_id=job_id,
+                    attempt_token=attempt_token,
+                    expected_snapshot=expected_snapshot,
+                    new_source_object_uri=normalized_source_uri,
+                )
+            )
+            candidate_ids = tuple(record.id for record in candidate_manifests)
+            if _document_replace_lineage_matches(
+                document,
+                job_id=job_id,
+                attempt_token=attempt_token,
+                expected_snapshot=expected_snapshot,
+                manifest_group_id=group_id,
+                manifest_ids=candidate_ids,
+                new_source_type=new_source_type,
+                new_source_name=new_source_name,
+                new_source_uri=new_source_uri,
+                new_source_hash=new_source_hash,
+                new_content_type=new_content_type,
+                new_size_bytes=new_size_bytes,
+                new_source_object_uri=normalized_source_uri,
+                new_source_generation_id=generation_id,
+            ):
+                _assert_document_mutation_job(
+                    job,
+                    document,
+                    "replace",
+                    allowed_statuses=_DOCUMENT_MUTATION_COMMIT_JOB_STATUSES,
+                    new_source_hash=new_source_hash,
+                )
+                manifest_rows = await conn.fetch(
+                    """
+                    SELECT * FROM kb_artifact_cleanup_manifests
+                    WHERE manifest_group_id = $1
+                    ORDER BY id ASC
+                    FOR UPDATE
+                    """,
+                    group_id,
+                )
+                persisted = [
+                    _artifact_cleanup_manifest_from_row(row) for row in manifest_rows
+                ]
+                if not _manifest_records_match_candidates(
+                    persisted,
+                    candidate_manifests,
+                    initial_dispositions={
+                        str(row["id"]): str(row["initial_disposition"])
+                        for row in manifest_rows
+                    },
+                    initial_audit_retain_until={
+                        str(row["id"]): str(row["initial_audit_retain_until"])
+                        for row in manifest_rows
+                    },
+                ):
+                    raise MetadataStoreError(
+                        "Document replacement manifest lineage is incomplete"
+                    )
+                return _document_mutation_commit_result(document, group_id, persisted)
+
+            artifact_rows = await conn.fetch(
+                """
+                SELECT data_json FROM kb_document_artifacts
+                WHERE kb_id = $1 AND document_id = $2
+                ORDER BY id ASC
+                FOR UPDATE
+                """,
+                kb_id,
+                document_id,
+            )
+            artifacts = [_artifact_from_row(row) for row in artifact_rows]
+            _assert_document_mutation_precommit(
+                document,
+                job,
+                artifacts,
+                operation="replace",
+                job_id=job_id,
+                attempt_token=attempt_token,
+                expected_snapshot=expected_snapshot,
+                new_source_hash=new_source_hash,
+            )
+            validated_group_id, validated_manifests = (
+                _validate_document_mutation_manifest_group(
+                    document,
+                    artifacts,
+                    candidate_manifests,
+                    operation="replace",
+                    kb_generation=kb_generation,
+                    job_id=job_id,
+                    attempt_token=attempt_token,
+                    expected_snapshot=expected_snapshot,
+                    new_source_object_uri=normalized_source_uri,
+                )
+            )
+            persisted = await self._enqueue_artifact_cleanup_manifests_in_tx(
+                conn,
+                validated_manifests,
+            )
+            committed = _apply_document_replace_commit(
+                document,
+                job_id=job_id,
+                attempt_token=attempt_token,
+                expected_snapshot=expected_snapshot,
+                manifest_group_id=validated_group_id,
+                manifest_ids=[record.id for record in persisted],
+                new_source_type=new_source_type,
+                new_source_name=new_source_name,
+                new_source_uri=new_source_uri,
+                new_source_hash=new_source_hash,
+                new_content_type=new_content_type,
+                new_size_bytes=new_size_bytes,
+                new_source_object_uri=normalized_source_uri,
+                new_source_generation_id=generation_id,
+                metadata_patch=metadata_patch,
+                now=utc_now_iso(),
+            )
+            await self._save_document(conn, committed)
+            await conn.execute(
+                "DELETE FROM kb_document_artifacts "
+                "WHERE kb_id = $1 AND document_id = $2",
+                kb_id,
+                document_id,
+            )
+            return _document_mutation_commit_result(
+                committed,
+                validated_group_id,
+                persisted,
+            )
+
+        return await self._write(write)
+
+    async def commit_document_delete_cow(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        kb_generation: str,
+        job_id: str,
+        attempt_token: str,
+        expected_snapshot: str,
+        metadata_patch: dict[str, Any] | None,
+        manifests: Sequence[ArtifactCleanupManifestRecord],
+    ) -> DocumentMutationCommitResult:
+        await self._ensure_initialized()
+        _validate_document_mutation_snapshot_digest(expected_snapshot)
+        _validate_document_attempt_token(attempt_token)
+        _validate_document_mutation_metadata_patch(metadata_patch)
+
+        async def write(conn: Any) -> DocumentMutationCommitResult:
+            lifecycle = await self._assert_kb_generation(
+                conn,
+                kb_id,
+                kb_generation,
+            )
+            if lifecycle is None:
+                raise _missing_kb_lifecycle_conflict(
+                    kb_id,
+                    kb_generation,
+                    expected_state="active",
+                )
+            document_row = await conn.fetchrow(
+                """
+                SELECT data_json FROM kb_documents
+                WHERE kb_id = $1 AND id = $2
+                FOR UPDATE
+                """,
+                kb_id,
+                document_id,
+            )
+            if document_row is None:
+                raise MetadataRecordNotFoundError(f"Document '{document_id}' not found")
+            document = _document_from_row(document_row)
+            job = await self._get_job(conn, kb_id, job_id, for_update=True)
+            group_id, candidate_manifests = (
+                _validate_document_mutation_manifest_replay_input(
+                    document,
+                    manifests,
+                    operation="delete",
+                    kb_generation=kb_generation,
+                    job_id=job_id,
+                    attempt_token=attempt_token,
+                    expected_snapshot=expected_snapshot,
+                )
+            )
+            candidate_ids = tuple(record.id for record in candidate_manifests)
+            if _document_delete_lineage_matches(
+                document,
+                job_id=job_id,
+                attempt_token=attempt_token,
+                expected_snapshot=expected_snapshot,
+                manifest_group_id=group_id,
+                manifest_ids=candidate_ids,
+            ):
+                _assert_document_mutation_job(
+                    job,
+                    document,
+                    "delete",
+                    allowed_statuses=_DOCUMENT_MUTATION_COMMIT_JOB_STATUSES,
+                )
+                manifest_rows = await conn.fetch(
+                    """
+                    SELECT * FROM kb_artifact_cleanup_manifests
+                    WHERE manifest_group_id = $1
+                    ORDER BY id ASC
+                    FOR UPDATE
+                    """,
+                    group_id,
+                )
+                persisted = [
+                    _artifact_cleanup_manifest_from_row(row) for row in manifest_rows
+                ]
+                if not _manifest_records_match_candidates(
+                    persisted,
+                    candidate_manifests,
+                    initial_dispositions={
+                        str(row["id"]): str(row["initial_disposition"])
+                        for row in manifest_rows
+                    },
+                    initial_audit_retain_until={
+                        str(row["id"]): str(row["initial_audit_retain_until"])
+                        for row in manifest_rows
+                    },
+                ):
+                    raise MetadataStoreError(
+                        "Document deletion manifest lineage is incomplete"
+                    )
+                return _document_mutation_commit_result(document, group_id, persisted)
+
+            if document.deleted_at is not None:
+                raise MetadataStoreError(
+                    "Document deletion mutation no longer owns the tombstone"
+                )
+            artifact_rows = await conn.fetch(
+                """
+                SELECT data_json FROM kb_document_artifacts
+                WHERE kb_id = $1 AND document_id = $2
+                ORDER BY id ASC
+                FOR UPDATE
+                """,
+                kb_id,
+                document_id,
+            )
+            artifacts = [_artifact_from_row(row) for row in artifact_rows]
+            _assert_document_mutation_precommit(
+                document,
+                job,
+                artifacts,
+                operation="delete",
+                job_id=job_id,
+                attempt_token=attempt_token,
+                expected_snapshot=expected_snapshot,
+            )
+            validated_group_id, validated_manifests = (
+                _validate_document_mutation_manifest_group(
+                    document,
+                    artifacts,
+                    candidate_manifests,
+                    operation="delete",
+                    kb_generation=kb_generation,
+                    job_id=job_id,
+                    attempt_token=attempt_token,
+                    expected_snapshot=expected_snapshot,
+                )
+            )
+            persisted = await self._enqueue_artifact_cleanup_manifests_in_tx(
+                conn,
+                validated_manifests,
+            )
+            committed = _apply_document_delete_commit(
+                document,
+                job_id=job_id,
+                attempt_token=attempt_token,
+                expected_snapshot=expected_snapshot,
+                manifest_group_id=validated_group_id,
+                manifest_ids=[record.id for record in persisted],
+                metadata_patch=metadata_patch,
+                now=utc_now_iso(),
+            )
+            await self._save_document(conn, committed)
+            await conn.execute(
+                "DELETE FROM kb_document_artifacts "
+                "WHERE kb_id = $1 AND document_id = $2",
+                kb_id,
+                document_id,
+            )
+            return _document_mutation_commit_result(
+                committed,
+                validated_group_id,
+                persisted,
+            )
+
+        return await self._write(write)
+
+    async def finalize_document_replace_cow(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        kb_generation: str,
+        job_id: str,
+        attempt_token: str,
+        source_object_uri: str,
+        source_generation_id: str,
+        manifest_group_id: str,
+    ) -> DocumentRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> DocumentRecord:
+            lifecycle = await self._assert_kb_generation(
+                conn,
+                kb_id,
+                kb_generation,
+            )
+            if lifecycle is None:
+                raise _missing_kb_lifecycle_conflict(
+                    kb_id,
+                    kb_generation,
+                    expected_state="active",
+                )
+            document = await self._get_document(
+                conn,
+                kb_id,
+                document_id,
+                for_update=True,
+            )
+            job = await self._get_job(conn, kb_id, job_id, for_update=True)
+            manifest_rows = await conn.fetch(
+                """
+                SELECT * FROM kb_artifact_cleanup_manifests
+                WHERE manifest_group_id = $1
+                ORDER BY id ASC
+                FOR UPDATE
+                """,
+                manifest_group_id,
+            )
+            manifests = [
+                _artifact_cleanup_manifest_from_row(row) for row in manifest_rows
+            ]
+            if _replace_final_is_idempotent(
+                document,
+                manifests,
+                job_id=job_id,
+                attempt_token=attempt_token,
+                source_object_uri=source_object_uri,
+                source_generation_id=source_generation_id,
+                manifest_group_id=manifest_group_id,
+            ):
+                _assert_document_mutation_job(
+                    job,
+                    document,
+                    "replace",
+                    allowed_statuses=_DOCUMENT_MUTATION_COMMIT_JOB_STATUSES,
+                )
+                return document
+            _assert_document_replace_final_fence(
+                document,
+                job,
+                manifests,
+                kb_generation=kb_generation,
+                job_id=job_id,
+                attempt_token=attempt_token,
+                source_object_uri=source_object_uri,
+                source_generation_id=source_generation_id,
+                manifest_group_id=manifest_group_id,
+            )
+            finalized = _apply_document_replace_final(
+                document,
+                job_id=job_id,
+                attempt_token=attempt_token,
+                now=utc_now_iso(),
+            )
+            await self._save_document(conn, finalized)
+            return finalized
+
+        return await self._write(write)
+
+    async def record_document_replace_engine_cleanup_failure_cow(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        kb_generation: str,
+        job_id: str,
+        attempt_token: str,
+        source_object_uri: str,
+        source_generation_id: str,
+        manifest_group_id: str,
+        error_code: str,
+        error_message: str,
+    ) -> DocumentRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> DocumentRecord:
+            lifecycle = await self._assert_kb_generation(
+                conn,
+                kb_id,
+                kb_generation,
+            )
+            if lifecycle is None:
+                raise _missing_kb_lifecycle_conflict(
+                    kb_id,
+                    kb_generation,
+                    expected_state="active",
+                )
+            document = await self._get_document(
+                conn,
+                kb_id,
+                document_id,
+                for_update=True,
+            )
+            job = await self._get_job(conn, kb_id, job_id, for_update=True)
+            manifest_rows = await conn.fetch(
+                """
+                SELECT * FROM kb_artifact_cleanup_manifests
+                WHERE manifest_group_id = $1
+                ORDER BY id ASC
+                FOR UPDATE
+                """,
+                manifest_group_id,
+            )
+            _assert_replace_engine_cleanup_failure_fence(
+                document,
+                job,
+                [_artifact_cleanup_manifest_from_row(row) for row in manifest_rows],
+                kb_generation=kb_generation,
+                job_id=job_id,
+                attempt_token=attempt_token,
+                source_object_uri=source_object_uri,
+                source_generation_id=source_generation_id,
+                manifest_group_id=manifest_group_id,
+            )
+            failed = _apply_replace_engine_cleanup_failure(
+                document,
+                error_code=error_code,
+                error_message=error_message,
+                now=utc_now_iso(),
+            )
+            await self._save_document(conn, failed)
+            return failed
+
+        return await self._write(write)
+
+    async def fail_document_replace_cow(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        kb_generation: str,
+        job_id: str,
+        attempt_token: str,
+        error_code: str,
+        error_message: str,
+    ) -> DocumentRecord:
+        return await self._fail_document_mutation_cow(
+            kb_id,
+            document_id,
+            operation="replace",
+            kb_generation=kb_generation,
+            job_id=job_id,
+            attempt_token=attempt_token,
+            error_code=error_code,
+            error_message=error_message,
+        )
+
+    async def fail_document_delete_cow(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        kb_generation: str,
+        job_id: str,
+        attempt_token: str,
+        error_code: str,
+        error_message: str,
+    ) -> DocumentRecord:
+        return await self._fail_document_mutation_cow(
+            kb_id,
+            document_id,
+            operation="delete",
+            kb_generation=kb_generation,
+            job_id=job_id,
+            attempt_token=attempt_token,
+            error_code=error_code,
+            error_message=error_message,
+        )
+
+    async def _fail_document_mutation_cow(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        operation: DocumentMutationOperation,
+        kb_generation: str,
+        job_id: str,
+        attempt_token: str,
+        error_code: str,
+        error_message: str,
+    ) -> DocumentRecord:
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> DocumentRecord:
+            lifecycle = await self._assert_kb_generation(
+                conn,
+                kb_id,
+                kb_generation,
+            )
+            if lifecycle is None:
+                raise _missing_kb_lifecycle_conflict(
+                    kb_id,
+                    kb_generation,
+                    expected_state="active",
+                )
+            document_row = await conn.fetchrow(
+                """
+                SELECT data_json FROM kb_documents
+                WHERE kb_id = $1 AND id = $2
+                FOR UPDATE
+                """,
+                kb_id,
+                document_id,
+            )
+            if document_row is None:
+                raise MetadataRecordNotFoundError(f"Document '{document_id}' not found")
+            job = await self._get_job(conn, kb_id, job_id, for_update=True)
+            failed = _apply_document_mutation_precommit_failure(
+                _document_from_row(document_row),
+                job,
+                operation=operation,
+                job_id=job_id,
+                attempt_token=attempt_token,
+                error_code=error_code,
+                error_message=error_message,
+                now=utc_now_iso(),
+            )
+            await self._save_document(conn, failed)
+            return failed
+
+        return await self._write(write)
+
+    async def reconcile_document_replace_cow_commit(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        kb_generation: str,
+        job_id: str,
+        attempt_token: str,
+        expected_snapshot: str,
+        new_source_type: str,
+        new_source_name: str,
+        new_source_uri: str,
+        new_source_hash: str,
+        new_content_type: str | None,
+        new_size_bytes: int,
+        new_source_object_uri: str,
+        new_source_generation_id: str,
+        manifests: Sequence[ArtifactCleanupManifestRecord],
+    ) -> MetadataCommitReconciliation[DocumentMutationCommitResult]:
+        await self._ensure_initialized()
+        candidate_manifests = _validated_document_mutation_manifests(manifests)
+        expected_generation_id = document_source_generation_id(
+            kb_id=kb_id,
+            kb_generation=kb_generation,
+            document_id=document_id,
+            job_id=job_id,
+            attempt_token=attempt_token,
+            source_hash=new_source_hash,
+        )
+        if new_source_generation_id != expected_generation_id:
+            raise ValueError("Document source generation id is not deterministic")
+        normalized_source_uri = normalize_artifact_target_uri(new_source_object_uri)
+        group_id = document_mutation_manifest_group_id(
+            "replace",
+            kb_id=kb_id,
+            kb_generation=kb_generation,
+            document_id=document_id,
+            job_id=job_id,
+            attempt_token=attempt_token,
+            snapshot_digest=expected_snapshot,
+        )
+        async with self._pool_or_raise().acquire() as conn:
+            async with conn.transaction(isolation="repeatable_read", readonly=True):
+                lifecycle_row = await conn.fetchrow(
+                    "SELECT * FROM enterprise_kb_lifecycle WHERE kb_id = $1",
+                    kb_id,
+                )
+                document_row = await conn.fetchrow(
+                    "SELECT data_json FROM kb_documents WHERE kb_id = $1 AND id = $2",
+                    kb_id,
+                    document_id,
+                )
+                job_row = await conn.fetchrow(
+                    "SELECT data_json FROM kb_jobs WHERE kb_id = $1 AND id = $2",
+                    kb_id,
+                    job_id,
+                )
+                artifact_rows = await conn.fetch(
+                    """
+                    SELECT data_json FROM kb_document_artifacts
+                    WHERE kb_id = $1 AND document_id = $2
+                    ORDER BY id ASC
+                    """,
+                    kb_id,
+                    document_id,
+                )
+                manifest_rows = await conn.fetch(
+                    """
+                    SELECT * FROM kb_artifact_cleanup_manifests
+                    WHERE manifest_group_id = $1
+                    ORDER BY id ASC
+                    """,
+                    group_id,
+                )
+                document = (
+                    _document_from_row(document_row)
+                    if document_row is not None
+                    else None
+                )
+                job = _job_from_row(job_row) if job_row is not None else None
+                if document is not None and job is not None and job.job_type == "sync":
+                    _assert_document_mutation_job(
+                        job,
+                        document,
+                        "replace",
+                        allowed_statuses=_DOCUMENT_MUTATION_RECONCILE_JOB_STATUSES,
+                        new_source_hash=new_source_hash,
+                    )
+        lifecycle = (
+            _kb_lifecycle_from_row(lifecycle_row) if lifecycle_row is not None else None
+        )
+        persisted = [_artifact_cleanup_manifest_from_row(row) for row in manifest_rows]
+        if document is not None:
+            try:
+                replay_group, candidate_manifests = (
+                    _validate_document_mutation_manifest_replay_input(
+                        document,
+                        candidate_manifests,
+                        operation="replace",
+                        kb_generation=kb_generation,
+                        job_id=job_id,
+                        attempt_token=attempt_token,
+                        expected_snapshot=expected_snapshot,
+                        new_source_object_uri=normalized_source_uri,
+                    )
+                )
+            except (MetadataStoreError, ValueError):
+                return MetadataCommitReconciliation(
+                    outcome=MetadataCommitOutcome.UNKNOWN,
+                    reason="replace_candidate_manifest_mismatch",
+                )
+            if replay_group != group_id:
+                return MetadataCommitReconciliation(
+                    outcome=MetadataCommitOutcome.UNKNOWN,
+                    reason="replace_candidate_group_mismatch",
+                )
+        return _reconcile_document_replace_state(
+            lifecycle,
+            document,
+            job,
+            [_artifact_from_row(row) for row in artifact_rows],
+            persisted,
+            candidate_manifests,
+            kb_id=kb_id,
+            document_id=document_id,
+            kb_generation=kb_generation,
+            job_id=job_id,
+            attempt_token=attempt_token,
+            expected_snapshot=expected_snapshot,
+            new_source_type=new_source_type,
+            new_source_name=new_source_name,
+            new_source_uri=new_source_uri,
+            new_source_hash=new_source_hash,
+            new_content_type=new_content_type,
+            new_size_bytes=new_size_bytes,
+            new_source_object_uri=normalized_source_uri,
+            new_source_generation_id=new_source_generation_id,
+            initial_dispositions={
+                str(row["id"]): str(row["initial_disposition"]) for row in manifest_rows
+            },
+            initial_audit_retain_until={
+                str(row["id"]): str(row["initial_audit_retain_until"])
+                for row in manifest_rows
+            },
+        )
+
+    async def reconcile_document_delete_cow_commit(
+        self,
+        kb_id: str,
+        document_id: str,
+        *,
+        kb_generation: str,
+        job_id: str,
+        attempt_token: str,
+        expected_snapshot: str,
+        manifests: Sequence[ArtifactCleanupManifestRecord],
+    ) -> MetadataCommitReconciliation[DocumentMutationCommitResult]:
+        await self._ensure_initialized()
+        candidate_manifests = _validated_document_mutation_manifests(manifests)
+        group_id = document_mutation_manifest_group_id(
+            "delete",
+            kb_id=kb_id,
+            kb_generation=kb_generation,
+            document_id=document_id,
+            job_id=job_id,
+            attempt_token=attempt_token,
+            snapshot_digest=expected_snapshot,
+        )
+        async with self._pool_or_raise().acquire() as conn:
+            async with conn.transaction(isolation="repeatable_read", readonly=True):
+                lifecycle_row = await conn.fetchrow(
+                    "SELECT * FROM enterprise_kb_lifecycle WHERE kb_id = $1",
+                    kb_id,
+                )
+                document_row = await conn.fetchrow(
+                    "SELECT data_json FROM kb_documents WHERE kb_id = $1 AND id = $2",
+                    kb_id,
+                    document_id,
+                )
+                job_row = await conn.fetchrow(
+                    "SELECT data_json FROM kb_jobs WHERE kb_id = $1 AND id = $2",
+                    kb_id,
+                    job_id,
+                )
+                artifact_rows = await conn.fetch(
+                    """
+                    SELECT data_json FROM kb_document_artifacts
+                    WHERE kb_id = $1 AND document_id = $2
+                    ORDER BY id ASC
+                    """,
+                    kb_id,
+                    document_id,
+                )
+                manifest_rows = await conn.fetch(
+                    """
+                    SELECT * FROM kb_artifact_cleanup_manifests
+                    WHERE manifest_group_id = $1
+                    ORDER BY id ASC
+                    """,
+                    group_id,
+                )
+        lifecycle = (
+            _kb_lifecycle_from_row(lifecycle_row) if lifecycle_row is not None else None
+        )
+        document = (
+            _document_from_row(document_row) if document_row is not None else None
+        )
+        job = _job_from_row(job_row) if job_row is not None else None
+        persisted = [_artifact_cleanup_manifest_from_row(row) for row in manifest_rows]
+        if document is not None:
+            try:
+                replay_group, candidate_manifests = (
+                    _validate_document_mutation_manifest_replay_input(
+                        document,
+                        candidate_manifests,
+                        operation="delete",
+                        kb_generation=kb_generation,
+                        job_id=job_id,
+                        attempt_token=attempt_token,
+                        expected_snapshot=expected_snapshot,
+                    )
+                )
+            except (MetadataStoreError, ValueError):
+                return MetadataCommitReconciliation(
+                    outcome=MetadataCommitOutcome.UNKNOWN,
+                    reason="delete_candidate_manifest_mismatch",
+                )
+            if replay_group != group_id:
+                return MetadataCommitReconciliation(
+                    outcome=MetadataCommitOutcome.UNKNOWN,
+                    reason="delete_candidate_group_mismatch",
+                )
+        return _reconcile_document_delete_state(
+            lifecycle,
+            document,
+            job,
+            [_artifact_from_row(row) for row in artifact_rows],
+            persisted,
+            candidate_manifests,
+            kb_id=kb_id,
+            document_id=document_id,
+            kb_generation=kb_generation,
+            job_id=job_id,
+            attempt_token=attempt_token,
+            expected_snapshot=expected_snapshot,
+            initial_dispositions={
+                str(row["id"]): str(row["initial_disposition"]) for row in manifest_rows
+            },
+            initial_audit_retain_until={
+                str(row["id"]): str(row["initial_audit_retain_until"])
+                for row in manifest_rows
+            },
+        )
+
     async def list_document_artifacts(
         self,
         kb_id: str,
@@ -1786,6 +5252,47 @@ class PostgresMetadataStore:
         if row is None:
             raise MetadataRecordNotFoundError(f"Artifact '{artifact_id}' not found")
         return _artifact_from_row(row)
+
+    async def get_document_and_artifacts_by_ids(
+        self,
+        kb_id: str,
+        document_id: str,
+        artifact_ids: Sequence[str],
+    ) -> tuple[DocumentRecord | None, dict[str, ArtifactRecord]]:
+        """Read one document and candidate artifacts from one snapshot."""
+
+        await self._ensure_initialized()
+        ordered_ids = list(dict.fromkeys(artifact_ids))
+        async with self._pool_or_raise().acquire() as conn:
+            async with conn.transaction(isolation="repeatable_read", readonly=True):
+                document_row = await conn.fetchrow(
+                    """
+                    SELECT data_json FROM kb_documents
+                    WHERE kb_id = $1 AND id = $2 AND deleted_at IS NULL
+                    """,
+                    kb_id,
+                    document_id,
+                )
+                artifact_rows = (
+                    await conn.fetch(
+                        """
+                        SELECT data_json FROM kb_document_artifacts
+                        WHERE kb_id = $1 AND id = ANY($2::text[])
+                        """,
+                        kb_id,
+                        ordered_ids,
+                    )
+                    if ordered_ids
+                    else []
+                )
+        document = (
+            _document_from_row(document_row) if document_row is not None else None
+        )
+        artifacts = {
+            artifact.id: artifact
+            for artifact in (_artifact_from_row(row) for row in artifact_rows)
+        }
+        return document, artifacts
 
     async def aggregate_control_plane_stats(
         self, kb_id: str | None = None
@@ -1905,6 +5412,33 @@ class PostgresMetadataStore:
             )
         return int(value or 0)
 
+    async def count_active_jobs_globally(self, statuses: Sequence[str]) -> int:
+        """Count jobs in any of ``statuses`` across ALL KBs (unscoped).
+
+        Migration apply is multi-KB and rewrites document pointers/artifact
+        attachments: it must not race with ANY concurrent mutation job in the
+        store. Unlike :meth:`count_active_jobs_for_principal` /
+        :meth:`count_active_jobs_for_tenant`, this query deliberately omits a
+        ``kb_id`` predicate (rows with NULL ``kb_id`` are counted too) so that
+        any active job — local or global — is treated as a mutation risk.
+
+        Raises ``ValueError`` when ``statuses`` is empty or contains a
+        non-string, since a malformed query would silently under-count and
+        defeat the online-mutation guard.
+        """
+        if not statuses:
+            raise ValueError("statuses must be a non-empty sequence")
+        for value in statuses:
+            if not isinstance(value, str):
+                raise ValueError("statuses must contain only strings")
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            value = await conn.fetchval(
+                "SELECT COUNT(*) FROM kb_jobs WHERE status = ANY($1::text[])",
+                list(statuses),
+            )
+        return int(value or 0)
+
     async def create_job(self, job: JobRecord) -> JobRecord:
         created_job, _created = await self.create_job_once(job)
         return created_job
@@ -1955,7 +5489,9 @@ class PostgresMetadataStore:
             clauses.append(f"status = ANY(${len(params)}::text[])")
         where = " AND ".join(clauses)
         async with self._pool_or_raise().acquire() as conn:
-            total = await conn.fetchval(f"SELECT COUNT(*) FROM kb_jobs WHERE {where}", *params)
+            total = await conn.fetchval(
+                f"SELECT COUNT(*) FROM kb_jobs WHERE {where}", *params
+            )
             rows = await conn.fetch(
                 f"""
                 SELECT data_json FROM kb_jobs
@@ -3075,9 +6611,7 @@ class PostgresMetadataStore:
             )
         return [_chat_message_from_row(row) for row in rows]
 
-    async def record_chat_memory_episode(
-        self, record: ChatMemoryEpisodeRecord
-    ) -> None:
+    async def record_chat_memory_episode(self, record: ChatMemoryEpisodeRecord) -> None:
         await self._ensure_initialized()
 
         async def write(conn: Any) -> None:
@@ -3172,9 +6706,7 @@ class PostgresMetadataStore:
             )
         return [_chat_memory_episode_from_row(row) for row in rows]
 
-    async def delete_chat_memory_episodes(
-        self, episode_uuids: Sequence[str]
-    ) -> int:
+    async def delete_chat_memory_episodes(self, episode_uuids: Sequence[str]) -> int:
         ids = [uuid for uuid in episode_uuids if uuid]
         if not ids:
             return 0
@@ -3393,13 +6925,14 @@ class PostgresMetadataStore:
                 )
                 assert group is not None
 
-            event_seq, reference_value = (
-                await self._allocate_postgres_chat_memory_event_seq(
-                    conn,
-                    head.user_id,
-                    head.project_id,
-                    allocate_reference_time=True,
-                )
+            (
+                event_seq,
+                reference_value,
+            ) = await self._allocate_postgres_chat_memory_event_seq(
+                conn,
+                head.user_id,
+                head.project_id,
+                allocate_reference_time=True,
             )
             assert reference_value is not None
             reference_time = str(_iso_timestamp(reference_value))
@@ -3758,9 +7291,7 @@ class PostgresMetadataStore:
                 else None
             ),
             active_config_fingerprint=row["active_config_fingerprint"],
-            active_graph_store_fingerprint=row[
-                "active_graph_store_fingerprint"
-            ],
+            active_graph_store_fingerprint=row["active_graph_store_fingerprint"],
             graph_group_id=row["graph_group_id"],
             generation_state=(
                 str(row["generation_state"])  # type: ignore[arg-type]
@@ -4170,7 +7701,10 @@ class PostgresMetadataStore:
                     expected={"event_type": "rebuild"},
                     current={"event_type": event.event_type},
                 )
-            if state.group.state != "rebuilding" or state.generation.state != "building":
+            if (
+                state.group.state != "rebuilding"
+                or state.generation.state != "building"
+            ):
                 raise MetadataConflictError(
                     "chat_memory_rebuild",
                     event_id,
@@ -4197,9 +7731,7 @@ class PostgresMetadataStore:
                     "chat_memory_event",
                     event_id,
                     expected={"side_effect_started_at": None},
-                    current={
-                        "side_effect_started_at": event.side_effect_started_at
-                    },
+                    current={"side_effect_started_at": event.side_effect_started_at},
                 )
 
             cutoff = (
@@ -4290,7 +7822,10 @@ class PostgresMetadataStore:
                         "chat_memory_event",
                         event_id,
                         expected={"status": "running", "claim_token": claim_token},
-                        current={"status": event.status, "claim_token": event.claim_token},
+                        current={
+                            "status": event.status,
+                            "claim_token": event.claim_token,
+                        },
                     )
                 await conn.execute(
                     """
@@ -4496,9 +8031,7 @@ class PostgresMetadataStore:
                     "chat_memory_event",
                     event_id,
                     expected={"side_effect_started_at": None},
-                    current={
-                        "side_effect_started_at": event.side_effect_started_at
-                    },
+                    current={"side_effect_started_at": event.side_effect_started_at},
                 )
             await self._assert_postgres_chat_memory_graph_store_invariant(
                 conn, state.group, graph_fingerprint
@@ -4611,8 +8144,7 @@ class PostgresMetadataStore:
             try:
                 if wait:
                     await conn.execute(
-                        "SELECT pg_advisory_lock("
-                        "hashtextextended($1, 1263295564))",
+                        "SELECT pg_advisory_lock(hashtextextended($1, 1263295564))",
                         logical_group_id,
                     )
                     locked = True
@@ -4629,8 +8161,7 @@ class PostgresMetadataStore:
                 if locked:
                     await self._unlock_operation_guard(
                         conn,
-                        "SELECT pg_advisory_unlock("
-                        "hashtextextended($1, 1263295564))",
+                        "SELECT pg_advisory_unlock(hashtextextended($1, 1263295564))",
                         logical_group_id,
                     )
 
@@ -4759,7 +8290,9 @@ class PostgresMetadataStore:
                 or event.first_seq is None
                 or event.last_seq is None
             ):
-                raise MetadataStoreError("Ingest event is missing source batch identity")
+                raise MetadataStoreError(
+                    "Ingest event is missing source batch identity"
+                )
             control_time = await conn.fetchval("SELECT clock_timestamp()")
             expected_mapping = ChatMemoryEpisodeRecord(
                 episode_uuid=episode_uuid,
@@ -4907,7 +8440,9 @@ class PostgresMetadataStore:
                 or event.first_seq is None
                 or event.last_seq is None
             ):
-                raise MetadataStoreError("Ingest event is missing source batch identity")
+                raise MetadataStoreError(
+                    "Ingest event is missing source batch identity"
+                )
 
             source_rows = await conn.fetch(
                 """
@@ -4922,9 +8457,7 @@ class PostgresMetadataStore:
                 event.project_id,
                 event.event_seq,
             )
-            source_messages = [
-                _chat_message_from_row(row) for row in source_rows
-            ]
+            source_messages = [_chat_message_from_row(row) for row in source_rows]
             _validate_chat_memory_ingest_source_batch(event, source_messages)
             eligible_payload = _chat_memory_canonical_episode_payload(
                 source_messages,
@@ -5149,8 +8682,8 @@ class PostgresMetadataStore:
                     expected={"identity": expected_target_identity},
                     current={"identity": current_target_identity},
                 )
-            authoritative_targets = (
-                await self._postgres_chat_memory_rebuild_group_ids(conn, event)
+            authoritative_targets = await self._postgres_chat_memory_rebuild_group_ids(
+                conn, event
             )
             if normalized_targets != authoritative_targets:
                 raise MetadataConflictError(
@@ -5220,9 +8753,9 @@ class PostgresMetadataStore:
                 event.snapshot_digest,
                 state.generation.snapshot_digest,
             )
-            if (
-                snapshot.snapshot_digest != invocation_digest
-                or persisted_digests != (invocation_digest, invocation_digest)
+            if snapshot.snapshot_digest != invocation_digest or persisted_digests != (
+                invocation_digest,
+                invocation_digest,
             ):
                 raise MetadataConflictError(
                     "chat_memory_rebuild_snapshot",
@@ -5237,9 +8770,7 @@ class PostgresMetadataStore:
             batch_count, message_count, byte_count = (
                 _chat_memory_replay_snapshot_metrics(snapshot.replay_batches)
             )
-            event_seqs = [
-                batch.project_event_seq for batch in snapshot.replay_batches
-            ]
+            event_seqs = [batch.project_event_seq for batch in snapshot.replay_batches]
             if event_seqs != sorted(set(event_seqs)) or any(
                 event_seq > snapshot.snapshot_cutoff for event_seq in event_seqs
             ):
@@ -5284,14 +8815,16 @@ class PostgresMetadataStore:
             batches_by_key: dict[tuple[str, int], ChatMemoryReplayBatch] = {}
             for batch in snapshot.replay_batches:
                 if not batch.messages:
-                    raise MetadataStoreError("Chat Memory replay batches cannot be empty")
+                    raise MetadataStoreError(
+                        "Chat Memory replay batches cannot be empty"
+                    )
                 key = (batch.append_batch_id, batch.project_event_seq)
                 if key in batches_by_key:
-                    raise MetadataStoreError("Duplicate Chat Memory replay batch identity")
+                    raise MetadataStoreError(
+                        "Duplicate Chat Memory replay batch identity"
+                    )
                 batches_by_key[key] = batch
-            mappings_by_key: dict[
-                tuple[str, int], ChatMemoryReplayMappingInput
-            ] = {}
+            mappings_by_key: dict[tuple[str, int], ChatMemoryReplayMappingInput] = {}
             episode_uuids: set[str] = set()
             for mapping in replay_mappings:
                 key = (mapping.append_batch_id, int(mapping.project_event_seq))
@@ -5597,19 +9130,17 @@ class PostgresMetadataStore:
         graph_fingerprint = _resolve_chat_memory_graph_store_fingerprint(
             fingerprint, runtime_graph_store_fingerprint
         )
-        target_record = targets if isinstance(targets, ChatMemoryPurgeTargetSet) else None
+        target_record = (
+            targets if isinstance(targets, ChatMemoryPurgeTargetSet) else None
+        )
         positional_expected: Sequence[str] | None = (
             targets
-            if targets is not None
-            and not isinstance(targets, ChatMemoryPurgeTargetSet)
+            if targets is not None and not isinstance(targets, ChatMemoryPurgeTargetSet)
             else None
         )
         if positional_expected is not None and expected_group_ids is not None:
             raise ValueError("Specify purge expected group ids only once")
-        if (
-            definitely_cleared_group_ids is not None
-            and cleared_group_ids is not None
-        ):
+        if definitely_cleared_group_ids is not None and cleared_group_ids is not None:
             raise ValueError("Specify definitely cleared group ids only once")
         caller_expected = (
             target_record.group_ids
@@ -5709,12 +9240,10 @@ class PostgresMetadataStore:
                         current={"identity": current_identity},
                     )
 
-            authoritative_expected = (
-                await self._postgres_chat_memory_purge_group_ids(
-                    conn,
-                    event.user_id,
-                    event.project_id,
-                )
+            authoritative_expected = await self._postgres_chat_memory_purge_group_ids(
+                conn,
+                event.user_id,
+                event.project_id,
             )
             if (
                 normalized_expected is not None
@@ -5726,9 +9255,7 @@ class PostgresMetadataStore:
                     expected={"group_ids": authoritative_expected},
                     current={"group_ids": normalized_expected},
                 )
-            missing = sorted(
-                set(authoritative_expected).difference(normalized_cleared)
-            )
+            missing = sorted(set(authoritative_expected).difference(normalized_cleared))
             if missing:
                 raise MetadataConflictError(
                     "chat_memory_purge_clear",
@@ -5876,8 +9403,7 @@ class PostgresMetadataStore:
                     },
                 )
             dead_letter = (
-                retry_delay_seconds is None
-                or state.event.attempt_no >= max_attempts
+                retry_delay_seconds is None or state.event.attempt_no >= max_attempts
             )
             delay = max(0.0, float(retry_delay_seconds or 0.0))
             status: ChatMemoryEventStatus = (
@@ -6045,8 +9571,7 @@ class PostgresMetadataStore:
                     },
                 )
             dead_letter = (
-                retry_delay_seconds is None
-                or state.event.attempt_no >= max_attempts
+                retry_delay_seconds is None or state.event.attempt_no >= max_attempts
             )
             status: ChatMemoryEventStatus = (
                 "dead_letter" if dead_letter else "retry_wait"
@@ -6153,9 +9678,7 @@ class PostgresMetadataStore:
                             event.graph_store_fingerprint
                         )
                     },
-                    current={
-                        "runtime_graph_store_fingerprint": graph_fingerprint
-                    },
+                    current={"runtime_graph_store_fingerprint": graph_fingerprint},
                 )
             if event.side_effect_started_at is None:
                 raise MetadataConflictError(
@@ -6462,9 +9985,7 @@ class PostgresMetadataStore:
             raise MetadataRecordNotFoundError(
                 f"Chat Memory event '{event_id}' not found"
             )
-        logical_group_id = chat_memory_logical_group_id(
-            event.user_id, event.project_id
-        )
+        logical_group_id = chat_memory_logical_group_id(event.user_id, event.project_id)
         async with self.chat_memory_group_execution_guard(
             logical_group_id, wait=False
         ) as acquired:
@@ -6493,9 +10014,7 @@ class PostgresMetadataStore:
                     event_id,
                     claim_token,
                     runtime_fingerprint,
-                    runtime_graph_store_fingerprint=(
-                        runtime_graph_store_fingerprint
-                    ),
+                    runtime_graph_store_fingerprint=(runtime_graph_store_fingerprint),
                     retry_delay_seconds=retry_delay_seconds,
                     error_code=error_code,
                     error_message=error_message,
@@ -6505,9 +10024,7 @@ class PostgresMetadataStore:
                     event_id,
                     claim_token,
                     runtime_fingerprint,
-                    runtime_graph_store_fingerprint=(
-                        runtime_graph_store_fingerprint
-                    ),
+                    runtime_graph_store_fingerprint=(runtime_graph_store_fingerprint),
                     error_code=error_code,
                     error_message=error_message,
                     retry_delay_seconds=retry_delay_seconds,
@@ -6677,12 +10194,9 @@ class PostgresMetadataStore:
         runtime_fingerprint: str,
         runtime_graph_store_fingerprint: str,
     ) -> bool:
-        return (
-            event.graph_store_fingerprint == runtime_graph_store_fingerprint
-            and (
-                event.event_type == "purge"
-                or event.config_fingerprint == runtime_fingerprint
-            )
+        return event.graph_store_fingerprint == runtime_graph_store_fingerprint and (
+            event.event_type == "purge"
+            or event.config_fingerprint == runtime_fingerprint
         )
 
     async def _resolve_postgres_stale_chat_memory_execution(
@@ -6822,9 +10336,7 @@ class PostgresMetadataStore:
             "generation_fingerprint": runtime_fingerprint,
             "desired_fingerprint": runtime_fingerprint,
             "event_graph_store_fingerprint": runtime_graph_store_fingerprint,
-            "generation_graph_store_fingerprint": (
-                runtime_graph_store_fingerprint
-            ),
+            "generation_graph_store_fingerprint": (runtime_graph_store_fingerprint),
             "desired_graph_store_fingerprint": runtime_graph_store_fingerprint,
             "graph_group_id": event.graph_group_id,
         }
@@ -6834,30 +10346,21 @@ class PostgresMetadataStore:
             "generation_fingerprint": generation.config_fingerprint,
             "desired_fingerprint": group.desired_config_fingerprint,
             "event_graph_store_fingerprint": event.graph_store_fingerprint,
-            "generation_graph_store_fingerprint": (
-                generation.graph_store_fingerprint
-            ),
-            "desired_graph_store_fingerprint": (
-                group.desired_graph_store_fingerprint
-            ),
+            "generation_graph_store_fingerprint": (generation.graph_store_fingerprint),
+            "desired_graph_store_fingerprint": (group.desired_graph_store_fingerprint),
             "graph_group_id": generation.graph_group_id,
         }
-        extraction_fingerprints_match = (
-            event.event_type == "purge"
-            or (
-                event.config_fingerprint == runtime_fingerprint
-                and generation.config_fingerprint == runtime_fingerprint
-                and group.desired_config_fingerprint == runtime_fingerprint
-            )
+        extraction_fingerprints_match = event.event_type == "purge" or (
+            event.config_fingerprint == runtime_fingerprint
+            and generation.config_fingerprint == runtime_fingerprint
+            and group.desired_config_fingerprint == runtime_fingerprint
         )
         if (
             group.desired_generation != event.generation
             or not extraction_fingerprints_match
             or event.graph_store_fingerprint != runtime_graph_store_fingerprint
-            or generation.graph_store_fingerprint
-            != runtime_graph_store_fingerprint
-            or group.desired_graph_store_fingerprint
-            != runtime_graph_store_fingerprint
+            or generation.graph_store_fingerprint != runtime_graph_store_fingerprint
+            or group.desired_graph_store_fingerprint != runtime_graph_store_fingerprint
             or generation.graph_group_id != event.graph_group_id
         ):
             raise MetadataConflictError(
@@ -7018,9 +10521,7 @@ class PostgresMetadataStore:
             user_id,
             project_id,
         )
-        return tuple(
-            sorted({str(row["graph_store_fingerprint"]) for row in rows})
-        )
+        return tuple(sorted({str(row["graph_store_fingerprint"]) for row in rows}))
 
     async def _assert_postgres_chat_memory_graph_store_invariant(
         self,
@@ -7028,9 +10529,7 @@ class PostgresMetadataStore:
         group: ChatMemoryGroupRecord,
         required_graph_store_fingerprint: str,
     ) -> None:
-        required = _validate_chat_memory_fingerprint(
-            required_graph_store_fingerprint
-        )
+        required = _validate_chat_memory_fingerprint(required_graph_store_fingerprint)
         observed = await self._postgres_chat_memory_graph_store_fingerprints(
             conn, group.user_id, group.project_id
         )
@@ -7551,10 +11050,8 @@ class PostgresMetadataStore:
                 generation_state="purge_pending",
             )
         else:
-            graph_store_fingerprint = (
-                _chat_memory_existing_graph_store_fingerprint(
-                    group, graph_store_fingerprint
-                )
+            graph_store_fingerprint = _chat_memory_existing_graph_store_fingerprint(
+                group, graph_store_fingerprint
             )
         generation_rows = await conn.fetch(
             """
@@ -7770,9 +11267,7 @@ class PostgresMetadataStore:
         await self._ensure_initialized()
 
         async def write(conn: Any) -> KBLifecycleRecord | None:
-            return await self._assert_kb_generation(
-                conn, kb_id, expected_generation
-            )
+            return await self._assert_kb_generation(conn, kb_id, expected_generation)
 
         return await self._write(write)
 
@@ -7803,8 +11298,7 @@ class PostgresMetadataStore:
             try:
                 if wait:
                     await conn.execute(
-                        "SELECT pg_advisory_lock("
-                        "hashtextextended($1, 1263295563))",
+                        "SELECT pg_advisory_lock(hashtextextended($1, 1263295563))",
                         job_id,
                     )
                     locked = True
@@ -7821,8 +11315,7 @@ class PostgresMetadataStore:
                 if locked:
                     await self._unlock_operation_guard(
                         conn,
-                        "SELECT pg_advisory_unlock("
-                        "hashtextextended($1, 1263295563))",
+                        "SELECT pg_advisory_unlock(hashtextextended($1, 1263295563))",
                         job_id,
                     )
 
@@ -7841,9 +11334,7 @@ class PostgresMetadataStore:
         # Reject a deletion that has already committed without queueing behind
         # its exclusive session lock; assert again after acquiring to close the
         # preflight race.
-        preflight_current = await self.assert_kb_generation(
-            kb_id, expected_generation
-        )
+        preflight_current = await self.assert_kb_generation(kb_id, expected_generation)
         guard_key = (kb_id, expected_generation)
         inherited_states = _OPERATION_SESSION_STATES.get() or {}
         inherited_state = inherited_states.get(id(self))
@@ -7901,8 +11392,7 @@ class PostgresMetadataStore:
             locked = False
             try:
                 await conn.execute(
-                    "SELECT pg_advisory_lock_shared("
-                    "hashtextextended($1, 1263295562))",
+                    "SELECT pg_advisory_lock_shared(hashtextextended($1, 1263295562))",
                     kb_id,
                 )
                 locked = True
@@ -7950,8 +11440,7 @@ class PostgresMetadataStore:
             locked = False
             try:
                 await conn.execute(
-                    "SELECT pg_advisory_lock("
-                    "hashtextextended($1, 1263295562))",
+                    "SELECT pg_advisory_lock(hashtextextended($1, 1263295562))",
                     kb_id,
                 )
                 locked = True
@@ -7960,8 +11449,7 @@ class PostgresMetadataStore:
                 if locked:
                     await self._unlock_operation_guard(
                         conn,
-                        "SELECT pg_advisory_unlock("
-                        "hashtextextended($1, 1263295562))",
+                        "SELECT pg_advisory_unlock(hashtextextended($1, 1263295562))",
                         kb_id,
                     )
 
@@ -8228,9 +11716,7 @@ class PostgresMetadataStore:
                 "SELECT data_json FROM enterprise_invitations WHERE id = $1", record.id
             )
             if row is None:
-                raise MetadataRecordNotFoundError(
-                    f"Invitation '{record.id}' not found"
-                )
+                raise MetadataRecordNotFoundError(f"Invitation '{record.id}' not found")
             return _enterprise_invitation_from_row(row)
 
         return await self._write(write)
@@ -8348,9 +11834,7 @@ class PostgresMetadataStore:
     # docs/多账号身份关联与切换执行文档.md sections 4 and 7.2.
     # ------------------------------------------------------------------
 
-    async def get_person_by_id(
-        self, person_id: str
-    ) -> EnterprisePersonRecord | None:
+    async def get_person_by_id(self, person_id: str) -> EnterprisePersonRecord | None:
         await self._ensure_initialized()
         async with self._pool_or_raise().acquire() as conn:
             row = await conn.fetchrow(
@@ -8564,9 +12048,7 @@ class PostgresMetadataStore:
                 "WHERE token_hash = $1",
                 token_hash,
             )
-        return (
-            _person_enrollment_grant_from_row(row) if row is not None else None
-        )
+        return _person_enrollment_grant_from_row(row) if row is not None else None
 
     async def get_person_enrollment_grant(
         self, grant_id: str
@@ -8577,9 +12059,7 @@ class PostgresMetadataStore:
                 "SELECT * FROM enterprise_person_enrollment_grants WHERE id = $1",
                 grant_id,
             )
-        return (
-            _person_enrollment_grant_from_row(row) if row is not None else None
-        )
+        return _person_enrollment_grant_from_row(row) if row is not None else None
 
     async def _postgres_revoke_person_sessions_locked(
         self,
@@ -9070,7 +12550,7 @@ class PostgresMetadataStore:
             if session.active_account_id:
                 acct_row = await conn.fetchrow(
                     "SELECT COALESCE((data_json->>'token_version')::int, 0) "
-                "AS token_version FROM enterprise_users WHERE id = $1",
+                    "AS token_version FROM enterprise_users WHERE id = $1",
                     session.active_account_id,
                 )
                 if acct_row is not None:
@@ -9244,9 +12724,7 @@ class PostgresMetadataStore:
                 person_id,
             )
             if prow is None:
-                raise MetadataRecordNotFoundError(
-                    f"Person '{person_id}' not found"
-                )
+                raise MetadataRecordNotFoundError(f"Person '{person_id}' not found")
             current_person = _person_from_row(prow)
             if current_person.status != "active":
                 raise MetadataConflictError(
@@ -9350,9 +12828,7 @@ class PostgresMetadataStore:
                 person_id,
             )
             if prow is None:
-                raise MetadataRecordNotFoundError(
-                    f"Person '{person_id}' not found"
-                )
+                raise MetadataRecordNotFoundError(f"Person '{person_id}' not found")
             current_person = _person_from_row(prow)
             new_epoch = current_person.auth_epoch + 1
             await conn.execute(
@@ -9414,9 +12890,7 @@ class PostgresMetadataStore:
                 person_id,
             )
             if prow is None:
-                raise MetadataRecordNotFoundError(
-                    f"Person '{person_id}' not found"
-                )
+                raise MetadataRecordNotFoundError(f"Person '{person_id}' not found")
             await conn.execute(
                 "UPDATE enterprise_persons SET status = 'active', "
                 "updated_at = $2 WHERE id = $1",
@@ -9555,9 +13029,7 @@ class PostgresMetadataStore:
                 person_id,
             )
             if prow is None:
-                raise MetadataRecordNotFoundError(
-                    f"Person '{person_id}' not found"
-                )
+                raise MetadataRecordNotFoundError(f"Person '{person_id}' not found")
             current_person = _person_from_row(prow)
             if current_person.status != "active":
                 raise MetadataConflictError(
@@ -9690,9 +13162,7 @@ class PostgresMetadataStore:
                 account_id,
             )
             if lrow is None:
-                raise MetadataRecordNotFoundError(
-                    "Person-account link not found"
-                )
+                raise MetadataRecordNotFoundError("Person-account link not found")
             current_link = _person_account_link_from_row(lrow)
             if current_link.status != "active":
                 revoked_sessions = 0
@@ -9781,11 +13251,7 @@ class PostgresMetadataStore:
                     "SELECT * FROM enterprise_person_login_sessions WHERE id = $1",
                     session_id,
                 )
-                return (
-                    _person_login_session_from_row(row)
-                    if row is not None
-                    else None
-                )
+                return _person_login_session_from_row(row) if row is not None else None
             await _insert_audit_event(
                 conn,
                 AuditEventRecord(
@@ -9825,9 +13291,7 @@ class PostgresMetadataStore:
                 person_id,
             )
             if prow is None:
-                raise MetadataRecordNotFoundError(
-                    f"Person '{person_id}' not found"
-                )
+                raise MetadataRecordNotFoundError(f"Person '{person_id}' not found")
             current_person = _person_from_row(prow)
             new_epoch = current_person.auth_epoch + 1
             await conn.execute(
@@ -10392,16 +13856,17 @@ class PostgresMetadataStore:
                     "updated_at": membership.updated_at,
                 }
             )
-            _saved_user, saved_membership = (
-                await self._upsert_enterprise_user_with_membership(
-                    conn,
-                    updated_user,
-                    membership=membership,
-                    expected_updated_at=user.updated_at,
-                    expected_token_version=user.token_version,
-                    expected_tenant_id=user.tenant_id,
-                    allow_tenant_change=True,
-                )
+            (
+                _saved_user,
+                saved_membership,
+            ) = await self._upsert_enterprise_user_with_membership(
+                conn,
+                updated_user,
+                membership=membership,
+                expected_updated_at=user.updated_at,
+                expected_token_version=user.token_version,
+                expected_tenant_id=user.tenant_id,
+                allow_tenant_change=True,
             )
             if saved_membership is None:
                 raise MetadataStoreError("Canonical membership was not saved")
@@ -10591,9 +14056,7 @@ class PostgresMetadataStore:
 
         return await self._write(write)
 
-    async def list_kb_tenant_acl(
-        self, kb_id: str
-    ) -> list[EnterpriseTenantKBACLRecord]:
+    async def list_kb_tenant_acl(self, kb_id: str) -> list[EnterpriseTenantKBACLRecord]:
         await self._ensure_initialized()
         async with self._pool_or_raise().acquire() as conn:
             rows = await conn.fetch(
@@ -10720,9 +14183,7 @@ class PostgresMetadataStore:
         await self._ensure_initialized()
 
         async def write(conn: Any) -> EnterpriseTenantUserKBOverrideRecord:
-            await self._assert_kb_generation(
-                conn, record.kb_id, expected_generation
-            )
+            await self._assert_kb_generation(conn, record.kb_id, expected_generation)
             user_row = await conn.fetchrow(
                 """
                 SELECT id, username, status, tenant_id, created_at, updated_at,
@@ -10903,9 +14364,7 @@ class PostgresMetadataStore:
 
         return await self._write(write)
 
-    async def append_audit_event(
-        self, event: AuditEventRecord
-    ) -> AuditEventRecord:
+    async def append_audit_event(self, event: AuditEventRecord) -> AuditEventRecord:
         await self._ensure_initialized()
 
         async def write(conn: Any) -> AuditEventRecord:
@@ -10930,9 +14389,7 @@ class PostgresMetadataStore:
                 event.id,
             )
             if row is None:
-                raise MetadataRecordNotFoundError(
-                    f"Audit event '{event.id}' not found"
-                )
+                raise MetadataRecordNotFoundError(f"Audit event '{event.id}' not found")
             return _audit_event_from_row(row)
 
         return await self._write(write)
@@ -11052,8 +14509,7 @@ class PostgresMetadataStore:
                 legacy_retry = (
                     generation is None
                     and lifecycle.state == "deleted"
-                    and lifecycle.generation
-                    == f"{_LEGACY_KB_TOMBSTONE_PREFIX}{kb_id}"
+                    and lifecycle.generation == f"{_LEGACY_KB_TOMBSTONE_PREFIX}{kb_id}"
                 )
                 if not legacy_retry and generation != lifecycle.generation:
                     raise _kb_lifecycle_conflict(kb_id, generation, lifecycle)
@@ -11099,9 +14555,7 @@ class PostgresMetadataStore:
                 key_data = _loads_json_object(key_row["data_json"])
                 scopes = key_data.get("scopes", {})
                 if not isinstance(scopes, dict):
-                    raise MetadataStoreError(
-                        "Service API key scopes must be an object"
-                    )
+                    raise MetadataStoreError("Service API key scopes must be an object")
                 kb_roles = scopes.get("kb_roles", {})
                 if not isinstance(kb_roles, dict):
                     raise MetadataStoreError(
@@ -11139,10 +14593,15 @@ class PostgresMetadataStore:
                     "enterprise_tenant_user_kb_overrides",
                     "enterprise_tenant_user_kb_overrides",
                 ),
-                ("enterprise_user_kb_query_settings", "enterprise_user_kb_query_settings"),
+                (
+                    "enterprise_user_kb_query_settings",
+                    "enterprise_user_kb_query_settings",
+                ),
                 ("kb_config_versions", "kb_config_versions"),
             ):
-                status = await conn.execute(f"DELETE FROM {table} WHERE kb_id = $1", kb_id)
+                status = await conn.execute(
+                    f"DELETE FROM {table} WHERE kb_id = $1", kb_id
+                )
                 counts[label] = _rowcount(status)
             if delete_job_id is None:
                 jobs_status = await conn.execute(
@@ -11194,12 +14653,9 @@ class PostgresMetadataStore:
             updated: list[JobRecord] = []
             for row in rows:
                 job = _job_from_row(row)
-                if (
-                    job.job_type in resumable
-                    and (
-                        job.document_id is not None
-                        or job.job_type in _AGGREGATE_RESUMABLE_JOB_TYPES
-                    )
+                if job.job_type in resumable and (
+                    job.document_id is not None
+                    or job.job_type in _AGGREGATE_RESUMABLE_JOB_TYPES
                 ):
                     continue
                 job.status = "failed"
@@ -11233,9 +14689,7 @@ class PostgresMetadataStore:
         candidates = [_job_from_row(row) for row in rows]
 
         for candidate in candidates:
-            async with self.job_execution_guard(
-                candidate.id, wait=False
-            ) as acquired:
+            async with self.job_execution_guard(candidate.id, wait=False) as acquired:
                 if not acquired:
                     continue
 
@@ -11344,7 +14798,10 @@ class PostgresMetadataStore:
             return None
 
         async def write(conn: Any) -> JobRecord | None:
-            params: list[Any] = [list(job_types), sorted(_AGGREGATE_RESUMABLE_JOB_TYPES)]
+            params: list[Any] = [
+                list(job_types),
+                sorted(_AGGREGATE_RESUMABLE_JOB_TYPES),
+            ]
             max_filter = ""
             if max_queued_at is not None:
                 params.append(max_queued_at)
@@ -11419,9 +14876,7 @@ class PostgresMetadataStore:
             user.id,
         )
         current_user = (
-            _enterprise_user_from_row(current_row)
-            if current_row is not None
-            else None
+            _enterprise_user_from_row(current_row) if current_row is not None else None
         )
         _assert_enterprise_user_write_preconditions(
             user,
@@ -11464,13 +14919,16 @@ class PostgresMetadataStore:
 
         selected_membership = membership
         if canonical_tenant is not None and selected_membership is None:
-            selected_membership = existing_membership or EnterpriseTenantMembershipRecord(
-                tenant_id=canonical_tenant,
-                user_id=user.id,
-                role="tenant_member",
-                granted_by=None,
-                created_at=user.updated_at,
-                updated_at=user.updated_at,
+            selected_membership = (
+                existing_membership
+                or EnterpriseTenantMembershipRecord(
+                    tenant_id=canonical_tenant,
+                    user_id=user.id,
+                    role="tenant_member",
+                    granted_by=None,
+                    created_at=user.updated_at,
+                    updated_at=user.updated_at,
+                )
             )
         elif selected_membership is not None and existing_membership is not None:
             selected_membership = EnterpriseTenantMembershipRecord(
@@ -12659,6 +16117,285 @@ class PostgresMetadataStore:
                 ON enterprise_person_kb_shares (target_tenant_id, status);
             """
         )
+        # Artifact lifecycle authority has no document/job/artifact foreign
+        # keys. Cleanup manifests must outlive document deletion and KB purge.
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kb_artifact_cleanup_manifests (
+                id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                manifest_group_id TEXT NOT NULL,
+                kb_id TEXT NOT NULL,
+                kb_generation TEXT NOT NULL,
+                workspace TEXT NOT NULL,
+                reason TEXT NOT NULL CHECK (reason IN (
+                    'replace', 'document_delete', 'kb_delete', 'staging_terminal',
+                    'migration_compensation', 'orphan_reconcile'
+                )),
+                target_kind TEXT NOT NULL CHECK (target_kind IN ('object', 'prefix')),
+                target_namespace TEXT NOT NULL CHECK (target_namespace IN (
+                    'source', 'legacy_source', 'artifact', 'staging', 'workspace'
+                )),
+                initial_disposition TEXT NOT NULL CHECK (
+                    initial_disposition IN ('delete', 'retain')
+                ),
+                initial_audit_retain_until TEXT NOT NULL,
+                disposition TEXT NOT NULL CHECK (disposition IN ('delete', 'retain')),
+                status TEXT NOT NULL CHECK (status IN (
+                    'retained', 'pending', 'leased', 'blocked', 'succeeded'
+                )),
+                target_uri TEXT NOT NULL,
+                delete_after TEXT NOT NULL,
+                cleanup_deadline_at TEXT NOT NULL,
+                audit_retain_until TEXT NOT NULL,
+                next_attempt_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                document_id TEXT,
+                artifact_id TEXT,
+                source_generation_id TEXT,
+                origin_job_id TEXT,
+                origin_attempt_token TEXT,
+                expected_checksum TEXT,
+                expected_etag TEXT,
+                expected_version_id TEXT,
+                expected_size_bytes BIGINT,
+                attempt_count BIGINT NOT NULL DEFAULT 0,
+                lease_owner TEXT,
+                lease_token TEXT,
+                lease_expires_at TEXT,
+                last_error_code TEXT,
+                last_checked_at TEXT,
+                completed_at TEXT,
+                CHECK (attempt_count >= 0),
+                CHECK (expected_size_bytes IS NULL OR expected_size_bytes >= 0),
+                CHECK (
+                    (status = 'leased' AND lease_owner IS NOT NULL
+                        AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+                    OR
+                    (status <> 'leased' AND lease_owner IS NULL
+                        AND lease_token IS NULL AND lease_expires_at IS NULL)
+                ),
+                CHECK (
+                    (status = 'retained' AND disposition = 'retain')
+                    OR (status <> 'retained' AND disposition = 'delete')
+                ),
+                CHECK (
+                    (status = 'succeeded' AND completed_at IS NOT NULL
+                        AND last_checked_at IS NOT NULL)
+                    OR (status <> 'succeeded' AND completed_at IS NULL)
+                )
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_kb_artifact_cleanup_manifest_lease_token
+                ON kb_artifact_cleanup_manifests (lease_token)
+                WHERE lease_token IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_cleanup_manifest_due
+                ON kb_artifact_cleanup_manifests (
+                    status, next_attempt_at, delete_after, created_at, id
+                ) WHERE status = 'pending';
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_cleanup_manifest_lease_expiry
+                ON kb_artifact_cleanup_manifests (status, lease_expires_at, id)
+                WHERE status = 'leased';
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_cleanup_manifest_status
+                ON kb_artifact_cleanup_manifests (status, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_cleanup_manifest_kb
+                ON kb_artifact_cleanup_manifests (
+                    kb_id, kb_generation, status, created_at, id
+                );
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_cleanup_manifest_group
+                ON kb_artifact_cleanup_manifests (
+                    kb_id, kb_generation, manifest_group_id, status, id
+                );
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_cleanup_manifest_group_lookup
+                ON kb_artifact_cleanup_manifests (
+                    manifest_group_id, status, created_at, id
+                );
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_cleanup_manifest_prune
+                ON kb_artifact_cleanup_manifests (status, audit_retain_until, id)
+                WHERE status = 'succeeded';
+
+            CREATE TABLE IF NOT EXISTS kb_artifact_maintenance_runs (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK (kind IN ('migration', 'orphan_reconcile')),
+                mode TEXT NOT NULL CHECK (mode IN ('dry_run', 'apply')),
+                status TEXT NOT NULL CHECK (status IN (
+                    'planned', 'running', 'waiting_cleanup', 'succeeded',
+                    'failed', 'cancelled'
+                )),
+                metadata_backend TEXT NOT NULL,
+                backend_fingerprint TEXT NOT NULL,
+                scope_fingerprint TEXT NOT NULL,
+                config_fingerprint TEXT NOT NULL,
+                scope_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                parent_plan_id TEXT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                cursor_json TEXT,
+                total_items BIGINT NOT NULL DEFAULT 0,
+                planned_items BIGINT NOT NULL DEFAULT 0,
+                uploaded_items BIGINT NOT NULL DEFAULT 0,
+                applied_items BIGINT NOT NULL DEFAULT 0,
+                verified_items BIGINT NOT NULL DEFAULT 0,
+                skipped_items BIGINT NOT NULL DEFAULT 0,
+                blocked_items BIGINT NOT NULL DEFAULT 0,
+                failed_items BIGINT NOT NULL DEFAULT 0,
+                actor_id TEXT,
+                lease_owner TEXT,
+                lease_token TEXT,
+                lease_expires_at TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                last_error_code TEXT,
+                CONSTRAINT kb_artifact_maintenance_run_backend_v6_check CHECK (
+                    metadata_backend IN ('sqlite', 'postgres')
+                ),
+                CHECK (total_items >= 0 AND planned_items >= 0
+                    AND uploaded_items >= 0 AND applied_items >= 0
+                    AND verified_items >= 0 AND skipped_items >= 0
+                    AND blocked_items >= 0 AND failed_items >= 0),
+                CHECK (
+                    (mode = 'dry_run' AND parent_plan_id IS NULL)
+                    OR (mode = 'apply' AND parent_plan_id IS NOT NULL)
+                ),
+                CHECK (
+                    (status = 'running' AND lease_owner IS NOT NULL
+                        AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL
+                        AND started_at IS NOT NULL)
+                    OR
+                    (status <> 'running' AND lease_owner IS NULL
+                        AND lease_token IS NULL AND lease_expires_at IS NULL)
+                ),
+                CHECK (
+                    (status IN ('succeeded', 'failed', 'cancelled')
+                        AND completed_at IS NOT NULL)
+                    OR
+                    (status NOT IN ('succeeded', 'failed', 'cancelled')
+                        AND completed_at IS NULL)
+                )
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_kb_artifact_maintenance_run_lease_token
+                ON kb_artifact_maintenance_runs (lease_token)
+                WHERE lease_token IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_maintenance_run_claim
+                ON kb_artifact_maintenance_runs (status, kind, mode, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_maintenance_run_parent
+                ON kb_artifact_maintenance_runs (parent_plan_id, created_at, id);
+
+            CREATE TABLE IF NOT EXISTS kb_artifact_maintenance_items (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                item_key TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN (
+                    'planned', 'uploaded', 'applied', 'verified', 'skipped',
+                    'blocked', 'failed'
+                )),
+                ordinal BIGINT NOT NULL,
+                subject_kind TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                kb_id TEXT,
+                kb_generation TEXT,
+                workspace TEXT,
+                document_id TEXT,
+                artifact_id TEXT,
+                logical_group_id TEXT NOT NULL,
+                relative_object_id TEXT NOT NULL,
+                root_label TEXT,
+                expected_checksum TEXT,
+                expected_size_bytes BIGINT,
+                target_uri_authority TEXT,
+                target_uri_digest TEXT,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                attempt_count BIGINT NOT NULL DEFAULT 0,
+                completed_at TEXT,
+                last_error_code TEXT,
+                UNIQUE (run_id, item_key),
+                CHECK (ordinal >= 0 AND attempt_count >= 0),
+                CHECK (expected_size_bytes IS NULL OR expected_size_bytes >= 0),
+                CONSTRAINT kb_artifact_maintenance_item_relative_v6_check CHECK (
+                    relative_object_id <> ''
+                    AND relative_object_id = btrim(relative_object_id)
+                    AND left(relative_object_id, 1) <> '/'
+                    AND right(relative_object_id, 1) <> '/'
+                    AND strpos(relative_object_id, '//') = 0
+                    AND strpos(relative_object_id, chr(92)) = 0
+                    AND strpos(relative_object_id, '://') = 0
+                    AND ('/' || relative_object_id || '/') NOT LIKE '%/./%'
+                    AND ('/' || relative_object_id || '/') NOT LIKE '%/../%'
+                ),
+                CONSTRAINT kb_artifact_maintenance_item_root_v6_check CHECK (
+                    root_label IS NULL OR (
+                        root_label <> '' AND root_label = btrim(root_label)
+                        AND strpos(root_label, '/') = 0
+                        AND strpos(root_label, chr(92)) = 0
+                        AND strpos(root_label, ':') = 0
+                    )
+                ),
+                CONSTRAINT kb_artifact_maintenance_item_authority_v6_check CHECK (
+                    target_uri_authority IS NULL OR target_uri_authority ~
+                        '^[a-z][a-z0-9+.-]*://[^/?#@]+$'
+                ),
+                CONSTRAINT kb_artifact_maintenance_item_digest_v6_check CHECK (
+                    target_uri_digest IS NULL
+                    OR target_uri_digest ~ '^[0-9a-f]{64}$'
+                ),
+                CONSTRAINT kb_artifact_maintenance_item_terminal_v6_check CHECK (
+                    (state IN ('verified', 'skipped', 'blocked', 'failed')
+                        AND completed_at IS NOT NULL)
+                    OR
+                    (state NOT IN ('verified', 'skipped', 'blocked', 'failed')
+                        AND completed_at IS NULL)
+                ),
+                CONSTRAINT kb_artifact_maintenance_item_error_v6_check CHECK (
+                    (state IN ('blocked', 'failed') AND last_error_code IS NOT NULL)
+                    OR state NOT IN ('blocked', 'failed')
+                )
+            );
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_maintenance_item_run_state
+                ON kb_artifact_maintenance_items (run_id, state, ordinal, item_key);
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_maintenance_item_subject
+                ON kb_artifact_maintenance_items (subject_kind, subject_id, run_id);
+
+            CREATE TABLE IF NOT EXISTS kb_artifact_recovery_cursors (
+                kb_id TEXT NOT NULL,
+                kb_generation TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('parsed', 'ready')),
+                last_created_at TEXT,
+                last_document_id TEXT,
+                sweep BIGINT NOT NULL DEFAULT 0,
+                version BIGINT NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (kb_id, kb_generation),
+                CHECK (sweep >= 0 AND version >= 1),
+                CHECK (
+                    (last_created_at IS NULL AND last_document_id IS NULL)
+                    OR (last_created_at IS NOT NULL AND last_document_id IS NOT NULL)
+                )
+            );
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_recovery_cursor_kb
+                ON kb_artifact_recovery_cursors (
+                    kb_id, kb_generation, status, sweep
+                );
+            CREATE INDEX IF NOT EXISTS idx_kb_documents_recovery_keyset
+                ON kb_documents (kb_id, status, created_at, id)
+                WHERE deleted_at IS NULL AND status IN ('parsed', 'ready');
+            """
+        )
+        artifact_lifecycle_v6_complete = (
+            await self._artifact_lifecycle_schema_v6_complete(conn)
+        )
+        artifact_lifecycle_v6_migration_needed = (
+            _POSTGRES_ARTIFACT_LIFECYCLE_SCHEMA_VERSION not in schema_versions
+            or not artifact_lifecycle_v6_complete
+        )
+        if artifact_lifecycle_v6_migration_needed:
+            await self._migrate_artifact_lifecycle_schema_v6(conn)
+            if not await self._artifact_lifecycle_schema_v6_complete(conn):
+                raise RuntimeError(
+                    "Artifact lifecycle metadata schema v6 migration incomplete"
+                )
         # account_token_version: snapshot for v2 account-access validation.
         # Added post-init; ADD COLUMN IF NOT EXISTS for existing databases.
         await conn.execute(
@@ -12674,7 +16411,9 @@ class PostgresMetadataStore:
         if chat_memory_v2_migration_needed:
             await self._migrate_chat_memory_schema_v2(conn)
             if not await self._chat_memory_schema_v2_complete(conn):
-                raise RuntimeError("Chat Memory metadata schema v2 migration incomplete")
+                raise RuntimeError(
+                    "Chat Memory metadata schema v2 migration incomplete"
+                )
         chat_memory_v3_complete = await self._chat_memory_schema_v3_complete(conn)
         chat_memory_v3_migration_needed = (
             3 not in schema_versions or not chat_memory_v3_complete
@@ -12682,7 +16421,9 @@ class PostgresMetadataStore:
         if chat_memory_v3_migration_needed:
             await self._migrate_chat_memory_schema_v3(conn)
             if not await self._chat_memory_schema_v3_complete(conn):
-                raise RuntimeError("Chat Memory metadata schema v3 migration incomplete")
+                raise RuntimeError(
+                    "Chat Memory metadata schema v3 migration incomplete"
+                )
         chat_memory_v4_complete = await self._chat_memory_schema_v4_complete(conn)
         chat_memory_v4_migration_needed = (
             4 not in schema_versions or not chat_memory_v4_complete
@@ -12690,7 +16431,9 @@ class PostgresMetadataStore:
         if chat_memory_v4_migration_needed:
             await self._migrate_chat_memory_schema_v4(conn)
             if not await self._chat_memory_schema_v4_complete(conn):
-                raise RuntimeError("Chat Memory metadata schema v4 migration incomplete")
+                raise RuntimeError(
+                    "Chat Memory metadata schema v4 migration incomplete"
+                )
         await conn.execute(
             """
             ALTER TABLE enterprise_kb_lifecycle
@@ -12889,6 +16632,308 @@ class PostgresMetadataStore:
                 SET applied_at = excluded.applied_at
                 """
             )
+        await conn.execute(
+            """
+            INSERT INTO kb_metadata_schema(version, applied_at)
+            VALUES (5, clock_timestamp()::text)
+            ON CONFLICT (version) DO NOTHING
+            """
+        )
+        if artifact_lifecycle_v6_migration_needed:
+            await conn.execute(
+                """
+                INSERT INTO kb_metadata_schema(version, applied_at)
+                VALUES (6, clock_timestamp()::text)
+                ON CONFLICT (version) DO UPDATE
+                SET applied_at = excluded.applied_at
+                """
+            )
+
+    async def _artifact_lifecycle_schema_v6_complete(self, conn: Any) -> bool:
+        run_columns = {
+            str(row["column_name"]): str(row["is_nullable"])
+            for row in await conn.fetch(
+                """
+                SELECT column_name, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'kb_artifact_maintenance_runs'
+                """
+            )
+        }
+        item_columns = {
+            str(row["column_name"]): str(row["is_nullable"])
+            for row in await conn.fetch(
+                """
+                SELECT column_name, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'kb_artifact_maintenance_items'
+                """
+            )
+        }
+        required_item_columns = {
+            "kb_id",
+            "kb_generation",
+            "workspace",
+            "document_id",
+            "artifact_id",
+            "logical_group_id",
+            "relative_object_id",
+            "root_label",
+            "expected_checksum",
+            "expected_size_bytes",
+            "target_uri_authority",
+            "target_uri_digest",
+        }
+        constraints = {
+            str(row["conname"])
+            for row in await conn.fetch(
+                """
+                SELECT conname
+                FROM pg_constraint
+                WHERE conrelid IN (
+                    'kb_artifact_maintenance_runs'::regclass,
+                    'kb_artifact_maintenance_items'::regclass
+                )
+                """
+            )
+        }
+        indexes = {
+            str(row["indexname"])
+            for row in await conn.fetch(
+                """
+                SELECT indexname
+                FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND tablename IN (
+                      'kb_artifact_maintenance_runs',
+                      'kb_artifact_maintenance_items'
+                  )
+                """
+            )
+        }
+        required_constraints = {
+            "kb_artifact_maintenance_run_backend_v6_check",
+            "kb_artifact_maintenance_item_relative_v6_check",
+            "kb_artifact_maintenance_item_root_v6_check",
+            "kb_artifact_maintenance_item_authority_v6_check",
+            "kb_artifact_maintenance_item_digest_v6_check",
+            "kb_artifact_maintenance_item_terminal_v6_check",
+            "kb_artifact_maintenance_item_error_v6_check",
+        }
+        required_indexes = {
+            "uq_kb_artifact_maintenance_run_lease_token",
+            "idx_kb_artifact_maintenance_run_claim",
+            "idx_kb_artifact_maintenance_run_parent",
+            "idx_kb_artifact_maintenance_run_backend",
+            "idx_kb_artifact_maintenance_item_run_state",
+            "idx_kb_artifact_maintenance_item_subject",
+            "idx_kb_artifact_maintenance_item_kb",
+            "idx_kb_artifact_maintenance_item_document",
+            "idx_kb_artifact_maintenance_item_artifact",
+            "idx_kb_artifact_maintenance_item_group",
+            "idx_kb_artifact_maintenance_item_uri_digest",
+        }
+        return bool(
+            run_columns.get("metadata_backend") == "NO"
+            and required_item_columns <= item_columns.keys()
+            and item_columns.get("logical_group_id") == "NO"
+            and item_columns.get("relative_object_id") == "NO"
+            and required_constraints <= constraints
+            and required_indexes <= indexes
+        )
+
+    async def _migrate_artifact_lifecycle_schema_v6(self, conn: Any) -> None:
+        await conn.execute(
+            """
+            ALTER TABLE kb_artifact_maintenance_runs
+                ADD COLUMN IF NOT EXISTS metadata_backend TEXT;
+            ALTER TABLE kb_artifact_maintenance_items
+                ADD COLUMN IF NOT EXISTS kb_id TEXT,
+                ADD COLUMN IF NOT EXISTS kb_generation TEXT,
+                ADD COLUMN IF NOT EXISTS workspace TEXT,
+                ADD COLUMN IF NOT EXISTS document_id TEXT,
+                ADD COLUMN IF NOT EXISTS artifact_id TEXT,
+                ADD COLUMN IF NOT EXISTS logical_group_id TEXT,
+                ADD COLUMN IF NOT EXISTS relative_object_id TEXT,
+                ADD COLUMN IF NOT EXISTS root_label TEXT,
+                ADD COLUMN IF NOT EXISTS expected_checksum TEXT,
+                ADD COLUMN IF NOT EXISTS expected_size_bytes BIGINT,
+                ADD COLUMN IF NOT EXISTS target_uri_authority TEXT,
+                ADD COLUMN IF NOT EXISTS target_uri_digest TEXT;
+            """
+        )
+        await conn.execute(
+            """
+            DO $$
+            DECLARE lifecycle_constraint TEXT;
+            BEGIN
+                FOR lifecycle_constraint IN
+                    SELECT conname
+                    FROM pg_constraint
+                    WHERE conrelid = 'kb_artifact_maintenance_items'::regclass
+                      AND contype = 'c'
+                      AND pg_get_constraintdef(oid) ILIKE '%state%'
+                      AND pg_get_constraintdef(oid) ILIKE '%completed_at%'
+                LOOP
+                    EXECUTE format(
+                        'ALTER TABLE kb_artifact_maintenance_items '
+                        'DROP CONSTRAINT %I',
+                        lifecycle_constraint
+                    );
+                END LOOP;
+            END $$;
+            ALTER TABLE kb_artifact_maintenance_runs
+                DROP CONSTRAINT IF EXISTS
+                    kb_artifact_maintenance_run_backend_v6_check;
+            ALTER TABLE kb_artifact_maintenance_items
+                DROP CONSTRAINT IF EXISTS
+                    kb_artifact_maintenance_item_relative_v6_check,
+                DROP CONSTRAINT IF EXISTS
+                    kb_artifact_maintenance_item_root_v6_check,
+                DROP CONSTRAINT IF EXISTS
+                    kb_artifact_maintenance_item_authority_v6_check,
+                DROP CONSTRAINT IF EXISTS
+                    kb_artifact_maintenance_item_digest_v6_check,
+                DROP CONSTRAINT IF EXISTS
+                    kb_artifact_maintenance_item_error_v6_check;
+            """
+        )
+
+        run_rows = await conn.fetch(
+            "SELECT * FROM kb_artifact_maintenance_runs ORDER BY created_at, id"
+        )
+        for row in run_rows:
+            upgraded = _artifact_maintenance_run_upgrade_record(
+                dict(row), metadata_backend="postgres"
+            )
+            await self._save_postgres_maintenance_run(conn, upgraded)
+
+        upgraded_at = _artifact_lifecycle_timestamp()
+        item_rows = await conn.fetch(
+            "SELECT * FROM kb_artifact_maintenance_items ORDER BY run_id, ordinal, id"
+        )
+        for row in item_rows:
+            upgraded = _artifact_maintenance_item_upgrade_record(
+                dict(row), upgraded_at=upgraded_at
+            )
+            await self._save_postgres_maintenance_item(conn, upgraded)
+
+        await conn.execute(
+            """
+            WITH item_counts AS (
+                SELECT run_id,
+                    COUNT(*) AS total_items,
+                    COUNT(*) FILTER (WHERE state = 'planned') AS planned_items,
+                    COUNT(*) FILTER (WHERE state = 'uploaded') AS uploaded_items,
+                    COUNT(*) FILTER (WHERE state = 'applied') AS applied_items,
+                    COUNT(*) FILTER (WHERE state = 'verified') AS verified_items,
+                    COUNT(*) FILTER (WHERE state = 'skipped') AS skipped_items,
+                    COUNT(*) FILTER (WHERE state = 'blocked') AS blocked_items,
+                    COUNT(*) FILTER (WHERE state = 'failed') AS failed_items
+                FROM kb_artifact_maintenance_items
+                GROUP BY run_id
+            )
+            UPDATE kb_artifact_maintenance_runs AS runs
+            SET total_items = counts.total_items,
+                planned_items = counts.planned_items,
+                uploaded_items = counts.uploaded_items,
+                applied_items = counts.applied_items,
+                verified_items = counts.verified_items,
+                skipped_items = counts.skipped_items,
+                blocked_items = counts.blocked_items,
+                failed_items = counts.failed_items
+            FROM item_counts AS counts
+            WHERE runs.id = counts.run_id;
+
+            ALTER TABLE kb_artifact_maintenance_runs
+                ALTER COLUMN metadata_backend SET NOT NULL;
+            ALTER TABLE kb_artifact_maintenance_items
+                ALTER COLUMN logical_group_id SET NOT NULL,
+                ALTER COLUMN relative_object_id SET NOT NULL;
+
+            ALTER TABLE kb_artifact_maintenance_runs
+                ADD CONSTRAINT kb_artifact_maintenance_run_backend_v6_check
+                CHECK (metadata_backend IN ('sqlite', 'postgres'));
+            ALTER TABLE kb_artifact_maintenance_items
+                ADD CONSTRAINT kb_artifact_maintenance_item_relative_v6_check CHECK (
+                    relative_object_id <> ''
+                    AND relative_object_id = btrim(relative_object_id)
+                    AND left(relative_object_id, 1) <> '/'
+                    AND right(relative_object_id, 1) <> '/'
+                    AND strpos(relative_object_id, '//') = 0
+                    AND strpos(relative_object_id, chr(92)) = 0
+                    AND strpos(relative_object_id, '://') = 0
+                    AND ('/' || relative_object_id || '/') NOT LIKE '%/./%'
+                    AND ('/' || relative_object_id || '/') NOT LIKE '%/../%'
+                ),
+                ADD CONSTRAINT kb_artifact_maintenance_item_root_v6_check CHECK (
+                    root_label IS NULL OR (
+                        root_label <> '' AND root_label = btrim(root_label)
+                        AND strpos(root_label, '/') = 0
+                        AND strpos(root_label, chr(92)) = 0
+                        AND strpos(root_label, ':') = 0
+                    )
+                ),
+                ADD CONSTRAINT kb_artifact_maintenance_item_authority_v6_check CHECK (
+                    target_uri_authority IS NULL OR target_uri_authority ~
+                        '^[a-z][a-z0-9+.-]*://[^/?#@]+$'
+                ),
+                ADD CONSTRAINT kb_artifact_maintenance_item_digest_v6_check CHECK (
+                    target_uri_digest IS NULL
+                    OR target_uri_digest ~ '^[0-9a-f]{64}$'
+                ),
+                ADD CONSTRAINT kb_artifact_maintenance_item_terminal_v6_check CHECK (
+                    (state IN ('verified', 'skipped', 'blocked', 'failed')
+                        AND completed_at IS NOT NULL)
+                    OR
+                    (state NOT IN ('verified', 'skipped', 'blocked', 'failed')
+                        AND completed_at IS NULL)
+                ),
+                ADD CONSTRAINT kb_artifact_maintenance_item_error_v6_check CHECK (
+                    (state IN ('blocked', 'failed') AND last_error_code IS NOT NULL)
+                    OR state NOT IN ('blocked', 'failed')
+                );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                uq_kb_artifact_maintenance_run_lease_token
+                ON kb_artifact_maintenance_runs (lease_token)
+                WHERE lease_token IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_maintenance_run_claim
+                ON kb_artifact_maintenance_runs (status, kind, mode, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_maintenance_run_parent
+                ON kb_artifact_maintenance_runs (parent_plan_id, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_maintenance_run_backend
+                ON kb_artifact_maintenance_runs (
+                    metadata_backend, status, kind, mode, created_at, id
+                );
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_maintenance_item_run_state
+                ON kb_artifact_maintenance_items (run_id, state, ordinal, item_key);
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_maintenance_item_subject
+                ON kb_artifact_maintenance_items (subject_kind, subject_id, run_id);
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_maintenance_item_kb
+                ON kb_artifact_maintenance_items (
+                    kb_id, kb_generation, state, run_id, ordinal, item_key
+                );
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_maintenance_item_document
+                ON kb_artifact_maintenance_items (
+                    document_id, state, run_id, ordinal, item_key
+                ) WHERE document_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_maintenance_item_artifact
+                ON kb_artifact_maintenance_items (
+                    artifact_id, state, run_id, ordinal, item_key
+                ) WHERE artifact_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_maintenance_item_group
+                ON kb_artifact_maintenance_items (
+                    logical_group_id, state, run_id, ordinal, item_key
+                );
+            CREATE INDEX IF NOT EXISTS idx_kb_artifact_maintenance_item_uri_digest
+                ON kb_artifact_maintenance_items (
+                    target_uri_digest, state, run_id, ordinal, item_key
+                ) WHERE target_uri_digest IS NOT NULL;
+            """
+        )
 
     async def _chat_memory_schema_v2_complete(self, conn: Any) -> bool:
         return bool(
@@ -13567,7 +17612,9 @@ class PostgresMetadataStore:
             document.status,
             document.source_name,
             document.source_hash,
-            _metadata_source_key(document.metadata) if document.deleted_at is None else None,
+            _metadata_source_key(document.metadata)
+            if document.deleted_at is None
+            else None,
             _batch_id(document.metadata),
             document.deleted_at,
             document.updated_at,
@@ -13578,7 +17625,9 @@ class PostgresMetadataStore:
         if _rowcount(status) == 0:
             raise MetadataRecordNotFoundError(f"Document '{document.id}' not found")
 
-    async def _check_source_key_available(self, conn: Any, document: DocumentRecord) -> None:
+    async def _check_source_key_available(
+        self, conn: Any, document: DocumentRecord
+    ) -> None:
         source_key = _metadata_source_key(document.metadata)
         if source_key is None or document.deleted_at is not None:
             return
@@ -13593,7 +17642,9 @@ class PostgresMetadataStore:
             document.id,
         )
         if existing_id is not None:
-            raise DuplicateDocumentSourceKeyError(document.kb_id, source_key, str(existing_id))
+            raise DuplicateDocumentSourceKeyError(
+                document.kb_id, source_key, str(existing_id)
+            )
 
     async def _insert_artifact(self, conn: Any, artifact: ArtifactRecord) -> None:
         await conn.execute(
@@ -13696,13 +17747,17 @@ class PostgresMetadataStore:
         )
         return _job_from_row(row) if row is not None else None
 
-    def _validate_idempotent_job(self, existing: JobRecord, candidate: JobRecord) -> None:
+    def _validate_idempotent_job(
+        self, existing: JobRecord, candidate: JobRecord
+    ) -> None:
         if existing.payload.get("idempotency_fingerprint") != candidate.payload.get(
             "idempotency_fingerprint"
         ):
             raise IdempotencyKeyConflictError(candidate.idempotency_key or "")
 
-    async def _documents_for_job(self, conn: Any, job: JobRecord) -> list[DocumentRecord]:
+    async def _documents_for_job(
+        self, conn: Any, job: JobRecord
+    ) -> list[DocumentRecord]:
         document_ids = job.payload.get("document_ids")
         if isinstance(document_ids, list) and all(
             isinstance(document_id, str) for document_id in document_ids
@@ -13717,8 +17772,15 @@ class PostgresMetadataStore:
                 job.kb_id,
                 document_ids,
             )
-            by_id = {_loads_json_object(row["data_json"])["id"]: _document_from_row(row) for row in rows}
-            return [by_id[document_id] for document_id in document_ids if document_id in by_id]
+            by_id = {
+                _loads_json_object(row["data_json"])["id"]: _document_from_row(row)
+                for row in rows
+            }
+            return [
+                by_id[document_id]
+                for document_id in document_ids
+                if document_id in by_id
+            ]
         if not job.batch_id:
             return []
         rows = await conn.fetch(
@@ -13739,23 +17801,44 @@ class PostgresMetadataStore:
         document_id: str,
         *,
         metadata_patch: dict[str, Any],
+        expected_snapshot: dict[str, Any] | None,
+        claim_token: str | None,
         raise_on_active: bool,
     ) -> DocumentRecord:
         document = await self._get_document(conn, kb_id, document_id, for_update=True)
+        if _document_pending_claim_is_idempotent(
+            document,
+            operation="parse",
+            metadata_patch=metadata_patch,
+            claim_token=claim_token,
+        ):
+            return document
+        _assert_document_snapshot(document, expected_snapshot)
         if raise_on_active and document.status in {"parse_queued", "parsing"}:
-            raise ActiveDocumentParseJobError(document_id, _active_parse_job_id(document))
+            raise ActiveDocumentParseJobError(
+                document_id, _active_parse_job_id(document)
+            )
         if document.status in {"build_queued", "building"}:
-            raise ActiveDocumentBuildJobError(document_id, _active_build_job_id(document))
+            raise ActiveDocumentBuildJobError(
+                document_id, _active_build_job_id(document)
+            )
         if document.status == "deleting":
-            raise ActiveDocumentDeleteJobError(document_id, _active_delete_job_id(document))
+            raise ActiveDocumentDeleteJobError(
+                document_id, _active_delete_job_id(document)
+            )
         if document.status == "replacing":
-            raise ActiveDocumentReplaceJobError(document_id, _active_replace_job_id(document))
+            raise ActiveDocumentReplaceJobError(
+                document_id, _active_replace_job_id(document)
+            )
+        claim_patch, _claim_token = _prepare_document_claim_metadata(
+            document, "parse", metadata_patch, claim_token
+        )
         return await self._update_document_parse_state(
             conn,
             kb_id,
             document_id,
             status="parse_queued",
-            metadata_patch=metadata_patch,
+            metadata_patch=claim_patch,
             clear_error=True,
         )
 
@@ -13766,23 +17849,46 @@ class PostgresMetadataStore:
         document_id: str,
         *,
         metadata_patch: dict[str, Any],
+        expected_snapshot: dict[str, Any] | None,
+        claim_token: str | None,
         require_parsed: bool,
     ) -> DocumentRecord:
         document = await self._get_document(conn, kb_id, document_id, for_update=True)
+        if _document_pending_claim_is_idempotent(
+            document,
+            operation="build",
+            metadata_patch=metadata_patch,
+            claim_token=claim_token,
+        ):
+            return document
+        _assert_document_snapshot(document, expected_snapshot)
         if document.status in {"build_queued", "building"}:
-            raise ActiveDocumentBuildJobError(document_id, _active_build_job_id(document))
+            raise ActiveDocumentBuildJobError(
+                document_id, _active_build_job_id(document)
+            )
         if document.status == "deleting":
-            raise ActiveDocumentDeleteJobError(document_id, _active_delete_job_id(document))
+            raise ActiveDocumentDeleteJobError(
+                document_id, _active_delete_job_id(document)
+            )
         if document.status == "replacing":
-            raise ActiveDocumentReplaceJobError(document_id, _active_replace_job_id(document))
-        if require_parsed and document.status not in {"parsed", "ready", "build_failed"}:
+            raise ActiveDocumentReplaceJobError(
+                document_id, _active_replace_job_id(document)
+            )
+        if require_parsed and document.status not in {
+            "parsed",
+            "ready",
+            "build_failed",
+        }:
             raise DocumentNotParsedError(document_id, str(document.status))
+        claim_patch, _claim_token = _prepare_document_claim_metadata(
+            document, "build", metadata_patch, claim_token
+        )
         return await self._update_document_parse_state(
             conn,
             kb_id,
             document_id,
             status="build_queued",
-            metadata_patch=metadata_patch,
+            metadata_patch=claim_patch,
             clear_error=True,
         )
 
@@ -13791,15 +17897,22 @@ class PostgresMetadataStore:
     ) -> DocumentRecord:
         document = await self._get_document(conn, kb_id, document_id, for_update=True)
         if document.status in {"parse_queued", "parsing"}:
-            raise ActiveDocumentParseJobError(document_id, _active_parse_job_id(document))
+            raise ActiveDocumentParseJobError(
+                document_id, _active_parse_job_id(document)
+            )
         if document.status in {"build_queued", "building"}:
-            raise ActiveDocumentBuildJobError(document_id, _active_build_job_id(document))
+            raise ActiveDocumentBuildJobError(
+                document_id, _active_build_job_id(document)
+            )
         if document.status == "deleting":
             existing_job_id = _active_delete_job_id(document)
-            requested_job_id = metadata_patch.get("pending_delete_job_id") or metadata_patch.get(
-                "current_delete_job_id"
-            )
-            if requested_job_id is not None and str(requested_job_id) == existing_job_id:
+            requested_job_id = metadata_patch.get(
+                "pending_delete_job_id"
+            ) or metadata_patch.get("current_delete_job_id")
+            if (
+                requested_job_id is not None
+                and str(requested_job_id) == existing_job_id
+            ):
                 return await self._update_document_parse_state(
                     conn,
                     kb_id,
@@ -13810,7 +17923,9 @@ class PostgresMetadataStore:
                 )
             raise ActiveDocumentDeleteJobError(document_id, existing_job_id)
         if document.status == "replacing":
-            raise ActiveDocumentReplaceJobError(document_id, _active_replace_job_id(document))
+            raise ActiveDocumentReplaceJobError(
+                document_id, _active_replace_job_id(document)
+            )
         return await self._update_document_parse_state(
             conn,
             kb_id,
@@ -13825,13 +17940,21 @@ class PostgresMetadataStore:
     ) -> DocumentRecord:
         document = await self._get_document(conn, kb_id, document_id, for_update=True)
         if document.status in {"parse_queued", "parsing"}:
-            raise ActiveDocumentParseJobError(document_id, _active_parse_job_id(document))
+            raise ActiveDocumentParseJobError(
+                document_id, _active_parse_job_id(document)
+            )
         if document.status in {"build_queued", "building"}:
-            raise ActiveDocumentBuildJobError(document_id, _active_build_job_id(document))
+            raise ActiveDocumentBuildJobError(
+                document_id, _active_build_job_id(document)
+            )
         if document.status == "deleting":
-            raise ActiveDocumentDeleteJobError(document_id, _active_delete_job_id(document))
+            raise ActiveDocumentDeleteJobError(
+                document_id, _active_delete_job_id(document)
+            )
         if document.status == "replacing":
-            raise ActiveDocumentReplaceJobError(document_id, _active_replace_job_id(document))
+            raise ActiveDocumentReplaceJobError(
+                document_id, _active_replace_job_id(document)
+            )
         return await self._update_document_parse_state(
             conn,
             kb_id,
@@ -13881,7 +18004,9 @@ class PostgresMetadataStore:
         await self._save_document(conn, document)
         return document
 
-    async def _insert_config_version(self, conn: Any, record: ConfigVersionRecord) -> None:
+    async def _insert_config_version(
+        self, conn: Any, record: ConfigVersionRecord
+    ) -> None:
         await conn.execute(
             """
             INSERT INTO kb_config_versions (
@@ -13896,7 +18021,9 @@ class PostgresMetadataStore:
             _record_json(record),
         )
 
-    async def _save_config_version(self, conn: Any, record: ConfigVersionRecord) -> None:
+    async def _save_config_version(
+        self, conn: Any, record: ConfigVersionRecord
+    ) -> None:
         await conn.execute(
             """
             UPDATE kb_config_versions
@@ -13921,7 +18048,9 @@ def _rowcount(status: str) -> int:
         return 0
 
 
-def _active_failure(document_id: str, error_code: str, exc: Exception) -> dict[str, Any]:
+def _active_failure(
+    document_id: str, error_code: str, exc: Exception
+) -> dict[str, Any]:
     detail = {
         "document_id": document_id,
         "status": "failed",

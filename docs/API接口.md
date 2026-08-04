@@ -1557,12 +1557,56 @@ KB Agent Profile 用于帮助 `/agent/query` 在多 KB 候选集中选库，不�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/health` | 系统健康、配置和队列状态；`chat_memory` 当前返回 `{enabled, available, pending_tasks, worker_running, extraction_fingerprint, graph_store_fingerprint}`。其中 `pending_tasks` 仅是进程内兼容任务数，durable outbox backlog 以管理恢复接口返回的状态计数为准；默认 whitelist 放行 |
+| `GET` | `/health` | 系统健康、配置和队列状态；`chat_memory` 当前返回 `{enabled, available, pending_tasks, worker_running, extraction_fingerprint, graph_store_fingerprint}`。其中 `pending_tasks` 仅是进程内兼容任务数，durable outbox backlog 以管理恢复接口返回的状态计数为准；`/health` 还返回两个对象生命周期相关的兄弟块：legacy `artifact_cleanup`（向后兼容）与新加性的 `artifact_lifecycle`（Phase 3.3，见下文“对象生命周期健康块”）；默认 whitelist 放行 |
 | `GET` | `/metrics` | Prometheus text format 指标（KB/doc/job/audit gauge + process-local HTTP counter/histogram）；受 `combined_auth` 保护，默认不在 whitelist；单服务器部署配套告警/SLO/dashboard 见 `deploy/monitoring/` |
 | `GET` | `/auth-status` | 认证模式状态；非企业模式下可能签发 guest token |
 | `POST` | `/login` | 非企业模式下使用 `AUTH_ACCOUNTS`；企业模式下使用企业用户表 |
 
 Chat Memory 运维信号：`enabled` 是新消息 admission/自动召回开关，`available` 表示当前 Graphiti/Neo4j backend slot 是否可用，`worker_running` 表示本进程 durable outbox consumer 是否运行；两个 fingerprint 只返回缩短后的 extraction/graph-store 身份用于部署核对。`/health` 不扫描 PostgreSQL outbox；需要 durable `pending/running/retry_wait/dead_letter` 数量、最老可执行事件和 lag 时，使用 super-admin `POST /admin/chat-memory:backlog-scan`。
+
+#### 对象生命周期健康块（`artifact_lifecycle` / `artifact_cleanup`）
+
+`GET /health` 同时返回两个互不影响的兄弟块，由 `lightrag/api/lightrag_server.py` 的 `_build_artifact_lifecycle_health_block(...)` 构建：
+
+- **`artifact_cleanup`**（legacy，保留不变）：`{enabled, worker_running, pending_count}`。`enabled` 表示对象模式的 cleanup 服务已构造并接到 durable worker 恢复周期；`worker_running` 表示共享 JobWorker 轮询任务是否运行；`pending_count` 是 `artifact_cleanup_manifests` 表的轻量 COUNT，任何失败（慢存储 / 瞬时错误）坍缩为 `"not_reported"`，保证 `/health` 不阻塞。现有断言不受影响。
+- **`artifact_lifecycle`**（Phase 3.3，fix-16，parent-accepted）：加性兄弟块。**无条件输出**（本地模式也输出 `mode='local'` / `backend='disabled'` / `object_store_ready=false`），形状稳定，适合 dashboard 直接采集。设计红线：**永不列举 bucket 内容、永不下载对象**；每个探针经 `_bounded_health_value(timeout=2.0s)` 包裹，超时或异常坍缩为 `"not_reported"`（`object_store_ready` 坍缩为 `false`）。
+
+`artifact_lifecycle` JSON 形态：
+
+```json
+{
+  "artifact_lifecycle": {
+    "mode": "local | object",
+    "backend": "none | disabled | s3",
+    "capability_admitted": {
+      "implemented": false,
+      "admission_gate_allows_object_mode": false
+    },
+    "object_store_ready": false,
+    "manifests": {
+      "total": 0, "retained": 0, "pending": 0, "leased": 0,
+      "blocked": 0, "succeeded": 0,
+      "due_pending": 0, "expired_leases": 0,
+      "cleanup_deadline_overdue": 0,
+      "oldest_due_at": null
+    },
+    "maintenance_runs": 0,
+    "migration_blockers": 0,
+    "unresolved_commit_unknown": 0,
+    "recovery_cursor_stale": 0
+  }
+}
+```
+
+字段含义与运维判读详见 `docs/生产级后端备份恢复Runbook.md` 第 12 节。要点：
+
+- `mode` / `backend`：当前制品存储模式与对象后端稳定标签（不含 endpoint / bucket / 凭据）。
+- `capability_admitted`：镜像代码能力常量 `OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED` 与启动准入闸门是否放行对象模式；当前两者均为 `false`（Gate 3 翻转后才为 `true`）。
+- `object_store_ready`：缓存的单次 `head_bucket` 探针（S3 约 30s TTL），永不抛异常；本地模式恒 `false`。
+- `manifests`：`artifact_cleanup_manifests` 表的有界单行聚合（`oldest_due_at` 是 `MIN(delete_after)`，ISO UTC 字符串或 `null`）。
+- `maintenance_runs` / `migration_blockers` / `unresolved_commit_unknown` / `recovery_cursor_stale`：均为 metadata store 上的索引化 COUNT（活跃集含 fix-15 补的 `retrying` 状态；`recovery_cursor_stale` 的阈值为 `now - 6h`）。
+
+聚合字段出现 `"not_reported"` 表示对应探针超时或失败（**不等于“零”**）；`/health` 顶层 `status` 不会因此变 unhealthy——这些是诊断信号，不是存活判定。
 
 ---
 

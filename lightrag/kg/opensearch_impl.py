@@ -14,6 +14,8 @@ import re
 import ssl as ssl_module
 import time
 import asyncio
+from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Union, final
 import numpy as np
@@ -30,6 +32,10 @@ from ..base import (
 from ..utils import logger, compute_mdhash_id, _cooperative_yield, merge_source_ids
 from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 from ..constants import GRAPH_FIELD_SEP, DEFAULT_QUERY_PRIORITY
+from ..artifact_runtime import (
+    PipelineAttemptCommitOutcomeUnknownError,
+    PipelineAttemptRowKind,
+)
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
 
 import pipmaster as pm
@@ -562,6 +568,154 @@ async def _mget_optional_doc(
     return doc
 
 
+_PIPELINE_ATTEMPT_TOKEN_PATHS = {
+    "full_docs": ("artifact_binding", "claim_token"),
+    "doc_status": ("metadata", "pipeline_attempt_token"),
+}
+
+_PIPELINE_ATTEMPT_CAS_SCRIPT = """
+def token_container = ctx._source[params.token_container];
+if (!(token_container instanceof Map)
+    || token_container[params.token_field] != params.expected_attempt_token) {
+  ctx.op = 'noop';
+} else {
+  ctx._source.clear();
+  ctx._source.putAll(params.payload);
+}
+""".strip()
+
+
+def _pipeline_attempt_token(
+    row: Mapping[str, Any] | None, row_kind: PipelineAttemptRowKind
+) -> Any:
+    """Return the attempt token carried by a pipeline storage row."""
+    path = _PIPELINE_ATTEMPT_TOKEN_PATHS[row_kind]
+    value: Any = row
+    for part in path:
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(part)
+    return value
+
+
+def _prepare_pipeline_attempt_source(
+    key: str,
+    payload: Mapping[str, Any],
+    *,
+    expected_attempt_token: str,
+    row_kind: PipelineAttemptRowKind,
+) -> dict[str, Any]:
+    """Copy a CAS payload into the exact OpenSearch ``_source`` shape."""
+    if not isinstance(key, str) or not key:
+        raise ValueError("Pipeline attempt commit key must be a non-empty string")
+    if row_kind not in _PIPELINE_ATTEMPT_TOKEN_PATHS:
+        raise ValueError(f"Unsupported pipeline attempt row kind: {row_kind!r}")
+    if not isinstance(expected_attempt_token, str) or not expected_attempt_token:
+        raise ValueError("expected_attempt_token must be a non-empty string")
+    if not isinstance(payload, Mapping):
+        raise TypeError("Pipeline attempt commit payload must be a mapping")
+
+    replacement = deepcopy(dict(payload))
+    payload_id = replacement.pop("_id", key)
+    if payload_id != key:
+        raise ValueError("Pipeline CAS payload _id does not match key")
+    mirrored_id = replacement.get("__mirrored_id", key)
+    if mirrored_id != key:
+        raise ValueError("Pipeline CAS payload __mirrored_id does not match key")
+    replacement["__mirrored_id"] = key
+    if _pipeline_attempt_token(replacement, row_kind) != expected_attempt_token:
+        raise ValueError(
+            "Pipeline CAS payload must preserve the expected attempt token"
+        )
+    return replacement
+
+
+async def _compare_and_commit_pipeline_attempt(
+    client: AsyncOpenSearch,
+    index_name: str,
+    key: str,
+    payload: Mapping[str, Any],
+    *,
+    expected_attempt_token: str,
+    row_kind: PipelineAttemptRowKind,
+) -> bool:
+    """Atomically replace one attempt-owned OpenSearch row.
+
+    The update script compares the nested token and replaces the complete
+    ``_source`` on the primary shard. A lost acknowledgement is reconciled by
+    one raw read-back; unresolved ambiguity is promoted to the core unknown
+    outcome instead of retrying the mutation.
+    """
+    try:
+        token_container, token_field = _PIPELINE_ATTEMPT_TOKEN_PATHS[row_kind]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported pipeline attempt row kind: {row_kind!r}"
+        ) from exc
+
+    replacement = _prepare_pipeline_attempt_source(
+        key,
+        payload,
+        expected_attempt_token=expected_attempt_token,
+        row_kind=row_kind,
+    )
+    body = {
+        "script": {
+            "lang": "painless",
+            "source": _PIPELINE_ATTEMPT_CAS_SCRIPT,
+            "params": {
+                "token_container": token_container,
+                "token_field": token_field,
+                "expected_attempt_token": expected_attempt_token,
+                "payload": replacement,
+            },
+        }
+    }
+
+    try:
+        response = await client.update(
+            index=index_name,
+            id=key,
+            body=body,
+            params={"refresh": "wait_for", "retry_on_conflict": 3},
+        )
+    except NotFoundError:
+        return False
+    except (ConflictError, RequestError):
+        # Exhausted version conflicts and Painless/request failures are known
+        # non-commits, not lost acknowledgements. Preserve the backend error.
+        raise
+    except OpenSearchException as write_error:
+        try:
+            current = await _mget_optional_doc(client, index_name, key)
+        except asyncio.CancelledError:
+            raise
+        except Exception as readback_error:
+            raise PipelineAttemptCommitOutcomeUnknownError(
+                key,
+                row_kind=row_kind,
+                reason=type(write_error).__name__,
+            ) from readback_error
+
+        current_source = current.get("_source") if current is not None else None
+        if current_source == replacement:
+            return True
+        if _pipeline_attempt_token(current_source, row_kind) != expected_attempt_token:
+            return False
+        raise PipelineAttemptCommitOutcomeUnknownError(
+            key,
+            row_kind=row_kind,
+            reason=type(write_error).__name__,
+        ) from write_error
+
+    result = response.get("result")
+    if result == "updated":
+        return True
+    if result in {"noop", "not_found"}:
+        return False
+    raise OpenSearchException(f"Unexpected pipeline attempt CAS result: {result!r}")
+
+
 def _is_missing_index_error(exc: Exception) -> bool:
     """Return True when an OpenSearch exception means the target index is missing."""
     return "index_not_found_exception" in str(exc)
@@ -955,6 +1109,42 @@ class OpenSearchKVStorage(BaseKVStorage):
                 self._pending_kv_deletes.discard(doc_id)
                 self._pending_upserts[doc_id] = source
 
+    async def compare_and_commit_pipeline_attempt(
+        self,
+        key: str,
+        payload: Mapping[str, Any],
+        *,
+        expected_attempt_token: str,
+        row_kind: PipelineAttemptRowKind,
+    ) -> bool:
+        """Flush buffered KV writes, then atomically replace an owned row.
+
+        The process-local KV buffer and the server-side CAS share
+        ``_flush_lock`` as one serialization boundary. This prevents a stale
+        buffered upsert/delete from landing after a successful CAS and
+        overwriting its result.
+        """
+        async with self._flush_lock:
+            await self._flush_pending_kv_ops_locked()
+            if self._pending_upserts or self._pending_kv_deletes:
+                # Per-action transient bulk failures intentionally remain
+                # buffered for a later retry. They make it unsafe to run the
+                # CAS now because a subsequent flush could overwrite/delete
+                # the CAS result.
+                raise RuntimeError(
+                    f"[{self.workspace}] Cannot commit pipeline attempt while "
+                    f"{len(self._pending_upserts)} KV upserts and "
+                    f"{len(self._pending_kv_deletes)} KV deletes remain buffered"
+                )
+            return await _compare_and_commit_pipeline_attempt(
+                self.client,
+                self._index_name,
+                key,
+                payload,
+                expected_attempt_token=expected_attempt_token,
+                row_kind=row_kind,
+            )
+
     async def delete(self, ids: list[str]) -> None:
         """Buffer document deletes for batched flush.
 
@@ -980,12 +1170,17 @@ class OpenSearchKVStorage(BaseKVStorage):
         )
 
     async def _flush_pending_kv_ops(self) -> None:
-        """Flush buffered upserts + deletes via a single async_bulk call.
+        """Acquire ``_flush_lock`` and flush buffered KV operations."""
+        async with self._flush_lock:
+            await self._flush_pending_kv_ops_locked()
 
-        Concurrency contract: the entire flush runs under ``_flush_lock``;
-        ``upsert`` / ``delete`` / reads / ``drop`` all acquire the same lock
-        so an in-flight flush cannot interleave with concurrent buffer
-        mutations.
+    async def _flush_pending_kv_ops_locked(self) -> None:
+        """Flush buffered upserts + deletes while ``_flush_lock`` is held.
+
+        The caller must already own the non-reentrant ``_flush_lock``. The
+        public ``_flush_pending_kv_ops`` wrapper owns the lock for ordinary
+        callbacks; compare-and-commit calls this private body so it can keep
+        the same lock held across the flush and server-side CAS.
 
         Failure handling mirrors the Vector-side helper:
           * If ``_ensure_index_ready`` raises, the buffers are left intact
@@ -995,115 +1190,113 @@ class OpenSearchKVStorage(BaseKVStorage):
           * Per-doc non-retryable failures (most 4xx) are cleared and a
             sample is logged at WARNING with op / id / status / error.
         """
-        async with self._flush_lock:
-            if not self._pending_upserts and not self._pending_kv_deletes:
-                return
-            if self.client is None:
-                return
+        if not self._pending_upserts and not self._pending_kv_deletes:
+            return
+        if self.client is None:
+            return
 
-            await self._ensure_index_ready()
+        await self._ensure_index_ready()
 
-            pending_upserts = self._pending_upserts
-            pending_deletes = self._pending_kv_deletes
+        pending_upserts = self._pending_upserts
+        pending_deletes = self._pending_kv_deletes
 
-            # Deletes are flushed before upserts so a delete followed (in time)
-            # by an upsert on the same id still ends as an index; the two
-            # buffers are disjoint anyway (upsert/delete pop each other), so
-            # running them as separate async_bulk requests is safe and lets the
-            # delete record-count cap differ from the upsert cap (mirrors
-            # mongo_impl's separate upsert/delete phases).
-            delete_actions: list[dict[str, Any]] = [
-                {
-                    "_op_type": "delete",
-                    "_index": self._index_name,
-                    "_id": doc_id,
-                }
-                for doc_id in pending_deletes
-            ]
-            index_actions: list[dict[str, Any]] = [
-                {
-                    "_op_type": "index",
-                    "_index": self._index_name,
-                    "_id": doc_id,
-                    "_source": source,
-                }
-                for doc_id, source in pending_upserts.items()
-            ]
-
-            try:
-                log_prefix = f"[{self.workspace}] {self.namespace} flush:"
-                del_success, del_failed = await _run_chunked_async_bulk(
-                    self.client,
-                    delete_actions,
-                    max_payload_bytes=self._max_upsert_payload_bytes,
-                    max_records_per_batch=self._max_delete_records_per_batch,
-                    log_prefix=log_prefix,
-                    what="delete",
-                    raise_on_error=False,
-                )
-                idx_success, idx_failed = await _run_chunked_async_bulk(
-                    self.client,
-                    index_actions,
-                    max_payload_bytes=self._max_upsert_payload_bytes,
-                    max_records_per_batch=self._max_upsert_records_per_batch,
-                    log_prefix=log_prefix,
-                    what="upsert",
-                    raise_on_error=False,
-                )
-                success = del_success + idx_success
-                failed = list(del_failed) + list(idx_failed)
-            except OpenSearchException as e:
-                logger.error(
-                    f"[{self.workspace}] Error flushing KV ops "
-                    f"(upserts={len(pending_upserts)}, "
-                    f"deletes={len(pending_deletes)}): {e}"
-                )
-                raise
-
-            retryable_ids, non_retryable_ops = _extract_bulk_failed_ids(failed)
-            non_retryable_ids = {op.doc_id for op in non_retryable_ops}
-
-            # Keep ONLY retryable ops buffered for the next flush. Successful
-            # ops are popped; non-retryable (permanent 4xx) ops are dropped
-            # here, not retained: a permanently-unwritable op can never land,
-            # so keeping it would replay-and-refail on every later flush and
-            # poison every caller that shares this buffer — including direct
-            # flush paths (e.g. _persist_parsed_full_docs) that never run the
-            # pipeline's cleanup. The raise below (not retention) is what
-            # surfaces the failure and prevents a silent PROCESSED.
-            keep_ids = retryable_ids
-            for doc_id in list(pending_upserts.keys()):
-                if doc_id not in keep_ids:
-                    pending_upserts.pop(doc_id, None)
-            new_deletes: set[str] = {
-                doc_id for doc_id in pending_deletes if doc_id in keep_ids
+        # Deletes are flushed before upserts so a delete followed (in time)
+        # by an upsert on the same id still ends as an index; the two
+        # buffers are disjoint anyway (upsert/delete pop each other), so
+        # running them as separate async_bulk requests is safe and lets the
+        # delete record-count cap differ from the upsert cap (mirrors
+        # mongo_impl's separate upsert/delete phases).
+        delete_actions: list[dict[str, Any]] = [
+            {
+                "_op_type": "delete",
+                "_index": self._index_name,
+                "_id": doc_id,
             }
-            pending_deletes.clear()
-            pending_deletes.update(new_deletes)
+            for doc_id in pending_deletes
+        ]
+        index_actions: list[dict[str, Any]] = [
+            {
+                "_op_type": "index",
+                "_index": self._index_name,
+                "_id": doc_id,
+                "_source": source,
+            }
+            for doc_id, source in pending_upserts.items()
+        ]
 
-            if retryable_ids:
-                logger.warning(
-                    f"[{self.workspace}] {len(retryable_ids)} KV ops will "
-                    f"retry on the next flush (transient failure)"
-                )
-            logger.debug(
-                f"[{self.workspace}] Flushed KV ops: {success} ok, "
-                f"retry={len(retryable_ids)}, permanent_fail={len(non_retryable_ids)}"
+        try:
+            log_prefix = f"[{self.workspace}] {self.namespace} flush:"
+            del_success, del_failed = await _run_chunked_async_bulk(
+                self.client,
+                delete_actions,
+                max_payload_bytes=self._max_upsert_payload_bytes,
+                max_records_per_batch=self._max_delete_records_per_batch,
+                log_prefix=log_prefix,
+                what="delete",
+                raise_on_error=False,
             )
-            if non_retryable_ops:
-                sample = non_retryable_ops[:5]
-                sample_text = ", ".join(
-                    f"{op.op}/{op.doc_id}/status={op.status}/{op.error}"
-                    for op in sample
-                )
-                # A permanent (non-retryable) bulk failure means the data did
-                # not land. Raise so index_done_callback surfaces it and the
-                # pipeline aborts instead of marking the document PROCESSED.
-                raise RuntimeError(
-                    f"[{self.workspace}] {self.namespace} flush: "
-                    f"{len(non_retryable_ops)} KV ops failed permanently "
-                    f"(non-retryable). Sample: {sample_text}"
-                )
+            idx_success, idx_failed = await _run_chunked_async_bulk(
+                self.client,
+                index_actions,
+                max_payload_bytes=self._max_upsert_payload_bytes,
+                max_records_per_batch=self._max_upsert_records_per_batch,
+                log_prefix=log_prefix,
+                what="upsert",
+                raise_on_error=False,
+            )
+            success = del_success + idx_success
+            failed = list(del_failed) + list(idx_failed)
+        except OpenSearchException as e:
+            logger.error(
+                f"[{self.workspace}] Error flushing KV ops "
+                f"(upserts={len(pending_upserts)}, "
+                f"deletes={len(pending_deletes)}): {e}"
+            )
+            raise
+
+        retryable_ids, non_retryable_ops = _extract_bulk_failed_ids(failed)
+        non_retryable_ids = {op.doc_id for op in non_retryable_ops}
+
+        # Keep ONLY retryable ops buffered for the next flush. Successful
+        # ops are popped; non-retryable (permanent 4xx) ops are dropped
+        # here, not retained: a permanently-unwritable op can never land,
+        # so keeping it would replay-and-refail on every later flush and
+        # poison every caller that shares this buffer — including direct
+        # flush paths (e.g. _persist_parsed_full_docs) that never run the
+        # pipeline's cleanup. The raise below (not retention) is what
+        # surfaces the failure and prevents a silent PROCESSED.
+        keep_ids = retryable_ids
+        for doc_id in list(pending_upserts.keys()):
+            if doc_id not in keep_ids:
+                pending_upserts.pop(doc_id, None)
+        new_deletes: set[str] = {
+            doc_id for doc_id in pending_deletes if doc_id in keep_ids
+        }
+        pending_deletes.clear()
+        pending_deletes.update(new_deletes)
+
+        if retryable_ids:
+            logger.warning(
+                f"[{self.workspace}] {len(retryable_ids)} KV ops will "
+                f"retry on the next flush (transient failure)"
+            )
+        logger.debug(
+            f"[{self.workspace}] Flushed KV ops: {success} ok, "
+            f"retry={len(retryable_ids)}, permanent_fail={len(non_retryable_ids)}"
+        )
+        if non_retryable_ops:
+            sample = non_retryable_ops[:5]
+            sample_text = ", ".join(
+                f"{op.op}/{op.doc_id}/status={op.status}/{op.error}" for op in sample
+            )
+            # A permanent (non-retryable) bulk failure means the data did
+            # not land. Raise so index_done_callback surfaces it and the
+            # pipeline aborts instead of marking the document PROCESSED.
+            raise RuntimeError(
+                f"[{self.workspace}] {self.namespace} flush: "
+                f"{len(non_retryable_ops)} KV ops failed permanently "
+                f"(non-retryable). Sample: {sample_text}"
+            )
 
     async def drop_pending_index_ops(self) -> None:
         """Discard buffered upserts/deletes (pipeline aborting on error)."""
@@ -1425,6 +1618,24 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
             # succeeded — a silently-lost doc-status row corrupts pipeline
             # bookkeeping (a doc could never be recorded FAILED/PROCESSED).
             raise
+
+    async def compare_and_commit_pipeline_attempt(
+        self,
+        key: str,
+        payload: Mapping[str, Any],
+        *,
+        expected_attempt_token: str,
+        row_kind: PipelineAttemptRowKind,
+    ) -> bool:
+        """Atomically replace a doc-status row owned by the expected attempt."""
+        return await _compare_and_commit_pipeline_attempt(
+            self.client,
+            self._index_name,
+            key,
+            payload,
+            expected_attempt_token=expected_attempt_token,
+            row_kind=row_kind,
+        )
 
     async def get_status_counts(self) -> dict[str, int]:
         """Get document counts grouped by status."""

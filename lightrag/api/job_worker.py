@@ -56,6 +56,8 @@ from lightrag.api.job_service import (
     JobService,
 )
 from lightrag.api.metadata_store import (
+    DocumentAttemptOwnershipError,
+    DocumentSnapshotConflictError,
     JobRecord,
     MetadataRecordNotFoundError,
     _same_job_execution_identity,
@@ -66,6 +68,15 @@ from lightrag.utils import logger
 # it to a terminal state (``succeeded`` / ``failed``) and return None. Raising
 # is allowed — the worker will mark the job ``failed`` as a backstop.
 JobExecutor = Callable[[JobRecord], Awaitable[None]]
+ArtifactRecoveryCallback = Callable[[], Awaitable[Any]]
+
+
+def _attempt_conflict_error_code(
+    exc: DocumentSnapshotConflictError | DocumentAttemptOwnershipError,
+) -> str:
+    if isinstance(exc, DocumentSnapshotConflictError):
+        return "document_snapshot_conflict"
+    return "document_attempt_ownership_conflict"
 
 
 def _utc_now() -> datetime:
@@ -84,6 +95,8 @@ class JobWorker:
         claim_grace_seconds: float = 5.0,
         recovery_interval_seconds: float = 30.0,
         recovery_grace_seconds: float | None = None,
+        artifact_recovery_callback: ArtifactRecoveryCallback | None = None,
+        artifact_cleanup_callback: ArtifactRecoveryCallback | None = None,
     ) -> None:
         self._job_service = job_service
         self._executors = dict(executors)
@@ -96,6 +109,8 @@ class JobWorker:
             else max(0.0, float(recovery_grace_seconds))
         )
         self._job_types = tuple(self._executors.keys())
+        self._artifact_recovery_callback = artifact_recovery_callback
+        self._artifact_cleanup_callback = artifact_cleanup_callback
         self._task: asyncio.Task[None] | None = None
         self._recovery_task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
@@ -110,6 +125,18 @@ class JobWorker:
         """Grace used by startup and periodic orphan recovery."""
 
         return self._recovery_grace_seconds
+
+    @property
+    def running(self) -> bool:
+        """Whether the polling loop (and any recovery cadence) is started.
+
+        Lightweight, non-blocking signal for health reporting. ``True`` only
+        when the main polling task exists and has not yet completed; the
+        recovery timer is best-effort and may be absent when its interval is
+        zero, so it is not required for ``running`` to be ``True``.
+        """
+
+        return self._task is not None and not self._task.done()
 
     def _grace_cutoff(self) -> str | None:
         if self._claim_grace_seconds <= 0:
@@ -192,13 +219,22 @@ class JobWorker:
                     except Exception as exc:  # noqa: BLE001 — terminal backstop
                         if executor_started:
                             logger.error(
-                                "JobWorker executor for job '%s' (type=%s) "
-                                "raised: %s",
+                                "JobWorker executor for job '%s' (type=%s) raised: %s",
                                 current.id,
                                 current.job_type,
                                 exc,
                             )
-                            error_code = "worker_executor_error"
+                            error_code = (
+                                _attempt_conflict_error_code(exc)
+                                if isinstance(
+                                    exc,
+                                    (
+                                        DocumentSnapshotConflictError,
+                                        DocumentAttemptOwnershipError,
+                                    ),
+                                )
+                                else "worker_executor_error"
+                            )
                         else:
                             logger.warning(
                                 "JobWorker rejected job '%s' (type=%s) at the "
@@ -232,13 +268,25 @@ class JobWorker:
                     await self._fail_job_quietly(
                         current,
                         str(exc),
-                        error_code="worker_executor_error",
+                        error_code=(
+                            _attempt_conflict_error_code(exc)
+                            if isinstance(
+                                exc,
+                                (
+                                    DocumentSnapshotConflictError,
+                                    DocumentAttemptOwnershipError,
+                                ),
+                            )
+                            else "worker_executor_error"
+                        ),
                     )
         except asyncio.CancelledError:
             # Guard finalizers release session/file ownership before propagating.
             raise
         except Exception as exc:  # noqa: BLE001 — keep the polling loop alive
-            logger.error("JobWorker execution guard for job '%s' failed: %s", job.id, exc)
+            logger.error(
+                "JobWorker execution guard for job '%s' failed: %s", job.id, exc
+            )
         return job
 
     async def _fail_job_quietly(
@@ -267,9 +315,7 @@ class JobWorker:
                     error_message=message,
                 )
         except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "JobWorker could not mark job '%s' failed: %s", job.id, exc
-            )
+            logger.error("JobWorker could not mark job '%s' failed: %s", job.id, exc)
 
     async def _recover_orphans_quietly(self) -> None:
         try:
@@ -278,13 +324,65 @@ class JobWorker:
                 grace_seconds=self._recovery_grace_seconds,
             )
             if recovered:
-                logger.warning(
-                    "JobWorker recovered %d orphan job(s)", len(recovered)
-                )
+                logger.warning("JobWorker recovered %d orphan job(s)", len(recovered))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — recovery must not stop polling
-            logger.error("JobWorker periodic orphan recovery failed: %s", exc)
+            logger.error(
+                "JobWorker periodic orphan recovery failed (error_type=%s)",
+                type(exc).__name__,
+            )
+
+    async def _recover_pipeline_artifacts_quietly(self) -> None:
+        callback = self._artifact_recovery_callback
+        if callback is None:
+            return
+        try:
+            await callback()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — recovery must not stop polling
+            logger.error(
+                "JobWorker periodic pipeline artifact recovery failed (error_type=%s)",
+                type(exc).__name__,
+            )
+
+    async def _drain_artifact_cleanup_quietly(self) -> None:
+        """Run the post-recovery artifact cleanup sweep (best-effort).
+
+        Mirrors ``_recover_pipeline_artifacts_quietly``: failure isolation
+        keeps the shared recovery cadence alive. The cleanup callback runs
+        AFTER recovery so it only sweeps manifests whose origin work has had
+        a chance to terminalize first.
+        """
+
+        callback = self._artifact_cleanup_callback
+        if callback is None:
+            return
+        try:
+            await callback()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — cleanup must not stop polling
+            logger.warning(
+                "JobWorker periodic artifact cleanup failed (error_type=%s)",
+                type(exc).__name__,
+            )
+
+    async def _run_recovery_cycle(self) -> None:
+        """Run independent orphan and artifact recovery on the shared cadence."""
+
+        try:
+            await self._recover_orphans_quietly()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - quiet helper is defensive
+            logger.error(
+                "JobWorker orphan recovery cycle failed (error_type=%s)",
+                type(exc).__name__,
+            )
+        await self._recover_pipeline_artifacts_quietly()
+        await self._drain_artifact_cleanup_quietly()
 
     async def _run_loop(self) -> None:
         logger.info(
@@ -318,7 +416,7 @@ class JobWorker:
             logger.info("JobWorker stopped")
 
     async def _run_recovery_loop(self) -> None:
-        """Run owner-aware recovery on a low-frequency independent timer."""
+        """Run owner-aware maintenance on a low-frequency independent timer."""
 
         try:
             while not self._stop_event.is_set():
@@ -327,9 +425,9 @@ class JobWorker:
                         self._stop_event.wait(), timeout=self._recovery_interval
                     )
                 except asyncio.TimeoutError:
-                    await self._recover_orphans_quietly()
+                    await self._run_recovery_cycle()
         finally:
-            logger.info("JobWorker orphan recovery stopped")
+            logger.info("JobWorker recovery cadence stopped")
 
     def start(self) -> None:
         """Start the background polling loop (idempotent)."""
@@ -343,11 +441,7 @@ class JobWorker:
     async def stop(self) -> None:
         """Stop promptly, cancelling any in-flight executor and its guard."""
         self._stop_event.set()
-        tasks = [
-            task
-            for task in (self._task, self._recovery_task)
-            if task is not None
-        ]
+        tasks = [task for task in (self._task, self._recovery_task) if task is not None]
         for task in tasks:
             task.cancel()
         if tasks:
@@ -409,7 +503,24 @@ def build_parse_executor(
             force_reparse=bool(payload.get("force_reparse", False)),
             auto_index=bool(payload.get("auto_index", False)),
         )
-        await document_service.mark_parse_queued(kb_id, document_id, job=job, plan=plan)
+        try:
+            await document_service.mark_parse_queued(
+                kb_id, document_id, job=job, plan=plan
+            )
+        except (
+            DocumentSnapshotConflictError,
+            DocumentAttemptOwnershipError,
+        ) as exc:
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                failed_items=1,
+                error_code=_attempt_conflict_error_code(exc),
+                error_message=str(exc),
+            )
+            return
         rag = await registry.get(kb_id)
         item = await _execute_parse_plan(
             document_service=document_service,
@@ -500,13 +611,24 @@ def build_parse_executor(
                         kb_id, document_id, job=job, plan=plan
                     )
                 except Exception as exc:  # noqa: BLE001 — plan/claim failure
+                    error_code = (
+                        _attempt_conflict_error_code(exc)
+                        if isinstance(
+                            exc,
+                            (
+                                DocumentSnapshotConflictError,
+                                DocumentAttemptOwnershipError,
+                            ),
+                        )
+                        else "parse_failed"
+                    )
                     return (
                         document_id,
                         None,
                         {
                             "document_id": document_id,
                             "status": "failed",
-                            "error_code": "parse_failed",
+                            "error_code": error_code,
                             "error_message": str(exc),
                         },
                     )
@@ -559,13 +681,23 @@ def build_parse_executor(
                     build_plan = await index_service.create_build_plan(
                         kb_id, doc_id, rag=rag
                     )
-                    if not build_plan.skipped:
-                        await index_service.claim_build_queued(
-                            kb_id, job_id=job.id, plan=build_plan
-                        )
+                    await index_service.claim_build_queued(
+                        kb_id, job_id=job.id, plan=build_plan
+                    )
                 except Exception as exc:  # noqa: BLE001 — per-item plan failure
+                    error_code = (
+                        _attempt_conflict_error_code(exc)
+                        if isinstance(
+                            exc,
+                            (
+                                DocumentSnapshotConflictError,
+                                DocumentAttemptOwnershipError,
+                            ),
+                        )
+                        else "build_failed"
+                    )
                     item["status"] = "failed"
-                    item["error_code"] = "build_failed"
+                    item["error_code"] = error_code
                     item["error_message"] = str(exc)
                     continue
                 build_plans.append(build_plan)
@@ -682,8 +814,22 @@ def build_build_kg_executor(
             force_extract=bool(payload.get("force_extract", False)),
             force_embedding=bool(payload.get("force_embedding", False)),
         )
-        if not plan.skipped:
+        try:
             await index_service.claim_build_queued(kb_id, job_id=job.id, plan=plan)
+        except (
+            DocumentSnapshotConflictError,
+            DocumentAttemptOwnershipError,
+        ) as exc:
+            await job_service.transition_job(
+                kb_id,
+                job.id,
+                status="failed",
+                progress=1.0,
+                failed_items=1,
+                error_code=_attempt_conflict_error_code(exc),
+                error_message=str(exc),
+            )
+            return
         item = await _execute_build_plan(
             index_service=index_service,
             kb_id=kb_id,
@@ -760,22 +906,30 @@ def build_build_kg_executor(
         completed_items = 0
         failed_items = len(item_results)
         for plan in batch_plan.plans:
-            if not plan.skipped:
-                try:
-                    await index_service.claim_build_queued(
-                        kb_id, job_id=job.id, plan=plan
+            try:
+                await index_service.claim_build_queued(kb_id, job_id=job.id, plan=plan)
+            except Exception as exc:  # noqa: BLE001 — per-item claim failure
+                error_code = (
+                    _attempt_conflict_error_code(exc)
+                    if isinstance(
+                        exc,
+                        (
+                            DocumentSnapshotConflictError,
+                            DocumentAttemptOwnershipError,
+                        ),
                     )
-                except Exception as exc:  # noqa: BLE001 — per-item claim failure
-                    item_results.append(
-                        {
-                            "document_id": plan.document.id,
-                            "status": "failed",
-                            "error_code": "build_failed",
-                            "error_message": str(exc),
-                        }
-                    )
-                    failed_items += 1
-                    continue
+                    else "build_failed"
+                )
+                item_results.append(
+                    {
+                        "document_id": plan.document.id,
+                        "status": "failed",
+                        "error_code": error_code,
+                        "error_message": str(exc),
+                    }
+                )
+                failed_items += 1
+                continue
             item = await _execute_build_plan(
                 index_service=index_service,
                 kb_id=kb_id,
@@ -891,37 +1045,67 @@ def build_delete_executor(
         pre_delete_footprint = _merge_footprints(_footprints_from_payload(payload))
         document: Any | None = None
         item: dict[str, Any] | None = None
-        try:
-            document = await document_service.claim_delete(
-                kb_id,
-                str(document_id),
-                job=job,
-                delete_source_file=delete_source_file,
-                delete_artifacts=delete_artifacts,
-            )
-        except MetadataRecordNotFoundError as exc:
-            if (
-                strategy != "rebuild_subgraph"
-                or index_service is None
-                or not persisted_footprints
-            ):
-                await job_service.transition_job(
-                    kb_id,
-                    job.id,
-                    status="failed",
-                    progress=1.0,
-                    failed_items=1,
-                    error_code="document_not_found",
-                    error_message=str(exc),
+        if document_service.object_authoritative:
+            # Object mode: B1 claims internally; skip local claim_delete.
+            try:
+                document = await document_service.get_document(
+                    kb_id, str(document_id)
                 )
-                return
-            item = {
-                "document_id": str(document_id),
-                "status": "succeeded",
-                "lightrag_doc_id": persisted_footprints[0].get("lightrag_doc_id")
-                or payload.get("lightrag_doc_id"),
-                "already_deleted_by_previous_attempt": True,
-            }
+            except MetadataRecordNotFoundError as exc:
+                if (
+                    strategy != "rebuild_subgraph"
+                    or index_service is None
+                    or not persisted_footprints
+                ):
+                    await job_service.transition_job(
+                        kb_id,
+                        job.id,
+                        status="failed",
+                        progress=1.0,
+                        failed_items=1,
+                        error_code="document_not_found",
+                        error_message=str(exc),
+                    )
+                    return
+                item = {
+                    "document_id": str(document_id),
+                    "status": "succeeded",
+                    "lightrag_doc_id": persisted_footprints[0].get("lightrag_doc_id")
+                    or payload.get("lightrag_doc_id"),
+                    "already_deleted_by_previous_attempt": True,
+                }
+        else:
+            try:
+                document = await document_service.claim_delete(
+                    kb_id,
+                    str(document_id),
+                    job=job,
+                    delete_source_file=delete_source_file,
+                    delete_artifacts=delete_artifacts,
+                )
+            except MetadataRecordNotFoundError as exc:
+                if (
+                    strategy != "rebuild_subgraph"
+                    or index_service is None
+                    or not persisted_footprints
+                ):
+                    await job_service.transition_job(
+                        kb_id,
+                        job.id,
+                        status="failed",
+                        progress=1.0,
+                        failed_items=1,
+                        error_code="document_not_found",
+                        error_message=str(exc),
+                    )
+                    return
+                item = {
+                    "document_id": str(document_id),
+                    "status": "succeeded",
+                    "lightrag_doc_id": persisted_footprints[0].get("lightrag_doc_id")
+                    or payload.get("lightrag_doc_id"),
+                    "already_deleted_by_previous_attempt": True,
+                }
         if document is not None:
             if strategy == "rebuild_subgraph" and index_service is not None:
                 if not persisted_footprints:
@@ -955,6 +1139,8 @@ def build_delete_executor(
                 delete_source_file=delete_source_file,
                 delete_artifacts=delete_artifacts,
                 delete_llm_cache=delete_llm_cache,
+                job_service=job_service,
+                job=job,
             )
         if item is None:
             await job_service.transition_job(
@@ -1034,13 +1220,36 @@ def build_delete_executor(
             for item in persisted_footprints
             if isinstance(item.get("document_id"), str)
         }
-        documents, claim_failures = await document_service.claim_batch_delete(
-            kb_id,
-            document_ids,
-            job=job,
-            delete_source_file=delete_source_file,
-            delete_artifacts=delete_artifacts,
-        )
+        if document_service.object_authoritative:
+            # Object mode: B1 claims per-document internally; skip local
+            # claim_batch_delete. Load documents directly; unknown ones become
+            # per-item document_not_found failures with per-document tokens.
+            existing_docs = await document_service.get_documents_by_ids(
+                kb_id, document_ids
+            )
+            found_by_id = {doc.id: doc for doc in existing_docs}
+            documents = []
+            claim_failures: list[dict[str, Any]] = []
+            for doc_id in document_ids:
+                if doc_id in found_by_id:
+                    documents.append(found_by_id[doc_id])
+                else:
+                    claim_failures.append(
+                        {
+                            "document_id": doc_id,
+                            "status": "failed",
+                            "error_code": "document_not_found",
+                            "error_message": f"Document '{doc_id}' not found",
+                        }
+                    )
+        else:
+            documents, claim_failures = await document_service.claim_batch_delete(
+                kb_id,
+                document_ids,
+                job=job,
+                delete_source_file=delete_source_file,
+                delete_artifacts=delete_artifacts,
+            )
         pre_delete_footprints: list[dict[str, Any]] = _footprints_from_payload(payload)
         if strategy == "rebuild_subgraph" and index_service is not None:
             footprint_rag = await registry.get(kb_id)
@@ -1105,6 +1314,8 @@ def build_delete_executor(
                 delete_source_file=delete_source_file,
                 delete_artifacts=delete_artifacts,
                 delete_llm_cache=delete_llm_cache,
+                job_service=job_service,
+                job=job,
             )
             item_results.append(item)
             if item["status"] == "succeeded":
@@ -1119,14 +1330,22 @@ def build_delete_executor(
             items=item_results,
         )
         final_result["resumed_by_worker"] = True
-        if strategy == "rebuild_kb" and completed_items > 0 and index_service is not None:
+        if (
+            strategy == "rebuild_kb"
+            and completed_items > 0
+            and index_service is not None
+        ):
             final_result["rebuild"] = await _run_conservative_kb_rebuild(
                 document_service=document_service,
                 index_service=index_service,
                 registry=registry,
                 kb_id=kb_id,
             )
-        elif strategy == "rebuild_subgraph" and completed_items > 0 and index_service is not None:
+        elif (
+            strategy == "rebuild_subgraph"
+            and completed_items > 0
+            and index_service is not None
+        ):
             final_result["rebuild"] = await _run_subgraph_rebuild(
                 document_service=document_service,
                 index_service=index_service,
@@ -1211,6 +1430,193 @@ def build_replace_executor(
                 error_message="replace job has invalid source_type",
             )
             return
+
+        if document_service.object_authoritative:
+            # Object mode: B1 owns the claim. Worker resume handles two cases:
+            #   1. ``engine_cleanup_pending`` — the pointer+manifest commit
+            #      already landed; re-drive only the engine delete (no bytes
+            #      needed, the committed source object is authoritative).
+            #   2. pre-commit crash WITH ``staging_object_uri`` (Phase 3.2) —
+            #      the request process staged the replacement bytes to the
+            #      deterministic COW candidate object before it died. Download
+            #      them and re-drive ``_execute_replace_document``; the
+            #      persisted ``attempt_token`` makes the COW upload idempotent.
+            # A pre-commit crash WITHOUT object staging still fails cleanly as
+            # ``replace_not_resumable`` (the original request bytes are gone).
+            try:
+                document = await document_service.get_document(kb_id, document_id)
+            except MetadataRecordNotFoundError as exc:
+                await job_service.transition_job(
+                    kb_id,
+                    job.id,
+                    status="failed",
+                    progress=1.0,
+                    failed_items=1,
+                    error_code="document_not_found",
+                    error_message=str(exc),
+                )
+                return
+            replace_phase = document.metadata.get("replace_phase")
+            staging_object_uri = payload.get("staging_object_uri")
+            if replace_phase != "engine_cleanup_pending":
+                if not staging_object_uri:
+                    # Pre-commit crash without object-backed staging.
+                    # Cannot resume without the original request bytes.
+                    await job_service.transition_job(
+                        kb_id,
+                        job.id,
+                        status="failed",
+                        progress=1.0,
+                        failed_items=1,
+                        error_code="replace_not_resumable",
+                        error_message=(
+                            "Object-mode replace resume requires "
+                            "engine_cleanup_pending state; re-submit the request"
+                        ),
+                    )
+                    return
+                # Pre-commit crash WITH object-backed staging (Phase 3.2):
+                # download the staged candidate and re-drive the same
+                # ``_execute_replace_document`` the route uses.
+                try:
+                    staged_replacement = (
+                        await document_service.load_staged_replacement_object(
+                            kb_id,
+                            document_id,
+                            job_id=job.id,
+                            staging_object_uri=str(staging_object_uri),
+                            source_name=str(
+                                payload.get("source_name") or "replacement"
+                            ),
+                            source_hash=str(payload.get("source_hash") or ""),
+                            content_type=payload.get("content_type"),
+                            size_bytes=int(payload.get("size_bytes") or 0),
+                            source_type=source_type,
+                        )
+                    )
+                except ValueError as exc:
+                    # Staged object present but its checksum no longer matches
+                    # the persisted source_hash. Fail cleanly instead of
+                    # replaying wrong bytes.
+                    await job_service.transition_job(
+                        kb_id,
+                        job.id,
+                        status="failed",
+                        progress=1.0,
+                        failed_items=1,
+                        error_code="replace_not_resumable",
+                        error_message=str(exc),
+                    )
+                    return
+                if staged_replacement is None:
+                    await job_service.transition_job(
+                        kb_id,
+                        job.id,
+                        status="failed",
+                        progress=1.0,
+                        failed_items=1,
+                        error_code="replace_not_resumable",
+                        error_message=(
+                            "Object-mode replace staging object is absent; "
+                            "re-submit the replace request"
+                        ),
+                    )
+                    return
+                item = await _execute_replace_document(
+                    document_service=document_service,
+                    kb_id=kb_id,
+                    job=job,
+                    document=document,
+                    replacement=staged_replacement,
+                    active_registry=registry,
+                    active_index_service=index_service,
+                    delete_source_file=bool(payload.get("delete_source_file", True)),
+                    delete_artifacts=bool(payload.get("delete_artifacts", True)),
+                    delete_llm_cache=bool(payload.get("delete_llm_cache", False)),
+                    auto_parse=bool(payload.get("auto_parse", False)),
+                    auto_index=bool(payload.get("auto_index", False)),
+                    parser_engine=payload.get("parser_engine"),
+                    process_options=payload.get("process_options"),
+                    force_reparse=bool(payload.get("force_reparse", False)),
+                    job_service=job_service,
+                )
+                if item["status"] == "succeeded":
+                    item["resumed_by_worker"] = True
+                    await job_service.transition_job(
+                        kb_id,
+                        job.id,
+                        status="succeeded",
+                        progress=1.0,
+                        completed_items=1,
+                        result=item,
+                    )
+                else:
+                    await job_service.transition_job(
+                        kb_id,
+                        job.id,
+                        status="failed",
+                        progress=1.0,
+                        failed_items=1,
+                        error_code=item.get("error_code", "replace_failed"),
+                        error_message=item.get("error_message", "replace failed"),
+                        result=item,
+                    )
+                return
+            # Build a minimal replacement for the response shape; B1 will not
+            # re-upload (resume path uses the already-committed source object).
+            from lightrag.api.document_lifecycle_service import (
+                DocumentReplacementSource,
+            )
+
+            replacement = DocumentReplacementSource(
+                source_name=str(payload.get("source_name") or "replacement"),
+                content=b"",
+                source_type=source_type,
+                source_hash=str(payload.get("source_hash") or ""),
+                content_type=payload.get("content_type"),
+                size_bytes=int(payload.get("size_bytes") or 0),
+            )
+            item = await _execute_replace_document(
+                document_service=document_service,
+                kb_id=kb_id,
+                job=job,
+                document=document,
+                replacement=replacement,
+                active_registry=registry,
+                active_index_service=index_service,
+                delete_source_file=bool(payload.get("delete_source_file", True)),
+                delete_artifacts=bool(payload.get("delete_artifacts", True)),
+                delete_llm_cache=bool(payload.get("delete_llm_cache", False)),
+                auto_parse=bool(payload.get("auto_parse", False)),
+                auto_index=bool(payload.get("auto_index", False)),
+                parser_engine=payload.get("parser_engine"),
+                process_options=payload.get("process_options"),
+                force_reparse=bool(payload.get("force_reparse", False)),
+                job_service=job_service,
+            )
+            if item["status"] == "succeeded":
+                item["resumed_by_worker"] = True
+                await job_service.transition_job(
+                    kb_id,
+                    job.id,
+                    status="succeeded",
+                    progress=1.0,
+                    completed_items=1,
+                    result=item,
+                )
+            else:
+                await job_service.transition_job(
+                    kb_id,
+                    job.id,
+                    status="failed",
+                    progress=1.0,
+                    failed_items=1,
+                    error_code=item.get("error_code", "replace_failed"),
+                    error_message=item.get("error_message", "replace failed"),
+                    result=item,
+                )
+            return
+
         try:
             replacement = await document_service.load_staged_replacement(
                 kb_id,
@@ -1284,6 +1690,7 @@ def build_replace_executor(
             parser_engine=payload.get("parser_engine"),
             process_options=payload.get("process_options"),
             force_reparse=bool(payload.get("force_reparse", False)),
+            job_service=job_service,
         )
         if item["status"] == "succeeded":
             item["resumed_by_worker"] = True
@@ -1342,9 +1749,7 @@ def build_sync_executor(
     def _invalid_payload_message(message: str) -> str:
         return f"sync job has invalid resumable payload: {message}"
 
-    async def _clear_staged_sync_if_terminal(
-        kb_id: str, batch_id: Any | None
-    ) -> None:
+    async def _clear_staged_sync_if_terminal(kb_id: str, batch_id: Any | None) -> None:
         if isinstance(batch_id, str) and batch_id:
             await document_service.clear_staged_sync_sources(kb_id, batch_id=batch_id)
 
@@ -1417,16 +1822,82 @@ def build_sync_executor(
                 )
                 return
             try:
-                source = await document_service.load_staged_sync_source(
-                    kb_id,
-                    batch_id=batch_id,
-                    item_index=index,
-                    source_name=source_name,
-                    content_type=content_type,
-                    metadata={"source_key": source_key},
-                    expected_hash=source_hash,
-                    source_type=source_type,
-                )
+                if document_service.object_authoritative:
+                    # Object mode: prefer Phase 3.2 object-backed staging when
+                    # the request process persisted a per-item staging URI.
+                    # Otherwise a metadata-only (empty-bytes) source is safe ONLY
+                    # when the document is already post-commit — the COW commit
+                    # already uploaded the authoritative source object, or the
+                    # existing source hash already matches so the item is skipped
+                    # with no re-upload. A pre-commit crash without object-backed
+                    # staging must fail cleanly as ``sync_not_resumable`` (parity
+                    # with the local-mode path's hash-mismatch handling).
+                    item_staging_uri: str | None = None
+                    staging_uris = payload.get("staging_object_uris")
+                    if isinstance(staging_uris, dict):
+                        candidate = staging_uris.get(source_key)
+                        if isinstance(candidate, str) and candidate:
+                            item_staging_uri = candidate
+                    if item_staging_uri is not None:
+                        source = await document_service.load_staged_sync_source_object(
+                            kb_id,
+                            staging_object_uri=item_staging_uri,
+                            source_name=source_name,
+                            content_type=content_type,
+                            metadata={"source_key": source_key},
+                            expected_hash=source_hash,
+                            source_type=source_type,
+                        )
+                    else:
+                        # No object-backed staging URI for this item. Verify the
+                        # document is already post-commit before falling back to
+                        # a metadata-only source: either the COW commit landed
+                        # (``replace_phase`` is ``engine_cleanup_pending`` or
+                        # ``completed``) or the existing document already carries
+                        # this exact source hash (the item will be skipped). Any
+                        # other state means a pre-commit crash with no staged
+                        # bytes; raise ValueError so the caller fails cleanly as
+                        # ``sync_not_resumable`` instead of uploading empties.
+                        existing_map = (
+                            await document_service.get_documents_by_source_keys(
+                                kb_id, [source_key]
+                            )
+                        )
+                        existing_doc = existing_map.get(source_key)
+                        post_commit = existing_doc is not None and (
+                            existing_doc.metadata.get("replace_phase")
+                            in {"engine_cleanup_pending", "completed"}
+                            or existing_doc.source_hash == source_hash
+                        )
+                        if not post_commit:
+                            raise ValueError(
+                                "Object-mode sync resume requires a persisted "
+                                "staging_object_uri or a post-commit document "
+                                "(engine_cleanup_pending/completed); "
+                                "re-submit the sync request"
+                            )
+                        from lightrag.api.document_lifecycle_service import (
+                            DocumentSourceInput,
+                        )
+
+                        source = DocumentSourceInput(
+                            source_name=source_name,
+                            content=b"",
+                            source_type=source_type,
+                            content_type=content_type,
+                            metadata={"source_key": source_key},
+                        )
+                else:
+                    source = await document_service.load_staged_sync_source(
+                        kb_id,
+                        batch_id=batch_id,
+                        item_index=index,
+                        source_name=source_name,
+                        content_type=content_type,
+                        metadata={"source_key": source_key},
+                        expected_hash=source_hash,
+                        source_type=source_type,
+                    )
             except ValueError as exc:
                 await job_service.transition_job(
                     kb_id,
@@ -1460,7 +1931,9 @@ def build_sync_executor(
                     "source": source,
                     "source_hash": source_hash,
                     "content_type": content_type,
-                    "size_bytes": int(raw_item.get("size_bytes") or len(source.content)),
+                    "size_bytes": int(
+                        raw_item.get("size_bytes") or len(source.content)
+                    ),
                 }
             )
 
@@ -1502,6 +1975,7 @@ def build_sync_executor(
                     delete_artifacts=bool(payload.get("delete_artifacts", True)),
                     delete_llm_cache=bool(payload.get("delete_llm_cache", False)),
                     defer_build=True,
+                    job_service=job_service,
                 )
             return item
 

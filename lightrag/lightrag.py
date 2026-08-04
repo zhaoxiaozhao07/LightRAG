@@ -5,7 +5,7 @@ import asyncio
 import os
 import time
 import warnings
-from copy import deepcopy
+from copy import copy, deepcopy
 
 try:
     import httpx
@@ -35,6 +35,7 @@ from lightrag.prompt import (
     resolve_entity_extraction_prompt_profile,
     validate_entity_extraction_prompt_profile_for_mode,
 )
+from lightrag.artifact_runtime import PipelineArtifactMaterializer
 from lightrag.constants import (
     DEFAULT_CHUNK_P_SIZE,
     DEFAULT_MAX_GLEANING,
@@ -516,6 +517,18 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     # Extensions
     # ---
 
+    pipeline_artifact_materializer: PipelineArtifactMaterializer | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    """Optional processing-owner artifact session factory.
+
+    ``None`` preserves the local/legacy pipeline.  A durable artifact binding
+    fails closed when this callback is absent instead of falling back to a
+    path written by another process.
+    """
+
     max_parallel_insert: int = field(
         default=int(os.getenv("MAX_PARALLEL_INSERT", DEFAULT_MAX_PARALLEL_INSERT))
     )
@@ -818,10 +831,18 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
     def _build_global_config(self) -> dict[str, Any]:
         self._ensure_addon_params_cache()
-        global_config = asdict(self)
+        # ``asdict`` deep-copies every dataclass field.  Materializer callbacks
+        # may own locks/clients that are intentionally not copyable, so remove
+        # the runtime-only callback on a shallow snapshot before conversion.
+        config_snapshot = copy(self)
+        config_snapshot.pipeline_artifact_materializer = None
+        global_config = asdict(config_snapshot)
         global_config.pop("_addon_params", None)
         global_config.pop("_addon_params_dirty", None)
         global_config.pop("_cached_entity_extraction_use_json", None)
+        # Runtime materialization is an operation-scoped callback, never model
+        # configuration and never durable/global pipeline state.
+        global_config.pop("pipeline_artifact_materializer", None)
         global_config["addon_params"] = dict(self._addon_params)
         # Inject runtime per-role wrapped LLM funcs (callable; not part of asdict
         # because they live in the private _role_llm_states map). The first

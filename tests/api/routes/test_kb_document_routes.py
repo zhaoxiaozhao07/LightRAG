@@ -28,8 +28,37 @@ from lightrag.api.metadata_store import (
     KBLifecycleConflictError,
     SQLiteMetadataStore,
 )
-from lightrag.api.object_storage import ObjectStorage
+from lightrag.api.object_storage import ObjectStat, ObjectStorage
 from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
+
+# Phase 3.1-C Integration Writer B2: object-authoritative COW branch imports.
+import hashlib as _hashlib_b2
+from dataclasses import replace as _dataclass_replace_b2
+from datetime import datetime as _datetime_b2, timezone as _timezone_b2
+from uuid import uuid4 as _uuid4_b2
+
+from lightrag.api.artifact_materialization import (
+    ArtifactMaterializer as _ArtifactMaterializer_b2,
+    MaterializationLimits as _MaterializationLimits_b2,
+)
+from lightrag.api.config import ArtifactCleanupConfig as _ArtifactCleanupConfig_b2
+from lightrag.api.document_lifecycle_service import (
+    DocumentReplacementSource as _DocumentReplacementSource_b2,
+)
+from lightrag.api.kb_service import utc_now_iso as _utc_now_iso_b2
+from lightrag.api.metadata_store import (
+    ArtifactRecord as _ArtifactRecord_b2,
+    DocumentRecord as _DocumentRecord_b2,
+)
+from lightrag.api.object_storage import (
+    ObjectReadback as _ObjectReadback_b2,
+    ObjectStat as _ObjectStat_b2,
+    ObjectStorageError as _ObjectStorageError_b2,
+)
+from lightrag.utils_pipeline import (
+    reset_canonical_input_root_for_tests as _reset_root_b2,
+    set_canonical_input_root as _set_root_b2,
+)
 
 _original_argv = sys.argv[:]
 sys.argv = [sys.argv[0]]
@@ -209,7 +238,17 @@ class FakeObjectStorage(ObjectStorage):
         local_path.parent.mkdir(parents=True, exist_ok=True)
         local_path.write_bytes(self.files[object_uri])
 
-    async def download_prefix(self, prefix_uri: str, local_dir: Path) -> int:
+    async def stat_object(self, object_uri: str) -> ObjectStat:
+        return ObjectStat(size=len(self.files[object_uri]))
+
+    async def download_prefix(
+        self,
+        prefix_uri: str,
+        local_dir: Path,
+        *,
+        max_objects: int | None = None,
+        max_total_bytes: int | None = None,
+    ) -> int:
         self.prefix_downloads.append((prefix_uri, local_dir))
         local_dir.mkdir(parents=True, exist_ok=True)
         files = self.prefix_files[prefix_uri]
@@ -250,10 +289,31 @@ class FakeObjectStorage(ObjectStorage):
         return f"https://objects.example/download?uri={object_uri}&expires={expires_in_seconds}"
 
     def validate_document_file_uri(
-        self, object_uri: str, *, workspace: str, document_id: str
+        self,
+        object_uri: str,
+        *,
+        workspace: str,
+        document_id: str,
+        namespace: str | None = None,
+        artifact_id: str | None = None,
     ) -> None:
         prefix = f"s3://fake-bucket/workspaces/{workspace}/documents/{document_id}/"
         if not object_uri.startswith(prefix) or object_uri.endswith("/"):
+            from lightrag.api.object_storage import ObjectStorageError
+
+            raise ObjectStorageError("Object URI is outside the document object prefix")
+
+    def validate_document_prefix_uri(
+        self,
+        prefix_uri: str,
+        *,
+        workspace: str,
+        document_id: str,
+        namespace: str | None = None,
+        artifact_id: str | None = None,
+    ) -> None:
+        prefix = f"s3://fake-bucket/workspaces/{workspace}/documents/{document_id}/"
+        if not prefix_uri.startswith(prefix) or not prefix_uri.endswith("/"):
             from lightrag.api.object_storage import ObjectStorageError
 
             raise ObjectStorageError("Object URI is outside the document object prefix")
@@ -2564,8 +2624,8 @@ def test_batch_parse_treats_active_parse_as_per_item_failure(tmp_path):
             lightrag_doc_id=plan.lightrag_doc_id,
             parser_engine=plan.parser_engine,
             process_options=plan.process_options,
-            source_uri=str(plan.source_path),
             source_hash=plan.document.source_hash,
+            source_name=plan.source_name,
         )
         await _document_service.mark_parse_queued(
             "kb_batch_active", active_document_id, job=job, plan=plan
@@ -2659,7 +2719,7 @@ def test_batch_parse_missing_document_and_source_are_per_item_failures(tmp_path)
     assert {
         item["error_code"] for item in result_items if item["status"] == "failed"
     } == {
-        "source_not_found",
+        "parse_failed",
         "document_not_found",
     }
 
@@ -2672,7 +2732,7 @@ def test_batch_parse_missing_document_and_source_are_per_item_failures(tmp_path)
         f"/kbs/kb_batch_missing/documents/{lost['id']}", headers=_HEADERS
     )
     assert lost_document.status_code == 200
-    assert lost_document.json()["status"] == "uploaded"
+    assert lost_document.json()["status"] == "parse_failed"
 
 
 def test_batch_parse_rejects_invalid_options_duplicates_and_cross_kb(tmp_path):
@@ -3183,7 +3243,7 @@ def test_parse_failure_job_is_retryable(tmp_path):
     assert body["error_message"] is None
 
 
-def test_parse_document_missing_source_returns_404(tmp_path):
+def test_parse_document_missing_source_fails_after_claim(tmp_path):
     client, _kb_service, _store, _document_service, _job_service = _build_client(
         tmp_path
     )
@@ -3203,8 +3263,15 @@ def test_parse_document_missing_source_returns_404(tmp_path):
         headers=_HEADERS,
     )
 
-    assert response.status_code == 404
-    assert "Document source not found" in response.json()["detail"]
+    assert response.status_code == 200
+    job_id = response.json()["id"]
+    job = client.get(f"/kbs/kb_missing_source/jobs/{job_id}", headers=_HEADERS)
+    assert job.status_code == 200
+    payload = job.json()
+    assert payload["status"] == "failed"
+    assert payload["error_code"] == "parse_failed"
+    assert "Document source not found" in payload["error_message"]
+    assert "source_uri" not in payload["payload"]
 
 
 def test_parse_document_rejects_invalid_process_options(tmp_path):
@@ -3260,8 +3327,8 @@ def test_parse_document_rejects_existing_active_parse_job(tmp_path):
             lightrag_doc_id=plan.lightrag_doc_id,
             parser_engine=plan.parser_engine,
             process_options=plan.process_options,
-            source_uri=str(plan.source_path),
             source_hash=plan.document.source_hash,
+            source_name=plan.source_name,
         )
         await _document_service.mark_parse_queued(
             "kb_parse_active", document_id, job=job, plan=plan
@@ -4060,3 +4127,840 @@ def test_delete_rebuild_kb_strategy_requires_index_service(tmp_path):
         headers=_HEADERS,
     )
     assert response.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.1-C Integration Writer B2: object-authoritative COW branches.
+#
+# These tests exercise the object-mode branches in the route-level helpers
+# (_execute_replace_document, _execute_delete_document_impl, _execute_sync_item)
+# directly via fakes, bypassing the HTTP admission gate which remains closed
+# (object-mode HTTP still 503 via assert_destructive_operation_supported).
+# ---------------------------------------------------------------------------
+
+_B2_NOW = _datetime_b2(2026, 8, 3, 12, 0, 0, tzinfo=_timezone_b2.utc)
+_B2_BUCKET = "b2-bucket"
+
+
+class _B2FakeObjectStorage(ObjectStorage):
+    """Deterministic object storage with metadata-only inspection (no GetObject).
+
+    Mirrors the proven fake from test_document_lifecycle_cow_service.py.
+    """
+
+    def __init__(self):
+        self.files: dict[str, bytes] = {}
+        self.upload_proof_calls: list[tuple[str, str | None]] = []
+        self.deleted_uris: list[str] = []
+        self.deleted_prefixes: list[str] = []
+
+    async def initialize(self):
+        return None
+
+    async def close(self):
+        return None
+
+    async def upload_file(self, local_path: Path, *, key: str, content_type=None):
+        uri = self.object_uri_for_key(key)
+        self.files[uri] = local_path.read_bytes()
+        return uri
+
+    async def upload_file_if_absent(
+        self, local_path: Path, *, key: str, content_type=None, expected_sha256=None
+    ):
+        del content_type
+        uri = self.object_uri_for_key(key)
+        self.upload_proof_calls.append((uri, expected_sha256))
+        if uri in self.files:
+            return uri, False
+        self.files[uri] = local_path.read_bytes()
+        return uri, True
+
+    def object_uri_for_key(self, key: str):
+        return f"s3://{_B2_BUCKET}/{key.lstrip('/')}"
+
+    def object_prefix_uri_for_key(self, prefix: str):
+        return f"s3://{_B2_BUCKET}/{prefix.strip('/')}/"
+
+    async def stat_object(self, object_uri: str):
+        rb = await self.inspect_object(object_uri)
+        if not rb.present or rb.stat is None:
+            raise _ObjectStorageError_b2(f"Missing: {object_uri}")
+        return rb.stat
+
+    async def inspect_object(self, object_uri: str, *, version_id=None):
+        if object_uri not in self.files:
+            return _ObjectReadback_b2(present=False)
+        data = self.files[object_uri]
+        return _ObjectReadback_b2(
+            present=True,
+            stat=_ObjectStat_b2(
+                size=len(data),
+                etag=f'"etag-{len(data)}"',
+                last_modified=_B2_NOW,
+                checksum=f"sha256:{_hashlib_b2.sha256(data).hexdigest()}",
+            ),
+        )
+
+    async def delete_uri(self, object_uri: str):
+        self.deleted_uris.append(object_uri)
+        return self.files.pop(object_uri, None) is not None
+
+    async def delete_prefix(self, prefix_uri: str):
+        self.deleted_prefixes.append(prefix_uri)
+        count = 0
+        for uri in list(self.files):
+            if uri.startswith(prefix_uri):
+                self.files.pop(uri)
+                count += 1
+        return count
+
+    async def delete_workspace(self, workspace: str):
+        return 0
+
+    def validate_document_file_uri(self, *args, **kwargs):
+        return None
+
+    def validate_document_prefix_uri(self, *args, **kwargs):
+        return None
+
+
+class _B2FakeRAG:
+    """Fake LightRAG instance whose adelete_by_doc_id is idempotent."""
+
+    def __init__(self):
+        self.deleted: list[tuple[str, bool]] = []
+
+    async def adelete_by_doc_id(self, doc_id: str, delete_llm_cache: bool = False):
+        self.deleted.append((doc_id, delete_llm_cache))
+        return SimpleNamespace(
+            status="success",
+            doc_id=doc_id,
+            message="deleted",
+            status_code=200,
+            file_path="",
+        )
+
+    async def finalize_storages(self):
+        return None
+
+    async def adrop_all_storages(self):
+        return {"dropped": 0, "failed": 0, "errors": []}
+
+
+class _B2FakeRegistry:
+    def __init__(self, rag):
+        self._rag = rag
+
+    async def get(self, kb_id: str):
+        return self._rag
+
+    async def acquire(self, kb_id: str):
+        return self._rag
+
+
+def _b2_sha256(data: bytes) -> str:
+    return _hashlib_b2.sha256(data).hexdigest()
+
+
+def _b2_limits():
+    return _MaterializationLimits_b2(
+        max_objects=1000, max_total_bytes=64 * 1024 * 1024, stale_ttl_seconds=1
+    )
+
+
+def _b2_document(
+    kb_id: str,
+    document_id: str,
+    *,
+    workspace: str,
+    source_generation_id: str = "srcg-b2-old",
+    artifact_id: str | None = "artifact-b2-old",
+    source_key: str | None = None,
+):
+    now = _utc_now_iso_b2()
+    source_uri = (
+        f"s3://{_B2_BUCKET}/workspaces/{workspace}/documents/{document_id}/source/"
+        f"generations/{source_generation_id}/source.pdf"
+    )
+    metadata: dict = {
+        "source_object_uri": source_uri,
+        "source_generation_id": source_generation_id,
+    }
+    if artifact_id is not None:
+        metadata.update(
+            {
+                "current_sidecar_artifact_id": artifact_id,
+                "current_artifact_ids": [artifact_id],
+            }
+        )
+    if source_key is not None:
+        metadata["source_key"] = source_key
+    return _DocumentRecord_b2(
+        id=document_id,
+        kb_id=kb_id,
+        workspace=workspace,
+        lightrag_doc_id=f"engine-{document_id}",
+        source_type="upload",
+        source_name="source.pdf",
+        source_uri=source_uri,
+        source_hash="sha256:" + "0" * 64,
+        content_type="application/pdf",
+        size_bytes=4,
+        parser_hash="parser-old",
+        index_hash="index-old",
+        status="ready",
+        enabled=True,
+        archived=False,
+        chunks_count=1,
+        entity_count=0,
+        relation_count=0,
+        error_code=None,
+        error_message=None,
+        metadata=metadata,
+        created_at=now,
+        updated_at=now,
+        deleted_at=None,
+    )
+
+
+def _b2_artifact(document, artifact_id="artifact-b2-old"):
+    now = _utc_now_iso_b2()
+    object_uri = (
+        f"s3://{_B2_BUCKET}/workspaces/{document.workspace}/documents/{document.id}/"
+        f"artifacts/raw/{artifact_id}/sidecar.json"
+    )
+    return _ArtifactRecord_b2(
+        id=artifact_id,
+        kb_id=document.kb_id,
+        workspace=document.workspace,
+        document_id=document.id,
+        artifact_type="sidecar",
+        uri=object_uri,
+        checksum="sha256:" + "a" * 64,
+        size_bytes=9,
+        metadata={"object_uri": object_uri},
+        created_at=now,
+    )
+
+
+async def _b2_put_artifact(store, artifact):
+    def write(conn):
+        store._insert_artifact(conn, artifact)
+
+    await store._write(write)
+
+
+@pytest.fixture
+def b2_object_setup(tmp_path: Path):
+    root = tmp_path / "source"
+    root.mkdir(parents=True, exist_ok=True)
+    _reset_root_b2()
+    _set_root_b2(root)
+
+    async def _build():
+        store = SQLiteMetadataStore(tmp_path / "b2.sqlite3")
+        await store.initialize()
+        kb_service = KnowledgeBaseService(tmp_path / "b2_kbs.json")
+        kb_id = f"kb_b2_{_uuid4_b2().hex[:10]}"
+        kb_record = await kb_service.create(name=kb_id, kb_id=kb_id)
+        workspace = kb_record.workspace
+        generation = kb_record.generation
+        await store.activate_kb_generation(kb_id, generation)
+        storage = _B2FakeObjectStorage()
+        materializer = _ArtifactMaterializer_b2(
+            storage, input_root=root, limits=_b2_limits()
+        )
+        service = DocumentLifecycleService(
+            kb_service,
+            store,
+            root,
+            object_storage=storage,
+            artifact_storage_mode="object",
+            materializer=materializer,
+            artifact_cleanup_config=_ArtifactCleanupConfig_b2(),
+            clock=lambda: _B2_NOW,
+        )
+        return service, store, storage, kb_id, workspace, generation
+
+    return _build
+
+
+async def _b2_seed(b2_object_setup, *, document_id="doc-b2", job_id="job-b2"):
+    service, store, storage, kb_id, workspace, generation = await b2_object_setup()
+    document = _b2_document(kb_id, document_id, workspace=workspace)
+    artifact = _b2_artifact(document)
+    from lightrag.api.metadata_store import JobRecord as _JobRecord_b2
+
+    now = _utc_now_iso_b2()
+    job = _JobRecord_b2(
+        id=job_id,
+        kb_id=kb_id,
+        workspace=workspace,
+        batch_id=None,
+        document_id=document_id,
+        job_type="replace",
+        status="running",
+        stage="replacing",
+        progress=0.1,
+        total_items=1,
+        completed_items=0,
+        failed_items=0,
+        idempotency_key=f"idem-{job_id}",
+        config_version_id=None,
+        config_hash=None,
+        retry_count=0,
+        max_retries=3,
+        payload={"idempotency_fingerprint": "sha256:b2", "attempt_tokens": {}},
+        result=None,
+        error_code=None,
+        error_message=None,
+        created_at=now,
+        updated_at=now,
+        queued_at=now,
+        started_at=now,
+        finished_at=None,
+        cancelled_at=None,
+    )
+    await store.create_documents_and_job([document], job)
+    await _b2_put_artifact(store, artifact)
+    storage.files[document.metadata["source_object_uri"]] = b"old-bytes"
+    storage.files[artifact.uri] = b"artifact"
+    return service, store, storage, kb_id, workspace, generation, document, artifact, job
+
+
+async def _b2_seed_for_delete(b2_object_setup, *, document_id="doc-b2-del", job_id="job-b2-del"):
+    """Seed a document with NO active replace job so a delete claim can proceed."""
+    service, store, storage, kb_id, workspace, generation = await b2_object_setup()
+    document = _b2_document(kb_id, document_id, workspace=workspace)
+    artifact = _b2_artifact(document)
+    from lightrag.api.metadata_store import JobRecord as _JobRecord_b2
+
+    now = _utc_now_iso_b2()
+    del_job = _JobRecord_b2(
+        id=job_id,
+        kb_id=kb_id,
+        workspace=workspace,
+        batch_id=None,
+        document_id=document_id,
+        job_type="delete",
+        status="running",
+        stage="deleting",
+        progress=0.1,
+        total_items=1,
+        completed_items=0,
+        failed_items=0,
+        idempotency_key=f"idem-{job_id}",
+        config_version_id=None,
+        config_hash=None,
+        retry_count=0,
+        max_retries=3,
+        payload={"idempotency_fingerprint": "sha256:del", "attempt_tokens": {}},
+        result=None,
+        error_code=None,
+        error_message=None,
+        created_at=now,
+        updated_at=now,
+        queued_at=now,
+        started_at=now,
+        finished_at=None,
+        cancelled_at=None,
+    )
+    await store.create_documents_and_job([document], del_job)
+    await _b2_put_artifact(store, artifact)
+    storage.files[document.metadata["source_object_uri"]] = b"old-bytes"
+    storage.files[artifact.uri] = b"artifact"
+    return service, store, storage, kb_id, workspace, generation, document, artifact, del_job
+
+
+async def test_b2_object_replace_commits_before_engine_delete(b2_object_setup):
+    """Object-mode replace commits pointer+manifest BEFORE engine delete."""
+    (
+        service,
+        store,
+        storage,
+        kb_id,
+        workspace,
+        generation,
+        document,
+        artifact,
+        job,
+    ) = await _b2_seed(b2_object_setup)
+    rag = _B2FakeRAG()
+    registry = _B2FakeRegistry(rag)
+    replacement = _DocumentReplacementSource_b2(
+        source_name="source.pdf",
+        content=b"new-content",
+        source_type="upload",
+        source_hash="sha256:" + _b2_sha256(b"new-content"),
+        content_type="application/pdf",
+        size_bytes=12,
+    )
+    item = await _kb_document_routes._execute_replace_document(
+        document_service=service,
+        kb_id=kb_id,
+        job=job,
+        document=document,
+        replacement=replacement,
+        active_registry=registry,  # type: ignore[arg-type]
+        active_index_service=None,
+        delete_source_file=True,
+        delete_artifacts=True,
+        delete_llm_cache=False,
+        auto_parse=False,
+        auto_index=False,
+        parser_engine=None,
+        process_options=None,
+        force_reparse=False,
+    )
+    assert item["status"] == "succeeded"
+    assert item["document_id"] == document.id
+    assert item["previous_lightrag_doc_id"] == document.lightrag_doc_id
+    # Engine delete happened (after commit).
+    assert rag.deleted == [(document.lightrag_doc_id, False)]
+    # No direct object/local cleanup; manifests enqueued instead.
+    assert storage.deleted_uris == []
+    assert storage.deleted_prefixes == []
+    # Current pointer is NOT in the cleanup group.
+    final = await store.get_document(kb_id, document.id)
+    new_uri = final.metadata["source_object_uri"]
+    manifests, total = await store.list_artifact_cleanup_manifests(
+        kb_id=kb_id, document_id=document.id, limit=20
+    )
+    assert total == 2
+    assert new_uri not in {m.target_uri for m in manifests}
+    assert document.metadata["source_object_uri"] in {m.target_uri for m in manifests}
+    assert item["cleanup_pending_count"] == 2
+
+
+async def test_b2_object_delete_pre_engine_recheck_and_tombstone(b2_object_setup):
+    """Object-mode delete: tombstone+manifest commit; response shape unchanged."""
+    (
+        service,
+        store,
+        storage,
+        kb_id,
+        workspace,
+        generation,
+        document,
+        artifact,
+        del_job,
+    ) = await _b2_seed_for_delete(b2_object_setup)
+    rag = _B2FakeRAG()
+    registry = _B2FakeRegistry(rag)
+    item = await _kb_document_routes._execute_delete_document_impl(
+        document_service=service,
+        kb_id=kb_id,
+        job_id=del_job.id,
+        document=document,
+        active_registry=registry,  # type: ignore[arg-type]
+        delete_source_file=True,
+        delete_artifacts=True,
+        delete_llm_cache=False,
+        job_service=None,
+        job=del_job,
+    )
+    assert item["status"] == "succeeded"
+    assert item["document_id"] == document.id
+    assert item["lightrag_doc_id"] == document.lightrag_doc_id
+    # Engine delete happened.
+    assert rag.deleted == [(document.lightrag_doc_id, False)]
+    # No direct object/local cleanup.
+    assert storage.deleted_uris == []
+    assert storage.deleted_prefixes == []
+    # Tombstone committed.
+    tombstone = await store.get_document_lifecycle(kb_id, document.id)
+    assert tombstone.deleted_at is not None
+    # Manifests enqueued.
+    manifests, total = await store.list_artifact_cleanup_manifests(
+        kb_id=kb_id, document_id=document.id, limit=20
+    )
+    assert total == 2
+    assert all(m.reason == "document_delete" for m in manifests)
+
+
+async def test_b2_object_delete_engine_failure_preserves_bytes(b2_object_setup):
+    """Engine delete failure in object mode preserves bytes (no tombstone)."""
+    (
+        service,
+        store,
+        storage,
+        kb_id,
+        workspace,
+        generation,
+        document,
+        artifact,
+        del_job,
+    ) = await _b2_seed_for_delete(b2_object_setup, job_id="job-b2-engfail")
+
+    class _FailingRAG:
+        async def adelete_by_doc_id(self, doc_id, delete_llm_cache=False):
+            raise RuntimeError("engine exploded")
+
+        async def finalize_storages(self):
+            return None
+
+        async def adrop_all_storages(self):
+            return {"dropped": 0, "failed": 0, "errors": []}
+
+    registry = _B2FakeRegistry(_FailingRAG())
+    item = await _kb_document_routes._execute_delete_document_impl(
+        document_service=service,
+        kb_id=kb_id,
+        job_id=del_job.id,
+        document=document,
+        active_registry=registry,  # type: ignore[arg-type]
+        delete_source_file=True,
+        delete_artifacts=True,
+        delete_llm_cache=False,
+        job_service=None,
+        job=del_job,
+    )
+    assert item["status"] == "failed"
+    assert item["error_code"] == "delete_failed"
+    # Bytes preserved: document is NOT tombstoned.
+    stalled = await store.get_document(kb_id, document.id)
+    assert stalled.deleted_at is None
+    assert storage.deleted_uris == []
+
+
+async def test_b2_object_batch_delete_partial_results(b2_object_setup):
+    """Object-mode batch delete with partial results and per-document tokens."""
+    service, store, storage, kb_id, workspace, generation = await b2_object_setup()
+    rag = _B2FakeRAG()
+    registry = _B2FakeRegistry(rag)
+    from lightrag.api.metadata_store import JobRecord as _JobRecord_b2
+
+    now = _utc_now_iso_b2()
+    doc1 = _b2_document(kb_id, "doc-batch-1", workspace=workspace)
+    doc2 = _b2_document(kb_id, "doc-batch-2", workspace=workspace, artifact_id=None)
+    for doc in (doc1, doc2):
+        storage.files[doc.metadata["source_object_uri"]] = b"old"
+    _b2_art = _b2_artifact(doc1)
+    await store.create_documents_and_job([doc1, doc2], _JobRecord_b2(
+        id="job-batch", kb_id=kb_id, workspace=workspace, batch_id="batch-1",
+        document_id=None, job_type="delete", status="running", stage="deleting",
+        progress=0.0, total_items=2, completed_items=0, failed_items=0,
+        idempotency_key="idem-batch", config_version_id=None, config_hash=None,
+        retry_count=0, max_retries=3,
+        payload={"document_ids": ["doc-batch-1", "doc-batch-2"], "attempt_tokens": {}},
+        result=None, error_code=None, error_message=None,
+        created_at=now, updated_at=now, queued_at=now, started_at=now,
+        finished_at=None, cancelled_at=None,
+    ))
+    await _b2_put_artifact(store, _b2_art)
+
+    job_payload = {"attempt_tokens": {}, "document_ids": ["doc-batch-1", "doc-batch-2"]}
+    job_obj = SimpleNamespace(
+        id="job-batch", kb_id=kb_id, workspace=workspace, batch_id="batch-1",
+        document_id=None, job_type="delete", status="running",
+        payload=job_payload,
+    )
+
+    items = []
+    for doc in (doc1, doc2):
+        item = await _kb_document_routes._execute_delete_document_impl(
+            document_service=service,
+            kb_id=kb_id,
+            job_id="job-batch",
+            document=doc,
+            active_registry=registry,  # type: ignore[arg-type]
+            delete_source_file=True,
+            delete_artifacts=True,
+            delete_llm_cache=False,
+            job_service=None,
+            job=job_obj,
+        )
+        items.append(item)
+    assert all(i["status"] == "succeeded" for i in items)
+    assert {i["document_id"] for i in items} == {"doc-batch-1", "doc-batch-2"}
+    # Each document has its own independent manifest group.
+    for doc in (doc1, doc2):
+        manifests, total = await store.list_artifact_cleanup_manifests(
+            kb_id=kb_id, document_id=doc.id, limit=10
+        )
+        assert total >= 1
+
+
+async def test_b2_object_replace_stale_generation_fenced(b2_object_setup):
+    """Stale kb generation is fenced by Store A before any side effect."""
+    (
+        service,
+        store,
+        storage,
+        kb_id,
+        workspace,
+        generation,
+        document,
+        artifact,
+        job,
+    ) = await _b2_seed(b2_object_setup)
+    rag = _B2FakeRAG()
+    registry = _B2FakeRegistry(rag)
+    replacement = _DocumentReplacementSource_b2(
+        source_name="source.pdf",
+        content=b"stale",
+        source_type="upload",
+        source_hash="sha256:" + _b2_sha256(b"stale"),
+        content_type="application/pdf",
+        size_bytes=5,
+    )
+    # Monkeypatch the service to use a stale generation.
+    original_get = service.kb_service.get
+
+    async def _stale_get(kb_id_arg, **kwargs):
+        record = await original_get(kb_id_arg, **kwargs)
+        return _dataclass_replace_b2(record, generation=generation + "-stale")
+
+    service._kb_service.get = _stale_get  # type: ignore[assignment]
+    try:
+        item = await _kb_document_routes._execute_replace_document(
+            document_service=service,
+            kb_id=kb_id,
+            job=job,
+            document=document,
+            replacement=replacement,
+            active_registry=registry,  # type: ignore[arg-type]
+            active_index_service=None,
+            delete_source_file=True,
+            delete_artifacts=True,
+            delete_llm_cache=False,
+            auto_parse=False,
+            auto_index=False,
+            parser_engine=None,
+            process_options=None,
+            force_reparse=False,
+        )
+    finally:
+        service._kb_service.get = original_get  # type: ignore[assignment]
+    assert item["status"] == "failed"
+    assert rag.deleted == []  # no engine side effect
+
+
+async def test_b2_http_admission_gate_remains_503_in_object_mode(tmp_path):
+    """The capability/HTTP admission gate stays closed: object-mode HTTP 503."""
+    root = tmp_path / "source"
+    root.mkdir(parents=True, exist_ok=True)
+    _reset_root_b2()
+    _set_root_b2(root)
+    store = SQLiteMetadataStore(tmp_path / "gate.sqlite3")
+    await store.initialize()
+    kb_service = KnowledgeBaseService(tmp_path / "gate_kbs.json")
+    kb_id = f"kb_gate_{_uuid4_b2().hex[:8]}"
+    kb_record = await kb_service.create(name=kb_id, kb_id=kb_id)
+    await store.activate_kb_generation(kb_id, kb_record.generation)
+    storage = _B2FakeObjectStorage()
+    materializer = _ArtifactMaterializer_b2(
+        storage, input_root=root, limits=_b2_limits()
+    )
+    document_service = DocumentLifecycleService(
+        kb_service,
+        store,
+        root,
+        object_storage=storage,
+        artifact_storage_mode="object",
+        materializer=materializer,
+        artifact_cleanup_config=_ArtifactCleanupConfig_b2(),
+        clock=lambda: _B2_NOW,
+    )
+    # The admission gate must raise in object mode.
+    with pytest.raises(Exception):
+        document_service.assert_destructive_operation_supported("Document replace")
+    with pytest.raises(Exception):
+        document_service.assert_destructive_operation_supported("Document delete")
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.2 route policy — HTTP-level object-mode admission coverage.
+#
+# These tests exercise the route-layer wiring (``_require_destructive_lifecycle``
+# and ``_reject_legacy_route_in_object_mode``) through the FastAPI router. The
+# capability constant ``OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED`` stays
+# False, so every object-mode destructive/legacy route must return 503 today.
+# The allowlist branch (capability True) is covered by direct unit tests in
+# ``tests/api/test_object_route_policy.py``.
+# ---------------------------------------------------------------------------
+
+
+def _build_object_mode_client(tmp_path: Path):
+    """Build a router whose DocumentLifecycleService runs in object mode.
+
+    Mirrors the B2 admission-gate fixture but wires a full document router so
+    HTTP-level admission can be asserted. The admission gate fires at the very
+    start of each handler (before any KB lookup), so no KB needs to be created.
+    Returns the TestClient. The capability constant stays False, so every
+    object-mode destructive/legacy route must return 503 today.
+    """
+
+    root = tmp_path / "object_source"
+    root.mkdir(parents=True, exist_ok=True)
+    _reset_root_b2()
+    _set_root_b2(root)
+    store = SQLiteMetadataStore(tmp_path / "policy.sqlite3")
+    kb_service = KnowledgeBaseService(tmp_path / "policy_kbs.json")
+    storage = _B2FakeObjectStorage()
+    materializer = _ArtifactMaterializer_b2(
+        storage, input_root=root, limits=_b2_limits()
+    )
+    document_service = DocumentLifecycleService(
+        kb_service,
+        store,
+        root,
+        object_storage=storage,
+        artifact_storage_mode="object",
+        materializer=materializer,
+        artifact_cleanup_config=_ArtifactCleanupConfig_b2(),
+        clock=lambda: _B2_NOW,
+    )
+    job_service = JobService(kb_service, store)
+    app = FastAPI()
+    app.include_router(
+        create_kb_document_routes(
+            document_service,
+            job_service,
+            api_key=_API_KEY,
+            registry=None,
+        )
+    )
+    return TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _restore_canonical_input_root_after_object_policy_tests():
+    """Ensure ``utils_pipeline`` canonical root is reset after object-mode tests."""
+
+    yield
+    _reset_root_b2()
+
+
+def test_object_mode_legacy_text_route_blocked(tmp_path):
+    """documents:texts is a legacy local-path route, permanently blocked in object mode."""
+
+    client = _build_object_mode_client(tmp_path)
+    response = client.post(
+        "/kbs/kb_policy/documents:texts",
+        json={"documents": [{"text": "hi", "source_name": "a.txt"}]},
+        headers=_HEADERS,
+    )
+    assert response.status_code in {403, 503}, response.text
+    assert "legacy local-path route" in response.text
+
+
+def test_object_mode_legacy_url_route_blocked(tmp_path, monkeypatch):
+    """documents:urls is a legacy local-path route, permanently blocked in object mode."""
+
+    client = _build_object_mode_client(tmp_path)
+    response = client.post(
+        "/kbs/kb_policy/documents:urls",
+        json={
+            "documents": [
+                {
+                    "url": "https://example.com/test.txt",
+                    "source_name": "test.txt",
+                }
+            ]
+        },
+        headers=_HEADERS,
+    )
+    assert response.status_code in {403, 503}, response.text
+    assert "legacy local-path route" in response.text
+
+
+def test_object_mode_legacy_import_route_blocked(tmp_path):
+    """documents:import is a legacy local-path route, permanently blocked in object mode."""
+
+    client = _build_object_mode_client(tmp_path)
+    staged = tmp_path / "staged.md"
+    staged.write_text("x", encoding="utf-8")
+    response = client.post(
+        "/kbs/kb_policy/documents:import",
+        json={"documents": [{"path": str(staged)}]},
+        headers=_HEADERS,
+    )
+    assert response.status_code in {403, 503}, response.text
+    assert "legacy local-path route" in response.text
+
+
+def test_object_mode_legacy_scan_route_blocked(tmp_path):
+    """documents:scan is a legacy local-path route, permanently blocked in object mode."""
+
+    client = _build_object_mode_client(tmp_path)
+    response = client.post(
+        "/kbs/kb_policy/documents:scan",
+        json={"directory": "."},
+        headers=_HEADERS,
+    )
+    assert response.status_code in {403, 503}, response.text
+    assert "legacy local-path route" in response.text
+
+
+def test_object_mode_destructive_routes_return_403_empty_policy(tmp_path):
+    """Regression: gated destructive routes return 403 (empty allowlist) now that
+    the capability constant is True. Legacy routes stay 403/503 independently.
+    """
+
+    from lightrag.api.config import OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED
+
+    assert OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED is True
+
+    client = _build_object_mode_client(tmp_path)
+
+    # documents:delete — empty allowlist → 403.
+    delete_response = client.delete(
+        "/kbs/kb_policy/documents/doc_admission",
+        headers=_HEADERS,
+    )
+    assert delete_response.status_code == 403, delete_response.text
+
+    # documents:batch-delete.
+    batch_delete_response = client.request(
+        "POST",
+        "/kbs/kb_policy/documents:batch-delete",
+        json={"document_ids": ["doc_admission_b"]},
+        headers=_HEADERS,
+    )
+    assert batch_delete_response.status_code == 403, batch_delete_response.text
+
+
+def test_object_mode_sync_route_returns_403_empty_policy(tmp_path):
+    """documents:sync returns 403 in object mode with empty allowlist (capability True)."""
+
+    client = _build_object_mode_client(tmp_path)
+    response = client.post(
+        "/kbs/kb_policy/documents:sync",
+        data={"source_keys": "key1"},
+        files={"files": ("a.txt", b"hi", "text/plain")},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 403, response.text
+
+
+def test_object_mode_replace_route_returns_403_empty_policy(tmp_path):
+    """documents replace returns 403 in object mode with empty allowlist (capability True)."""
+
+    client = _build_object_mode_client(tmp_path)
+    response = client.post(
+        "/kbs/kb_policy/documents/doc_admission_replace:replace",
+        files={"file": ("a.txt", b"hi", "text/plain")},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 403, response.text
+
+
+def test_local_mode_legacy_routes_still_allowed(tmp_path):
+    """Regression: legacy routes work normally in local mode (guard is a no-op)."""
+
+    client, _kb_service, _store, document_service, _job_service = _build_client(
+        tmp_path
+    )
+    _create_kb(client, "kb_local_legacy")
+    staged = document_service.source_root / "staged" / "local.md"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_text("local-mode", encoding="utf-8")
+    response = client.post(
+        "/kbs/kb_local_legacy/documents:import",
+        json={"documents": [{"path": str(staged)}]},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["documents"][0]["source_type"] == "import"

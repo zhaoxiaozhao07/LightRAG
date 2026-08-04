@@ -20,9 +20,10 @@ import logging.config
 import sys
 import time
 import textwrap
+from datetime import datetime, timedelta, timezone
 import uvicorn
 import pipmaster as pm
-from typing import Any, cast
+from typing import Any, Awaitable, Callable, cast
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 from pathlib import Path
@@ -42,7 +43,12 @@ from .config import (
     resolve_asymmetric_embedding_opt_in,
     PREFIX_ASYMMETRIC_EMBEDDING_BINDINGS,
     normalize_kb_metadata_backend,
+    OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED,
     validate_chat_memory_configuration,
+    configure_artifact_storage_args,
+    validate_artifact_storage_configuration,
+    validate_artifact_storage_server_admission,
+    artifact_cleanup_config_from_args,
 )
 from lightrag.utils import get_env_value
 from lightrag import LightRAG, ROLES, RoleLLMConfig, __version__ as core_version
@@ -73,7 +79,16 @@ from lightrag.api.config_version_service import (
     attach_active_config_metadata,
 )
 from lightrag.api.document_lifecycle_service import DocumentLifecycleService
+from lightrag.api.artifact_materialization import (
+    ArtifactMaterializer,
+    materialization_limits_from_args,
+)
 from lightrag.api.index_build_service import IndexBuildService
+from lightrag.api.pipeline_artifact_coordinator import PipelineArtifactCoordinator
+from lightrag.api.pipeline_artifact_recovery import (
+    PipelineArtifactTerminalizationReconciler,
+)
+from lightrag.api.artifact_cleanup_service import ArtifactCleanupService
 from lightrag.api.job_service import JobService
 from lightrag.api.kb_operation_fence import KBWriteAdmissionMiddleware
 from lightrag.api.kb_deletion_service import KBDeletionService
@@ -81,7 +96,10 @@ from lightrag.api.kb_service import KnowledgeBaseRecord, KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
 from lightrag.api.metadata_store import SQLiteMetadataStore
 from lightrag.api.metrics import build_prometheus_metrics, record_http_request
-from lightrag.api.object_storage import create_object_storage_from_env
+from lightrag.api.object_storage import (
+    ObjectStorageConfig,
+    create_object_storage,
+)
 from lightrag.api.postgres_kb_service import PostgresKnowledgeBaseService
 from lightrag.api.postgres_metadata_store import PostgresMetadataStore
 from lightrag.api.agent_profile_service import AgentProfileService
@@ -91,6 +109,7 @@ from lightrag.api.routers.kb_document_routes import create_kb_document_routes
 from lightrag.api.routers.kb_graph_routes import create_kb_graph_routes
 from lightrag.api.routers.kb_query_routes import create_kb_query_routes
 from lightrag.api.routers.kb_routes import create_kb_routes
+from lightrag.artifact_runtime import PipelineAttemptCompareAndCommitStorage
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -121,6 +140,367 @@ from lightrag.api.chat_memory_service import ChatMemoryConfig, ChatMemoryService
 from lightrag.api.chat_memory_worker import ChatMemoryWorker
 from lightrag.api.routers.enterprise_routes import create_enterprise_routes
 from lightrag.api.routers.person_routes import create_person_routes
+from lightrag.utils_pipeline import (
+    resolve_canonical_input_root_candidate,
+    set_canonical_input_root,
+)
+
+
+def _validate_object_pipeline_attempt_storage_capabilities(rag: Any) -> None:
+    """Fail closed when an initialized object-mode RAG lacks atomic fencing."""
+
+    has_full_docs = hasattr(rag, "full_docs")
+    has_doc_status = hasattr(rag, "doc_status")
+    if not has_full_docs and not has_doc_status:
+        # Lightweight registry test doubles may model only initialization
+        # ordering and no storage surface at all. Real LightRAG instances expose
+        # both attributes before/after initialize_storages().
+        return
+    for name in ("full_docs", "doc_status"):
+        storage = getattr(rag, name, None)
+        if not isinstance(storage, PipelineAttemptCompareAndCommitStorage):
+            raise RuntimeError(
+                "Object artifact mode requires "
+                f"{name}.compare_and_commit_pipeline_attempt"
+            )
+
+
+async def _initialize_kb_lightrag_instance(
+    rag_instance: Any,
+    record: KnowledgeBaseRecord,
+    *,
+    artifact_storage_mode: str,
+    coordinator: PipelineArtifactCoordinator | None,
+) -> Any:
+    """Inject the generation-bound callback before any storage initializes."""
+
+    if artifact_storage_mode == "object":
+        if coordinator is None:
+            raise RuntimeError("Object artifact mode has no pipeline coordinator")
+        rag_instance.pipeline_artifact_materializer = coordinator.materializer_for(
+            record
+        )
+    else:
+        rag_instance.pipeline_artifact_materializer = None
+    await rag_instance.initialize_storages()
+    if artifact_storage_mode == "object":
+        _validate_object_pipeline_attempt_storage_capabilities(rag_instance)
+    await rag_instance.check_and_migrate_data()
+    return rag_instance
+
+
+PipelineArtifactRecoveryCallback = Callable[[], Awaitable[None]]
+ArtifactCleanupCallback = Callable[[], Awaitable[None]]
+_PIPELINE_ARTIFACT_RECOVERY_DOCUMENT_LIMIT = 200
+_ARTIFACT_CLEANUP_LEASE_OWNER = "job-worker"
+
+
+def _build_pipeline_artifact_recovery_callback(
+    *,
+    kb_service: Any,
+    registry: LightRAGInstanceRegistry,
+    reconciler: PipelineArtifactTerminalizationReconciler,
+    document_limit: int = _PIPELINE_ARTIFACT_RECOVERY_DOCUMENT_LIMIT,
+) -> PipelineArtifactRecoveryCallback:
+    """Build the bounded, fail-soft all-KB terminalization callback."""
+
+    bounded_document_limit = max(
+        1,
+        min(int(document_limit), _PIPELINE_ARTIFACT_RECOVERY_DOCUMENT_LIMIT),
+    )
+
+    async def reconcile_pipeline_artifacts() -> None:
+        discovered = 0
+        finalized = 0
+        skipped = 0
+        error_count = 0
+        records = await kb_service.list(include_deleted=False)
+        for record in records:
+            if record.status != "active":
+                continue
+            try:
+                rag_instance = await registry.get(record.id)
+                summary = await reconciler.reconcile_kb(
+                    record.id,
+                    rag_instance,
+                    limit=bounded_document_limit,
+                )
+                discovered += summary.discovered
+                finalized += summary.finalized
+                skipped += summary.skipped
+                error_count += summary.error_count
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one KB cannot stop the sweep
+                error_count += 1
+                logger.error(
+                    "Pipeline artifact terminalization reconciliation failed for "
+                    "one KB (error_type=%s)",
+                    type(exc).__name__,
+                )
+                continue
+
+        logger.info(
+            "Pipeline artifact terminalization reconciliation completed "
+            "(discovered=%d finalized=%d skipped=%d error_count=%d)",
+            discovered,
+            finalized,
+            skipped,
+            error_count,
+        )
+
+    return reconcile_pipeline_artifacts
+
+
+def _build_artifact_cleanup_callback(
+    *,
+    cleanup_service: ArtifactCleanupService,
+    lease_owner: str = _ARTIFACT_CLEANUP_LEASE_OWNER,
+) -> ArtifactCleanupCallback:
+    """Build the periodic, fail-soft artifact cleanup callback.
+
+    The cleanup service is constructed only in object mode. This wrapper
+    drives one ``run_once`` sweep per JobWorker recovery cycle (recovery
+    first, then cleanup). Any exception is logged and swallowed so the
+    shared recovery cadence and the artifact recovery callback cannot be
+    wedged by a cleanup failure; ``JobWorker._drain_artifact_cleanup_quietly``
+    is the outer isolation layer, this wrapper is defense-in-depth.
+    """
+
+    async def drain_artifact_cleanup() -> None:
+        try:
+            await cleanup_service.run_once(
+                now=datetime.now(timezone.utc),
+                lease_owner=lease_owner,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — never propagate into the cadence
+            logger.warning(
+                "Artifact cleanup run_once failed (error_type=%s)",
+                type(exc).__name__,
+            )
+
+    return drain_artifact_cleanup
+
+
+def _artifact_cleanup_pending_count_or_none(
+    cleanup_service: ArtifactCleanupService | None,
+    metadata_store: Any,
+) -> Awaitable[int] | None:
+    """Return the lightweight COUNT coroutine for pending manifests, or None.
+
+    When ``cleanup_service`` is None (local mode) the caller omits the
+    ``pending_count`` key entirely. When the metadata store does not expose
+    the lightweight count method, the caller reports ``"not_reported"``. The
+    caller wraps the returned coroutine in ``asyncio.wait_for`` so a
+    slow/blocking query collapses to ``"not_reported"`` instead of
+    propagating into the /health response.
+    """
+
+    if cleanup_service is None:
+        return None
+    count_fn = getattr(metadata_store, "count_artifact_cleanup_manifests", None)
+    if count_fn is None or not callable(count_fn):
+        return None
+    return cast(Awaitable[int], count_fn(status="pending"))
+
+
+# ---------------------------------------------------------------------------
+# Artifact lifecycle health block (Phase 3.3 — additive sibling of
+# ``artifact_cleanup``). Every probe below is a bounded indexed aggregate or
+# a cached HeadBucket; /health MUST NEVER list bucket contents or download
+# objects. Each probe collapses to ``"not_reported"`` (or ``False`` for the
+# object-store probe) on timeout/error so /health stays fast and non-blocking.
+# ---------------------------------------------------------------------------
+
+_ARTIFACT_LIFECYCLE_HEALTH_QUERY_TIMEOUT = 2.0
+_ARTIFACT_LIFECYCLE_HEALTH_NOT_REPORTED = "not_reported"
+# Mirrors ``lightrag/tools/migrate_artifacts_to_object._ACTIVE_MUTATION_JOB_STATUSES``
+# — the online-mutation guard set the migration CLI uses. Kept as a private
+# copy so /health does not import a tool module.
+_ARTIFACT_LIFECYCLE_ACTIVE_MUTATION_STATUSES = (
+    "queued",
+    "running",
+    "retrying",
+    "cancelling",
+)
+# Non-terminal maintenance run statuses (everything except
+# succeeded/failed/cancelled).
+_ARTIFACT_LIFECYCLE_NON_TERMINAL_RUN_STATUSES = (
+    "planned",
+    "running",
+    "waiting_cleanup",
+)
+_ARTIFACT_LIFECYCLE_MAINTENANCE_RUN_LIMIT = 25
+# A recovery cursor not advanced for this long signals a stalled sweep.
+_ARTIFACT_LIFECYCLE_RECOVERY_CURSOR_STALE_SECONDS = 6 * 60 * 60
+
+
+def _object_storage_backend_name(object_storage: Any) -> str:
+    """Return a stable, non-sensitive backend label for the health block."""
+
+    if object_storage is None:
+        # ``create_object_storage`` returns ``None`` in local mode; report a
+        # stable label rather than the implicit None.
+        return "none"
+    cls = type(object_storage)
+    name = cls.__name__
+    if name == "S3ObjectStorage":
+        return "s3"
+    if name == "DisabledObjectStorage":
+        return "disabled"
+    return name
+
+
+async def _bounded_health_value(
+    coro_factory: Callable[[], Awaitable[Any]],
+    *,
+    default: Any,
+    timeout: float = _ARTIFACT_LIFECYCLE_HEALTH_QUERY_TIMEOUT,
+) -> Any:
+    """Run one store/object probe under a bounded ``wait_for``; never raise."""
+
+    try:
+        return await asyncio.wait_for(coro_factory(), timeout=timeout)
+    except asyncio.TimeoutError:
+        return default
+    except Exception:  # noqa: BLE001 - /health must never block on a probe
+        return default
+
+
+async def _build_artifact_lifecycle_health_block(
+    *,
+    artifact_storage_mode: str,
+    object_storage: Any,
+    metadata_store: Any,
+    capability_implemented: bool,
+    admission_allows_object_mode: bool,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Build the bounded ``artifact_lifecycle`` health block.
+
+    Every field is an indexed aggregate or a cached HeadBucket probe — this
+    function performs NO bucket listing and NO object download. Any probe that
+    times out (~2s) or errors collapses to ``"not_reported"`` (or ``False``
+    for the object-store readiness probe) so /health latency is bounded.
+    """
+
+    reference = now or datetime.now(timezone.utc)
+    not_reported = _ARTIFACT_LIFECYCLE_HEALTH_NOT_REPORTED
+
+    # --- object store readiness (cached bounded HeadBucket) ---------------
+    probe_fn = getattr(object_storage, "readiness_probe", None)
+    if probe_fn is None or not callable(probe_fn):
+        object_store_ready: Any = False
+    else:
+        object_store_ready = await _bounded_health_value(
+            lambda: cast(Awaitable[bool], probe_fn()),
+            default=False,
+        )
+        if not isinstance(object_store_ready, bool):
+            object_store_ready = False
+
+    # --- manifests aggregate (additive: includes oldest_due_at) ----------
+    aggregate_fn = getattr(metadata_store, "aggregate_artifact_cleanup_manifests", None)
+    if aggregate_fn is None or not callable(aggregate_fn):
+        manifests: Any = not_reported
+    else:
+        manifests = await _bounded_health_value(
+            lambda: cast(Awaitable[dict[str, Any]], aggregate_fn(now=reference)),
+            default=not_reported,
+        )
+        if not isinstance(manifests, dict):
+            manifests = not_reported
+
+    # --- non-terminal maintenance runs (migration / orphan_reconcile) -----
+    runs_fn = getattr(metadata_store, "list_artifact_maintenance_runs", None)
+    if runs_fn is None or not callable(runs_fn):
+        maintenance_runs: Any = not_reported
+    else:
+
+        async def _count_non_terminal_runs() -> int:
+            total_non_terminal = 0
+            for status in _ARTIFACT_LIFECYCLE_NON_TERMINAL_RUN_STATUSES:
+                _records, total = await cast(
+                    Awaitable[tuple[Any, int]],
+                    runs_fn(
+                        status=status,
+                        limit=_ARTIFACT_LIFECYCLE_MAINTENANCE_RUN_LIMIT,
+                    ),
+                )
+                total_non_terminal += int(total or 0)
+            return total_non_terminal
+
+        maintenance_runs = await _bounded_health_value(
+            _count_non_terminal_runs, default=not_reported
+        )
+        if isinstance(maintenance_runs, bool) or not isinstance(maintenance_runs, int):
+            maintenance_runs = not_reported
+
+    # --- migration blockers (active mutation jobs across ALL KBs) ---------
+    blockers_fn = getattr(metadata_store, "count_active_jobs_globally", None)
+    if blockers_fn is None or not callable(blockers_fn):
+        migration_blockers: Any = not_reported
+    else:
+        migration_blockers = await _bounded_health_value(
+            lambda: cast(
+                Awaitable[int],
+                blockers_fn(_ARTIFACT_LIFECYCLE_ACTIVE_MUTATION_STATUSES),
+            ),
+            default=not_reported,
+        )
+        if isinstance(migration_blockers, bool) or not isinstance(
+            migration_blockers, int
+        ):
+            migration_blockers = not_reported
+
+    # --- unresolved commit-unknown jobs ----------------------------------
+    unknown_fn = getattr(metadata_store, "count_unresolved_commit_unknown_jobs", None)
+    if unknown_fn is None or not callable(unknown_fn):
+        unresolved_commit_unknown: Any = not_reported
+    else:
+        unresolved_commit_unknown = await _bounded_health_value(
+            lambda: cast(Awaitable[int], unknown_fn()),
+            default=not_reported,
+        )
+        if isinstance(unresolved_commit_unknown, bool) or not isinstance(
+            unresolved_commit_unknown, int
+        ):
+            unresolved_commit_unknown = not_reported
+
+    # --- stale recovery cursors ------------------------------------------
+    stale_fn = getattr(metadata_store, "count_stale_artifact_recovery_cursors", None)
+    if stale_fn is None or not callable(stale_fn):
+        recovery_cursor_stale: Any = not_reported
+    else:
+        cutoff = reference - timedelta(
+            seconds=_ARTIFACT_LIFECYCLE_RECOVERY_CURSOR_STALE_SECONDS
+        )
+        recovery_cursor_stale = await _bounded_health_value(
+            lambda: cast(Awaitable[int], stale_fn(stale_before=cutoff)),
+            default=not_reported,
+        )
+        if isinstance(recovery_cursor_stale, bool) or not isinstance(
+            recovery_cursor_stale, int
+        ):
+            recovery_cursor_stale = not_reported
+
+    return {
+        "mode": str(artifact_storage_mode or "local"),
+        "backend": _object_storage_backend_name(object_storage),
+        "capability_admitted": {
+            "implemented": bool(capability_implemented),
+            "admission_gate_allows_object_mode": bool(admission_allows_object_mode),
+        },
+        "object_store_ready": object_store_ready,
+        "manifests": manifests,
+        "maintenance_runs": maintenance_runs,
+        "migration_blockers": migration_blockers,
+        "unresolved_commit_unknown": unresolved_commit_unknown,
+        "recovery_cursor_stale": recovery_cursor_stale,
+    }
+
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -880,16 +1260,22 @@ def _coerce_binary_string_schemas(node: Any) -> None:
 
 
 def create_app(args):
+    configure_artifact_storage_args(args)
     configured_metadata_backend = getattr(args, "kb_metadata_backend", None)
     if configured_metadata_backend is None:
-        configured_metadata_backend = os.getenv(
-            "LIGHTRAG_KB_METADATA_BACKEND", "local"
-        )
+        configured_metadata_backend = os.getenv("LIGHTRAG_KB_METADATA_BACKEND", "local")
     kb_metadata_backend = normalize_kb_metadata_backend(configured_metadata_backend)
-    validate_chat_memory_configuration(
-        args, kb_metadata_backend=kb_metadata_backend
+    validate_chat_memory_configuration(args, kb_metadata_backend=kb_metadata_backend)
+    input_root_candidate = resolve_canonical_input_root_candidate(args.input_dir)
+    object_storage_config = ObjectStorageConfig.from_env()
+    object_storage = create_object_storage(object_storage_config)
+    validate_artifact_storage_configuration(
+        args,
+        kb_metadata_backend=kb_metadata_backend,
+        object_storage_backend=object_storage_config.backend,
+        object_storage_available=object_storage is not None,
+        canonical_input_root=input_root_candidate,
     )
-
     # Check frontend build first and get status
     webui_assets_exist, is_frontend_outdated = check_frontend_build()
 
@@ -952,8 +1338,22 @@ def create_app(args):
         if not os.path.exists(args.ssl_keyfile):
             raise Exception(f"SSL key file not found: {args.ssl_keyfile}")
 
+    validate_artifact_storage_server_admission(args)
+
     # Check if API key is provided either through env var or args
     api_key = os.getenv("LIGHTRAG_API_KEY") or args.key
+
+    canonical_input_root = set_canonical_input_root(input_root_candidate)
+    args.input_dir = str(canonical_input_root)
+    artifact_materializer = None
+    if args.artifact_storage_mode == "object":
+        if object_storage is None:
+            raise ValueError("Object artifact mode requires object storage")
+        artifact_materializer = ArtifactMaterializer(
+            object_storage,
+            input_root=canonical_input_root,
+            limits=materialization_limits_from_args(args),
+        )
 
     # Initialize document manager with workspace support for data isolation
     doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
@@ -967,12 +1367,31 @@ def create_app(args):
         metadata_store = SQLiteMetadataStore(
             Path(args.working_dir) / "metadata" / "metadata.sqlite3"
         )
-    object_storage = create_object_storage_from_env()
     document_lifecycle_service = DocumentLifecycleService(
-        kb_service, metadata_store, Path(args.input_dir), object_storage=object_storage
+        kb_service,
+        metadata_store,
+        Path(args.input_dir),
+        object_storage=object_storage,
+        artifact_storage_mode=args.artifact_storage_mode,
+        materializer=artifact_materializer,
     )
     job_service = JobService(kb_service, metadata_store)
     index_build_service = IndexBuildService(document_lifecycle_service)
+    pipeline_artifact_coordinator = (
+        PipelineArtifactCoordinator(
+            kb_service,
+            document_lifecycle_service,
+            index_build_service,
+        )
+        if args.artifact_storage_mode == "object"
+        else None
+    )
+    pipeline_artifact_reconciler: PipelineArtifactTerminalizationReconciler | None = (
+        None
+    )
+    pipeline_artifact_recovery_callback: PipelineArtifactRecoveryCallback | None = None
+    artifact_cleanup_service: ArtifactCleanupService | None = None
+    artifact_cleanup_callback: ArtifactCleanupCallback | None = None
     enterprise_enabled = bool(getattr(args, "enterprise_auth_enabled", False))
     chat_memory_runtime_configured = bool(
         enterprise_enabled
@@ -989,7 +1408,9 @@ def create_app(args):
         if chat_memory_runtime_configured
         else None
     )
-    enterprise_audit_service = AuditService(metadata_store) if enterprise_enabled else None
+    enterprise_audit_service = (
+        AuditService(metadata_store) if enterprise_enabled else None
+    )
     enterprise_user_service = (
         UserService(
             metadata_store,
@@ -998,9 +1419,7 @@ def create_app(args):
                 chat_memory_config.enabled and chat_memory_runtime_configured
             ),
             memory_extraction_fingerprint=service_memory_extraction_fingerprint,
-            memory_graph_store_fingerprint=(
-                service_memory_graph_store_fingerprint
-            ),
+            memory_graph_store_fingerprint=(service_memory_graph_store_fingerprint),
         )
         if enterprise_enabled
         else None
@@ -1026,9 +1445,7 @@ def create_app(args):
                 chat_memory_config.enabled and chat_memory_runtime_configured
             ),
             memory_extraction_fingerprint=service_memory_extraction_fingerprint,
-            memory_graph_store_fingerprint=(
-                service_memory_graph_store_fingerprint
-            ),
+            memory_graph_store_fingerprint=(service_memory_graph_store_fingerprint),
         )
         if enterprise_enabled
         else None
@@ -1066,9 +1483,7 @@ def create_app(args):
             person_token_handler,
             login_max_attempts=getattr(global_args, "person_login_max_attempts", 5),
             password_min_length=getattr(global_args, "person_password_min_length", 8),
-            lockout_seconds=getattr(
-                global_args, "person_login_lockout_seconds", 900.0
-            ),
+            lockout_seconds=getattr(global_args, "person_login_lockout_seconds", 900.0),
             enroll_tracker=LoginAttemptTracker(
                 max_attempts=getattr(global_args, "person_enroll_max_attempts", 10),
                 window_seconds=getattr(
@@ -1124,6 +1539,7 @@ def create_app(args):
         if enterprise_enabled
         else None
     )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """Lifespan context manager for startup and shutdown events"""
@@ -1139,7 +1555,10 @@ def create_app(args):
             await kb_service.initialize()
             await metadata_store.initialize()
             if enterprise_enabled:
-                if enterprise_settings_service is None or enterprise_user_service is None:
+                if (
+                    enterprise_settings_service is None
+                    or enterprise_user_service is None
+                ):
                     raise RuntimeError("Enterprise services were not initialized")
                 await enterprise_settings_service.initialize_registration_setting(
                     bool(getattr(args, "user_registration_enabled", False))
@@ -1174,9 +1593,7 @@ def create_app(args):
             recovery_grace_seconds = (
                 worker.recovery_grace_seconds
                 if worker is not None
-                else get_env_value(
-                    "LIGHTRAG_KB_JOB_RECOVERY_GRACE_SECONDS", 5.0, float
-                )
+                else get_env_value("LIGHTRAG_KB_JOB_RECOVERY_GRACE_SECONDS", 5.0, float)
             )
             recovered = await job_service.recover_orphan_jobs(
                 resumable_job_types=resumable_types,
@@ -1190,9 +1607,36 @@ def create_app(args):
             # Initialize database connections
             # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
             await rag.initialize_storages()
+            if args.artifact_storage_mode == "object":
+                _validate_object_pipeline_attempt_storage_capabilities(rag)
 
             # Data migration regardless of storage implementation
             await rag.check_and_migrate_data()
+
+            # The per-KB callback resolves through the registry, which lazily
+            # initializes each KB's generation/config-bound RAG storages. Run
+            # after orphan recovery and before worker consumption; one sweep
+            # failure remains fail-soft so startup can continue.
+            artifact_recovery_callback = (
+                getattr(
+                    app.state,
+                    "pipeline_artifact_recovery_callback",
+                    None,
+                )
+                if args.artifact_storage_mode == "object"
+                else None
+            )
+            if artifact_recovery_callback is not None:
+                try:
+                    await artifact_recovery_callback()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - startup must continue
+                    logger.error(
+                        "Startup pipeline artifact terminalization reconciliation "
+                        "failed (error_type=%s)",
+                        type(exc).__name__,
+                    )
 
             if worker is not None:
                 worker.start()
@@ -2501,6 +2945,7 @@ def create_app(args):
 
     # Initialize RAG with unified configuration
     try:
+
         def build_lightrag_for_workspace(
             workspace: str,
             active_config_version: Any | None = None,
@@ -2523,7 +2968,9 @@ def create_app(args):
                     document_prefix=args.embedding_document_prefix,
                     query_prefix=args.embedding_query_prefix,
                 )
-                workspace_embedding_func.send_dimensions = embedding_func.send_dimensions
+                workspace_embedding_func.send_dimensions = (
+                    embedding_func.send_dimensions
+                )
 
             lightrag_kwargs = {
                 "working_dir": args.working_dir,
@@ -2629,9 +3076,12 @@ def create_app(args):
             # binding/model/host/api_key changes rebuild the role func; perf
             # knobs (max_async/timeout) and kwargs apply directly.
             await rag_instance.aupdate_llm_role_config(role, **override)
-        await rag_instance.initialize_storages()
-        await rag_instance.check_and_migrate_data()
-        return rag_instance
+        return await _initialize_kb_lightrag_instance(
+            rag_instance,
+            record,
+            artifact_storage_mode=args.artifact_storage_mode,
+            coordinator=pipeline_artifact_coordinator,
+        )
 
     async def finalize_kb_lightrag(rag_instance: LightRAGLike) -> None:
         await rag_instance.finalize_storages()
@@ -2641,6 +3091,34 @@ def create_app(args):
         builder=build_kb_lightrag,
         finalizer=finalize_kb_lightrag,
     )
+    if args.artifact_storage_mode == "object":
+        if pipeline_artifact_coordinator is None:
+            raise RuntimeError("Object artifact mode has no pipeline coordinator")
+        pipeline_artifact_reconciler = PipelineArtifactTerminalizationReconciler(
+            document_lifecycle_service,
+            pipeline_artifact_coordinator,
+            index_build_service,
+        )
+        pipeline_artifact_recovery_callback = (
+            _build_pipeline_artifact_recovery_callback(
+                kb_service=kb_service,
+                registry=kb_registry,
+                reconciler=pipeline_artifact_reconciler,
+            )
+        )
+        # Object mode also wires the leased artifact cleanup sweep onto the
+        # JobWorker recovery cadence (no standalone background task). The
+        # service is constructed here so the wiring site, callback builder,
+        # and any construction-time validation share one fail point. Local
+        # mode never constructs this service; its callback stays None.
+        artifact_cleanup_service = ArtifactCleanupService(
+            metadata_store,
+            object_storage,
+            artifact_cleanup_config_from_args(args),
+        )
+        artifact_cleanup_callback = _build_artifact_cleanup_callback(
+            cleanup_service=artifact_cleanup_service,
+        )
     agent_profile_service = AgentProfileService(
         kb_service=kb_service,
         document_service=document_lifecycle_service,
@@ -2685,6 +3163,7 @@ def create_app(args):
         input_root=Path(args.input_dir),
         working_dir=Path(args.working_dir),
         object_storage=object_storage,
+        artifact_storage_mode=args.artifact_storage_mode,
     )
     app.state.kb_service = kb_service
     app.state.lightrag_registry = kb_registry
@@ -2695,6 +3174,11 @@ def create_app(args):
     app.state.kb_deletion_service = kb_deletion_service
     app.state.agent_profile_service = agent_profile_service
     app.state.object_storage = object_storage
+    app.state.pipeline_artifact_coordinator = pipeline_artifact_coordinator
+    app.state.pipeline_artifact_reconciler = pipeline_artifact_reconciler
+    app.state.pipeline_artifact_recovery_callback = pipeline_artifact_recovery_callback
+    app.state.artifact_cleanup_service = artifact_cleanup_service
+    app.state.artifact_cleanup_callback = artifact_cleanup_callback
 
     # Optional durable job worker: re-drives queued single-document
     # parse / build_kg / reindex jobs (retry consumption + restart resume).
@@ -2752,6 +3236,15 @@ def create_app(args):
         claim_grace_seconds = get_env_value(
             "LIGHTRAG_KB_JOB_WORKER_GRACE_SECONDS", 5.0, float
         )
+        artifact_recovery_worker_kwargs: dict[str, Any] = {}
+        if pipeline_artifact_recovery_callback is not None:
+            artifact_recovery_worker_kwargs["artifact_recovery_callback"] = (
+                pipeline_artifact_recovery_callback
+            )
+        if artifact_cleanup_callback is not None:
+            artifact_recovery_worker_kwargs["artifact_cleanup_callback"] = (
+                artifact_cleanup_callback
+            )
         job_worker = JobWorker(
             job_service,
             executors={
@@ -2776,6 +3269,7 @@ def create_app(args):
                 claim_grace_seconds,
                 float,
             ),
+            **artifact_recovery_worker_kwargs,
         )
     app.state.job_worker = job_worker
     if job_worker is None:
@@ -2959,7 +3453,9 @@ def create_app(args):
         if enterprise_enabled:
             registration_enabled = False
             if enterprise_settings_service is not None:
-                registration_enabled = await enterprise_settings_service.registration_enabled()
+                registration_enabled = (
+                    await enterprise_settings_service.registration_enabled()
+                )
             return {
                 "auth_configured": True,
                 "auth_mode": "enterprise",
@@ -3179,6 +3675,51 @@ def create_app(args):
                 or pipeline_pending_enqueues > 0
             )
 
+            # Artifact cleanup pending-count probe (object mode only). The
+            # cleanup service is constructed only when object storage is
+            # enabled; in local mode there is nothing to count. Bound the
+            # store query so a slow/blocking backend collapses to
+            # ``"not_reported"`` instead of degrading /health latency.
+            artifact_cleanup_pending_count: Any = "not_reported"
+            if artifact_cleanup_service is not None:
+                pending_coro = _artifact_cleanup_pending_count_or_none(
+                    artifact_cleanup_service, metadata_store
+                )
+                if pending_coro is not None:
+                    try:
+                        artifact_cleanup_pending_count = await asyncio.wait_for(
+                            pending_coro, timeout=2.0
+                        )
+                        if isinstance(
+                            artifact_cleanup_pending_count, bool
+                        ) or not isinstance(artifact_cleanup_pending_count, int):
+                            artifact_cleanup_pending_count = "not_reported"
+                    except asyncio.TimeoutError:
+                        artifact_cleanup_pending_count = "not_reported"
+                    except Exception:  # noqa: BLE001 - never block /health
+                        artifact_cleanup_pending_count = "not_reported"
+                # else: store lacks the count method -> "not_reported" default.
+
+            # Artifact lifecycle aggregate block (Phase 3.3). Additive sibling
+            # of ``artifact_cleanup`` above: bounded indexed aggregates + a
+            # cached HeadBucket readiness probe. NEVER lists bucket contents
+            # or downloads objects; every probe collapses to
+            # ``"not_reported"`` / ``False`` on timeout or error so /health
+            # latency stays bounded. Built unconditionally (local mode reports
+            # ``mode='local'`` / ``backend='disabled'`` / ``object_store_ready
+            # =False``) so the shape is stable for ops dashboards.
+            artifact_lifecycle_block = await _build_artifact_lifecycle_health_block(
+                artifact_storage_mode=getattr(args, "artifact_storage_mode", "local"),
+                object_storage=object_storage,
+                metadata_store=metadata_store,
+                capability_implemented=OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED,
+                # The startup admission gate (validate_artifact_storage_server_
+                # admission) rejects object mode unless the capability
+                # constant is True, so today these two are equal; they are
+                # reported separately because Gate 3 decouples them.
+                admission_allows_object_mode=OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED,
+            )
+
             if not auth_configured:
                 auth_mode = "disabled"
             else:
@@ -3289,6 +3830,25 @@ def create_app(args):
                         else None
                     ),
                 },
+                # Artifact cleanup cadence (object mode only). ``enabled`` is
+                # True when the leased cleanup service has been constructed and
+                # wired onto the JobWorker recovery cycle; ``worker_running``
+                # reflects the shared JobWorker polling task. The pending
+                # manifest count is a best-effort lightweight COUNT — any
+                # failure (slow/blocking store, transient error) collapses to
+                # ``"not_reported"`` so /health stays fast and non-blocking.
+                "artifact_cleanup": {
+                    "enabled": artifact_cleanup_service is not None,
+                    "worker_running": (
+                        job_worker.running if job_worker is not None else False
+                    ),
+                    "pending_count": artifact_cleanup_pending_count,
+                },
+                # Artifact lifecycle aggregate (Phase 3.3). Additive sibling of
+                # ``artifact_cleanup``: bounded indexed aggregates + a cached
+                # HeadBucket readiness probe. The legacy ``artifact_cleanup``
+                # block above is preserved unchanged for existing assertions.
+                "artifact_lifecycle": artifact_lifecycle_block,
                 "core_version": core_version,
                 "api_version": api_version_display,
                 "webui_title": webui_title,

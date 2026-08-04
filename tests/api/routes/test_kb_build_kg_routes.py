@@ -14,6 +14,8 @@ from fastapi.testclient import TestClient
 
 from lightrag.api.document_lifecycle_service import DocumentLifecycleService
 from lightrag.api.index_build_service import (
+    BuildArtifactReference,
+    IndexBuildExecution,
     IndexBuildPlan,
     IndexBuildService,
     _await_doc_status_terminal,
@@ -114,8 +116,10 @@ def _document_record(
 def _build_plan(document: DocumentRecord) -> IndexBuildPlan:
     return IndexBuildPlan(
         document=document,
-        sidecar_uri=None,
-        blocks_path=None,
+        sidecar_artifact=None,
+        blocks_artifact=None,
+        expected_current_sidecar_artifact_id=None,
+        expected_current_blocks_artifact_id=None,
         parser_hash=document.parser_hash or "",
         index_hash="sha256:index",
         process_options="",
@@ -759,8 +763,18 @@ def _built_doc_record() -> DocumentRecord:
 def _nonforced_rebuild_plan(document: DocumentRecord) -> IndexBuildPlan:
     return IndexBuildPlan(
         document=document,
-        sidecar_uri="file:///sidecar/",
-        blocks_path=None,
+        sidecar_artifact=BuildArtifactReference(
+            id="artifact-sidecar",
+            artifact_type="sidecar",
+            checksum=None,
+            size_bytes=None,
+            object_uri=None,
+            object_prefix_uri=None,
+            compatibility_locator="file:///sidecar/",
+        ),
+        blocks_artifact=None,
+        expected_current_sidecar_artifact_id=None,
+        expected_current_blocks_artifact_id=None,
         parser_hash=document.parser_hash or "sha256:parser",
         index_hash="sha256:new-index",  # differs from doc.index_hash => not skipped
         process_options="",
@@ -768,6 +782,21 @@ def _nonforced_rebuild_plan(document: DocumentRecord) -> IndexBuildPlan:
         force_extract=False,
         force_embedding=False,
         skipped=False,
+    )
+
+
+def _unit_build_execution() -> IndexBuildExecution:
+    return IndexBuildExecution(
+        lease=None,
+        runtime_sidecar_dir=Path("/sidecar"),
+        runtime_sidecar_uri="file:///sidecar/",
+        runtime_blocks_path=Path("/sidecar/paper.blocks.jsonl"),
+        canonical_sidecar_locator=Path("/sidecar"),
+        canonical_blocks_locator=Path("/sidecar/paper.blocks.jsonl"),
+        expected_current_sidecar_artifact_id=None,
+        expected_current_blocks_artifact_id=None,
+        initial_sidecar_checksum="sha256:sidecar",
+        initial_blocks_checksum="sha256:blocks",
     )
 
 
@@ -786,7 +815,7 @@ async def test_run_build_nonforced_rebuild_of_built_doc_clears_stale_row():
     assert rag.doc_status.stamp_counts[document.lightrag_doc_id] == 1
 
     run_result = await _unit_index_service().run_build(
-        rag, _nonforced_rebuild_plan(document)
+        rag, _nonforced_rebuild_plan(document), _unit_build_execution()
     )
 
     # Old row cleared, then re-enqueued and re-processed afresh (not deduped).
@@ -810,8 +839,12 @@ async def test_run_build_batch_nonforced_rebuild_of_built_doc_clears_stale_row()
         document.lightrag_doc_id, chunks_count=1, entity_count=1, relation_count=1
     )
 
+    plan = _nonforced_rebuild_plan(document)
     results = await _unit_index_service().run_build_batch(
-        rag, [_nonforced_rebuild_plan(document)], job_id="job_rebuild"
+        rag,
+        [plan],
+        {document.id: _unit_build_execution()},
+        job_id="job_rebuild",
     )
 
     assert (document.lightrag_doc_id, False) in rag.delete_calls
@@ -833,7 +866,7 @@ async def test_run_build_first_build_does_not_pre_delete():
     assert document.index_hash is None
 
     run_result = await _unit_index_service().run_build(
-        rag, _nonforced_rebuild_plan(document)
+        rag, _nonforced_rebuild_plan(document), _unit_build_execution()
     )
 
     assert rag.delete_calls == []
@@ -1701,8 +1734,8 @@ def test_durable_parse_executor_redrives_queued_job(tmp_path):
             lightrag_doc_id=plan.lightrag_doc_id,
             parser_engine="mineru",
             process_options="iF",
-            source_uri=document.source_uri,
             source_hash=document.source_hash,
+            source_name=plan.source_name,
         )
         executor = build_parse_executor(
             document_service=document_service,
@@ -1753,9 +1786,16 @@ def test_durable_build_executor_redrives_queued_job(tmp_path):
             index_hash=plan.index_hash,
             source_hash=document.source_hash,
             lightrag_doc_id=document.lightrag_doc_id,
-            sidecar_uri=plan.sidecar_uri,
-            blocks_path=plan.blocks_path,
-            process_options=plan.process_options,
+            sidecar_artifact_id=(
+                plan.sidecar_artifact.id
+                if plan.sidecar_artifact is not None
+                else None
+            ),
+            blocks_artifact_id=(
+                plan.blocks_artifact.id
+                if plan.blocks_artifact is not None
+                else None
+            ),
         )
         executor = build_build_kg_executor(
             document_service=document_service,
@@ -1806,9 +1846,16 @@ def test_build_executor_honors_cancelling_checkpoint(tmp_path):
             index_hash=plan.index_hash,
             source_hash=document.source_hash,
             lightrag_doc_id=document.lightrag_doc_id,
-            sidecar_uri=plan.sidecar_uri,
-            blocks_path=plan.blocks_path,
-            process_options=plan.process_options,
+            sidecar_artifact_id=(
+                plan.sidecar_artifact.id
+                if plan.sidecar_artifact is not None
+                else None
+            ),
+            blocks_artifact_id=(
+                plan.blocks_artifact.id
+                if plan.blocks_artifact is not None
+                else None
+            ),
         )
         await index_service.claim_build_queued(
             "kb_build_cancel", job_id=job.id, plan=plan
@@ -1872,8 +1919,8 @@ def test_parse_executor_honors_cancelling_checkpoint(tmp_path):
             lightrag_doc_id=plan.lightrag_doc_id,
             parser_engine=plan.parser_engine,
             process_options=plan.process_options,
-            source_uri=str(plan.source_path),
             source_hash=plan.document.source_hash,
+            source_name=plan.source_name,
         )
         await document_service.mark_parse_queued(
             "kb_parse_cancel", document_id, job=job, plan=plan

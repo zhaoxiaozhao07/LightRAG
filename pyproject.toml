@@ -173,6 +173,8 @@ lightrag-hash-password = "lightrag.tools.hash_password:main"
 lightrag-download-cache = "lightrag.tools.download_cache:main"
 lightrag-clean-llmqc = "lightrag.tools.clean_llm_query_cache:main"
 lightrag-migrate-kb-metadata = "lightrag.tools.migrate_kb_metadata_to_postgres:main"
+lightrag-migrate-artifacts-to-object = "lightrag.tools.migrate_artifacts_to_object:main"
+lightrag-reconcile-orphans = "lightrag.tools.reconcile_orphans:main"
 
 [project.urls]
 Homepage = "https://github.com/HKUDS/LightRAG"

@@ -1,6 +1,10 @@
+import asyncio
 import os
+import threading
+from collections.abc import Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, final
+from typing import IO, Any, Literal, final
 
 from lightrag.base import (
     BaseKVStorage,
@@ -13,6 +17,57 @@ from lightrag.utils import (
     write_json,
 )
 from lightrag.exceptions import StorageNotInitializedError
+
+try:
+    from lightrag.artifact_runtime import (
+        PipelineAttemptCommitOutcomeUnknownError,
+        PipelineAttemptRowKind,
+        extract_pipeline_attempt_token,
+    )
+except ImportError:  # pragma: no cover - compatibility until core capability lands
+    PipelineAttemptRowKind = Literal["full_docs", "doc_status"]
+
+    class PipelineAttemptCommitOutcomeUnknownError(RuntimeError):
+        """A JSON attempt-fenced commit may already be durable."""
+
+        error_code = "pipeline_attempt_commit_outcome_unknown"
+
+        def __init__(
+            self,
+            key: str,
+            *,
+            row_kind: PipelineAttemptRowKind,
+            reason: str | None = None,
+        ) -> None:
+            self.key = key
+            self.row_kind = row_kind
+            self.reason = reason
+            super().__init__(
+                f"{self.error_code}: {row_kind} row {key!r} commit outcome is "
+                f"unknown ({reason or 'json_durability_ambiguity'})"
+            )
+
+    def extract_pipeline_attempt_token(
+        row: Mapping[str, Any] | None,
+        *,
+        row_kind: PipelineAttemptRowKind,
+    ) -> str | None:
+        if row_kind not in {"full_docs", "doc_status"}:
+            raise ValueError(f"Unsupported pipeline attempt row kind: {row_kind!r}")
+        if not isinstance(row, Mapping):
+            return None
+        if row_kind == "full_docs":
+            container = row.get("artifact_binding")
+            token_key = "claim_token"
+        else:
+            container = row.get("metadata")
+            token_key = "pipeline_attempt_token"
+        if not isinstance(container, Mapping):
+            return None
+        token = container.get(token_key)
+        return token if isinstance(token, str) and token else None
+
+
 from .shared_storage import (
     get_namespace_data,
     get_namespace_lock,
@@ -22,6 +77,234 @@ from .shared_storage import (
     clear_all_update_flags,
     try_initialize_namespace,
 )
+
+
+_JSON_PROCESS_LOCKS: dict[str, threading.Lock] = {}
+_JSON_PROCESS_LOCKS_GUARD = threading.Lock()
+
+
+def _get_json_process_lock(lock_path: str) -> threading.Lock:
+    with _JSON_PROCESS_LOCKS_GUARD:
+        lock = _JSON_PROCESS_LOCKS.get(lock_path)
+        if lock is None:
+            lock = threading.Lock()
+            _JSON_PROCESS_LOCKS[lock_path] = lock
+        return lock
+
+
+class _JsonWriterFileLock:
+    """Serialize atomic JSON snapshot writers across processes and instances."""
+
+    def __init__(self, file_name: str) -> None:
+        self.lock_path = os.path.abspath(f"{file_name}.lock")
+        self._process_lock = _get_json_process_lock(self.lock_path)
+        self._file: IO[bytes] | None = None
+
+    def __enter__(self) -> "_JsonWriterFileLock":
+        self._process_lock.acquire()
+        try:
+            file = open(self.lock_path, "a+b")
+            self._file = file
+            if file.seek(0, os.SEEK_END) == 0:
+                file.write(b"0")
+                file.flush()
+                os.fsync(file.fileno())
+            file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(file.fileno(), fcntl.LOCK_EX)
+        except BaseException:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
+            self._process_lock.release()
+            raise
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if self._file is None:
+            self._process_lock.release()
+            return
+        try:
+            self._file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._file.close()
+            self._file = None
+            self._process_lock.release()
+
+
+def _pipeline_attempt_unknown_error(
+    key: str,
+    *,
+    row_kind: PipelineAttemptRowKind,
+    error: BaseException,
+) -> PipelineAttemptCommitOutcomeUnknownError:
+    return PipelineAttemptCommitOutcomeUnknownError(
+        key,
+        row_kind=row_kind,
+        reason=type(error).__name__,
+    )
+
+
+async def _compare_and_commit_json_pipeline_attempt(
+    storage: Any,
+    key: str,
+    payload: Mapping[str, Any],
+    *,
+    expected_attempt_token: str,
+    row_kind: PipelineAttemptRowKind,
+    load_json_fn: Callable[[str], Any],
+    write_json_fn: Callable[[Any, str], bool],
+) -> bool:
+    """Replace an attempt-owned row only when memory and disk still agree."""
+
+    if not isinstance(key, str) or not key:
+        raise ValueError("Pipeline attempt commit key must be a non-empty string")
+    if row_kind not in {"full_docs", "doc_status"}:
+        raise ValueError(f"Unsupported pipeline attempt row kind: {row_kind!r}")
+    if not isinstance(expected_attempt_token, str) or not expected_attempt_token:
+        raise ValueError("expected_attempt_token must be a non-empty string")
+    if not isinstance(payload, Mapping):
+        raise TypeError("Pipeline attempt commit payload must be a mapping")
+
+    replacement = deepcopy(dict(payload))
+    if "_id" in replacement and replacement["_id"] != key:
+        raise ValueError("Pipeline attempt commit payload _id does not match key")
+    if (
+        extract_pipeline_attempt_token(replacement, row_kind=row_kind)
+        != expected_attempt_token
+    ):
+        raise ValueError(
+            f"{row_kind} payload does not carry the expected pipeline attempt token"
+        )
+    if storage._storage_lock is None or storage._data is None:
+        raise StorageNotInitializedError(type(storage).__name__)
+
+    durable_commit_visible = False
+    try:
+        async with storage._storage_lock:
+            shared_current = storage._data.get(key)
+            if (
+                extract_pipeline_attempt_token(shared_current, row_kind=row_kind)
+                != expected_attempt_token
+            ):
+                return False
+
+            with _JsonWriterFileLock(storage._file_name):
+                persisted = load_json_fn(storage._file_name)
+                if persisted is None:
+                    return False
+                if not isinstance(persisted, dict):
+                    raise TypeError(
+                        f"JSON storage snapshot must be an object: {storage._file_name}"
+                    )
+
+                durable_current = persisted.get(key)
+                if (
+                    extract_pipeline_attempt_token(durable_current, row_kind=row_kind)
+                    != expected_attempt_token
+                ):
+                    return False
+
+                candidate = deepcopy(persisted)
+                candidate[key] = replacement
+                committed_snapshot = candidate
+                try:
+                    write_json_fn(candidate, storage._file_name)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as write_error:
+                    try:
+                        observed = load_json_fn(storage._file_name)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as read_error:
+                        raise _pipeline_attempt_unknown_error(
+                            key,
+                            row_kind=row_kind,
+                            error=write_error,
+                        ) from read_error
+
+                    if observed == candidate:
+                        committed_snapshot = observed
+                    elif observed == persisted:
+                        raise
+                    elif (
+                        extract_pipeline_attempt_token(
+                            observed.get(key)
+                            if isinstance(observed, Mapping)
+                            else None,
+                            row_kind=row_kind,
+                        )
+                        != expected_attempt_token
+                    ):
+                        return False
+                    else:
+                        raise _pipeline_attempt_unknown_error(
+                            key,
+                            row_kind=row_kind,
+                            error=write_error,
+                        ) from write_error
+                else:
+                    durable_commit_visible = True
+                    try:
+                        committed_snapshot = load_json_fn(storage._file_name)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as read_error:
+                        raise _pipeline_attempt_unknown_error(
+                            key,
+                            row_kind=row_kind,
+                            error=read_error,
+                        ) from read_error
+
+                durable_commit_visible = True
+                if committed_snapshot != candidate:
+                    error = RuntimeError(
+                        "durable JSON snapshot differs from the committed candidate"
+                    )
+                    raise _pipeline_attempt_unknown_error(
+                        key,
+                        row_kind=row_kind,
+                        error=error,
+                    ) from error
+                committed_row = committed_snapshot.get(key)
+                if not isinstance(committed_row, dict):
+                    error = RuntimeError(
+                        "durable JSON snapshot omitted the committed row"
+                    )
+                    raise _pipeline_attempt_unknown_error(
+                        key,
+                        row_kind=row_kind,
+                        error=error,
+                    ) from error
+                storage._data[key] = deepcopy(committed_row)
+        return True
+    except PipelineAttemptCommitOutcomeUnknownError:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        if durable_commit_visible:
+            raise _pipeline_attempt_unknown_error(
+                key,
+                row_kind=row_kind,
+                error=error,
+            ) from error
+        raise
 
 
 @final
@@ -231,18 +514,19 @@ class JsonKVStorage(BaseKVStorage):
                     f"[{self.workspace}] Process {os.getpid()} KV writting {data_count} records to {self.namespace}"
                 )
 
-                # Write JSON and check if sanitization was applied
-                needs_reload = write_json(data_dict, self._file_name)
+                with _JsonWriterFileLock(self._file_name):
+                    # Write JSON and check if sanitization was applied
+                    needs_reload = write_json(data_dict, self._file_name)
 
-                # If data was sanitized, reload cleaned data to update shared memory
-                if needs_reload:
-                    logger.info(
-                        f"[{self.workspace}] Reloading sanitized data into shared memory for {self.namespace}"
-                    )
-                    cleaned_data = load_json(self._file_name)
-                    if cleaned_data is not None:
-                        self._data.clear()
-                        self._data.update(cleaned_data)
+                    # If data was sanitized, reload cleaned data to update shared memory
+                    if needs_reload:
+                        logger.info(
+                            f"[{self.workspace}] Reloading sanitized data into shared memory for {self.namespace}"
+                        )
+                        cleaned_data = load_json(self._file_name)
+                        if cleaned_data is not None:
+                            self._data.clear()
+                            self._data.update(cleaned_data)
 
                 await clear_all_update_flags(self.namespace, workspace=self.workspace)
 
@@ -280,6 +564,26 @@ class JsonKVStorage(BaseKVStorage):
     async def filter_keys(self, keys: set[str]) -> set[str]:
         async with self._storage_lock:
             return set(keys) - set(self._data.keys())
+
+    async def compare_and_commit_pipeline_attempt(
+        self,
+        key: str,
+        payload: Mapping[str, Any],
+        *,
+        expected_attempt_token: str,
+        row_kind: PipelineAttemptRowKind,
+    ) -> bool:
+        """Atomically replace and durably publish an attempt-owned JSON row."""
+
+        return await _compare_and_commit_json_pipeline_attempt(
+            self,
+            key,
+            payload,
+            expected_attempt_token=expected_attempt_token,
+            row_kind=row_kind,
+            load_json_fn=load_json,
+            write_json_fn=write_json,
+        )
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         """Insert or update KV records in shared memory; mark all processes dirty.

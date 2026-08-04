@@ -310,8 +310,10 @@ async def test_rebuild_action_background_task_holds_shared_guard_until_complete(
     )
     plan = IndexBuildPlan(
         document=document,
-        sidecar_uri=None,
-        blocks_path=None,
+        sidecar_artifact=None,
+        blocks_artifact=None,
+        expected_current_sidecar_artifact_id=None,
+        expected_current_blocks_artifact_id=None,
         parser_hash="sha256:parser",
         index_hash="sha256:index",
         process_options="",

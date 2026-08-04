@@ -5,6 +5,7 @@ import json
 import os
 import re
 import datetime
+from collections.abc import Mapping
 from datetime import timezone
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, TypeVar, Union, final
@@ -33,6 +34,11 @@ from ..base import (
     DocProcessingStatus,
     DocStatus,
     DocStatusStorage,
+)
+from ..artifact_runtime import (
+    PipelineAttemptCommitOutcomeUnknownError,
+    PipelineAttemptRowKind,
+    extract_pipeline_attempt_token,
 )
 from ..constants import DEFAULT_QUERY_PRIORITY
 from ..exceptions import DataMigrationError
@@ -210,6 +216,109 @@ def _resolve_pg_batch_limits() -> tuple[int, int, int]:
             f"POSTGRES_DELETE_MAX_RECORDS_PER_BATCH={delete_records} is non-positive, disable delete record-count splitting"
         )
     return upsert_payload_bytes, upsert_records, delete_records
+
+
+def _validate_pipeline_attempt_cas(
+    key: str,
+    payload: Mapping[str, Any],
+    *,
+    expected_attempt_token: str,
+    row_kind: PipelineAttemptRowKind,
+) -> None:
+    if not isinstance(key, str) or not key:
+        raise ValueError("Pipeline attempt CAS key must be a non-empty string")
+    if row_kind not in {"full_docs", "doc_status"}:
+        raise ValueError(f"Unsupported pipeline attempt row kind: {row_kind!r}")
+    if not isinstance(expected_attempt_token, str) or not expected_attempt_token:
+        raise ValueError("expected_attempt_token must be a non-empty string")
+    if not isinstance(payload, Mapping):
+        raise TypeError("Pipeline attempt CAS payload must be a mapping")
+    for identity_field in ("id", "_id"):
+        if identity_field in payload and payload[identity_field] != key:
+            raise ValueError(
+                f"Pipeline attempt CAS payload {identity_field} does not match key"
+            )
+    if (
+        extract_pipeline_attempt_token(payload, row_kind=row_kind)
+        != expected_attempt_token
+    ):
+        raise ValueError(
+            "Pipeline attempt CAS payload must preserve the expected token"
+        )
+
+
+async def _execute_pipeline_attempt_cas(
+    storage: Any,
+    key: str,
+    *,
+    sql: str,
+    params: tuple[Any, ...],
+    expected_row: dict[str, Any],
+    expected_attempt_token: str,
+    row_kind: PipelineAttemptRowKind,
+) -> bool:
+    """Run one non-retried atomic UPDATE and reconcile a lost acknowledgement."""
+
+    operation_started = False
+    operation_completed = False
+    operation_result: Any = None
+
+    async def _atomic_update(connection: asyncpg.Connection) -> Any:
+        nonlocal operation_completed, operation_result, operation_started
+        # The explicit transaction makes the durability boundary observable:
+        # returning from this closure means COMMIT was acknowledged. The DB
+        # helper intentionally performs no retry, including when pool release
+        # itself loses the acknowledgement after the commit.
+        async with connection.transaction():
+            operation_started = True
+            operation_result = await connection.fetchrow(sql, *params)
+        operation_completed = True
+        return operation_result
+
+    try:
+        updated = await storage.db._run_pipeline_attempt_cas_once(_atomic_update)
+    except asyncio.CancelledError:
+        raise
+    except Exception as write_error:
+        # The explicit transaction committed and returned before a later pool
+        # release error. The result is therefore known and must not be retried.
+        if operation_completed:
+            return operation_result is not None
+        transient_exceptions = getattr(storage.db, "_transient_exceptions", ())
+        if not operation_started or not isinstance(write_error, transient_exceptions):
+            raise
+
+        # The one-shot helper has already released the write connection.
+        # get_by_id therefore performs an independent, current checkout.
+        try:
+            current = await storage.get_by_id(key)
+        except (Exception, asyncio.CancelledError) as readback_error:
+            raise PipelineAttemptCommitOutcomeUnknownError(
+                key,
+                row_kind=row_kind,
+                reason=(
+                    f"{type(write_error).__name__}: PostgreSQL CAS "
+                    "acknowledgement and read-back both failed"
+                ),
+            ) from readback_error
+
+        if isinstance(current, Mapping) and dict(current) == expected_row:
+            return True
+        if (
+            extract_pipeline_attempt_token(current, row_kind=row_kind)
+            != expected_attempt_token
+        ):
+            return False
+        raise PipelineAttemptCommitOutcomeUnknownError(
+            key,
+            row_kind=row_kind,
+            reason=(
+                f"{type(write_error).__name__}: PostgreSQL CAS "
+                "acknowledgement was lost and read-back was ambiguous"
+            ),
+        ) from write_error
+
+    return updated is not None
 
 
 # All known vector index suffixes, used to drop conflicting indexes when switching types
@@ -718,6 +827,23 @@ class PostgreSQLDB:
                     elif with_age and not graph_name:
                         raise ValueError("Graph name is required when with_age is True")
                     return await operation(connection)
+
+    async def _run_pipeline_attempt_cas_once(
+        self,
+        operation: Callable[[asyncpg.Connection], Awaitable[T]],
+    ) -> T:
+        """Run an attempt-fenced mutation once, without transport retries.
+
+        A connection error can be raised while releasing the pool checkout after
+        PostgreSQL has committed. Keeping acquisition, callback execution, and
+        release inside this one-shot boundary lets the storage CAS reconcile
+        that outcome instead of replaying the mutation through _run_with_retry.
+        """
+
+        await self._ensure_pool()
+        assert self.pool is not None
+        async with self.pool.acquire() as connection:  # type: ignore[arg-type]
+            return await operation(connection)
 
     def _get_pool_snapshot(self) -> str:
         """Best-effort snapshot of asyncpg pool state for diagnostics.
@@ -2515,6 +2641,104 @@ class ClientManager:
                         await db.pool.close()
 
 
+def _json_round_trip(value: Any) -> Any:
+    """Normalize a JSON value to the same Python shape returned by JSONB."""
+
+    return json.loads(json.dumps(value))
+
+
+def _full_doc_artifact_meta(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the JSONB meta shape used for full-doc artifact bindings."""
+
+    return {"artifact_binding": _json_round_trip(payload["artifact_binding"])}
+
+
+def _restore_full_doc_artifact_binding(row: dict[str, Any]) -> None:
+    """Restore the logical artifact_binding field from LIGHTRAG_DOC_FULL.meta."""
+
+    meta = row.pop("meta", {})
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except json.JSONDecodeError:
+            meta = {}
+    if isinstance(meta, Mapping) and "artifact_binding" in meta:
+        row["artifact_binding"] = meta["artifact_binding"]
+
+
+def _prepare_full_docs_pipeline_attempt_cas(
+    key: str,
+    payload: Mapping[str, Any],
+    *,
+    workspace: str,
+    expected_attempt_token: str,
+) -> tuple[str, tuple[Any, ...], dict[str, Any]]:
+    """Serialize one logical full_docs replacement into its PostgreSQL row."""
+
+    meta = _full_doc_artifact_meta(payload)
+    chunk_options = _json_round_trip(payload.get("chunk_options") or {})
+    artifact_binding = meta["artifact_binding"]
+    content = payload["content"]
+    file_path = payload.get("file_path", "")
+    sidecar_location = payload.get("sidecar_location")
+    parse_format = payload.get("parse_format")
+    content_hash = payload.get("content_hash")
+    process_options = payload.get("process_options")
+    parse_engine = payload.get("parse_engine")
+
+    sql = """
+        UPDATE LIGHTRAG_DOC_FULL
+           SET content = $3,
+               doc_name = $4,
+               meta = CASE
+                   WHEN jsonb_typeof(COALESCE(meta, '{}'::jsonb)) = 'object'
+                   THEN COALESCE(meta, '{}'::jsonb) || $5::jsonb
+                   ELSE $5::jsonb
+               END,
+               sidecar_location = $6,
+               parse_format = $7,
+               content_hash = $8,
+               process_options = $9,
+               chunk_options = $10::jsonb,
+               parse_engine = $11,
+               update_time = CURRENT_TIMESTAMP
+         WHERE workspace = $1
+           AND id = $2
+           AND COALESCE(meta, '{}'::jsonb)
+                   #>> '{artifact_binding,claim_token}' = $12
+         RETURNING id
+    """
+    params = (
+        # The positional order is intentionally identical to the UPDATE above.
+        # workspace + id are part of the durable row identity/fence.
+        workspace,
+        key,
+        content,
+        file_path,
+        json.dumps(meta),
+        sidecar_location,
+        parse_format,
+        content_hash,
+        process_options,
+        json.dumps(chunk_options),
+        parse_engine,
+        expected_attempt_token,
+    )
+    expected_row = {
+        "id": key,
+        "content": content,
+        "file_path": file_path,
+        "sidecar_location": sidecar_location,
+        "parse_format": parse_format,
+        "content_hash": content_hash,
+        "process_options": process_options,
+        "chunk_options": chunk_options,
+        "parse_engine": parse_engine,
+        "artifact_binding": artifact_binding,
+    }
+    return sql, params, expected_row
+
+
 @final
 @dataclass
 class PGKVStorage(BaseKVStorage):
@@ -2609,6 +2833,7 @@ class PGKVStorage(BaseKVStorage):
             if not isinstance(chunk_options, dict):
                 chunk_options = {}
             response["chunk_options"] = chunk_options
+            _restore_full_doc_artifact_binding(response)
 
         # Special handling for LLM cache to ensure compatibility with _get_cached_extraction_results
         if response and is_namespace(
@@ -2776,6 +3001,7 @@ class PGKVStorage(BaseKVStorage):
                 if not isinstance(chunk_options, dict):
                     chunk_options = {}
                 result["chunk_options"] = chunk_options
+                _restore_full_doc_artifact_binding(result)
 
         # Special handling for LLM cache to ensure compatibility with _get_cached_extraction_results
         if results and is_namespace(
@@ -2894,6 +3120,44 @@ class PGKVStorage(BaseKVStorage):
             )
             raise
 
+    async def compare_and_commit_pipeline_attempt(
+        self,
+        key: str,
+        payload: Mapping[str, Any],
+        *,
+        expected_attempt_token: str,
+        row_kind: PipelineAttemptRowKind,
+    ) -> bool:
+        """Atomically replace one attempt-owned full_docs PostgreSQL row."""
+
+        if row_kind != "full_docs" or not is_namespace(
+            self.namespace, NameSpace.KV_STORE_FULL_DOCS
+        ):
+            raise ValueError(
+                "PGKVStorage pipeline attempt CAS is supported only for full_docs"
+            )
+        _validate_pipeline_attempt_cas(
+            key,
+            payload,
+            expected_attempt_token=expected_attempt_token,
+            row_kind=row_kind,
+        )
+        sql, params, expected_row = _prepare_full_docs_pipeline_attempt_cas(
+            key,
+            payload,
+            workspace=self.workspace,
+            expected_attempt_token=expected_attempt_token,
+        )
+        return await _execute_pipeline_attempt_cas(
+            self,
+            key,
+            sql=sql,
+            params=params,
+            expected_row=expected_row,
+            expected_attempt_token=expected_attempt_token,
+            row_kind=row_kind,
+        )
+
     ################ INSERT METHODS ################
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         logger.debug(f"[{self.workspace}] Inserting {len(data)} to {self.namespace}")
@@ -2943,7 +3207,7 @@ class PGKVStorage(BaseKVStorage):
             for i, (k, v) in enumerate(data.items(), start=1):
                 # Tuple order must match SQL: (id, content, doc_name, workspace,
                 #   sidecar_location, parse_format, content_hash, process_options,
-                #   chunk_options, parse_engine)
+                #   chunk_options, parse_engine, meta)
                 #
                 # All pipeline-derived fields pass through untouched so the
                 # SQL-level COALESCE guard in upsert_doc_full can distinguish
@@ -2964,6 +3228,17 @@ class PGKVStorage(BaseKVStorage):
                         v.get("process_options"),
                         json.dumps(v.get("chunk_options") or {}),
                         v.get("parse_engine"),
+                        (
+                            json.dumps(
+                                {
+                                    "artifact_binding": _json_round_trip(
+                                        v["artifact_binding"]
+                                    )
+                                }
+                            )
+                            if "artifact_binding" in v
+                            else None
+                        ),
                     )
                 )
                 await _cooperative_yield(i)
@@ -4761,6 +5036,96 @@ def _parse_doc_status_datetime(
         return None
 
 
+def _format_pg_doc_status_datetime(dt: datetime.datetime | None) -> str | None:
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc).isoformat()
+
+
+def _prepare_doc_status_pipeline_attempt_cas(
+    key: str,
+    payload: Mapping[str, Any],
+    *,
+    workspace: str,
+    expected_attempt_token: str,
+) -> tuple[str, tuple[Any, ...], dict[str, Any]]:
+    """Serialize one logical doc_status replacement into its PostgreSQL row."""
+
+    status = payload["status"]
+    if isinstance(status, DocStatus):
+        status = status.value
+    chunks_list = _json_round_trip(payload.get("chunks_list", []))
+    metadata = _json_round_trip(payload.get("metadata", {}))
+    created_at = _parse_doc_status_datetime(
+        payload.get("created_at"),
+        f"[{workspace}] doc {key} created_at",
+    )
+    updated_at = _parse_doc_status_datetime(
+        payload.get("updated_at"),
+        f"[{workspace}] doc {key} updated_at",
+    )
+    content_summary = payload["content_summary"]
+    content_length = payload["content_length"]
+    chunks_count = payload.get("chunks_count", -1)
+    file_path = payload["file_path"]
+    track_id = payload.get("track_id")
+    error_msg = payload.get("error_msg")
+    content_hash = payload.get("content_hash")
+
+    sql = """
+        UPDATE LIGHTRAG_DOC_STATUS
+           SET content_summary = $3,
+               content_length = $4,
+               chunks_count = $5,
+               status = $6,
+               file_path = $7,
+               chunks_list = $8::jsonb,
+               track_id = $9,
+               metadata = $10::jsonb,
+               error_msg = $11,
+               content_hash = $12,
+               created_at = $13,
+               updated_at = $14
+         WHERE workspace = $1
+           AND id = $2
+           AND COALESCE(metadata, '{}'::jsonb)
+                   ->> 'pipeline_attempt_token' = $15
+         RETURNING id
+    """
+    params = (
+        workspace,
+        key,
+        content_summary,
+        content_length,
+        chunks_count,
+        status,
+        file_path,
+        json.dumps(chunks_list),
+        track_id,
+        json.dumps(metadata),
+        error_msg,
+        content_hash,
+        created_at,
+        updated_at,
+        expected_attempt_token,
+    )
+    expected_row = {
+        "content_length": content_length,
+        "content_summary": content_summary,
+        "status": status,
+        "chunks_count": chunks_count,
+        "created_at": _format_pg_doc_status_datetime(created_at),
+        "updated_at": _format_pg_doc_status_datetime(updated_at),
+        "file_path": file_path,
+        "chunks_list": chunks_list,
+        "metadata": metadata,
+        "error_msg": error_msg,
+        "track_id": track_id,
+        "content_hash": content_hash,
+    }
+    return sql, params, expected_row
+
+
 @final
 @dataclass
 class PGDocStatusStorage(DocStatusStorage):
@@ -4835,6 +5200,45 @@ class PGDocStatusStorage(DocStatusStorage):
                 f"[{self.workspace}] PostgreSQL database,\nsql:{sql},\nparams:{params},\nerror:{e}"
             )
             raise
+
+    async def compare_and_commit_pipeline_attempt(
+        self,
+        key: str,
+        payload: Mapping[str, Any],
+        *,
+        expected_attempt_token: str,
+        row_kind: PipelineAttemptRowKind,
+    ) -> bool:
+        """Atomically replace one attempt-owned doc_status PostgreSQL row."""
+
+        if row_kind != "doc_status" or not is_namespace(
+            self.namespace, NameSpace.DOC_STATUS
+        ):
+            raise ValueError(
+                "PGDocStatusStorage pipeline attempt CAS is supported only for "
+                "doc_status"
+            )
+        _validate_pipeline_attempt_cas(
+            key,
+            payload,
+            expected_attempt_token=expected_attempt_token,
+            row_kind=row_kind,
+        )
+        sql, params, expected_row = _prepare_doc_status_pipeline_attempt_cas(
+            key,
+            payload,
+            workspace=self.workspace,
+            expected_attempt_token=expected_attempt_token,
+        )
+        return await _execute_pipeline_attempt_cas(
+            self,
+            key,
+            sql=sql,
+            params=params,
+            expected_row=expected_row,
+            expected_attempt_token=expected_attempt_token,
+            row_kind=row_kind,
+        )
 
     async def get_by_id(self, id: str) -> Union[dict[str, Any], None]:
         sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and id=$2"
@@ -8076,6 +8480,7 @@ SQL_TEMPLATES = {
     # SQL for KVStorage
     "get_by_id_full_docs": """SELECT id, COALESCE(content, '') as content,
                                 COALESCE(doc_name, '') as file_path,
+                                COALESCE(meta, '{}'::jsonb) as meta,
                                 sidecar_location,
                                 parse_format,
                                 content_hash,
@@ -8100,6 +8505,7 @@ SQL_TEMPLATES = {
                                """,
     "get_by_ids_full_docs": """SELECT id, COALESCE(content, '') as content,
                                  COALESCE(doc_name, '') as file_path,
+                                 COALESCE(meta, '{}'::jsonb) as meta,
                                  sidecar_location,
                                  parse_format,
                                  content_hash,
@@ -8175,11 +8581,26 @@ SQL_TEMPLATES = {
     # "no value, preserve existing".
     "upsert_doc_full": """INSERT INTO LIGHTRAG_DOC_FULL (id, content, doc_name, workspace,
                             sidecar_location, parse_format, content_hash,
-                            process_options, chunk_options, parse_engine)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                            process_options, chunk_options, parse_engine, meta)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                         ON CONFLICT (workspace,id) DO UPDATE
                            SET content = EXCLUDED.content,
                                doc_name = EXCLUDED.doc_name,
+                               meta = CASE
+                                   WHEN EXCLUDED.meta IS NULL
+                                   THEN LIGHTRAG_DOC_FULL.meta
+                                   ELSE CASE
+                                       WHEN jsonb_typeof(COALESCE(
+                                           LIGHTRAG_DOC_FULL.meta,
+                                           '{}'::jsonb
+                                       )) = 'object'
+                                       THEN COALESCE(
+                                           LIGHTRAG_DOC_FULL.meta,
+                                           '{}'::jsonb
+                                       )
+                                       ELSE '{}'::jsonb
+                                   END || EXCLUDED.meta
+                               END,
                                sidecar_location = COALESCE(
                                    NULLIF(EXCLUDED.sidecar_location, ''),
                                    LIGHTRAG_DOC_FULL.sidecar_location

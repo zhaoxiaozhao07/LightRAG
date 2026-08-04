@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, cast
@@ -36,6 +37,67 @@ from lightrag.utils import (
 
 PLACEHOLDER_DOCUMENT_SOURCES = {"", "no-file-path", "unknown_source"}
 SIDECAR_LOCATION_UNKNOWN = "unknown_source"
+
+
+_canonical_input_root: Path | None = None
+_canonical_input_root_lock = threading.RLock()
+
+
+def resolve_canonical_input_root_candidate(input_dir: Path | str) -> Path:
+    """Resolve an ``INPUT_DIR`` candidate without mutating process state."""
+
+    try:
+        raw_value = os.fspath(input_dir).strip()
+    except TypeError as exc:
+        raise ValueError("Canonical INPUT_DIR must be a filesystem path") from exc
+    if not raw_value:
+        raise ValueError("Canonical INPUT_DIR cannot be empty")
+    try:
+        return Path(raw_value).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Unable to resolve canonical INPUT_DIR: {raw_value}") from exc
+
+
+def set_canonical_input_root(input_dir: Path | str) -> Path:
+    """Pin the process-wide input root to one resolved filesystem path.
+
+    API/server callers must invoke this immediately before constructing document
+    or pipeline services. Once set, later environment or CWD changes cannot move
+    the root, and a second, different explicit root is rejected rather than
+    silently creating a second containment boundary.
+    """
+
+    resolved = resolve_canonical_input_root_candidate(input_dir)
+
+    global _canonical_input_root
+    with _canonical_input_root_lock:
+        if _canonical_input_root is None:
+            _canonical_input_root = resolved
+        elif _canonical_input_root != resolved:
+            raise RuntimeError(
+                "Canonical INPUT_DIR is already set to "
+                f"{_canonical_input_root}; refusing conflicting root {resolved}"
+            )
+        return _canonical_input_root
+
+
+def get_canonical_input_root() -> Path | None:
+    """Return the explicitly pinned input root, if server wiring set one."""
+
+    with _canonical_input_root_lock:
+        return _canonical_input_root
+
+
+def reset_canonical_input_root_for_tests() -> None:
+    """Clear the process root for hermetic tests only.
+
+    Production code must never reset the root: doing so would reopen the
+    containment boundary to CWD/environment drift after services are alive.
+    """
+
+    global _canonical_input_root
+    with _canonical_input_root_lock:
+        _canonical_input_root = None
 
 
 def build_chunks_dict_from_chunking_result(
@@ -265,6 +327,7 @@ def resolve_doc_status_parse_engine(
 _DOC_STATUS_METADATA_CARRY_OVER_KEYS: tuple[str, ...] = (
     "process_options",
     "source_file",
+    "pipeline_attempt_token",
     "parse_warnings",
     "chunk_opts",
     "parse_start_time",
@@ -327,6 +390,7 @@ def doc_status_transition_metadata(
 _DOC_STATUS_METADATA_DIRECTIVE_KEYS: tuple[str, ...] = (
     "process_options",
     "source_file",
+    "pipeline_attempt_token",
 )
 
 
@@ -477,6 +541,9 @@ def compute_file_content_hash(path_str: str) -> str | None:
 
 
 def configured_input_dir() -> Path:
+    canonical_root = get_canonical_input_root()
+    if canonical_root is not None:
+        return canonical_root
     input_dir = os.getenv("INPUT_DIR", "").strip()
     return Path(input_dir) if input_dir else Path.cwd() / "inputs"
 
@@ -747,7 +814,15 @@ async def load_lightrag_document_content(sidecar_uri: str) -> tuple[str, str]:
         raise FileNotFoundError(
             f"LightRAG blocks file not found from sidecar uri: {sidecar_uri}"
         )
-    blocks_path = Path(resolved)
+    return await load_lightrag_document_content_from_blocks_path(resolved)
+
+
+async def load_lightrag_document_content_from_blocks_path(
+    blocks_path: str | Path,
+) -> tuple[str, str]:
+    """Load merged content from a processing-owner runtime blocks path."""
+
+    blocks_path = Path(blocks_path)
 
     merged_parts: list[str] = []
     with blocks_path.open("r", encoding="utf-8") as f:

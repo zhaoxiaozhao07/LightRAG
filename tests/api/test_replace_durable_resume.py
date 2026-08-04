@@ -680,3 +680,92 @@ async def test_orphan_recovery_preserves_queued_sync_job(tmp_path):
     recovered2 = await metadata_store.recover_orphan_jobs(resumable_job_types={"parse"})
     assert any(r.id == job2.id for r in recovered2)
     assert (await job_service.get_job(kb_id, job2.id)).status == "failed"
+
+
+async def test_local_mode_staging_unchanged_and_no_object_staging_payload(tmp_path):
+    """Phase 3.2 regression guard: local mode keeps local staging and never
+    emits the object-staging payload fields.
+
+    Object-backed staging (Phase 3.2) is strictly additive and gated on
+    ``object_authoritative``. Local-mode replace/sync must continue to stage
+    bytes to disk and the job payload must never carry
+    ``staging_object_uri`` / ``staging_object_uris`` (those are object-mode
+    only, metadata-only, and must not leak into local-mode payloads).
+    """
+
+    env = _wire(tmp_path)
+    client = env["client"]
+    document_service = env["document_service"]
+    job_service = env["job_service"]
+    assert document_service.object_authoritative is False
+
+    kb_id = "kb_local_stage_guard"
+    document_id = _ready_document(client, kb_id)
+
+    replacement = document_service.prepare_replacement_source(
+        DocumentSourceInput(
+            source_name="paper-v2.pdf",
+            content=b"local-replacement-bytes",
+            source_type="url",
+            content_type="application/pdf",
+            metadata={},
+        )
+    )
+    before = client.get(f"/kbs/{kb_id}/documents/{document_id}", headers=_HEADERS).json()
+
+    job, created = await job_service.create_replace_job_once(
+        kb_id,
+        document_id=document_id,
+        previous_lightrag_doc_id=before["lightrag_doc_id"],
+        source_name=replacement.source_name,
+        source_type=replacement.source_type,
+        source_hash=replacement.source_hash,
+        content_type=replacement.content_type,
+        size_bytes=replacement.size_bytes,
+        auto_parse=False,
+        auto_index=False,
+    )
+    assert created is True
+
+    # Local mode stages bytes to disk.
+    staged_path = await document_service.stage_replacement_bytes(
+        kb_id, document_id, job_id=job.id, replacement=replacement
+    )
+    assert Path(staged_path).is_file()
+
+    # The local-mode job payload must NOT carry object-staging fields.
+    persisted = await job_service.get_job(kb_id, job.id)
+    assert "staging_object_uri" not in persisted.payload
+    assert "staging_object_uris" not in persisted.payload
+
+    # And reload round-trips through the local staged file.
+    reloaded = await document_service.load_staged_replacement(
+        kb_id,
+        document_id,
+        job_id=job.id,
+        source_name=replacement.source_name,
+        source_hash=replacement.source_hash,
+        content_type=replacement.content_type,
+        size_bytes=replacement.size_bytes,
+        source_type=replacement.source_type,
+    )
+    assert reloaded is not None
+    assert reloaded.content == replacement.content
+
+    # Aggregate sync staging is likewise local-only in local mode.
+    sync_source = DocumentSourceInput(
+        source_name="synced.pdf",
+        content=b"sync-bytes",
+        source_type="upload",
+        content_type="application/pdf",
+        metadata={"source_key": "manual/synced.pdf"},
+    )
+    sync_staged_path = await document_service.stage_sync_source_bytes(
+        kb_id,
+        batch_id="batch-guard",
+        item_index=0,
+        source=sync_source,
+    )
+    assert Path(sync_staged_path).is_file()
+    await document_service.clear_staged_sync_sources(kb_id, batch_id="batch-guard")
+    assert not Path(sync_staged_path).exists()

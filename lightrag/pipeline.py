@@ -24,12 +24,28 @@ import re
 import shutil
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
+from lightrag.artifact_runtime import (
+    PipelineArtifactCommitOutcome,
+    PipelineArtifactBinding,
+    PipelineArtifactFinalizationResult,
+    PipelineArtifactMaterializerMissingError,
+    PipelineArtifactRuntimeError,
+    PipelineArtifactSession,
+    PipelineArtifactSessionMismatchError,
+    PipelineAttemptCommitOutcomeUnknownError,
+    PipelineAttemptCommitStaleError,
+    PipelineTerminalOutcome,
+    assert_no_runtime_artifact_payload,
+    canonicalize_pipeline_logical_filename,
+    commit_pipeline_attempt_if_current,
+    extract_pipeline_attempt_token,
+)
 from lightrag.base import DocProcessingStatus, DocStatus
 from lightrag.constants import (
     FULL_DOCS_FORMAT_LIGHTRAG,
@@ -83,6 +99,7 @@ from lightrag.utils_pipeline import (
     has_known_document_source,
     input_dir_path,
     load_lightrag_document_content,
+    load_lightrag_document_content_from_blocks_path,
     make_lightrag_doc_content,
     normalize_document_file_path,
     doc_status_metadata_has_attempt_fields,
@@ -110,6 +127,11 @@ _INFLIGHT_DOC_STATUSES = (
     DocStatus.ANALYZING,
 )
 
+_SCRATCH_ERROR_TOKEN = re.compile(
+    r"(?:(?:file://)?[^\s'\"()]*\.lightrag-scratch[^\s'\"()]*)",
+    re.IGNORECASE,
+)
+
 
 def _looks_like_uri(value: str) -> bool:
     """Return True for URI-looking inputs without misclassifying Windows paths."""
@@ -117,6 +139,17 @@ def _looks_like_uri(value: str) -> bool:
     if not parts.scheme:
         return False
     return not (len(parts.scheme) == 1 and len(value) >= 2 and value[1] == ":")
+
+
+def _pipeline_artifact_extraction_counts(chunk_results: list[Any]) -> tuple[int, int]:
+    """Mirror merge input cardinality for the processing-owner durable result."""
+
+    entity_names: set[Any] = set()
+    relation_keys: set[tuple[Any, ...]] = set()
+    for maybe_nodes, maybe_edges in chunk_results:
+        entity_names.update(maybe_nodes)
+        relation_keys.update(tuple(sorted(edge_key)) for edge_key in maybe_edges)
+    return len(entity_names), len(relation_keys)
 
 
 def _call_source_file_resolver(
@@ -139,6 +172,44 @@ def _call_source_file_resolver(
             parser_engine=parser_engine,
         )
     return resolver(source_file or file_path)
+
+
+def _durable_parser_file_path(
+    content_data: Mapping[str, Any], runtime_file_path: str
+) -> str:
+    if content_data.get("artifact_binding") is None:
+        return runtime_file_path
+    return canonicalize_pipeline_logical_filename(content_data.get("durable_file_path"))
+
+
+def _parsed_full_docs_fields(
+    content_data: Mapping[str, Any],
+    *,
+    runtime_file_path: str,
+    sidecar_location: str,
+) -> dict[str, Any]:
+    raw_binding = content_data.get("artifact_binding")
+    if raw_binding is None:
+        return {
+            "file_path": runtime_file_path,
+            "sidecar_location": sidecar_location,
+        }
+    binding = (
+        raw_binding
+        if isinstance(raw_binding, PipelineArtifactBinding)
+        else PipelineArtifactBinding.from_mapping(raw_binding)
+    )
+    fields: dict[str, Any] = {
+        "file_path": _durable_parser_file_path(content_data, runtime_file_path),
+        "artifact_binding": binding.to_dict(),
+    }
+    process_options = content_data.get("process_options")
+    if isinstance(process_options, str) and process_options:
+        fields["process_options"] = process_options
+    chunk_options = content_data.get("chunk_options")
+    if isinstance(chunk_options, dict):
+        fields["chunk_options"] = dict(chunk_options)
+    return fields
 
 
 # Backward-compatible source-file reader.  Implementation lives in
@@ -196,6 +267,42 @@ def _format_chunking_params(
 
 
 @dataclass
+class _ActivePipelineArtifactSession:
+    """One binding session currently owned by this batch.
+
+    This map is lifecycle bookkeeping only; the durable binding and callback
+    remain authoritative, so it is never used to discover or reconstruct a
+    runtime across processes.
+
+    ``producer_active`` remains true if a worker task is cancelled while an
+    engine/analyzer/processor may still be consuming scratch.  Batch cleanup
+    must defer such a session rather than deleting its runtime tree.
+    """
+
+    binding: PipelineArtifactBinding
+    session: PipelineArtifactSession
+    status_doc: Any
+    file_path: str
+    stage: str = "parse"
+    producer_active: bool = False
+    terminalizing: bool = False
+    finish_called: bool = False
+    close_called: bool = False
+    deferred: bool = False
+    success_handed_off: bool = False
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+@dataclass(frozen=True)
+class _PipelineArtifactSuccessDisposition:
+    """Pipeline-visible outcome after consuming a session success result."""
+
+    result: PipelineArtifactFinalizationResult | None
+    status_published: bool = False
+    recovery_stage: str | None = None
+
+
+@dataclass
 class _BatchRunContext:
     """Per-batch shared state for the parse/analyze/process worker pipeline.
 
@@ -215,6 +322,9 @@ class _BatchRunContext:
     q_analyze: asyncio.Queue
     q_process: asyncio.Queue
     processed_count: int = 0
+    active_sessions: dict[str, _ActivePipelineArtifactSession] = field(
+        default_factory=dict
+    )
 
 
 class _PipelineMixin:
@@ -243,6 +353,8 @@ class _PipelineMixin:
         process_options: str | list[str] | None = None,
         chunk_options: dict | list[dict] | None = None,
         from_scan: bool = False,
+        artifact_bindings: Sequence[PipelineArtifactBinding | Mapping[str, Any]]
+        | None = None,
     ) -> str:
         """
         Pipeline for Processing Documents
@@ -291,6 +403,10 @@ class _PipelineMixin:
                 forwarded as a defence-in-depth bypass so an unexpected
                 scan-owned write inside the classification window is
                 allowed through.  External callers must leave this False.
+            artifact_bindings: optional metadata-authoritative bindings aligned
+                with ``input`` and explicit ``ids``. Binding mode persists no
+                runtime sidecar/source locators and treats each explicit ID as
+                the dedupe identity.
 
         Returns:
             str: tracking ID for monitoring processing status
@@ -359,6 +475,47 @@ class _PipelineMixin:
         if isinstance(chunk_options, dict):
             chunk_options = [chunk_options] * len(input)
 
+        binding_mode = artifact_bindings is not None
+        normalized_bindings: list[PipelineArtifactBinding] = []
+        if binding_mode:
+            if docs_format != FULL_DOCS_FORMAT_LIGHTRAG:
+                raise ValueError(
+                    "artifact binding enqueue requires lightrag document format"
+                )
+            if ids is None:
+                raise ValueError("artifact_bindings require explicit document IDs")
+            if isinstance(artifact_bindings, (str, bytes)):
+                raise TypeError("artifact_bindings must be an aligned sequence")
+            if len(artifact_bindings) != len(input):
+                raise ValueError(
+                    "Number of artifact bindings must match the number of documents"
+                )
+            if len(ids) != len(input):
+                raise ValueError("Number of IDs must match the number of documents")
+            if file_paths is None:
+                raise ValueError("artifact binding enqueue requires logical file_paths")
+            if lightrag_document_paths is not None:
+                raise ValueError(
+                    "artifact binding enqueue does not accept local sidecar paths"
+                )
+            for index, raw_binding in enumerate(artifact_bindings):
+                binding = (
+                    raw_binding
+                    if isinstance(raw_binding, PipelineArtifactBinding)
+                    else PipelineArtifactBinding.from_mapping(
+                        raw_binding, expected_workspace=self.workspace
+                    )
+                )
+                if binding.workspace != self.workspace:
+                    raise ValueError(
+                        "Pipeline artifact binding workspace does not match pipeline"
+                    )
+                if binding.lightrag_doc_id != ids[index]:
+                    raise ValueError(
+                        "Pipeline artifact binding lightrag_doc_id does not match IDs"
+                    )
+                normalized_bindings.append(binding)
+
         # If file_paths is provided, ensure it matches the number of documents
         if file_paths is not None:
             if isinstance(file_paths, str):
@@ -373,6 +530,11 @@ class _PipelineMixin:
             file_paths = [path if path else "unknown_source" for path in file_paths]
         else:
             file_paths = ["unknown_source"] * len(input)
+
+        if binding_mode:
+            file_paths = [
+                canonicalize_pipeline_logical_filename(path) for path in file_paths
+            ]
 
         is_lightrag_format = docs_format == FULL_DOCS_FORMAT_LIGHTRAG
         if is_lightrag_format and lightrag_document_paths is not None:
@@ -448,9 +610,11 @@ class _PipelineMixin:
         # Canonicalize every input filename once: the stored ``file_path``
         # is hint-stripped and serves UI display, filename dedup, and the
         # deterministic doc_id seed in one go.
-        file_paths_canonical = [
-            normalize_document_file_path(path) for path in file_paths
-        ]
+        file_paths_canonical = (
+            list(file_paths)
+            if binding_mode
+            else [normalize_document_file_path(path) for path in file_paths]
+        )
         contents: dict[str, dict[str, Any]] = {}
         source_to_doc_id: dict[str, str] = {}
         content_hash_to_doc_id: dict[str, str] = {}
@@ -470,6 +634,7 @@ class _PipelineMixin:
             sidecar_location: str | None = None,
         ) -> None:
             file_path_canonical = file_paths_canonical[index]
+            binding = normalized_bindings[index] if binding_mode else None
 
             # Body length excludes the {{LRdoc}} marker so duplicate-attempt
             # bookkeeping reports the same units as raw documents.
@@ -481,7 +646,10 @@ class _PipelineMixin:
             # carried by different envelopes (raw text vs sidecar) dedupes
             # against itself across formats.
             content_hash: str | None = None
-            if doc_format in (FULL_DOCS_FORMAT_RAW, FULL_DOCS_FORMAT_LIGHTRAG):
+            if binding is None and doc_format in (
+                FULL_DOCS_FORMAT_RAW,
+                FULL_DOCS_FORMAT_LIGHTRAG,
+            ):
                 content_hash = compute_text_content_hash(
                     strip_lightrag_doc_prefix(content or "", doc_format)
                 )
@@ -500,7 +668,11 @@ class _PipelineMixin:
                     f"{file_path_canonical}-{track_id}-{index}", prefix="doc-"
                 )
 
-            if known_source and file_path_canonical in source_to_doc_id:
+            if (
+                binding is None
+                and known_source
+                and file_path_canonical in source_to_doc_id
+            ):
                 duplicate_attempts.append(
                     {
                         "doc_id": doc_id,
@@ -514,7 +686,11 @@ class _PipelineMixin:
                 )
                 return
 
-            if content_hash and content_hash in content_hash_to_doc_id:
+            if (
+                binding is None
+                and content_hash
+                and content_hash in content_hash_to_doc_id
+            ):
                 duplicate_attempts.append(
                     {
                         "doc_id": doc_id,
@@ -538,9 +714,11 @@ class _PipelineMixin:
                 "file_path": file_path_canonical,
                 "parse_format": doc_format,
             }
+            if binding is not None:
+                content_data["artifact_binding"] = binding.to_dict()
             if content_hash:
                 content_data["content_hash"] = content_hash
-            if sidecar_location:
+            if sidecar_location and binding is None:
                 content_data["sidecar_location"] = sidecar_location
             if engine := _parse_engine_at(index):
                 content_data["parse_engine"] = engine
@@ -558,7 +736,14 @@ class _PipelineMixin:
             content_data["chunk_options"] = _chunk_options_at(index)
             contents[doc_id] = content_data
 
-        if is_lightrag_format:
+        if binding_mode:
+            for i, doc in enumerate(input):
+                _add_content(
+                    i,
+                    sanitize_text_for_encoding(doc),
+                    docs_format,
+                )
+        elif is_lightrag_format:
             # LightRAG Document: no content hash dedup; content may be empty
             for i in range(len(file_paths)):
                 path = file_paths[i]
@@ -689,6 +874,9 @@ class _PipelineMixin:
             source_file = _read_source_file(content_data)
             if source_file:
                 metadata["source_file"] = source_file
+            artifact_binding = content_data.get("artifact_binding")
+            if isinstance(artifact_binding, dict):
+                metadata["pipeline_attempt_token"] = artifact_binding["claim_token"]
             if metadata:
                 base["metadata"] = metadata
             return base
@@ -733,6 +921,12 @@ class _PipelineMixin:
 
             for doc_id in list(unique_new_doc_ids):
                 content_data = contents[doc_id]
+
+                # Binding identity is the explicit LightRAG document ID.  Empty
+                # content and repeated logical basenames are valid (notably for
+                # build enqueue), so legacy filename/content dedupe is skipped.
+                if binding_mode:
+                    continue
 
                 # 3a. Filename-based dedup: same basename always treated as duplicate.
                 match = await get_existing_doc_by_file_basename(
@@ -867,6 +1061,11 @@ class _PipelineMixin:
 
                 # Store duplicate records in doc_status
                 if duplicate_docs:
+                    if binding_mode:
+                        assert_no_runtime_artifact_payload(
+                            duplicate_docs,
+                            context="pipeline binding duplicate status write",
+                        )
                     await self.doc_status.upsert(duplicate_docs)
                     logger.info(
                         f"Created {len(duplicate_docs)} duplicate document records with track_id: {track_id}"
@@ -916,6 +1115,10 @@ class _PipelineMixin:
                     full_docs_data[doc_id]["content_hash"] = contents[doc_id][
                         "content_hash"
                     ]
+                if contents[doc_id].get("artifact_binding") is not None:
+                    full_docs_data[doc_id]["artifact_binding"] = contents[doc_id][
+                        "artifact_binding"
+                    ]
                 if contents[doc_id].get("sidecar_location"):
                     full_docs_data[doc_id]["sidecar_location"] = contents[doc_id][
                         "sidecar_location"
@@ -934,11 +1137,21 @@ class _PipelineMixin:
                     full_docs_data[doc_id]["chunk_options"] = contents[doc_id][
                         "chunk_options"
                     ]
+            if binding_mode:
+                assert_no_runtime_artifact_payload(
+                    full_docs_data,
+                    context="pipeline binding full_docs write",
+                )
             await self.full_docs.upsert(full_docs_data)
             # Persist data to disk immediately
             await self.full_docs.index_done_callback()
 
             # Store document status (without content)
+            if binding_mode:
+                assert_no_runtime_artifact_payload(
+                    new_docs,
+                    context="pipeline binding doc_status write",
+                )
             await self.doc_status.upsert(new_docs)
             logger.debug(f"Stored {len(new_docs)} new unique documents")
 
@@ -1337,11 +1550,11 @@ class _PipelineMixin:
                     content_data=content_data,
                 )
                 if engine == "mineru":
-                    await ctx.q_mineru.put((doc_id, status_doc))
+                    await ctx.q_mineru.put((doc_id, status_doc, None))
                 elif engine == "docling":
-                    await ctx.q_docling.put((doc_id, status_doc))
+                    await ctx.q_docling.put((doc_id, status_doc, None))
                 else:
-                    await ctx.q_native.put((doc_id, status_doc))
+                    await ctx.q_native.put((doc_id, status_doc, None))
 
             await asyncio.gather(
                 ctx.q_native.join(), ctx.q_mineru.join(), ctx.q_docling.join()
@@ -1352,6 +1565,7 @@ class _PipelineMixin:
             for w in workers:
                 w.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
+            await self._cleanup_residual_pipeline_artifact_sessions(ctx)
 
         # If the batch aborted on an internal storage error, the shared
         # cross-file flush buffers may still hold records from the documents
@@ -1466,14 +1680,37 @@ class _PipelineMixin:
         # stale keys itself — carries the clean dict forward through
         # ``doc_status_transition_metadata`` at every later transition.
         docs_to_reset = {}
+        attempt_reset_bindings: dict[str, PipelineArtifactBinding] = {}
         reset_count = 0
         normalized_count = 0
 
-        for doc_id, status_doc in to_process_docs.items():
+        for doc_id, status_doc in list(to_process_docs.items()):
             # Check if document has corresponding content in full_docs (consistency check)
             content_data = await self.full_docs.get_by_id(doc_id)
             if not content_data:  # Fails consistency check; handled above
                 continue
+            raw_binding = content_data.get("artifact_binding")
+            reset_binding: PipelineArtifactBinding | None = None
+            if isinstance(raw_binding, Mapping):
+                reset_binding = PipelineArtifactBinding.from_mapping(
+                    raw_binding,
+                    expected_workspace=self.workspace,
+                )
+                current_status_token = extract_pipeline_attempt_token(
+                    {
+                        "metadata": doc_status_field(status_doc, "metadata", {}),
+                    },
+                    row_kind="doc_status",
+                )
+                if (
+                    reset_binding.lightrag_doc_id != doc_id
+                    or reset_binding.state != "claimed"
+                    or current_status_token != reset_binding.claim_token
+                ):
+                    # A committed/newer object-bound row is recovery-owned, not
+                    # eligible for the legacy interrupted-row reset path.
+                    to_process_docs.pop(doc_id, None)
+                    continue
             status = getattr(status_doc, "status", None)
             is_interrupted = status in (
                 DocStatus.PROCESSING,
@@ -1516,6 +1753,9 @@ class _PipelineMixin:
                 "error_msg": "",
                 "metadata": reset_metadata,
             }
+            if reset_binding is not None:
+                reset_metadata["pipeline_attempt_token"] = reset_binding.claim_token
+                attempt_reset_bindings[doc_id] = reset_binding
 
             # Mirror onto the in-memory status_doc so workers carry it forward.
             status_doc.status = DocStatus.PENDING
@@ -1528,7 +1768,27 @@ class _PipelineMixin:
 
         # Update doc_status storage if there are documents to reset
         if docs_to_reset:
-            await self.doc_status.upsert(docs_to_reset)
+            ordinary_resets = {
+                doc_id: payload
+                for doc_id, payload in docs_to_reset.items()
+                if doc_id not in attempt_reset_bindings
+            }
+            if ordinary_resets:
+                await self.doc_status.upsert(ordinary_resets)
+            for doc_id, binding in attempt_reset_bindings.items():
+                try:
+                    await commit_pipeline_attempt_if_current(
+                        self.doc_status,
+                        doc_id,
+                        docs_to_reset[doc_id],
+                        expected_attempt_token=binding.claim_token,
+                        row_kind="doc_status",
+                    )
+                except PipelineAttemptCommitStaleError:
+                    # The processing snapshot lost ownership between its read
+                    # and reset CAS.  Drop it from this batch without touching
+                    # the newer row.
+                    to_process_docs.pop(doc_id, None)
 
             async with pipeline_status_lock:
                 reset_message = (
@@ -1598,6 +1858,929 @@ class _PipelineMixin:
     # Cascading queue workers (Layer 1 -> 2 -> 3)
     # ============================================================
 
+    @staticmethod
+    def _unpack_parse_queue_item(item: Any) -> tuple[Any, Any, Any]:
+        if isinstance(item, (tuple, list)) and len(item) == 2:
+            doc_id, status_doc = item
+            return doc_id, status_doc, None
+        if isinstance(item, (tuple, list)) and len(item) == 3:
+            doc_id, status_doc, session = item
+            return doc_id, status_doc, session
+        raise TypeError("Parse queue item must carry doc, status, and session")
+
+    @staticmethod
+    def _unpack_stage_queue_item(item: Any) -> tuple[Any, Any, Any, Any]:
+        if isinstance(item, (tuple, list)) and len(item) == 3:
+            doc_id, status_doc, parsed_data = item
+            return doc_id, status_doc, parsed_data, None
+        if isinstance(item, (tuple, list)) and len(item) == 4:
+            doc_id, status_doc, parsed_data, session = item
+            return doc_id, status_doc, parsed_data, session
+        raise TypeError(
+            "Analyze/process queue item must carry doc, status, payload, and session"
+        )
+
+    def _strict_pipeline_artifact_binding(
+        self,
+        *,
+        doc_id: str,
+        status_doc: Any,
+        content_data: Mapping[str, Any],
+    ) -> PipelineArtifactBinding | None:
+        """Parse and validate a durable binding in the actual drain worker."""
+
+        raw_binding = content_data.get("artifact_binding")
+        if raw_binding is None:
+            return None
+        if not isinstance(raw_binding, Mapping):
+            raise TypeError("Durable pipeline artifact_binding must be a mapping")
+        assert_no_runtime_artifact_payload(
+            content_data,
+            context="pipeline binding drain row",
+        )
+        binding = PipelineArtifactBinding.from_mapping(
+            raw_binding,
+            expected_workspace=self.workspace,
+        )
+        if binding.lightrag_doc_id != doc_id:
+            raise ValueError("Pipeline artifact binding document identity mismatch")
+        if binding.state != "claimed":
+            raise ValueError("Pipeline artifact drain requires a claimed binding")
+
+        durable_file_path = canonicalize_pipeline_logical_filename(
+            content_data.get("file_path")
+        )
+        if not durable_file_path:
+            raise ValueError("Pipeline artifact binding has no logical file name")
+
+        parse_format = content_data.get("parse_format")
+        if binding.operation == "build":
+            if parse_format != FULL_DOCS_FORMAT_LIGHTRAG:
+                raise ValueError("Build artifact binding requires lightrag format")
+        elif parse_format != FULL_DOCS_FORMAT_PENDING_PARSE:
+            raise ValueError("Parse artifact binding requires pending_parse format")
+
+        metadata = doc_status_field(status_doc, "metadata", {})
+        attempt_token = (
+            metadata.get("pipeline_attempt_token")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if attempt_token != binding.claim_token:
+            raise ValueError("Pipeline artifact binding attempt token mismatch")
+        return binding
+
+    async def _open_pipeline_artifact_session(
+        self,
+        *,
+        binding: PipelineArtifactBinding,
+        doc_id: str,
+        status_doc: Any,
+        file_path: str,
+        ctx: _BatchRunContext,
+    ) -> PipelineArtifactSession:
+        callback = getattr(self, "pipeline_artifact_materializer", None)
+        if callback is None or not callable(callback):
+            raise PipelineArtifactMaterializerMissingError(binding.document_id)
+
+        session: Any = None
+        try:
+            try:
+                session = await callback(binding)
+            except PipelineArtifactRuntimeError:
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise PipelineArtifactRuntimeError(
+                    "artifact_materialization_failed: binding document "
+                    f"{binding.document_id!r} could not be materialized"
+                ) from exc
+            try:
+                session_binding = session.binding
+            except Exception as exc:
+                raise PipelineArtifactSessionMismatchError(binding.document_id) from exc
+            if not isinstance(session_binding, PipelineArtifactBinding):
+                raise PipelineArtifactSessionMismatchError(binding.document_id)
+            if session_binding != binding:
+                raise PipelineArtifactSessionMismatchError(binding.document_id)
+            for method_name in (
+                "finish",
+                "aclose",
+                "defer_cleanup",
+                "redact",
+                "handoff_success",
+            ):
+                if not callable(getattr(session, method_name, None)):
+                    raise TypeError(
+                        f"Pipeline artifact session is missing {method_name}()"
+                    )
+            try:
+                bool(session.producer_active)
+            except Exception as exc:
+                raise TypeError(
+                    "Pipeline artifact session has no producer_active state"
+                ) from exc
+            if doc_id in ctx.active_sessions:
+                raise RuntimeError(
+                    "Pipeline artifact session already active for document"
+                )
+        except (Exception, asyncio.CancelledError):
+            if session is not None:
+                await self._close_rejected_pipeline_artifact_session(session)
+            raise
+
+        ctx.active_sessions[doc_id] = _ActivePipelineArtifactSession(
+            binding=binding,
+            session=session,
+            status_doc=status_doc,
+            file_path=file_path,
+        )
+        return session
+
+    async def _close_rejected_pipeline_artifact_session(self, session: Any) -> None:
+        """Best-effort close for a callback result that violates the protocol."""
+
+        finish = getattr(session, "finish", None)
+        if callable(finish):
+            try:
+                await self._await_pipeline_artifact_cleanup_step(
+                    finish(PipelineTerminalOutcome.FAILED)
+                )
+            except (Exception, asyncio.CancelledError) as exc:
+                logger.error(
+                    "Rejected artifact session finish failed: %s",
+                    self._redact_pipeline_artifact_error(exc),
+                )
+        close = getattr(session, "aclose", None)
+        if callable(close):
+            try:
+                await self._await_pipeline_artifact_cleanup_step(close())
+            except (Exception, asyncio.CancelledError) as exc:
+                logger.error(
+                    "Rejected artifact session close failed: %s",
+                    self._redact_pipeline_artifact_error(exc),
+                )
+
+    @staticmethod
+    async def _await_pipeline_artifact_cleanup_step(awaitable: Any) -> Any:
+        """Let finish/close reach a result even if the worker is cancelled."""
+
+        task = asyncio.ensure_future(awaitable)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # ``shield`` kept the cleanup task alive. Wait for it before this
+            # worker can leave and before batch residual cleanup runs.
+            return await task
+
+    @staticmethod
+    def _required_pipeline_artifact_path(
+        session: PipelineArtifactSession,
+        attribute: str,
+        *,
+        expect_directory: bool,
+    ) -> Path:
+        value = getattr(session, attribute, None)
+        if not isinstance(value, Path):
+            raise ValueError(f"Pipeline artifact session has no {attribute}")
+        try:
+            path = value.expanduser().resolve(strict=True)
+        except (OSError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Pipeline artifact session {attribute} is unavailable"
+            ) from exc
+        if expect_directory:
+            if not path.is_dir():
+                raise ValueError(
+                    f"Pipeline artifact session {attribute} is not a directory"
+                )
+        elif not path.is_file():
+            raise ValueError(f"Pipeline artifact session {attribute} is not a file")
+        return path
+
+    def _pipeline_artifact_state(
+        self,
+        *,
+        doc_id: str,
+        session: PipelineArtifactSession | None,
+        ctx: _BatchRunContext,
+    ) -> _ActivePipelineArtifactSession | None:
+        if session is None:
+            return None
+        state = ctx.active_sessions.get(doc_id)
+        if state is None or state.session is not session:
+            raise RuntimeError("Pipeline artifact session handoff ownership mismatch")
+        return state
+
+    def _set_pipeline_artifact_stage(
+        self,
+        *,
+        doc_id: str,
+        session: PipelineArtifactSession | None,
+        status_doc: Any,
+        file_path: str,
+        stage: str,
+        ctx: _BatchRunContext,
+    ) -> _ActivePipelineArtifactSession | None:
+        state = self._pipeline_artifact_state(
+            doc_id=doc_id,
+            session=session,
+            ctx=ctx,
+        )
+        if state is not None:
+            if state.stage != stage or state.terminalizing:
+                raise PipelineArtifactSessionMismatchError(doc_id)
+            state.status_doc = status_doc
+            state.file_path = file_path
+            state.stage = stage
+        return state
+
+    def _set_pipeline_artifact_producer_active(
+        self,
+        *,
+        doc_id: str,
+        session: PipelineArtifactSession | None,
+        active: bool,
+        ctx: _BatchRunContext,
+    ) -> None:
+        state = self._pipeline_artifact_state(
+            doc_id=doc_id,
+            session=session,
+            ctx=ctx,
+        )
+        if state is not None:
+            state.producer_active = active
+
+    def _handoff_pipeline_artifact_session(
+        self,
+        *,
+        doc_id: str,
+        session: PipelineArtifactSession | None,
+        from_stage: str,
+        to_stage: str,
+        ctx: _BatchRunContext,
+    ) -> None:
+        """Fence one explicit queue ownership transfer."""
+
+        state = self._pipeline_artifact_state(
+            doc_id=doc_id,
+            session=session,
+            ctx=ctx,
+        )
+        if state is None:
+            return
+        if state.stage != from_stage or state.terminalizing:
+            raise PipelineArtifactSessionMismatchError(doc_id)
+        state.producer_active = False
+        state.stage = to_stage
+
+    async def _parse_with_pipeline_artifact_session(
+        self,
+        *,
+        engine: str,
+        doc_id: str,
+        durable_file_path: str,
+        content_data: dict[str, Any],
+        binding: PipelineArtifactBinding,
+        session: PipelineArtifactSession,
+        ctx: _BatchRunContext,
+    ) -> dict[str, Any]:
+        state = self._pipeline_artifact_state(
+            doc_id=doc_id,
+            session=session,
+            ctx=ctx,
+        )
+        if state is None:  # pragma: no cover - guarded by the caller
+            raise RuntimeError("Pipeline artifact session was not registered")
+
+        if binding.operation == "build":
+            sidecar_dir = self._required_pipeline_artifact_path(
+                session,
+                "sidecar_dir",
+                expect_directory=True,
+            )
+            blocks_path = self._required_pipeline_artifact_path(
+                session,
+                "blocks_path",
+                expect_directory=False,
+            )
+            if not blocks_path.is_relative_to(sidecar_dir):
+                raise ValueError(
+                    "Pipeline artifact session blocks_path escapes sidecar_dir"
+                )
+            (
+                merged_text,
+                runtime_blocks_path,
+            ) = await load_lightrag_document_content_from_blocks_path(blocks_path)
+            await self._persist_materialized_build_full_docs(
+                doc_id=doc_id,
+                content_data=content_data,
+                binding=binding,
+                merged_text=merged_text,
+            )
+            parse_engine = content_data.get("parse_engine") or PARSER_ENGINE_NATIVE
+            return {
+                "doc_id": doc_id,
+                "file_path": durable_file_path,
+                "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
+                "parse_engine": parse_engine,
+                "content": merged_text,
+                "blocks_path": runtime_blocks_path,
+                "parse_stage_skipped": True,
+            }
+
+        source_path = self._required_pipeline_artifact_path(
+            session,
+            "source_path",
+            expect_directory=False,
+        )
+        runtime_content_data = dict(content_data)
+        runtime_content_data["durable_file_path"] = durable_file_path
+        runtime_content_data["archive_source_after_parse"] = False
+        # The materialized source is authoritative for this attempt.  Removing
+        # the durable basename hint prevents the legacy resolver from selecting
+        # a same-named file under this process's local INPUT_DIR.
+        runtime_content_data.pop("source_file", None)
+        runtime_file_path = str(source_path)
+        if engine == PARSER_ENGINE_LEGACY:
+            return await self.parse_legacy(
+                doc_id,
+                runtime_file_path,
+                runtime_content_data,
+            )
+        if engine == "mineru":
+            return await self.parse_mineru(
+                doc_id,
+                runtime_file_path,
+                runtime_content_data,
+            )
+        if engine == "docling":
+            return await self.parse_docling(
+                doc_id,
+                runtime_file_path,
+                runtime_content_data,
+            )
+        return await self.parse_native(
+            doc_id,
+            runtime_file_path,
+            runtime_content_data,
+        )
+
+    async def _persist_materialized_build_full_docs(
+        self,
+        *,
+        doc_id: str,
+        content_data: Mapping[str, Any],
+        binding: PipelineArtifactBinding,
+        merged_text: str,
+    ) -> None:
+        """Persist only the H2-A durable allowlist after owner materialization."""
+
+        process_options = content_data.get("process_options")
+        if not isinstance(process_options, str):
+            process_options = ""
+        chunk_options = content_data.get("chunk_options")
+        if not isinstance(chunk_options, dict):
+            from lightrag.parser.routing import resolve_chunk_options
+
+            chunk_options = resolve_chunk_options(
+                self.addon_params,
+                process_options=process_options,
+            )
+        payload = {
+            "content": make_lightrag_doc_content(merged_text),
+            "file_path": canonicalize_pipeline_logical_filename(
+                content_data.get("file_path")
+            ),
+            "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
+            "parse_engine": content_data.get("parse_engine") or PARSER_ENGINE_NATIVE,
+            "process_options": process_options,
+            "chunk_options": dict(chunk_options),
+            "artifact_binding": binding.to_dict(),
+            "update_time": int(time.time()),
+        }
+        assert_no_runtime_artifact_payload(
+            {doc_id: payload},
+            context="processing-owner build full_docs write",
+        )
+        await commit_pipeline_attempt_if_current(
+            self.full_docs,
+            doc_id,
+            payload,
+            expected_attempt_token=binding.claim_token,
+            row_kind="full_docs",
+        )
+
+    async def _patch_committed_pipeline_artifact_binding(
+        self,
+        *,
+        doc_id: str,
+        state: _ActivePipelineArtifactSession,
+        committed_binding: PipelineArtifactBinding,
+    ) -> None:
+        """Patch only the durable full_docs allowlist after metadata commits."""
+
+        existing = await self.full_docs.get_by_id(doc_id)
+        if not isinstance(existing, dict):
+            raise PipelineArtifactSessionMismatchError(doc_id)
+        raw_binding = existing.get("artifact_binding")
+        if not isinstance(raw_binding, Mapping):
+            raise PipelineArtifactSessionMismatchError(doc_id)
+        current_binding = PipelineArtifactBinding.from_mapping(
+            raw_binding,
+            expected_workspace=state.binding.workspace,
+        )
+        if current_binding.claim_token != state.binding.claim_token:
+            raise PipelineAttemptCommitStaleError(doc_id, row_kind="full_docs")
+        if current_binding not in {state.binding, committed_binding}:
+            raise PipelineArtifactSessionMismatchError(doc_id)
+
+        payload: dict[str, Any] = {
+            "content": existing.get("content", ""),
+            "file_path": canonicalize_pipeline_logical_filename(state.file_path),
+            "parse_format": existing.get("parse_format", FULL_DOCS_FORMAT_LIGHTRAG),
+            "artifact_binding": committed_binding.to_dict(),
+        }
+        for key in (
+            "parse_engine",
+            "process_options",
+            "chunk_options",
+            "content_hash",
+            "update_time",
+        ):
+            value = existing.get(key)
+            if value is not None:
+                payload[key] = value
+        assert_no_runtime_artifact_payload(
+            {doc_id: payload},
+            context="pipeline committed binding full_docs write",
+        )
+        await commit_pipeline_attempt_if_current(
+            self.full_docs,
+            doc_id,
+            payload,
+            expected_attempt_token=state.binding.claim_token,
+            row_kind="full_docs",
+        )
+
+    @staticmethod
+    def _validate_pipeline_artifact_success_result(
+        claimed: PipelineArtifactBinding,
+        result: PipelineArtifactFinalizationResult,
+    ) -> None:
+        if not isinstance(result, PipelineArtifactFinalizationResult):
+            raise TypeError("Pipeline artifact handoff returned an invalid result")
+        result.__post_init__()
+        for count_name in ("chunks_count", "entity_count", "relation_count"):
+            count = getattr(result, count_name)
+            if count is not None and (
+                isinstance(count, bool) or not isinstance(count, int) or count < 0
+            ):
+                raise ValueError(
+                    f"Pipeline artifact {count_name} must be a non-negative integer"
+                )
+        if result.outcome is PipelineArtifactCommitOutcome.UNKNOWN:
+            return
+        committed = result.committed_binding
+        if committed is None:  # pragma: no cover - enforced by result dataclass
+            raise PipelineArtifactSessionMismatchError(claimed.document_id)
+        fixed_fields = (
+            "version",
+            "authority",
+            "operation",
+            "kb_id",
+            "kb_generation",
+            "workspace",
+            "document_id",
+            "lightrag_doc_id",
+            "job_id",
+            "claim_token",
+            "source_hash",
+            "parser_hash",
+            "expected_current_sidecar_artifact_id",
+            "expected_current_blocks_artifact_id",
+        )
+        if any(
+            getattr(committed, field_name) != getattr(claimed, field_name)
+            for field_name in fixed_fields
+        ):
+            raise PipelineArtifactSessionMismatchError(claimed.document_id)
+        if claimed.operation == "build" and (
+            committed.parse_generation_id != claimed.parse_generation_id
+            or committed.index_hash != claimed.index_hash
+            or committed.raw_artifact_ids
+        ):
+            raise PipelineArtifactSessionMismatchError(claimed.document_id)
+        if claimed.operation == "parse" and (
+            committed.parse_generation_id != claimed.claim_token
+            or committed.index_hash != claimed.index_hash
+        ):
+            raise PipelineArtifactSessionMismatchError(claimed.document_id)
+
+    async def _close_successful_pipeline_artifact_session(
+        self,
+        state: _ActivePipelineArtifactSession,
+    ) -> str | None:
+        state.close_called = True
+        try:
+            await self._await_pipeline_artifact_cleanup_step(state.session.aclose())
+        except (Exception, asyncio.CancelledError) as exc:
+            return self._redact_pipeline_artifact_error(exc, state)
+        return None
+
+    async def _write_pipeline_artifact_processed_status(
+        self,
+        *,
+        doc_id: str,
+        state: _ActivePipelineArtifactSession,
+        committed_binding: PipelineArtifactBinding,
+        status_doc: DocProcessingStatus,
+        file_path: str,
+        terminal_fields: dict[str, Any],
+        terminal_metadata: dict[str, Any],
+    ) -> None:
+        get_by_id = getattr(self.doc_status, "get_by_id", None)
+        if callable(get_by_id):
+            existing = await get_by_id(doc_id)
+            if isinstance(existing, Mapping):
+                attempt_token = extract_pipeline_attempt_token(
+                    existing,
+                    row_kind="doc_status",
+                )
+                if attempt_token != state.binding.claim_token:
+                    raise PipelineAttemptCommitStaleError(
+                        doc_id,
+                        row_kind="doc_status",
+                    )
+        await self._upsert_doc_status_transition(
+            doc_id=doc_id,
+            status=DocStatus.PROCESSED,
+            status_doc=status_doc,
+            file_path=file_path,
+            extra_fields=terminal_fields,
+            metadata_extra=terminal_metadata,
+            artifact_binding=committed_binding,
+        )
+
+    def _redact_pipeline_artifact_error(
+        self,
+        error: BaseException | str,
+        state: _ActivePipelineArtifactSession | None = None,
+    ) -> str:
+        if state is not None:
+            try:
+                text = state.session.redact(error)
+            except Exception:
+                text = "Pipeline artifact session failed"
+        else:
+            text = str(error) or (
+                type(error).__name__
+                if isinstance(error, BaseException)
+                else "unknown error"
+            )
+        if not isinstance(text, str) or not text.strip():
+            text = "Pipeline artifact session failed"
+        text = _SCRATCH_ERROR_TOKEN.sub("<artifact-runtime>", text)
+        return text.replace(".lightrag-scratch", "artifact-runtime")
+
+    async def _finish_pipeline_artifact_session(
+        self,
+        *,
+        doc_id: str,
+        session: PipelineArtifactSession | None,
+        outcome: PipelineTerminalOutcome,
+        ctx: _BatchRunContext,
+    ) -> str | None:
+        """Finish then close one session exactly once, claiming ownership first."""
+
+        if session is None:
+            return None
+        state = ctx.active_sessions.get(doc_id)
+        if state is None:
+            # A prior terminal path already claimed and removed it.
+            return None
+        if state.session is not session:
+            raise RuntimeError("Pipeline artifact session terminal ownership mismatch")
+        if state.terminalizing:
+            return None
+        state.terminalizing = True
+        ctx.active_sessions.pop(doc_id, None)
+        state.producer_active = False
+
+        errors: list[str] = []
+        state.finish_called = True
+        try:
+            await self._await_pipeline_artifact_cleanup_step(
+                state.session.finish(outcome)
+            )
+        except (Exception, asyncio.CancelledError) as exc:
+            errors.append("finish: " + self._redact_pipeline_artifact_error(exc, state))
+        state.close_called = True
+        try:
+            await self._await_pipeline_artifact_cleanup_step(state.session.aclose())
+        except (Exception, asyncio.CancelledError) as exc:
+            errors.append("close: " + self._redact_pipeline_artifact_error(exc, state))
+        if errors:
+            message = "; ".join(errors)
+            logger.error("Pipeline artifact session finalization failed: %s", message)
+            return message
+        return None
+
+    def _defer_pipeline_artifact_session(
+        self,
+        *,
+        doc_id: str,
+        state: _ActivePipelineArtifactSession,
+        ctx: _BatchRunContext,
+    ) -> bool:
+        """Transfer an active producer's runtime to deferred cleanup."""
+
+        current = ctx.active_sessions.get(doc_id)
+        if current is not state or state.terminalizing:
+            return False
+        state.terminalizing = True
+        try:
+            state.session.defer_cleanup()
+            state.deferred = True
+        except Exception as exc:
+            state.terminalizing = False
+            logger.error(
+                "Pipeline artifact session defer failed: %s",
+                self._redact_pipeline_artifact_error(exc, state),
+            )
+            return False
+        ctx.active_sessions.pop(doc_id, None)
+        return True
+
+    async def _handoff_pipeline_artifact_success(
+        self,
+        *,
+        doc_id: str,
+        session: PipelineArtifactSession,
+        parsed_data: Mapping[str, Any],
+        chunks_count: int,
+        status_doc: DocProcessingStatus,
+        file_path: str,
+        terminal_fields: dict[str, Any],
+        terminal_metadata: dict[str, Any],
+        ctx: _BatchRunContext,
+    ) -> _PipelineArtifactSuccessDisposition:
+        """Consume owner success without publishing a false terminal state."""
+
+        state = self._pipeline_artifact_state(
+            doc_id=doc_id,
+            session=session,
+            ctx=ctx,
+        )
+        if state is None or state.stage != "process" or state.terminalizing:
+            raise PipelineArtifactSessionMismatchError(doc_id)
+        state.producer_active = True
+        try:
+            result = await self._await_pipeline_artifact_cleanup_step(
+                session.handoff_success(
+                    parsed_data=parsed_data,
+                    chunks_count=chunks_count,
+                )
+            )
+        except (Exception, asyncio.CancelledError) as exc:
+            state.producer_active = False
+            if getattr(exc, "error_code", None) != "artifact_binding_stale":
+                raise
+            state.terminalizing = True
+            ctx.active_sessions.pop(doc_id, None)
+            close_error = await self._close_successful_pipeline_artifact_session(state)
+            message = self._redact_pipeline_artifact_error(exc, state)
+            if close_error:
+                message = f"{message}; close: {close_error}"
+            logger.warning(
+                "Rejected stale pipeline artifact success for %s: %s",
+                doc_id,
+                message,
+            )
+            return _PipelineArtifactSuccessDisposition(
+                result=None,
+                recovery_stage="authority_stale",
+            )
+        state.producer_active = False
+        state.success_handed_off = True
+        state.terminalizing = True
+        ctx.active_sessions.pop(doc_id, None)
+
+        try:
+            self._validate_pipeline_artifact_success_result(state.binding, result)
+        except Exception as exc:
+            close_error = await self._close_successful_pipeline_artifact_session(state)
+            message = self._redact_pipeline_artifact_error(exc, state)
+            if close_error:
+                message = f"{message}; close: {close_error}"
+            logger.error(
+                "Pipeline artifact durable result requires recovery for %s: %s",
+                doc_id,
+                message,
+            )
+            return _PipelineArtifactSuccessDisposition(
+                result=result,
+                recovery_stage="result_validation",
+            )
+
+        if result.outcome is PipelineArtifactCommitOutcome.UNKNOWN:
+            close_error = await self._close_successful_pipeline_artifact_session(state)
+            if close_error:
+                logger.error(
+                    "Pipeline artifact UNKNOWN close failed for %s: %s",
+                    doc_id,
+                    close_error,
+                )
+                return _PipelineArtifactSuccessDisposition(
+                    result=result,
+                    recovery_stage="unknown_close",
+                )
+            return _PipelineArtifactSuccessDisposition(
+                result=result,
+                recovery_stage="metadata_commit_unknown",
+            )
+
+        committed_binding = result.committed_binding
+        assert committed_binding is not None
+        try:
+            await self._await_pipeline_artifact_cleanup_step(
+                self._patch_committed_pipeline_artifact_binding(
+                    doc_id=doc_id,
+                    state=state,
+                    committed_binding=committed_binding,
+                )
+            )
+        except PipelineAttemptCommitStaleError as exc:
+            close_error = await self._close_successful_pipeline_artifact_session(state)
+            message = self._redact_pipeline_artifact_error(exc, state)
+            if close_error:
+                message = f"{message}; close: {close_error}"
+            logger.warning(
+                "Rejected stale pipeline artifact binding patch for %s: %s",
+                doc_id,
+                message,
+            )
+            return _PipelineArtifactSuccessDisposition(
+                result=result,
+                recovery_stage="authority_stale",
+            )
+        except PipelineAttemptCommitOutcomeUnknownError as exc:
+            close_error = await self._close_successful_pipeline_artifact_session(state)
+            message = self._redact_pipeline_artifact_error(exc, state)
+            if close_error:
+                message = f"{message}; close: {close_error}"
+            logger.error(
+                "Pipeline artifact binding patch outcome is unknown for %s: %s",
+                doc_id,
+                message,
+            )
+            return _PipelineArtifactSuccessDisposition(
+                result=result,
+                recovery_stage="binding_patch_unknown",
+            )
+        except (Exception, asyncio.CancelledError) as exc:
+            close_error = await self._close_successful_pipeline_artifact_session(state)
+            message = self._redact_pipeline_artifact_error(exc, state)
+            if close_error:
+                message = f"{message}; close: {close_error}"
+            logger.error(
+                "Pipeline artifact binding patch requires recovery for %s: %s",
+                doc_id,
+                message,
+            )
+            return _PipelineArtifactSuccessDisposition(
+                result=result,
+                recovery_stage="binding_patch",
+            )
+
+        close_error = await self._close_successful_pipeline_artifact_session(state)
+        if close_error:
+            logger.error(
+                "Pipeline artifact close requires recovery for %s: %s",
+                doc_id,
+                close_error,
+            )
+            return _PipelineArtifactSuccessDisposition(
+                result=result,
+                recovery_stage="close",
+            )
+
+        committed_terminal_fields = dict(terminal_fields)
+        for field_name in ("chunks_count", "entity_count", "relation_count"):
+            value = getattr(result, field_name)
+            if value is not None:
+                committed_terminal_fields[field_name] = value
+        try:
+            await self._await_pipeline_artifact_cleanup_step(
+                self._write_pipeline_artifact_processed_status(
+                    doc_id=doc_id,
+                    state=state,
+                    committed_binding=committed_binding,
+                    status_doc=status_doc,
+                    file_path=file_path,
+                    terminal_fields=committed_terminal_fields,
+                    terminal_metadata=terminal_metadata,
+                )
+            )
+        except PipelineAttemptCommitStaleError as exc:
+            logger.warning(
+                "Rejected stale pipeline artifact terminal status for %s: %s",
+                doc_id,
+                self._redact_pipeline_artifact_error(exc, state),
+            )
+            return _PipelineArtifactSuccessDisposition(
+                result=result,
+                recovery_stage="doc_status_stale",
+            )
+        except PipelineAttemptCommitOutcomeUnknownError as exc:
+            logger.error(
+                "Pipeline artifact terminal status outcome is unknown for %s: %s",
+                doc_id,
+                self._redact_pipeline_artifact_error(exc, state),
+            )
+            return _PipelineArtifactSuccessDisposition(
+                result=result,
+                recovery_stage="doc_status_unknown",
+            )
+        except (Exception, asyncio.CancelledError) as exc:
+            logger.error(
+                "Pipeline artifact terminal status requires recovery for %s: %s",
+                doc_id,
+                self._redact_pipeline_artifact_error(exc, state),
+            )
+            return _PipelineArtifactSuccessDisposition(
+                result=result,
+                recovery_stage="doc_status",
+            )
+        return _PipelineArtifactSuccessDisposition(
+            result=result,
+            status_published=True,
+        )
+
+    async def _cleanup_residual_pipeline_artifact_sessions(
+        self,
+        ctx: _BatchRunContext,
+    ) -> None:
+        """Reclaim every session not terminalized by a normal worker path."""
+
+        async with ctx.pipeline_status_lock:
+            cancelled = bool(ctx.pipeline_status.get("cancellation_requested", False))
+        outcome = (
+            PipelineTerminalOutcome.CANCELLED
+            if cancelled
+            else PipelineTerminalOutcome.FAILED
+        )
+        for doc_id, state in list(ctx.active_sessions.items()):
+            try:
+                producer_active = state.producer_active or bool(
+                    state.session.producer_active
+                )
+            except Exception as exc:
+                producer_active = False
+                logger.error(
+                    "Pipeline artifact producer-state read failed: %s",
+                    self._redact_pipeline_artifact_error(exc, state),
+                )
+            if producer_active:
+                self._defer_pipeline_artifact_session(
+                    doc_id=doc_id,
+                    state=state,
+                    ctx=ctx,
+                )
+                # Never finish/close a runtime that may still be in use.  A
+                # defer failure is logged by the helper and deliberately
+                # remains non-terminal rather than risking scratch deletion.
+                continue
+
+            cleanup_error = await self._finish_pipeline_artifact_session(
+                doc_id=doc_id,
+                session=state.session,
+                outcome=outcome,
+                ctx=ctx,
+            )
+            if cancelled:
+                message = f"Pipeline cancelled during {state.stage}"
+            else:
+                message = f"Pipeline batch stopped during {state.stage}"
+            if cleanup_error:
+                message = f"{message}; artifact finalization failed: {cleanup_error}"
+            message = self._redact_pipeline_artifact_error(message, state)
+            try:
+                await self._upsert_doc_status_transition(
+                    doc_id=doc_id,
+                    status=DocStatus.FAILED,
+                    status_doc=state.status_doc,
+                    file_path=state.file_path,
+                    extra_fields={"error_msg": message},
+                    artifact_binding=state.binding,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to mark residual artifact session terminal: %s",
+                    self._redact_pipeline_artifact_error(exc, state),
+                )
+
     async def _parse_worker(
         self,
         engine: str,
@@ -1613,30 +2796,57 @@ class _PipelineMixin:
         """
         while True:
             item = await in_q.get()
+            doc_id_w = ""
+            status_doc_w: Any = None
+            session_w: PipelineArtifactSession | None = None
+            binding_w: PipelineArtifactBinding | None = None
             try:
-                doc_id_w, status_doc_w = item
+                doc_id_w, status_doc_w, queued_session = self._unpack_parse_queue_item(
+                    item
+                )
+                session_w = queued_session
                 file_path_w = getattr(status_doc_w, "file_path", "unknown_source")
-                # Boundary cancellation check: skip parsing the next queued doc
-                # without invoking the engine, mark it FAILED with a friendly
-                # "User cancelled" message, and let the finally task_done()
-                # drain the queue so q.join() in _run_pipeline_batch returns.
-                if await self._cancellation_requested(
-                    ctx.pipeline_status, ctx.pipeline_status_lock
-                ):
-                    await self._mark_doc_cancelled_in_stage(
-                        doc_id=doc_id_w,
-                        status_doc=status_doc_w,
-                        file_path=file_path_w,
-                        stage_label="parse",
-                        pipeline_status=ctx.pipeline_status,
-                        pipeline_status_lock=ctx.pipeline_status_lock,
-                    )
-                    continue
                 content_data_w = await self.full_docs.get_by_id(doc_id_w)
                 if not content_data_w:
                     raise Exception(
                         f"Document content not found in full_docs for doc_id: {doc_id_w}"
                     )
+                binding_w = self._strict_pipeline_artifact_binding(
+                    doc_id=doc_id_w,
+                    status_doc=status_doc_w,
+                    content_data=content_data_w,
+                )
+                if binding_w is not None:
+                    if session_w is not None:
+                        raise RuntimeError(
+                            "Parse queue must not receive a pre-opened artifact session"
+                        )
+                    file_path_w = canonicalize_pipeline_logical_filename(
+                        content_data_w.get("file_path")
+                    )
+                    status_doc_w.file_path = file_path_w
+                    session_w = await self._open_pipeline_artifact_session(
+                        binding=binding_w,
+                        doc_id=doc_id_w,
+                        status_doc=status_doc_w,
+                        file_path=file_path_w,
+                        ctx=ctx,
+                    )
+                    self._set_pipeline_artifact_stage(
+                        doc_id=doc_id_w,
+                        session=session_w,
+                        status_doc=status_doc_w,
+                        file_path=file_path_w,
+                        stage="parse",
+                        ctx=ctx,
+                    )
+                # Binding cancellation still opens the drain-owner session so
+                # finish(CANCELLED) and aclose() run before terminal status.
+                # Local rows keep the same parser-free cancellation behavior.
+                await self._raise_if_cancelled(
+                    ctx.pipeline_status,
+                    ctx.pipeline_status_lock,
+                )
                 if isinstance(status_doc_w.metadata, dict):
                     source_file_w = _read_source_file(status_doc_w.metadata)
                     if source_file_w:
@@ -1667,28 +2877,65 @@ class _PipelineMixin:
                     status=DocStatus.PARSING,
                     status_doc=status_doc_w,
                     file_path=file_path_w,
+                    artifact_binding=binding_w,
                 )
                 async with ctx.pipeline_status_lock:
                     log_message = f"Parsing ({engine}): {doc_id_w}"
                     logger.info(log_message)
                     ctx.pipeline_status["latest_message"] = log_message
                     ctx.pipeline_status["history_messages"].append(log_message)
-                if engine == PARSER_ENGINE_LEGACY:
-                    parsed_data_w = await self.parse_legacy(
-                        doc_id_w, file_path_w, content_data_w
+                producer_stopped_w = False
+                if session_w is not None:
+                    self._set_pipeline_artifact_producer_active(
+                        doc_id=doc_id_w,
+                        session=session_w,
+                        active=True,
+                        ctx=ctx,
                     )
-                elif engine == "mineru":
-                    parsed_data_w = await self.parse_mineru(
-                        doc_id_w, file_path_w, content_data_w
-                    )
-                elif engine == "docling":
-                    parsed_data_w = await self.parse_docling(
-                        doc_id_w, file_path_w, content_data_w
-                    )
-                else:
-                    parsed_data_w = await self.parse_native(
-                        doc_id_w, file_path_w, content_data_w
-                    )
+                try:
+                    if binding_w is not None and session_w is not None:
+                        parsed_data_w = (
+                            await self._parse_with_pipeline_artifact_session(
+                                engine=engine,
+                                doc_id=doc_id_w,
+                                durable_file_path=file_path_w,
+                                content_data=content_data_w,
+                                binding=binding_w,
+                                session=session_w,
+                                ctx=ctx,
+                            )
+                        )
+                    elif engine == PARSER_ENGINE_LEGACY:
+                        parsed_data_w = await self.parse_legacy(
+                            doc_id_w, file_path_w, content_data_w
+                        )
+                    elif engine == "mineru":
+                        parsed_data_w = await self.parse_mineru(
+                            doc_id_w, file_path_w, content_data_w
+                        )
+                    elif engine == "docling":
+                        parsed_data_w = await self.parse_docling(
+                            doc_id_w, file_path_w, content_data_w
+                        )
+                    else:
+                        parsed_data_w = await self.parse_native(
+                            doc_id_w, file_path_w, content_data_w
+                        )
+                    producer_stopped_w = True
+                except Exception:
+                    # The awaited producer returned by raising, so it no longer
+                    # owns scratch.  Task cancellation is deliberately not in
+                    # this branch; batch cleanup defers that uncertain case.
+                    producer_stopped_w = True
+                    raise
+                finally:
+                    if producer_stopped_w and session_w is not None:
+                        self._set_pipeline_artifact_producer_active(
+                            doc_id=doc_id_w,
+                            session=session_w,
+                            active=False,
+                            ctx=ctx,
+                        )
 
                 # Mirror non-fatal parser warnings (e.g. legacy docx tables
                 # missing w14:paraId) onto the in-memory status_doc so the
@@ -1786,14 +3033,22 @@ class _PipelineMixin:
                     status=DocStatus.PARSING,
                     status_doc=status_doc_w,
                     file_path=file_path_w,
+                    artifact_binding=binding_w,
                 )
 
-                # Drop the heavy body from the queue payload; q_analyze /
-                # q_process now carry only lightweight metadata (blocks_path,
-                # parse_format, flags). process_single_document re-reads the
-                # body from full_docs by doc_id.
+                # The processing-owner build persisted a path-free merged body
+                # to full_docs, so every queue remains lightweight.
                 parsed_data_w.pop("content", None)
-                await ctx.q_analyze.put((doc_id_w, status_doc_w, parsed_data_w))
+                await ctx.q_analyze.put(
+                    (doc_id_w, status_doc_w, parsed_data_w, session_w)
+                )
+                self._handoff_pipeline_artifact_session(
+                    doc_id=doc_id_w,
+                    session=session_w,
+                    from_stage="parse",
+                    to_stage="analyze",
+                    ctx=ctx,
+                )
             except PipelineCancelledException:
                 # Cancellation raised from inside the parse engine (future-
                 # proofing — engines don't currently call _raise_if_cancelled,
@@ -1807,19 +3062,59 @@ class _PipelineMixin:
                     stage_label="parse",
                     pipeline_status=ctx.pipeline_status,
                     pipeline_status_lock=ctx.pipeline_status_lock,
+                    artifact_session=session_w,
+                    artifact_binding=binding_w,
+                    ctx=ctx,
                 )
             except Exception as e:
-                logger.error(f"Parse worker failed ({engine}): {e}")
+                state_w = (
+                    ctx.active_sessions.get(doc_id_w) if session_w is not None else None
+                )
+                if state_w is not None:
+                    state_w.producer_active = False
+                error_msg_w = self._redact_pipeline_artifact_error(e, state_w)
+                cleanup_error_w = await self._finish_pipeline_artifact_session(
+                    doc_id=doc_id_w,
+                    session=session_w,
+                    outcome=(
+                        PipelineTerminalOutcome.CANCELLED
+                        if isinstance(e, PipelineCancelledException)
+                        else PipelineTerminalOutcome.FAILED
+                    ),
+                    ctx=ctx,
+                )
+                if cleanup_error_w:
+                    error_msg_w = (
+                        f"{error_msg_w}; artifact finalization failed: "
+                        f"{cleanup_error_w}"
+                    )
+                logger.error(f"Parse worker failed ({engine}): {error_msg_w}")
+                if isinstance(
+                    e,
+                    (
+                        PipelineAttemptCommitStaleError,
+                        PipelineAttemptCommitOutcomeUnknownError,
+                    ),
+                ):
+                    # A stale result is already a known loser; an unknown
+                    # transport outcome must be reconciled before any further
+                    # same-row mutation.  Never turn either into a blind FAILED
+                    # retry against doc_status.
+                    continue
                 try:
                     await self._upsert_doc_status_transition(
                         doc_id=doc_id_w,
                         status=DocStatus.FAILED,
                         status_doc=status_doc_w,
                         file_path=getattr(status_doc_w, "file_path", "unknown_source"),
-                        extra_fields={"error_msg": str(e)},
+                        extra_fields={"error_msg": error_msg_w},
+                        artifact_binding=binding_w,
                     )
-                except Exception:
-                    pass
+                except Exception as status_error:
+                    logger.error(
+                        "Failed to persist parse terminal status: %s",
+                        self._redact_pipeline_artifact_error(status_error, state_w),
+                    )
             finally:
                 in_q.task_done()
 
@@ -1833,9 +3128,26 @@ class _PipelineMixin:
         """
         while True:
             item = await ctx.q_analyze.get()
+            doc_id_w = ""
+            status_doc_w: Any = None
+            session_w: PipelineArtifactSession | None = None
+            binding_w: PipelineArtifactBinding | None = None
             try:
-                doc_id_w, status_doc_w, parsed_data_w = item
+                doc_id_w, status_doc_w, parsed_data_w, queued_session = (
+                    self._unpack_stage_queue_item(item)
+                )
+                session_w = queued_session
                 file_path_w = getattr(status_doc_w, "file_path", "unknown_source")
+                state_w = self._set_pipeline_artifact_stage(
+                    doc_id=doc_id_w,
+                    session=session_w,
+                    status_doc=status_doc_w,
+                    file_path=file_path_w,
+                    stage="analyze",
+                    ctx=ctx,
+                )
+                if state_w is not None:
+                    binding_w = state_w.binding
                 # Boundary cancellation check: same pattern as _parse_worker.
                 # Items already past PARSING that are still queued for analyze
                 # are short-circuited to FAILED here so the multimodal VLM
@@ -1850,6 +3162,9 @@ class _PipelineMixin:
                         stage_label="analyze",
                         pipeline_status=ctx.pipeline_status,
                         pipeline_status_lock=ctx.pipeline_status_lock,
+                        artifact_session=session_w,
+                        artifact_binding=binding_w,
+                        ctx=ctx,
                     )
                     continue
                 # content_summary / content_length were computed by the parse
@@ -1868,14 +3183,36 @@ class _PipelineMixin:
                     status=DocStatus.ANALYZING,
                     status_doc=status_doc_w,
                     file_path=file_path_w,
+                    artifact_binding=binding_w,
                 )
-                analyzed = await self.analyze_multimodal(
-                    doc_id=doc_id_w,
-                    file_path=file_path_w,
-                    parsed_data=parsed_data_w,
-                    pipeline_status=ctx.pipeline_status,
-                    pipeline_status_lock=ctx.pipeline_status_lock,
-                )
+                producer_stopped_w = False
+                if session_w is not None:
+                    self._set_pipeline_artifact_producer_active(
+                        doc_id=doc_id_w,
+                        session=session_w,
+                        active=True,
+                        ctx=ctx,
+                    )
+                try:
+                    analyzed = await self.analyze_multimodal(
+                        doc_id=doc_id_w,
+                        file_path=file_path_w,
+                        parsed_data=parsed_data_w,
+                        pipeline_status=ctx.pipeline_status,
+                        pipeline_status_lock=ctx.pipeline_status_lock,
+                    )
+                    producer_stopped_w = True
+                except Exception:
+                    producer_stopped_w = True
+                    raise
+                finally:
+                    if producer_stopped_w and session_w is not None:
+                        self._set_pipeline_artifact_producer_active(
+                            doc_id=doc_id_w,
+                            session=session_w,
+                            active=False,
+                            ctx=ctx,
+                        )
                 # Mirror analyze-stage outcome as a 3-way decision so the
                 # ``analyzing_end_time`` stamp only ever lands on attempts
                 # that genuinely completed:
@@ -1912,8 +3249,16 @@ class _PipelineMixin:
                         status=DocStatus.ANALYZING,
                         status_doc=status_doc_w,
                         file_path=file_path_w,
+                        artifact_binding=binding_w,
                     )
-                await ctx.q_process.put((doc_id_w, status_doc_w, analyzed))
+                await ctx.q_process.put((doc_id_w, status_doc_w, analyzed, session_w))
+                self._handoff_pipeline_artifact_session(
+                    doc_id=doc_id_w,
+                    session=session_w,
+                    from_stage="analyze",
+                    to_stage="process",
+                    ctx=ctx,
+                )
             except PipelineCancelledException:
                 # In-flight cancellation surfaced from analyze_multimodal
                 # (poll loop detected cancellation_requested mid-VLM).
@@ -1926,6 +3271,9 @@ class _PipelineMixin:
                     stage_label="analyze",
                     pipeline_status=ctx.pipeline_status,
                     pipeline_status_lock=ctx.pipeline_status_lock,
+                    artifact_session=session_w,
+                    artifact_binding=binding_w,
+                    ctx=ctx,
                 )
             except Exception as e:
                 # Mirror _parse_worker: failures here must transition the
@@ -1933,17 +3281,50 @@ class _PipelineMixin:
                 # MultimodalAnalysisError (raised by analyze_multimodal under
                 # the new hard-failure contract) would leave the doc stuck in
                 # ANALYZING forever.
-                logger.error(f"Analyze worker failed: {e}")
+                state_w = (
+                    ctx.active_sessions.get(doc_id_w) if session_w is not None else None
+                )
+                if state_w is not None:
+                    state_w.producer_active = False
+                error_msg_w = self._redact_pipeline_artifact_error(e, state_w)
+                cleanup_error_w = await self._finish_pipeline_artifact_session(
+                    doc_id=doc_id_w,
+                    session=session_w,
+                    outcome=(
+                        PipelineTerminalOutcome.CANCELLED
+                        if isinstance(e, PipelineCancelledException)
+                        else PipelineTerminalOutcome.FAILED
+                    ),
+                    ctx=ctx,
+                )
+                if cleanup_error_w:
+                    error_msg_w = (
+                        f"{error_msg_w}; artifact finalization failed: "
+                        f"{cleanup_error_w}"
+                    )
+                logger.error(f"Analyze worker failed: {error_msg_w}")
+                if isinstance(
+                    e,
+                    (
+                        PipelineAttemptCommitStaleError,
+                        PipelineAttemptCommitOutcomeUnknownError,
+                    ),
+                ):
+                    continue
                 try:
                     await self._upsert_doc_status_transition(
                         doc_id=doc_id_w,
                         status=DocStatus.FAILED,
                         status_doc=status_doc_w,
                         file_path=getattr(status_doc_w, "file_path", "unknown_source"),
-                        extra_fields={"error_msg": str(e)},
+                        extra_fields={"error_msg": error_msg_w},
+                        artifact_binding=binding_w,
                     )
-                except Exception:
-                    pass
+                except Exception as status_error:
+                    logger.error(
+                        "Failed to persist analyze terminal status: %s",
+                        self._redact_pipeline_artifact_error(status_error, state_w),
+                    )
             finally:
                 ctx.q_analyze.task_done()
 
@@ -1951,14 +3332,41 @@ class _PipelineMixin:
         """Layer 3 worker: dispatch each ready document to single-doc processing."""
         while True:
             item = await ctx.q_process.get()
+            doc_id_w = ""
+            status_doc_w: Any = None
+            session_w: PipelineArtifactSession | None = None
+            binding_w: PipelineArtifactBinding | None = None
+            producer_stopped_w = False
             try:
-                doc_id_w, status_doc_w, parsed_data_w = item
+                doc_id_w, status_doc_w, parsed_data_w, queued_session = (
+                    self._unpack_stage_queue_item(item)
+                )
+                session_w = queued_session
+                file_path_w = getattr(status_doc_w, "file_path", "unknown_source")
+                state_w = self._set_pipeline_artifact_stage(
+                    doc_id=doc_id_w,
+                    session=session_w,
+                    status_doc=status_doc_w,
+                    file_path=file_path_w,
+                    stage="process",
+                    ctx=ctx,
+                )
+                if state_w is not None:
+                    binding_w = state_w.binding
+                    self._set_pipeline_artifact_producer_active(
+                        doc_id=doc_id_w,
+                        session=session_w,
+                        active=True,
+                        ctx=ctx,
+                    )
                 await self.process_single_document(
                     doc_id=doc_id_w,
                     status_doc=status_doc_w,
                     parsed_data=parsed_data_w,
                     ctx=ctx,
+                    artifact_session=session_w,
                 )
+                producer_stopped_w = True
             except Exception as e:
                 # process_single_document handles its own per-doc failures; an
                 # escape here means even the FAILED-status write failed (e.g.
@@ -1969,15 +3377,80 @@ class _PipelineMixin:
                 # keep draining so the batch winds down cleanly. CancelledError
                 # is a BaseException, not caught here, so a normal worker
                 # cancellation at batch end still propagates.
-                logger.error(f"Unhandled error in process worker; aborting batch: {e}")
-                logger.error(traceback.format_exc())
-                async with ctx.pipeline_status_lock:
-                    ctx.pipeline_status["cancellation_requested"] = True
-                    ctx.pipeline_status["cancellation_reason"] = "internal_error"
-                    ctx.pipeline_status["cancellation_detail"] = (
-                        f"process worker unhandled error: {e}"
+                producer_stopped_w = True
+                state_w = (
+                    ctx.active_sessions.get(doc_id_w) if session_w is not None else None
+                )
+                if state_w is not None:
+                    state_w.producer_active = False
+                error_msg_w = self._redact_pipeline_artifact_error(e, state_w)
+                cleanup_error_w = await self._finish_pipeline_artifact_session(
+                    doc_id=doc_id_w,
+                    session=session_w,
+                    outcome=(
+                        PipelineTerminalOutcome.CANCELLED
+                        if isinstance(e, PipelineCancelledException)
+                        else PipelineTerminalOutcome.FAILED
+                    ),
+                    ctx=ctx,
+                )
+                if cleanup_error_w:
+                    error_msg_w = (
+                        f"{error_msg_w}; artifact finalization failed: "
+                        f"{cleanup_error_w}"
                     )
+                if binding_w is not None and not isinstance(
+                    e,
+                    (
+                        PipelineAttemptCommitStaleError,
+                        PipelineAttemptCommitOutcomeUnknownError,
+                    ),
+                ):
+                    try:
+                        await self._upsert_doc_status_transition(
+                            doc_id=doc_id_w,
+                            status=DocStatus.FAILED,
+                            status_doc=status_doc_w,
+                            file_path=getattr(
+                                status_doc_w, "file_path", "unknown_source"
+                            ),
+                            extra_fields={"error_msg": error_msg_w},
+                            artifact_binding=binding_w,
+                        )
+                    except Exception as status_error:
+                        logger.error(
+                            "Failed to persist process terminal status: %s",
+                            self._redact_pipeline_artifact_error(status_error, state_w),
+                        )
+                if isinstance(e, PipelineCancelledException):
+                    logger.warning("Process worker cancelled: %s", error_msg_w)
+                    async with ctx.pipeline_status_lock:
+                        ctx.pipeline_status["cancellation_requested"] = True
+                else:
+                    logger.error(
+                        "Unhandled error in process worker; aborting batch: %s",
+                        error_msg_w,
+                    )
+                    if binding_w is None:
+                        logger.error(traceback.format_exc())
+                    async with ctx.pipeline_status_lock:
+                        ctx.pipeline_status["cancellation_requested"] = True
+                        ctx.pipeline_status["cancellation_reason"] = "internal_error"
+                        ctx.pipeline_status["cancellation_detail"] = (
+                            f"process worker unhandled error: {error_msg_w}"
+                        )
             finally:
+                if (
+                    producer_stopped_w
+                    and session_w is not None
+                    and doc_id_w in ctx.active_sessions
+                ):
+                    self._set_pipeline_artifact_producer_active(
+                        doc_id=doc_id_w,
+                        session=session_w,
+                        active=False,
+                        ctx=ctx,
+                    )
                 ctx.q_process.task_done()
 
     # ============================================================
@@ -1991,6 +3464,7 @@ class _PipelineMixin:
         status_doc: DocProcessingStatus,
         parsed_data: dict[str, Any],
         ctx: _BatchRunContext,
+        artifact_session: PipelineArtifactSession | None = None,
     ) -> None:
         """Single-document state machine: chunking → KG extraction → merge.
 
@@ -2012,6 +3486,14 @@ class _PipelineMixin:
         extraction_meta: dict[str, Any] = {}
         chunk_results: list = []
         doc_process_opts = parse_process_options("")
+        artifact_state = self._pipeline_artifact_state(
+            doc_id=doc_id,
+            session=artifact_session,
+            ctx=ctx,
+        )
+        artifact_binding = (
+            artifact_state.binding if artifact_state is not None else None
+        )
 
         def get_failed_chunk_snapshot() -> tuple[list[str], int]:
             if chunks:
@@ -2025,11 +3507,27 @@ class _PipelineMixin:
                 # cancellation so corrupted doc_status placeholders do not
                 # get written back again during retry/cancel flows.
                 content_data = await self.full_docs.get_by_id(doc_id)
-                if content_data:
-                    file_path = resolve_doc_file_path(
-                        status_doc=status_doc,
-                        content_data=content_data,
+                if artifact_binding is not None and not content_data:
+                    raise RuntimeError(
+                        "Pipeline artifact full_docs row disappeared before process"
                     )
+                if content_data:
+                    if artifact_binding is not None:
+                        current_binding = self._strict_pipeline_artifact_binding(
+                            doc_id=doc_id,
+                            status_doc=status_doc,
+                            content_data=content_data,
+                        )
+                        if current_binding != artifact_binding:
+                            raise PipelineArtifactSessionMismatchError(doc_id)
+                        file_path = canonicalize_pipeline_logical_filename(
+                            content_data.get("file_path")
+                        )
+                    else:
+                        file_path = resolve_doc_file_path(
+                            status_doc=status_doc,
+                            content_data=content_data,
+                        )
                     status_doc.file_path = file_path
 
                 # Check for cancellation before starting document processing.
@@ -2447,6 +3945,7 @@ class _PipelineMixin:
                             "process_start_time": process_start_time,
                             **extraction_meta,
                         },
+                        artifact_binding=artifact_binding,
                     )
                 )
                 chunks_vdb_task = asyncio.create_task(self.chunks_vdb.upsert(chunks))
@@ -2502,6 +4001,9 @@ class _PipelineMixin:
                     },
                     pipeline_status=ctx.pipeline_status,
                     pipeline_status_lock=ctx.pipeline_status_lock,
+                    artifact_session=artifact_session,
+                    artifact_binding=artifact_binding,
+                    ctx=ctx,
                 )
 
             # Concurrency is controlled by keyed lock for individual
@@ -2547,31 +4049,82 @@ class _PipelineMixin:
                         ctx.pipeline_status, ctx.pipeline_status_lock
                     )
 
-                    process_end_time = int(time.time())
-                    await self._upsert_doc_status_transition(
-                        doc_id=doc_id,
-                        status=DocStatus.PROCESSED,
-                        status_doc=status_doc,
-                        file_path=file_path,
-                        extra_fields={
-                            "chunks_count": len(chunks),
-                            "chunks_list": list(chunks.keys()),
-                        },
-                        metadata_extra={
-                            "process_start_time": process_start_time,
-                            "process_end_time": process_end_time,
-                            **extraction_meta,
-                        },
-                    )
+                    if artifact_session is not None:
+                        if doc_process_opts.skip_kg:
+                            entity_count, relation_count = 0, 0
+                        else:
+                            entity_count, relation_count = (
+                                _pipeline_artifact_extraction_counts(chunk_results)
+                            )
+                        parsed_data["entity_count"] = entity_count
+                        parsed_data["relation_count"] = relation_count
 
-                    await self._insert_done()
+                    process_end_time = int(time.time())
+                    terminal_fields = {
+                        "chunks_count": len(chunks),
+                        "chunks_list": list(chunks.keys()),
+                    }
+                    terminal_metadata = {
+                        "process_start_time": process_start_time,
+                        "process_end_time": process_end_time,
+                        **extraction_meta,
+                    }
+                    if artifact_session is None:
+                        # Preserve the local pipeline's established ordering.
+                        await self._upsert_doc_status_transition(
+                            doc_id=doc_id,
+                            status=DocStatus.PROCESSED,
+                            status_doc=status_doc,
+                            file_path=file_path,
+                            extra_fields=terminal_fields,
+                            metadata_extra=terminal_metadata,
+                        )
+                        await self._insert_done()
+                    else:
+                        # Flush graph/vector output before artifact metadata
+                        # completion. The processing owner then promotes bytes,
+                        # commits PG, patches full_docs, closes scratch, and only
+                        # finally publishes PROCESSED.
+                        await self._insert_done()
+                        self._set_pipeline_artifact_producer_active(
+                            doc_id=doc_id,
+                            session=artifact_session,
+                            active=False,
+                            ctx=ctx,
+                        )
+                        artifact_disposition = (
+                            await self._handoff_pipeline_artifact_success(
+                                doc_id=doc_id,
+                                session=artifact_session,
+                                parsed_data=parsed_data,
+                                chunks_count=len(chunks),
+                                status_doc=status_doc,
+                                file_path=file_path,
+                                terminal_fields=terminal_fields,
+                                terminal_metadata=terminal_metadata,
+                                ctx=ctx,
+                            )
+                        )
 
                     async with ctx.pipeline_status_lock:
-                        log_message = (
-                            f"Completed processing file "
-                            f"{current_file_number}/{ctx.total_files}: "
-                            f"{file_path}"
-                        )
+                        if artifact_session is None:
+                            log_message = (
+                                f"Completed processing file "
+                                f"{current_file_number}/{ctx.total_files}: "
+                                f"{file_path}"
+                            )
+                        elif artifact_disposition.status_published:
+                            log_message = (
+                                f"Completed processing file "
+                                f"{current_file_number}/{ctx.total_files}: "
+                                f"{file_path}"
+                            )
+                        else:
+                            log_message = (
+                                "Artifact owner terminalization requires recovery "
+                                f"for {doc_id} at "
+                                f"{artifact_disposition.recovery_stage or 'unknown'}"
+                            )
                         logger.info(log_message)
                         ctx.pipeline_status["latest_message"] = log_message
                         ctx.pipeline_status["history_messages"].append(log_message)
@@ -2614,6 +4167,9 @@ class _PipelineMixin:
                         },
                         pipeline_status=ctx.pipeline_status,
                         pipeline_status_lock=ctx.pipeline_status_lock,
+                        artifact_session=artifact_session,
+                        artifact_binding=artifact_binding,
+                        ctx=ctx,
                     )
 
     async def _purge_stale_extraction_if_resuming(
@@ -2710,6 +4266,7 @@ class _PipelineMixin:
         *,
         extra_fields: dict[str, Any] | None = None,
         metadata_extra: dict[str, Any] | None = None,
+        artifact_binding: PipelineArtifactBinding | None = None,
     ) -> None:
         """Single source of truth for doc_status state-transition upserts.
 
@@ -2734,6 +4291,23 @@ class _PipelineMixin:
         }
         if extra_fields:
             payload.update(extra_fields)
+        if artifact_binding is not None:
+            metadata = payload.get("metadata")
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            metadata["pipeline_attempt_token"] = artifact_binding.claim_token
+            payload["metadata"] = metadata
+            assert_no_runtime_artifact_payload(
+                {doc_id: payload},
+                context="pipeline binding doc_status transition",
+            )
+            await commit_pipeline_attempt_if_current(
+                self.doc_status,
+                doc_id,
+                payload,
+                expected_attempt_token=artifact_binding.claim_token,
+                row_kind="doc_status",
+            )
+            return
         await self.doc_status.upsert({doc_id: payload})
 
     async def _raise_if_cancelled(
@@ -2794,6 +4368,9 @@ class _PipelineMixin:
         stage_label: str,
         pipeline_status: dict,
         pipeline_status_lock,
+        artifact_session: PipelineArtifactSession | None = None,
+        artifact_binding: PipelineArtifactBinding | None = None,
+        ctx: _BatchRunContext | None = None,
     ) -> None:
         """Mark a queued document FAILED with a 'User cancelled' message.
 
@@ -2804,10 +4381,18 @@ class _PipelineMixin:
         sibling tasks (e.g. successful multimodal items inside a doc that is
         being cancelled) survive a server restart.
         """
+        state = (
+            ctx.active_sessions.get(doc_id)
+            if ctx is not None and artifact_session is not None
+            else None
+        )
+        if state is not None:
+            state.producer_active = False
         error_msg = (
             f"{self._cancellation_label(pipeline_status)} during "
             f"{stage_label}: {file_path}"
         )
+        error_msg = self._redact_pipeline_artifact_error(error_msg, state)
         logger.warning(error_msg)
         async with pipeline_status_lock:
             pipeline_status["latest_message"] = error_msg
@@ -2817,6 +4402,17 @@ class _PipelineMixin:
                 await self.llm_response_cache.index_done_callback()
             except Exception as persist_error:
                 logger.error(f"Failed to persist LLM cache: {persist_error}")
+        if ctx is not None:
+            cleanup_error = await self._finish_pipeline_artifact_session(
+                doc_id=doc_id,
+                session=artifact_session,
+                outcome=PipelineTerminalOutcome.CANCELLED,
+                ctx=ctx,
+            )
+            if cleanup_error:
+                error_msg = (
+                    f"{error_msg}; artifact finalization failed: {cleanup_error}"
+                )
         try:
             await self._upsert_doc_status_transition(
                 doc_id=doc_id,
@@ -2824,6 +4420,7 @@ class _PipelineMixin:
                 status_doc=status_doc,
                 file_path=file_path,
                 extra_fields={"error_msg": error_msg},
+                artifact_binding=artifact_binding,
             )
         except Exception as exc:
             logger.error(f"Failed to mark cancelled doc {doc_id} as FAILED: {exc}")
@@ -2843,6 +4440,9 @@ class _PipelineMixin:
         metadata_extra: dict[str, Any],
         pipeline_status: dict,
         pipeline_status_lock,
+        artifact_session: PipelineArtifactSession | None = None,
+        artifact_binding: PipelineArtifactBinding | None = None,
+        ctx: _BatchRunContext | None = None,
     ) -> None:
         """Common epilogue for an extract / merge stage failure.
 
@@ -2850,6 +4450,11 @@ class _PipelineMixin:
         flushes the LLM response cache, and writes a FAILED status row that
         preserves the failed chunks snapshot and processing-time metadata.
         """
+        state = (
+            ctx.active_sessions.get(doc_id)
+            if ctx is not None and artifact_session is not None
+            else None
+        )
         if isinstance(error, PipelineCancelledException):
             cancel_label = self._cancellation_label(pipeline_status)
             # The cancel exceptions raised by the merge/summary stages hardcode a
@@ -2860,11 +4465,15 @@ class _PipelineMixin:
             # during <stage>" rather than "User cancelled during <stage>".
             raw = str(error)
             if raw.startswith("User cancelled"):
-                doc_error_msg = f"{cancel_label}{raw[len('User cancelled'):]}"
+                doc_error_msg = f"{cancel_label}{raw[len('User cancelled') :]}"
             elif raw:
                 doc_error_msg = f"{cancel_label}: {raw}"
             else:
                 doc_error_msg = cancel_label
+            doc_error_msg = self._redact_pipeline_artifact_error(
+                doc_error_msg,
+                state,
+            )
             if stage_label == "merge":
                 error_msg = (
                     f"{cancel_label} during merge {current_file_number}/"
@@ -2879,8 +4488,11 @@ class _PipelineMixin:
                 pipeline_status["latest_message"] = error_msg
                 pipeline_status["history_messages"].append(error_msg)
         else:
-            doc_error_msg = str(error)
-            logger.error(traceback.format_exc())
+            doc_error_msg = self._redact_pipeline_artifact_error(error, state)
+            if artifact_binding is None:
+                logger.error(traceback.format_exc())
+            else:
+                logger.error("Artifact-bound pipeline failure: %s", doc_error_msg)
             if stage_label == "merge":
                 error_msg = (
                     f"Merging stage failed in document "
@@ -2894,18 +4506,57 @@ class _PipelineMixin:
             logger.error(error_msg)
             async with pipeline_status_lock:
                 pipeline_status["latest_message"] = error_msg
-                pipeline_status["history_messages"].append(traceback.format_exc())
+                pipeline_status["history_messages"].append(
+                    traceback.format_exc()
+                    if artifact_binding is None
+                    else doc_error_msg
+                )
                 pipeline_status["history_messages"].append(error_msg)
 
         for task in pending_tasks:
             if task and not task.done():
                 task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
         if self.llm_response_cache:
             try:
                 await self.llm_response_cache.index_done_callback()
             except Exception as persist_error:
                 logger.error(f"Failed to persist LLM cache: {persist_error}")
+
+        if state is not None:
+            # All explicitly tracked child tasks have stopped.  Relinquish the
+            # producer marker before finish/close so batch cleanup cannot defer
+            # a session that is already entering its terminal sequence.
+            state.producer_active = False
+        if ctx is not None:
+            cleanup_error = await self._finish_pipeline_artifact_session(
+                doc_id=doc_id,
+                session=artifact_session,
+                outcome=(
+                    PipelineTerminalOutcome.CANCELLED
+                    if isinstance(error, PipelineCancelledException)
+                    else PipelineTerminalOutcome.FAILED
+                ),
+                ctx=ctx,
+            )
+            if cleanup_error:
+                doc_error_msg = (
+                    f"{doc_error_msg}; artifact finalization failed: {cleanup_error}"
+                )
+
+        if isinstance(
+            error,
+            (
+                PipelineAttemptCommitStaleError,
+                PipelineAttemptCommitOutcomeUnknownError,
+            ),
+        ):
+            # The failed operation was itself the attempt-fenced status/full-doc
+            # write.  A stale owner must not publish a terminal row, and an
+            # unknown outcome must not be followed by a blind second mutation.
+            return
 
         failed_chunks_list, failed_chunks_count = failed_chunks_snapshot
         await self._upsert_doc_status_transition(
@@ -2919,6 +4570,7 @@ class _PipelineMixin:
                 "chunks_list": failed_chunks_list,
             },
             metadata_extra=metadata_extra,
+            artifact_binding=artifact_binding,
         )
 
     # ============================================================
@@ -2956,11 +4608,14 @@ class _PipelineMixin:
             )
             p = Path(source_path)
             if not (p.exists() and p.is_file()):
-                raise ValueError(f"Legacy parser pending file does not exist: {file_path}")
+                raise ValueError(
+                    f"Legacy parser pending file does not exist: {file_path}"
+                )
 
             from lightrag.parser.legacy import parse_legacy_source_file
 
-            document_name = normalize_document_file_path(file_path)
+            durable_file_path = _durable_parser_file_path(content_data, file_path)
+            document_name = normalize_document_file_path(durable_file_path)
             if document_name == "unknown_source":
                 document_name = p.name or f"{doc_id}.txt"
             parsed_data = await asyncio.to_thread(
@@ -2975,13 +4630,18 @@ class _PipelineMixin:
                 doc_id,
                 {
                     "content": make_lightrag_doc_content(parsed_data["content"]),
-                    "file_path": file_path,
                     "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
-                    "sidecar_location": sidecar_uri_for(sidecar_dir)
-                    if sidecar_dir is not None
-                    else "unknown_source",
                     "parse_engine": PARSER_ENGINE_LEGACY,
                     "update_time": int(time.time()),
+                    **_parsed_full_docs_fields(
+                        content_data,
+                        runtime_file_path=file_path,
+                        sidecar_location=(
+                            sidecar_uri_for(sidecar_dir)
+                            if sidecar_dir is not None
+                            else "unknown_source"
+                        ),
+                    ),
                 },
             )
             if content_data.get("archive_source_after_parse", True):
@@ -2991,7 +4651,7 @@ class _PipelineMixin:
             )
             return {
                 "doc_id": doc_id,
-                "file_path": file_path,
+                "file_path": durable_file_path,
                 "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
                 "parse_engine": PARSER_ENGINE_LEGACY,
                 "content": parsed_data["content"],
@@ -3068,16 +4728,17 @@ class _PipelineMixin:
             # ``file_path`` is canonical at the worker layer; canonicalize
             # again defensively so direct callers (tests, CLI) may pass
             # absolute paths or hint-bearing names.
-            document_name = normalize_document_file_path(file_path)
+            durable_file_path = _durable_parser_file_path(content_data, file_path)
+            document_name = normalize_document_file_path(durable_file_path)
             if document_name == "unknown_source":
                 document_name = p.name or f"{doc_id}.bin"
             base_name = Path(document_name).stem or document_name
             parsed_dir = parsed_artifact_dir_for(document_name, parent_hint=p.parent)
             asset_dir = parsed_dir / f"{base_name}.blocks.assets"
 
-            def _extract_blocks_sync() -> (
-                tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]
-            ):
+            def _extract_blocks_sync() -> tuple[
+                list[dict[str, Any]], dict[str, Any], dict[str, Any]
+            ]:
                 # Pre-clean parsed_dir and pre-create the asset dir so the
                 # drawing extractor can write image bytes BEFORE write_sidecar
                 # runs (which is then called with clean_parsed_dir=False to
@@ -3163,11 +4824,14 @@ class _PipelineMixin:
                 doc_id,
                 {
                     "content": make_lightrag_doc_content(parsed_data["content"]),
-                    "file_path": file_path,
                     "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
-                    "sidecar_location": sidecar_uri_for(parsed_dir),
                     "parse_engine": PARSER_ENGINE_NATIVE,
                     "update_time": int(time.time()),
+                    **_parsed_full_docs_fields(
+                        content_data,
+                        runtime_file_path=file_path,
+                        sidecar_location=sidecar_uri_for(parsed_dir),
+                    ),
                 },
             )
             if content_data.get("archive_source_after_parse", True):
@@ -3178,7 +4842,7 @@ class _PipelineMixin:
             )
             result: dict[str, Any] = {
                 "doc_id": doc_id,
-                "file_path": file_path,
+                "file_path": durable_file_path,
                 "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
                 "parse_engine": PARSER_ENGINE_NATIVE,
                 "content": parsed_data["content"],
@@ -3247,7 +4911,8 @@ class _PipelineMixin:
 
         # Canonicalize defensively so direct callers (tests, CLI) may pass
         # absolute paths or hint-bearing names.
-        document_name = normalize_document_file_path(file_path)
+        durable_file_path = _durable_parser_file_path(content_data, file_path)
+        document_name = normalize_document_file_path(durable_file_path)
         if document_name == "unknown_source":
             document_name = source_file_path.name or f"{doc_id}.bin"
         parsed_dir = parsed_artifact_dir_for(
@@ -3306,18 +4971,21 @@ class _PipelineMixin:
             doc_id,
             {
                 "content": make_lightrag_doc_content(parsed_data["content"]),
-                "file_path": file_path,
                 "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
-                "sidecar_location": sidecar_uri_for(parsed_dir),
                 "parse_engine": PARSER_ENGINE_MINERU,
                 "update_time": int(time.time()),
+                **_parsed_full_docs_fields(
+                    content_data,
+                    runtime_file_path=file_path,
+                    sidecar_location=sidecar_uri_for(parsed_dir),
+                ),
             },
         )
         if content_data.get("archive_source_after_parse", True):
             await archive_docx_source_after_full_docs_sync(str(source_file_path))
         return {
             "doc_id": doc_id,
-            "file_path": file_path,
+            "file_path": durable_file_path,
             "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
             "parse_engine": PARSER_ENGINE_MINERU,
             "content": parsed_data["content"],
@@ -3368,7 +5036,8 @@ class _PipelineMixin:
                 f"Docling source file not found: {source_file_path}"
             )
 
-        document_name = normalize_document_file_path(file_path)
+        durable_file_path = _durable_parser_file_path(content_data, file_path)
+        document_name = normalize_document_file_path(durable_file_path)
         if document_name == "unknown_source":
             document_name = source_file_path.name or f"{doc_id}.bin"
         parsed_dir = parsed_artifact_dir_for(
@@ -3453,18 +5122,21 @@ class _PipelineMixin:
             doc_id,
             {
                 "content": make_lightrag_doc_content(parsed_data["content"]),
-                "file_path": file_path,
                 "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
-                "sidecar_location": sidecar_uri_for(parsed_dir),
                 "parse_engine": PARSER_ENGINE_DOCLING,
                 "update_time": int(time.time()),
+                **_parsed_full_docs_fields(
+                    content_data,
+                    runtime_file_path=file_path,
+                    sidecar_location=sidecar_uri_for(parsed_dir),
+                ),
             },
         )
         if content_data.get("archive_source_after_parse", True):
             await archive_docx_source_after_full_docs_sync(str(source_file_path))
         return {
             "doc_id": doc_id,
-            "file_path": file_path,
+            "file_path": durable_file_path,
             "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
             "parse_engine": PARSER_ENGINE_DOCLING,
             "content": parsed_data["content"],
@@ -3509,16 +5181,84 @@ class _PipelineMixin:
                 strip_lightrag_doc_prefix(record.get("content") or "", fmt)
             )
 
+        raw_binding = record.get("artifact_binding")
+        binding: PipelineArtifactBinding | None = None
         existing = await self.full_docs.get_by_id(doc_id)
-        if isinstance(existing, dict):
-            payload = {**existing, **record}
+        attempt_already_bound = False
+        if raw_binding is not None:
+            binding = (
+                raw_binding
+                if isinstance(raw_binding, PipelineArtifactBinding)
+                else PipelineArtifactBinding.from_mapping(
+                    raw_binding, expected_workspace=self.workspace
+                )
+            )
+            if (
+                binding.operation != "parse"
+                or binding.state != "claimed"
+                or binding.lightrag_doc_id != doc_id
+            ):
+                raise ValueError(
+                    "Parser artifact binding does not match the claimed document"
+                )
+            process_options = record.get("process_options")
+            if not isinstance(process_options, str):
+                process_options = ""
+            chunk_options = record.get("chunk_options")
+            if not isinstance(chunk_options, dict):
+                from lightrag.parser.routing import resolve_chunk_options
+
+                chunk_options = resolve_chunk_options(
+                    self.addon_params,
+                    process_options=process_options,
+                )
+            payload = {
+                "content": record.get("content", ""),
+                "file_path": canonicalize_pipeline_logical_filename(
+                    record.get("file_path")
+                ),
+                "parse_format": record.get("parse_format", FULL_DOCS_FORMAT_LIGHTRAG),
+                "parse_engine": record.get("parse_engine"),
+                "process_options": process_options,
+                "chunk_options": chunk_options,
+                "artifact_binding": binding.to_dict(),
+                "update_time": record.get("update_time", int(time.time())),
+            }
+            attempt_already_bound = (
+                extract_pipeline_attempt_token(
+                    existing if isinstance(existing, Mapping) else None,
+                    row_kind="full_docs",
+                )
+                == binding.claim_token
+            )
         else:
-            payload = dict(record)
+            if isinstance(existing, dict):
+                payload = {**existing, **record}
+            else:
+                payload = dict(record)
         if content_hash:
             payload["content_hash"] = content_hash
 
-        await self.full_docs.upsert({doc_id: payload})
-        await self.full_docs.index_done_callback()
+        if binding is not None:
+            assert_no_runtime_artifact_payload(
+                {doc_id: payload},
+                context="parser binding full_docs first write",
+            )
+        if binding is not None and attempt_already_bound:
+            await commit_pipeline_attempt_if_current(
+                self.full_docs,
+                doc_id,
+                payload,
+                expected_attempt_token=binding.claim_token,
+                row_kind="full_docs",
+            )
+        else:
+            # This is the enqueue/origin write for a newly claimed parse
+            # attempt.  No row carrying this attempt token exists yet, so the
+            # initial claimed row remains the one intentional unconditional
+            # write.  Every later same-attempt mutation takes the CAS branch.
+            await self.full_docs.upsert({doc_id: payload})
+            await self.full_docs.index_done_callback()
 
         if content_hash:
             existing_status = await self.doc_status.get_by_id(doc_id)
@@ -3526,7 +5266,24 @@ class _PipelineMixin:
                 patched = dict(existing_status)
                 patched["content_hash"] = content_hash
                 patched["updated_at"] = datetime.now(timezone.utc).isoformat()
-                await self.doc_status.upsert({doc_id: patched})
+                if binding is not None:
+                    metadata = patched.get("metadata")
+                    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+                    metadata["pipeline_attempt_token"] = binding.claim_token
+                    patched["metadata"] = metadata
+                    assert_no_runtime_artifact_payload(
+                        {doc_id: patched},
+                        context="parser binding doc_status hash patch",
+                    )
+                    await commit_pipeline_attempt_if_current(
+                        self.doc_status,
+                        doc_id,
+                        patched,
+                        expected_attempt_token=binding.claim_token,
+                        row_kind="doc_status",
+                    )
+                else:
+                    await self.doc_status.upsert({doc_id: patched})
         return content_hash
 
     async def _mark_duplicate_after_parse(
@@ -3541,6 +5298,23 @@ class _PipelineMixin:
         pipeline_status_lock: asyncio.Lock | None = None,
     ) -> bool:
         """Mark post-parse content duplicates and stop further processing."""
+        raw_binding = (content_data or {}).get("artifact_binding")
+        if raw_binding is not None:
+            binding = (
+                raw_binding
+                if isinstance(raw_binding, PipelineArtifactBinding)
+                else PipelineArtifactBinding.from_mapping(
+                    raw_binding, expected_workspace=self.workspace
+                )
+            )
+            if binding.lightrag_doc_id != doc_id:
+                raise ValueError(
+                    "Parser artifact binding does not match the parsed document"
+                )
+            # Metadata authority supplied the exact document identity.  Do not
+            # collapse a different explicit ID merely because its extracted
+            # body matches another document.
+            return False
         if not content_hash:
             return False
 
@@ -3730,12 +5504,20 @@ class _PipelineMixin:
         file_path: str,
         content_list: list[dict[str, Any]],
         engine: str,
+        content_data: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Convert parser content list to LightRAG Document files and return parsed_data."""
-        document_name = normalize_document_file_path(file_path)
+        parser_context = content_data or {}
+        durable_file_path = _durable_parser_file_path(parser_context, file_path)
+        document_name = normalize_document_file_path(durable_file_path)
         if document_name == "unknown_source":
             document_name = f"{doc_id}.bin"
-        parsed_dir = parsed_artifact_dir_for(document_name)
+        if parser_context.get("artifact_binding") is None:
+            parsed_dir = parsed_artifact_dir_for(document_name)
+        else:
+            parsed_dir = parsed_artifact_dir_for(
+                document_name, parent_hint=Path(file_path).parent
+            )
         if parsed_dir.exists():
             shutil.rmtree(parsed_dir)
         parsed_dir.mkdir(parents=True, exist_ok=True)
@@ -4129,19 +5911,23 @@ class _PipelineMixin:
             doc_id,
             {
                 "content": make_lightrag_doc_content(merged_text),
-                "file_path": file_path,
                 "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
-                "sidecar_location": sidecar_uri_for(parsed_dir),
                 "parse_engine": engine,
                 "update_time": int(time.time()),
+                **_parsed_full_docs_fields(
+                    parser_context,
+                    runtime_file_path=file_path,
+                    sidecar_location=sidecar_uri_for(parsed_dir),
+                ),
             },
         )
-        await archive_docx_source_after_full_docs_sync(
-            self._resolve_source_file_for_parser(file_path)
-        )
+        if parser_context.get("archive_source_after_parse", True):
+            await archive_docx_source_after_full_docs_sync(
+                self._resolve_source_file_for_parser(file_path)
+            )
         return {
             "doc_id": doc_id,
-            "file_path": file_path,
+            "file_path": durable_file_path,
             "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
             "content": merged_text,
             "blocks_path": str(blocks_path),
@@ -4461,8 +6247,7 @@ class _PipelineMixin:
                 ):
                     return (
                         _skipped_result(
-                            f"image width or height is smaller than "
-                            f"{min_image_pixel}px"
+                            f"image width or height is smaller than {min_image_pixel}px"
                         ),
                         None,
                     )

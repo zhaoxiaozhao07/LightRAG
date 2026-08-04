@@ -277,6 +277,30 @@ docker buildx build \
 
 After building a custom tag, update the `postgres.image` value in the generated `docker-compose.final.yml` to point at that tag. On later setup wizard reruns, existing wizard-managed service images are preserved.
 
+### Object-storage deployment (S3 / MinIO)
+
+LightRAG supports an object-authoritative artifact storage mode in which S3/MinIO holds source bytes and generated artifacts, while the local filesystem is only operation-scoped scratch. This is intended for horizontally-scaled / stateless deployments. Configure the object-storage backend with the `LIGHTRAG_OBJECT_STORAGE_*` variables:
+
+| Variable | Purpose |
+| -------- | ------- |
+| `LIGHTRAG_OBJECT_STORAGE` | Backend selector: `local` (default, no object storage), `s3`, or `minio`. Object-authoritative mode requires `s3` or `minio`. |
+| `LIGHTRAG_OBJECT_STORAGE_ENDPOINT` | S3/MinIO endpoint URL (e.g. `http://minio:9000` for a compose service, `http://host.docker.internal:9000` for a host-side MinIO). |
+| `LIGHTRAG_OBJECT_STORAGE_BUCKET` | Target bucket name (validated for DNS-safe naming). |
+| `LIGHTRAG_OBJECT_STORAGE_PREFIX` | Object key prefix (default `kb`); all artifact keys are namespaced under it. Empty is allowed; trailing slash is not. |
+| `LIGHTRAG_OBJECT_STORAGE_ACCESS_KEY_ID` | Access key. |
+| `LIGHTRAG_OBJECT_STORAGE_SECRET_ACCESS_KEY` | Secret key. |
+| `LIGHTRAG_OBJECT_STORAGE_USE_SSL` | `true`/`false` — TLS to the endpoint. |
+| `LIGHTRAG_OBJECT_STORAGE_REGION` | AWS region (regional S3 endpoints). |
+| `LIGHTRAG_OBJECT_STORAGE_CREATE_BUCKET` | `true` lets the server create the bucket on startup if it does not exist (development convenience; verify bucket policy in production). |
+
+When running in Docker against a host-side MinIO/S3, use `host.docker.internal` in the endpoint (the same host-rewrite the setup wizard applies to LLM endpoints). For a compose-side MinIO service, point at the service name.
+
+**Volume / mount considerations.** In object-authoritative mode (`LIGHTRAG_ARTIFACT_STORAGE_MODE=object`), persistent local artifact storage is **not** required — artifacts live in the bucket, not under `data/inputs`. The container still needs a canonical `INPUT_DIR` (POSIX `fcntl` locking + writable scratch) for transient operation-scoped work, but it does not need to be backed up or shared across replicas. For multi-replica deployments, point every replica at the same bucket + PostgreSQL metadata backend (`LIGHTRAG_KB_METADATA_BACKEND=postgres`); do not share a local `data/inputs` across containers.
+
+**Capability gate.** Even with all prerequisites met, production object mode is currently disabled by the code-level constant `OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED = False` (`lightrag/api/config.py`). The server refuses to start in object mode until that constant is flipped to `True` after Phase 3 Gate 3 passes. The constant is not configurable via environment variables. See [LightRAG-API-Server.md → Object-Authoritative Artifact Storage](./LightRAG-API-Server.md) for the gate, migration/orphan CLIs, and route policy, and the [Production Backup & Recovery Runbook](./生产级后端备份恢复Runbook.md) for operational detail.
+
+**Health readiness.** When object mode is enabled, `GET /health` exposes an `artifact_lifecycle` block whose `object_store_ready` field is a cached HeadBucket probe (~30s TTL). Container orchestrators that keys readiness off `/health` should be aware that `artifact_lifecycle.object_store_ready=false` indicates the bucket is unreachable / auth failed / the probe timed out — verify endpoint, credentials, and network policy. The probe is metadata-only (a single `head_bucket`); `/health` never lists bucket contents or downloads objects, so its latency stays bounded regardless of bucket size. See the Runbook, section 12, for field-by-field interpretation.
+
 ### Updates
 
 To update the Docker container:

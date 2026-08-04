@@ -7,6 +7,7 @@ import re
 import json
 import argparse
 import logging
+from dataclasses import dataclass
 from dotenv import load_dotenv
 from lightrag import ROLES
 from lightrag.utils import get_env_value, logger
@@ -20,7 +21,7 @@ from lightrag.llm.binding_options import (
 )
 from lightrag.base import OllamaServerInfos
 import sys
-from typing import cast
+from typing import Iterable, Mapping, cast
 
 from lightrag.constants import (
     DEFAULT_WOKERS,
@@ -49,6 +50,17 @@ from lightrag.constants import (
     DEFAULT_EMBEDDING_TIMEOUT,
     DEFAULT_RERANK_TIMEOUT,
 )
+from lightrag.api.artifact_materialization import (
+    DEFAULT_MATERIALIZATION_MAX_BYTES,
+    DEFAULT_MATERIALIZATION_MAX_OBJECTS,
+    DEFAULT_MATERIALIZATION_STALE_TTL_SECONDS,
+    MATERIALIZATION_MAX_BYTES_ENV,
+    MATERIALIZATION_MAX_OBJECTS_ENV,
+    MATERIALIZATION_STALE_TTL_ENV,
+    ensure_materialization_scratch_root,
+    materialization_limits_from_values,
+    require_posix_materialization_support,
+)
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -68,6 +80,465 @@ PROVIDER_ASYMMETRIC_EMBEDDING_BINDINGS = {"gemini", "jina", "voyageai"}
 PREFIX_ASYMMETRIC_EMBEDDING_BINDINGS = {"azure_openai", "ollama", "openai"}
 POSTGRES_METADATA_BACKEND_ALIASES = {"postgres", "postgresql", "pg"}
 LOCAL_METADATA_BACKEND_ALIASES = {"", "local", "json", "sqlite"}
+ARTIFACT_STORAGE_MODES = {"local", "object"}
+# This is a code capability, not configuration. It must become ``True`` only
+# when the object-authoritative lifecycle is implemented and reviewed.
+# Flipped to True after Phase 3 Gates 1-3 all PASS (fresh Oracle reviews).
+OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED = True
+
+# ---------------------------------------------------------------------------
+# Object route policy (Phase 3.2)
+# ---------------------------------------------------------------------------
+# This allowlist is a DISTINCT per-KB admission control surface, separate from
+# the capability constant above and from the startup admission gate
+# (``validate_artifact_storage_server_admission``). It does NOT flip the
+# capability constant and does NOT open production object mode.
+#
+# After the capability constant flips True at Gate 3, object-mode KBs may be
+# individually allowlisted to use specific destructive routes. The allowlist is
+# advisory configuration loaded from the environment; the actual enforcement
+# lives in ``kb_document_routes._require_destructive_lifecycle``.
+#
+# Canonical route-operation tokens that may appear in an allowlist. Legacy
+# local-path routes (import/scan/texts/urls) are deliberately absent: they are
+# permanently disabled in object mode and must NEVER appear in an allowlist.
+OBJECT_ROUTE_POLICY_OPERATIONS: frozenset[str] = frozenset(
+    {
+        "upload",
+        "parse",
+        "build",
+        "replace",
+        "delete",
+        "batch_delete",
+        "sync",
+        "hard_delete",
+    }
+)
+# Key inside an object-route-policy mapping that applies to every KB. Per-KB
+# entries are unioned with this global default.
+OBJECT_ROUTE_POLICY_GLOBAL_KEY = "*"
+OBJECT_ROUTE_POLICY_ENV_VAR = "LIGHTRAG_OBJECT_ROUTE_POLICY"
+
+
+def _normalize_object_route_policy_operations(
+    raw: object, *, source_label: str
+) -> set[str]:
+    """Normalize one allowlist entry into a validated set of tokens.
+
+    Unknown tokens are dropped with a logged warning rather than failing the
+    whole policy load: admission must fail closed (deny the route), but a
+    malformed neighbor entry must not take down server startup.
+    """
+
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        candidates: list[str] = [raw]
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        candidates = list(raw)
+    else:
+        logger.warning(
+            "Object route policy entry %s ignored: expected a string or list, got %s",
+            source_label,
+            type(raw).__name__,
+        )
+        return set()
+    normalized: set[str] = set()
+    for item in candidates:
+        if not isinstance(item, str):
+            logger.warning(
+                "Object route policy entry %s contains a non-string token %r; dropping",
+                source_label,
+                item,
+            )
+            continue
+        token = item.strip().lower()
+        if not token:
+            continue
+        if token not in OBJECT_ROUTE_POLICY_OPERATIONS:
+            logger.warning(
+                "Object route policy entry %s contains unknown operation %r; dropping",
+                source_label,
+                token,
+            )
+            continue
+        normalized.add(token)
+    return normalized
+
+
+def load_object_route_policy_from_env(
+    env: "Mapping[str, str] | None" = None,
+) -> dict[str, set[str]]:
+    """Load the per-KB object-route allowlist from the environment.
+
+    The environment variable named by ``OBJECT_ROUTE_POLICY_ENV_VAR`` must be a
+    JSON object mapping KB IDs (or the global key ``OBJECT_ROUTE_POLICY_GLOBAL_KEY``)
+    to lists of operation tokens, for example::
+
+        {"*": ["replace", "delete"], "kb_abc": ["sync"]}
+
+    Returns a fresh ``dict`` mapping KB IDs to normalized operation sets. Any
+    parse or validation failure returns an empty dict (fail closed) so that
+    admission never silently widens.
+    """
+
+    env_mapping = env if env is not None else os.environ
+    raw = env_mapping.get(OBJECT_ROUTE_POLICY_ENV_VAR)
+    if raw is None:
+        return {}
+    raw = raw.strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "Object route policy in %s is not valid JSON and was ignored: %s",
+            OBJECT_ROUTE_POLICY_ENV_VAR,
+            exc,
+        )
+        return {}
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "Object route policy in %s must be a JSON object; ignored",
+            OBJECT_ROUTE_POLICY_ENV_VAR,
+        )
+        return {}
+    policy: dict[str, set[str]] = {}
+    for key, value in parsed.items():
+        if not isinstance(key, str) or not key.strip():
+            logger.warning(
+                "Object route policy contains a non-string KB key %r; ignored",
+                key,
+            )
+            continue
+        normalized_key = key.strip()
+        operations = _normalize_object_route_policy_operations(
+            value, source_label=repr(normalized_key)
+        )
+        if not operations:
+            continue
+        policy[normalized_key] = operations
+    return policy
+
+
+def object_route_policy_allows(
+    policy: "Mapping[str, Iterable[str]] | None",
+    kb_id: str | None,
+    operation: str,
+) -> bool:
+    """Return True if ``operation`` is allowlisted for ``kb_id``.
+
+    The check unions the global default key (``OBJECT_ROUTE_POLICY_GLOBAL_KEY``)
+    with the explicit per-KB entry when present. Unknown / legacy operations are
+    never considered allowed even if they appear in the policy: admission is the
+    authoritative filter and must independently reject legacy routes.
+    """
+
+    if operation not in OBJECT_ROUTE_POLICY_OPERATIONS:
+        return False
+    if not policy:
+        return False
+    allowed: set[str] = set()
+    global_entry = policy.get(OBJECT_ROUTE_POLICY_GLOBAL_KEY)
+    if global_entry is not None:
+        allowed.update(global_entry)
+    if kb_id is not None:
+        per_kb = policy.get(kb_id)
+        if per_kb is not None:
+            allowed.update(per_kb)
+    return operation in allowed
+
+
+DEFAULT_ARTIFACT_CLEANUP_REPLACEMENT_GRACE_SECONDS = 24 * 60 * 60
+DEFAULT_ARTIFACT_CLEANUP_STAGING_GRACE_SECONDS = 24 * 60 * 60
+DEFAULT_ARTIFACT_CLEANUP_SLO_SECONDS = 24 * 60 * 60
+DEFAULT_ARTIFACT_CLEANUP_SUCCESSFUL_AUDIT_RETENTION_DAYS = 30
+DEFAULT_ARTIFACT_CLEANUP_LEASE_DURATION_SECONDS = 60.0
+DEFAULT_ARTIFACT_CLEANUP_MAX_CONCURRENT_MANIFESTS = 8
+DEFAULT_ARTIFACT_CLEANUP_CLAIM_LIMIT = 8
+DEFAULT_ARTIFACT_CLEANUP_OBJECT_PAGE_SIZE = 1000
+DEFAULT_ARTIFACT_CLEANUP_DELETE_BATCH_SIZE = 1000
+DEFAULT_ARTIFACT_CLEANUP_MAX_PREFIX_PAGES_PER_MANIFEST_ATTEMPT = 32
+DEFAULT_ARTIFACT_CLEANUP_EXPIRED_LEASE_RECOVERY_LIMIT = 500
+DEFAULT_ARTIFACT_CLEANUP_BACKOFF_BASE_SECONDS = 30.0
+DEFAULT_ARTIFACT_CLEANUP_BACKOFF_MAX_SECONDS = 60.0 * 60.0
+DEFAULT_ARTIFACT_CLEANUP_ACTIVE_JOB_QUERY_LIMIT = 200
+
+_ARTIFACT_CLEANUP_ENV_BY_FIELD = {
+    "replacement_grace_seconds": "LIGHTRAG_ARTIFACT_CLEANUP_REPLACEMENT_GRACE_SECONDS",
+    "staging_grace_seconds": "LIGHTRAG_ARTIFACT_CLEANUP_STAGING_GRACE_SECONDS",
+    "cleanup_slo_seconds": "LIGHTRAG_ARTIFACT_CLEANUP_SLO_SECONDS",
+    "successful_audit_retention_days": (
+        "LIGHTRAG_ARTIFACT_CLEANUP_SUCCESSFUL_AUDIT_RETENTION_DAYS"
+    ),
+    "lease_duration_seconds": "LIGHTRAG_ARTIFACT_CLEANUP_LEASE_DURATION_SECONDS",
+    "max_concurrent_manifests": ("LIGHTRAG_ARTIFACT_CLEANUP_MAX_CONCURRENT_MANIFESTS"),
+    "claim_limit": "LIGHTRAG_ARTIFACT_CLEANUP_CLAIM_LIMIT",
+    "object_page_size": "LIGHTRAG_ARTIFACT_CLEANUP_OBJECT_PAGE_SIZE",
+    "delete_batch_size": "LIGHTRAG_ARTIFACT_CLEANUP_DELETE_BATCH_SIZE",
+    "max_prefix_pages_per_manifest_attempt": (
+        "LIGHTRAG_ARTIFACT_CLEANUP_MAX_PREFIX_PAGES_PER_MANIFEST_ATTEMPT"
+    ),
+    "expired_lease_recovery_limit": (
+        "LIGHTRAG_ARTIFACT_CLEANUP_EXPIRED_LEASE_RECOVERY_LIMIT"
+    ),
+    "backoff_base_seconds": "LIGHTRAG_ARTIFACT_CLEANUP_BACKOFF_BASE_SECONDS",
+    "backoff_max_seconds": "LIGHTRAG_ARTIFACT_CLEANUP_BACKOFF_MAX_SECONDS",
+    "active_job_query_limit": "LIGHTRAG_ARTIFACT_CLEANUP_ACTIVE_JOB_QUERY_LIMIT",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactCleanupConfig:
+    replacement_grace_seconds: int = DEFAULT_ARTIFACT_CLEANUP_REPLACEMENT_GRACE_SECONDS
+    staging_grace_seconds: int = DEFAULT_ARTIFACT_CLEANUP_STAGING_GRACE_SECONDS
+    cleanup_slo_seconds: int = DEFAULT_ARTIFACT_CLEANUP_SLO_SECONDS
+    successful_audit_retention_days: int = (
+        DEFAULT_ARTIFACT_CLEANUP_SUCCESSFUL_AUDIT_RETENTION_DAYS
+    )
+    lease_duration_seconds: float = DEFAULT_ARTIFACT_CLEANUP_LEASE_DURATION_SECONDS
+    max_concurrent_manifests: int = DEFAULT_ARTIFACT_CLEANUP_MAX_CONCURRENT_MANIFESTS
+    claim_limit: int = DEFAULT_ARTIFACT_CLEANUP_CLAIM_LIMIT
+    object_page_size: int = DEFAULT_ARTIFACT_CLEANUP_OBJECT_PAGE_SIZE
+    delete_batch_size: int = DEFAULT_ARTIFACT_CLEANUP_DELETE_BATCH_SIZE
+    max_prefix_pages_per_manifest_attempt: int = (
+        DEFAULT_ARTIFACT_CLEANUP_MAX_PREFIX_PAGES_PER_MANIFEST_ATTEMPT
+    )
+    expired_lease_recovery_limit: int = (
+        DEFAULT_ARTIFACT_CLEANUP_EXPIRED_LEASE_RECOVERY_LIMIT
+    )
+    backoff_base_seconds: float = DEFAULT_ARTIFACT_CLEANUP_BACKOFF_BASE_SECONDS
+    backoff_max_seconds: float = DEFAULT_ARTIFACT_CLEANUP_BACKOFF_MAX_SECONDS
+    active_job_query_limit: int = DEFAULT_ARTIFACT_CLEANUP_ACTIVE_JOB_QUERY_LIMIT
+
+    def __post_init__(self) -> None:
+        _validate_cleanup_int(
+            "replacement_grace_seconds",
+            self.replacement_grace_seconds,
+            minimum=0,
+            maximum=366 * 24 * 60 * 60,
+        )
+        _validate_cleanup_int(
+            "staging_grace_seconds",
+            self.staging_grace_seconds,
+            minimum=0,
+            maximum=366 * 24 * 60 * 60,
+        )
+        _validate_cleanup_int(
+            "cleanup_slo_seconds",
+            self.cleanup_slo_seconds,
+            minimum=1,
+            maximum=366 * 24 * 60 * 60,
+        )
+        _validate_cleanup_int(
+            "successful_audit_retention_days",
+            self.successful_audit_retention_days,
+            minimum=30,
+            maximum=3650,
+        )
+        _validate_cleanup_float(
+            "lease_duration_seconds",
+            self.lease_duration_seconds,
+            minimum=1.0,
+            maximum=3600.0,
+        )
+        _validate_cleanup_int(
+            "max_concurrent_manifests",
+            self.max_concurrent_manifests,
+            minimum=1,
+            maximum=64,
+        )
+        _validate_cleanup_int("claim_limit", self.claim_limit, minimum=1, maximum=500)
+        _validate_cleanup_int(
+            "object_page_size", self.object_page_size, minimum=1, maximum=1000
+        )
+        _validate_cleanup_int(
+            "delete_batch_size", self.delete_batch_size, minimum=1, maximum=1000
+        )
+        _validate_cleanup_int(
+            "max_prefix_pages_per_manifest_attempt",
+            self.max_prefix_pages_per_manifest_attempt,
+            minimum=1,
+            maximum=10_000,
+        )
+        _validate_cleanup_int(
+            "expired_lease_recovery_limit",
+            self.expired_lease_recovery_limit,
+            minimum=1,
+            maximum=500,
+        )
+        _validate_cleanup_float(
+            "backoff_base_seconds",
+            self.backoff_base_seconds,
+            minimum=0.1,
+            maximum=24 * 60 * 60,
+        )
+        _validate_cleanup_float(
+            "backoff_max_seconds",
+            self.backoff_max_seconds,
+            minimum=0.1,
+            maximum=7 * 24 * 60 * 60,
+        )
+        if self.backoff_max_seconds < self.backoff_base_seconds:
+            raise ValueError(
+                "artifact cleanup backoff_max_seconds must be at least the base"
+            )
+        _validate_cleanup_int(
+            "active_job_query_limit",
+            self.active_job_query_limit,
+            minimum=1,
+            maximum=200,
+        )
+
+    @classmethod
+    def from_env(cls) -> "ArtifactCleanupConfig":
+        defaults = cls()
+        return artifact_cleanup_config_from_values(
+            **{
+                field_name: os.getenv(env_name, str(getattr(defaults, field_name)))
+                for field_name, env_name in _ARTIFACT_CLEANUP_ENV_BY_FIELD.items()
+            }
+        )
+
+    @classmethod
+    def from_values(cls, **values: object) -> "ArtifactCleanupConfig":
+        return artifact_cleanup_config_from_values(**values)
+
+
+def artifact_cleanup_config_from_values(
+    *,
+    replacement_grace_seconds: object = DEFAULT_ARTIFACT_CLEANUP_REPLACEMENT_GRACE_SECONDS,
+    staging_grace_seconds: object = DEFAULT_ARTIFACT_CLEANUP_STAGING_GRACE_SECONDS,
+    cleanup_slo_seconds: object = DEFAULT_ARTIFACT_CLEANUP_SLO_SECONDS,
+    successful_audit_retention_days: object = DEFAULT_ARTIFACT_CLEANUP_SUCCESSFUL_AUDIT_RETENTION_DAYS,
+    lease_duration_seconds: object = DEFAULT_ARTIFACT_CLEANUP_LEASE_DURATION_SECONDS,
+    max_concurrent_manifests: object = DEFAULT_ARTIFACT_CLEANUP_MAX_CONCURRENT_MANIFESTS,
+    claim_limit: object = DEFAULT_ARTIFACT_CLEANUP_CLAIM_LIMIT,
+    object_page_size: object = DEFAULT_ARTIFACT_CLEANUP_OBJECT_PAGE_SIZE,
+    delete_batch_size: object = DEFAULT_ARTIFACT_CLEANUP_DELETE_BATCH_SIZE,
+    max_prefix_pages_per_manifest_attempt: object = DEFAULT_ARTIFACT_CLEANUP_MAX_PREFIX_PAGES_PER_MANIFEST_ATTEMPT,
+    expired_lease_recovery_limit: object = DEFAULT_ARTIFACT_CLEANUP_EXPIRED_LEASE_RECOVERY_LIMIT,
+    backoff_base_seconds: object = DEFAULT_ARTIFACT_CLEANUP_BACKOFF_BASE_SECONDS,
+    backoff_max_seconds: object = DEFAULT_ARTIFACT_CLEANUP_BACKOFF_MAX_SECONDS,
+    active_job_query_limit: object = DEFAULT_ARTIFACT_CLEANUP_ACTIVE_JOB_QUERY_LIMIT,
+) -> ArtifactCleanupConfig:
+    """Coerce env/programmatic cleanup settings through one strict contract."""
+
+    return ArtifactCleanupConfig(
+        replacement_grace_seconds=_coerce_cleanup_int(
+            "replacement_grace_seconds", replacement_grace_seconds
+        ),
+        staging_grace_seconds=_coerce_cleanup_int(
+            "staging_grace_seconds", staging_grace_seconds
+        ),
+        cleanup_slo_seconds=_coerce_cleanup_int(
+            "cleanup_slo_seconds", cleanup_slo_seconds
+        ),
+        successful_audit_retention_days=_coerce_cleanup_int(
+            "successful_audit_retention_days", successful_audit_retention_days
+        ),
+        lease_duration_seconds=_coerce_cleanup_float(
+            "lease_duration_seconds", lease_duration_seconds
+        ),
+        max_concurrent_manifests=_coerce_cleanup_int(
+            "max_concurrent_manifests", max_concurrent_manifests
+        ),
+        claim_limit=_coerce_cleanup_int("claim_limit", claim_limit),
+        object_page_size=_coerce_cleanup_int("object_page_size", object_page_size),
+        delete_batch_size=_coerce_cleanup_int("delete_batch_size", delete_batch_size),
+        max_prefix_pages_per_manifest_attempt=_coerce_cleanup_int(
+            "max_prefix_pages_per_manifest_attempt",
+            max_prefix_pages_per_manifest_attempt,
+        ),
+        expired_lease_recovery_limit=_coerce_cleanup_int(
+            "expired_lease_recovery_limit", expired_lease_recovery_limit
+        ),
+        backoff_base_seconds=_coerce_cleanup_float(
+            "backoff_base_seconds", backoff_base_seconds
+        ),
+        backoff_max_seconds=_coerce_cleanup_float(
+            "backoff_max_seconds", backoff_max_seconds
+        ),
+        active_job_query_limit=_coerce_cleanup_int(
+            "active_job_query_limit", active_job_query_limit
+        ),
+    )
+
+
+def artifact_cleanup_config_from_env() -> ArtifactCleanupConfig:
+    return ArtifactCleanupConfig.from_env()
+
+
+def artifact_cleanup_config_from_args(
+    args: argparse.Namespace,
+) -> ArtifactCleanupConfig:
+    missing = [
+        f"artifact_cleanup_{field_name}"
+        for field_name in _ARTIFACT_CLEANUP_ENV_BY_FIELD
+        if not hasattr(args, f"artifact_cleanup_{field_name}")
+    ]
+    if missing:
+        raise ValueError(
+            "Validated artifact cleanup args are missing: " + ", ".join(missing)
+        )
+    return artifact_cleanup_config_from_values(
+        **{
+            field_name: getattr(args, f"artifact_cleanup_{field_name}")
+            for field_name in _ARTIFACT_CLEANUP_ENV_BY_FIELD
+        }
+    )
+
+
+def _coerce_cleanup_int(name: str, value: object) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"artifact cleanup {name} must be an integer")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        raise ValueError(f"artifact cleanup {name} must be an integer")
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"artifact cleanup {name} must be an integer") from exc
+
+
+def _coerce_cleanup_float(name: str, value: object) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"artifact cleanup {name} must be numeric")
+    try:
+        result = float(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"artifact cleanup {name} must be numeric") from exc
+    if result != result or result in {float("inf"), float("-inf")}:
+        raise ValueError(f"artifact cleanup {name} must be finite")
+    return result
+
+
+def _validate_cleanup_int(name: str, value: int, *, minimum: int, maximum: int) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not minimum <= value <= maximum
+    ):
+        raise ValueError(
+            f"artifact cleanup {name} must be between {minimum} and {maximum}"
+        )
+
+
+def _validate_cleanup_float(
+    name: str, value: float, *, minimum: float, maximum: float
+) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not minimum <= float(value) <= maximum
+    ):
+        raise ValueError(
+            f"artifact cleanup {name} must be between {minimum} and {maximum}"
+        )
 
 
 def normalize_kb_metadata_backend(value: object | None) -> str:
@@ -81,6 +552,165 @@ def normalize_kb_metadata_backend(value: object | None) -> str:
         "Unsupported LIGHTRAG_KB_METADATA_BACKEND: "
         f"{normalized!r}; expected local or postgres"
     )
+
+
+def normalize_artifact_storage_mode(value: object | None) -> str:
+    """Normalize the artifact mode and reject unknown values fail-closed."""
+
+    normalized = "local" if value is None else str(value).strip().lower()
+    if normalized not in ARTIFACT_STORAGE_MODES:
+        raise ValueError(
+            "Unsupported LIGHTRAG_ARTIFACT_STORAGE_MODE: "
+            f"{normalized!r}; expected local or object"
+        )
+    return normalized
+
+
+def configure_artifact_storage_args(args: argparse.Namespace) -> str:
+    """Populate and validate artifact-foundation settings on any args object."""
+
+    configured_mode = getattr(args, "artifact_storage_mode", None)
+    if configured_mode is None:
+        configured_mode = os.getenv("LIGHTRAG_ARTIFACT_STORAGE_MODE", "local")
+    mode = normalize_artifact_storage_mode(configured_mode)
+
+    def configured_value(attribute: str, env_name: str, default: object) -> object:
+        value = getattr(args, attribute, None)
+        if value is not None:
+            return value
+        return os.getenv(env_name, str(default))
+
+    limits = materialization_limits_from_values(
+        max_objects=configured_value(
+            "artifact_materialization_max_objects",
+            MATERIALIZATION_MAX_OBJECTS_ENV,
+            DEFAULT_MATERIALIZATION_MAX_OBJECTS,
+        ),
+        max_total_bytes=configured_value(
+            "artifact_materialization_max_bytes",
+            MATERIALIZATION_MAX_BYTES_ENV,
+            DEFAULT_MATERIALIZATION_MAX_BYTES,
+        ),
+        stale_ttl_seconds=configured_value(
+            "artifact_materialization_stale_ttl_seconds",
+            MATERIALIZATION_STALE_TTL_ENV,
+            DEFAULT_MATERIALIZATION_STALE_TTL_SECONDS,
+        ),
+    )
+    cleanup_defaults = ArtifactCleanupConfig()
+    cleanup_config = artifact_cleanup_config_from_values(
+        **{
+            field_name: configured_value(
+                f"artifact_cleanup_{field_name}",
+                env_name,
+                getattr(cleanup_defaults, field_name),
+            )
+            for field_name, env_name in _ARTIFACT_CLEANUP_ENV_BY_FIELD.items()
+        }
+    )
+
+    args.artifact_storage_mode = mode
+    args.artifact_materialization_max_objects = limits.max_objects
+    args.artifact_materialization_max_bytes = limits.max_total_bytes
+    args.artifact_materialization_stale_ttl_seconds = limits.stale_ttl_seconds
+    for field_name in _ARTIFACT_CLEANUP_ENV_BY_FIELD:
+        setattr(
+            args,
+            f"artifact_cleanup_{field_name}",
+            getattr(cleanup_config, field_name),
+        )
+    if getattr(args, "object_storage_backend", None) is None:
+        args.object_storage_backend = (
+            os.getenv("LIGHTRAG_OBJECT_STORAGE", "local").strip().lower()
+        )
+    return mode
+
+
+def validate_artifact_storage_configuration(
+    args: argparse.Namespace,
+    *,
+    kb_metadata_backend: str | None = None,
+    object_storage_backend: str | None = None,
+    object_storage_available: bool | None = None,
+    canonical_input_root: os.PathLike[str] | str | None = None,
+) -> None:
+    """Validate the Phase-1 startup gate without enabling object lifecycle.
+
+    Object mode remains infrastructure-only in this phase. The gate merely
+    ensures a future object-authoritative lifecycle cannot start against local
+    metadata, disabled object storage, a drifting/unwritable root, or enabled
+    legacy global mutation routes.
+    """
+
+    mode = configure_artifact_storage_args(args)
+    if mode == "local":
+        return
+
+    backend = normalize_kb_metadata_backend(
+        kb_metadata_backend
+        if kb_metadata_backend is not None
+        else getattr(args, "kb_metadata_backend", None)
+    )
+    if backend != "postgres":
+        raise ValueError(
+            "LIGHTRAG_ARTIFACT_STORAGE_MODE=object requires "
+            "LIGHTRAG_KB_METADATA_BACKEND=postgres"
+        )
+
+    storage_backend = (
+        str(
+            object_storage_backend
+            if object_storage_backend is not None
+            else getattr(args, "object_storage_backend", "local")
+        )
+        .strip()
+        .lower()
+    )
+    if storage_backend not in {"s3", "minio"} or object_storage_available is False:
+        raise ValueError(
+            "LIGHTRAG_ARTIFACT_STORAGE_MODE=object requires enabled "
+            "S3/MinIO object storage"
+        )
+
+    if not _config_bool(getattr(args, "enterprise_auth_enabled", False)):
+        raise ValueError(
+            "LIGHTRAG_ARTIFACT_STORAGE_MODE=object requires "
+            "LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true"
+        )
+    if not _config_bool(getattr(args, "enterprise_disable_global_routes", False)):
+        raise ValueError(
+            "LIGHTRAG_ARTIFACT_STORAGE_MODE=object requires "
+            "LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES=true"
+        )
+
+    root_value = (
+        canonical_input_root
+        if canonical_input_root is not None
+        else getattr(args, "input_dir", None)
+    )
+    if root_value is None or not str(root_value).strip():
+        raise ValueError(
+            "LIGHTRAG_ARTIFACT_STORAGE_MODE=object requires a canonical INPUT_DIR"
+        )
+    try:
+        require_posix_materialization_support()
+        ensure_materialization_scratch_root(os.fspath(root_value), probe_writable=True)
+    except RuntimeError as exc:
+        raise ValueError(
+            "LIGHTRAG_ARTIFACT_STORAGE_MODE=object requires POSIX fcntl locking "
+            "and writable canonical INPUT_DIR scratch"
+        ) from exc
+
+
+def validate_artifact_storage_server_admission(args: argparse.Namespace) -> None:
+    """Reject production object mode until its authoritative lifecycle exists."""
+
+    mode = normalize_artifact_storage_mode(getattr(args, "artifact_storage_mode", None))
+    if mode == "object" and not OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED:
+        raise ValueError(
+            "LIGHTRAG_ARTIFACT_STORAGE_MODE=object cannot start the server: "
+            "the object-authoritative document lifecycle is not implemented yet"
+        )
 
 
 def _config_bool(value: object) -> bool:
@@ -279,12 +909,8 @@ def validate_auth_configuration(args: argparse.Namespace) -> None:
     auth_accounts = (getattr(args, "auth_accounts", "") or "").strip()
     token_secret = (getattr(args, "token_secret", "") or "").strip()
     enterprise_enabled = bool(getattr(args, "enterprise_auth_enabled", False))
-    super_admin_username = (
-        getattr(args, "super_admin_username", "") or ""
-    ).strip()
-    super_admin_password = (
-        getattr(args, "super_admin_password", "") or ""
-    ).strip()
+    super_admin_username = (getattr(args, "super_admin_username", "") or "").strip()
+    super_admin_password = (getattr(args, "super_admin_password", "") or "").strip()
     super_admin_password_hash = (
         getattr(args, "super_admin_password_hash", "") or ""
     ).strip()
@@ -403,9 +1029,7 @@ def validate_auth_configuration(args: argparse.Namespace) -> None:
                 "LIGHTRAG_PERSON_AUTH_ENABLED=true requires "
                 "LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true."
             )
-        person_token_secret = (
-            getattr(args, "person_token_secret", "") or ""
-        ).strip()
+        person_token_secret = (getattr(args, "person_token_secret", "") or "").strip()
         if not person_token_secret or person_token_secret == DEFAULT_TOKEN_SECRET:
             raise ValueError(
                 "LIGHTRAG_PERSON_TOKEN_SECRET must be explicitly set to a "
@@ -752,6 +1376,7 @@ def parse_args() -> argparse.Namespace:
     args.kb_metadata_backend = normalize_kb_metadata_backend(
         get_env_value("LIGHTRAG_KB_METADATA_BACKEND", "local")
     )
+    configure_artifact_storage_args(args)
 
     # Get MAX_PARALLEL_INSERT from environment
     args.max_parallel_insert = get_env_value(
@@ -908,9 +1533,7 @@ def parse_args() -> argparse.Namespace:
     args.enterprise_auth_enabled = get_env_value(
         "LIGHTRAG_ENTERPRISE_AUTH_ENABLED", False, bool
     )
-    args.super_admin_username = get_env_value(
-        "LIGHTRAG_SUPER_ADMIN_USERNAME", "admin"
-    )
+    args.super_admin_username = get_env_value("LIGHTRAG_SUPER_ADMIN_USERNAME", "admin")
     args.super_admin_password = get_env_value("LIGHTRAG_SUPER_ADMIN_PASSWORD", None)
     args.super_admin_password_hash = get_env_value(
         "LIGHTRAG_SUPER_ADMIN_PASSWORD_HASH", None
@@ -985,9 +1608,7 @@ def parse_args() -> argparse.Namespace:
     args.person_access_token_ttl = get_env_value(
         "LIGHTRAG_PERSON_ACCESS_TOKEN_TTL", 3600, int
     )
-    args.person_session_ttl = get_env_value(
-        "LIGHTRAG_PERSON_SESSION_TTL", 28800, int
-    )
+    args.person_session_ttl = get_env_value("LIGHTRAG_PERSON_SESSION_TTL", 28800, int)
     args.person_login_max_attempts = get_env_value(
         "LIGHTRAG_PERSON_LOGIN_MAX_ATTEMPTS", 5, int
     )
@@ -1101,12 +1722,8 @@ def parse_args() -> argparse.Namespace:
         "MEMORY_LLM_SMALL_MODEL", None, str, special_none=True
     )
     args.memory_llm_timeout = get_env_value("MEMORY_LLM_TIMEOUT", 300, int)
-    args.memory_llm_temperature = get_env_value(
-        "MEMORY_LLM_TEMPERATURE", 0.0, float
-    )
-    args.memory_llm_max_tokens = get_env_value(
-        "MEMORY_LLM_MAX_TOKENS", 16384, int
-    )
+    args.memory_llm_temperature = get_env_value("MEMORY_LLM_TEMPERATURE", 0.0, float)
+    args.memory_llm_max_tokens = get_env_value("MEMORY_LLM_MAX_TOKENS", 16384, int)
     args.memory_openai_llm_extra_body = get_env_value(
         "MEMORY_OPENAI_LLM_EXTRA_BODY", None, str, special_none=True
     )
@@ -1150,17 +1767,11 @@ def parse_args() -> argparse.Namespace:
     args.chat_memory_allow_cross_provider_query_egress = get_chat_memory_env_value(
         "ALLOW_CROSS_PROVIDER_QUERY_EGRESS", False, bool
     )
-    args.memory_ingest_concurrency = get_env_value(
-        "MEMORY_INGEST_CONCURRENCY", 2, int
-    )
+    args.memory_ingest_concurrency = get_env_value("MEMORY_INGEST_CONCURRENCY", 2, int)
     args.memory_max_coroutines = get_env_value("MEMORY_MAX_COROUTINES", 4, int)
-    args.memory_ingest_max_chars = get_env_value(
-        "MEMORY_INGEST_MAX_CHARS", 6000, int
-    )
+    args.memory_ingest_max_chars = get_env_value("MEMORY_INGEST_MAX_CHARS", 6000, int)
     # Rerank memory facts with the deployment reranker (cross-encoder recipe).
-    args.memory_rerank_enabled = get_env_value(
-        "MEMORY_RERANK_ENABLED", False, bool
-    )
+    args.memory_rerank_enabled = get_env_value("MEMORY_RERANK_ENABLED", False, bool)
     # immediate: distill each persisted batch right away; debounced: buffer
     # per session and flush after MEMORY_INGEST_DEBOUNCE_SECONDS of quiet.
     args.memory_ingest_mode = get_env_value("MEMORY_INGEST_MODE", "immediate")
@@ -1345,6 +1956,7 @@ def initialize_config(args=None, force=False):
         return _global_args
 
     resolved_args = args if args is not None else parse_args()
+    configure_artifact_storage_args(resolved_args)
     validate_auth_configuration(resolved_args)
     validate_chat_memory_configuration(resolved_args)
     validate_bedrock_auth_configuration(resolved_args)

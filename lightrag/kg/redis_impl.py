@@ -1,6 +1,7 @@
 import os
 import logging
-from typing import Any, final, Union
+import asyncio
+from typing import Any, final, Mapping, Union
 from dataclasses import dataclass
 import pipmaster as pm
 import configparser
@@ -20,6 +21,11 @@ from lightrag.base import (
     DocStatusStorage,
     DocStatus,
     DocProcessingStatus,
+)
+from lightrag.artifact_runtime import (
+    PipelineAttemptCommitOutcomeUnknownError,
+    PipelineAttemptRowKind,
+    extract_pipeline_attempt_token,
 )
 from ..kg.shared_storage import get_data_init_lock
 import json
@@ -53,6 +59,132 @@ redis_retry = retry(
     ),
     before_sleep=before_sleep_log(logger, logging.WARNING),
 )
+
+
+_PIPELINE_ATTEMPT_COMPARE_AND_SET_LUA = """
+local current = redis.call("GET", KEYS[1])
+if not current then
+    return 0
+end
+
+local decoded_ok, decoded = pcall(cjson.decode, current)
+if not decoded_ok or type(decoded) ~= "table" then
+    return 0
+end
+
+local token = nil
+if ARGV[1] == "full_docs" then
+    local binding = decoded["artifact_binding"]
+    if type(binding) == "table" then
+        token = binding["claim_token"]
+    end
+elseif ARGV[1] == "doc_status" then
+    local metadata = decoded["metadata"]
+    if type(metadata) == "table" then
+        token = metadata["pipeline_attempt_token"]
+    end
+else
+    return redis.error_reply("unsupported pipeline attempt row kind")
+end
+
+if type(token) ~= "string" or token == "" or token ~= ARGV[2] then
+    return 0
+end
+
+redis.call("SET", KEYS[1], ARGV[3], "KEEPTTL")
+return 1
+""".strip()
+
+
+def _decode_redis_json(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(value, str):
+        return None
+    try:
+        decoded = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+async def _compare_and_commit_pipeline_attempt(
+    storage: Any,
+    key: str,
+    payload: Mapping[str, Any],
+    *,
+    expected_attempt_token: str,
+    row_kind: PipelineAttemptRowKind,
+) -> bool:
+    if row_kind not in {"full_docs", "doc_status"}:
+        raise ValueError(f"Unsupported pipeline attempt row kind: {row_kind!r}")
+    if not isinstance(expected_attempt_token, str) or not expected_attempt_token:
+        raise ValueError("expected_attempt_token must be a non-empty string")
+    if not isinstance(payload, Mapping):
+        raise TypeError("Pipeline attempt CAS payload must be a mapping")
+    if (
+        extract_pipeline_attempt_token(payload, row_kind=row_kind)
+        != expected_attempt_token
+    ):
+        raise ValueError(
+            "Pipeline attempt CAS payload must preserve the expected token"
+        )
+
+    redis_key = f"{storage.final_namespace}:{key}"
+    serialized_payload = json.dumps(dict(payload))
+
+    async with storage._get_redis_connection() as redis:
+        try:
+            result = await redis.eval(
+                _PIPELINE_ATTEMPT_COMPARE_AND_SET_LUA,
+                1,
+                redis_key,
+                row_kind,
+                expected_attempt_token,
+                serialized_payload,
+            )
+        except (ConnectionError, TimeoutError) as script_error:
+            try:
+                current = await redis.get(redis_key)
+            except asyncio.CancelledError:
+                raise
+            except Exception as readback_error:
+                raise PipelineAttemptCommitOutcomeUnknownError(
+                    key,
+                    row_kind=row_kind,
+                    reason=type(script_error).__name__,
+                ) from readback_error
+
+            if isinstance(current, bytes):
+                exact_payload = current == serialized_payload.encode("utf-8")
+            else:
+                exact_payload = current == serialized_payload
+            if exact_payload:
+                return True
+
+            decoded = _decode_redis_json(current)
+            if (
+                extract_pipeline_attempt_token(decoded, row_kind=row_kind)
+                != expected_attempt_token
+            ):
+                return False
+
+            # The attempt is still current, but the stored payload is not the
+            # candidate. The lost script response therefore cannot be resolved.
+            raise PipelineAttemptCommitOutcomeUnknownError(
+                key,
+                row_kind=row_kind,
+                reason=type(script_error).__name__,
+            ) from script_error
+
+    if result in (1, "1", b"1"):
+        return True
+    if result in (0, "0", b"0"):
+        return False
+    raise RedisError(f"Unexpected pipeline attempt CAS result: {result!r}")
 
 
 class RedisConnectionManager:
@@ -314,6 +446,23 @@ class RedisKVStorage(BaseKVStorage):
 
             existing_ids = {keys_list[i] for i, exists in enumerate(results) if exists}
             return set(keys) - existing_ids
+
+    async def compare_and_commit_pipeline_attempt(
+        self,
+        key: str,
+        payload: Mapping[str, Any],
+        *,
+        expected_attempt_token: str,
+        row_kind: PipelineAttemptRowKind,
+    ) -> bool:
+        """Atomically replace a current pipeline-attempt row in Redis."""
+        return await _compare_and_commit_pipeline_attempt(
+            self,
+            key,
+            payload,
+            expected_attempt_token=expected_attempt_token,
+            row_kind=row_kind,
+        )
 
     @redis_retry
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
@@ -663,6 +812,23 @@ class RedisDocStatusStorage(DocStatusStorage):
 
             existing_ids = {keys_list[i] for i, exists in enumerate(results) if exists}
             return set(keys) - existing_ids
+
+    async def compare_and_commit_pipeline_attempt(
+        self,
+        key: str,
+        payload: Mapping[str, Any],
+        *,
+        expected_attempt_token: str,
+        row_kind: PipelineAttemptRowKind,
+    ) -> bool:
+        """Atomically replace a current pipeline-attempt row in Redis."""
+        return await _compare_and_commit_pipeline_attempt(
+            self,
+            key,
+            payload,
+            expected_attempt_token=expected_attempt_token,
+            row_kind=row_kind,
+        )
 
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
         ordered_results: list[dict[str, Any] | None] = []

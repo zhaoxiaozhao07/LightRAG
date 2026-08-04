@@ -361,7 +361,8 @@ def test_carry_over_keys_grouped_by_stage():
 
     The tuple order is the WebUI ``DocumentStatusDetailsDialog`` render order,
     so per-stage fields must stay grouped (parse-stage fields then analyze-stage
-    trio). ``parse_format`` / ``parse_engine`` join the parse-stage group so
+    trio). ``pipeline_attempt_token`` stays with the durable directives while
+    ``parse_format`` / ``parse_engine`` join the parse-stage group so
     they are stamped at PARSING (once the engine has run) and carried through
     to PROCESSED instead of only landing at PROCESSING. Locking the order here
     forces any future field addition to update this assertion alongside the
@@ -372,6 +373,7 @@ def test_carry_over_keys_grouped_by_stage():
     assert _DOC_STATUS_METADATA_CARRY_OVER_KEYS == (
         "process_options",
         "source_file",
+        "pipeline_attempt_token",
         "parse_warnings",
         "chunk_opts",
         "parse_start_time",

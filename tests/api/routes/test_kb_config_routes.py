@@ -1310,8 +1310,8 @@ def test_create_app_selects_postgres_kb_metadata_backend(tmp_path, monkeypatch):
     monkeypatch.setattr(lightrag_server, "PostgresMetadataStore", FakePostgresMetadataStore)
     monkeypatch.setattr(
         lightrag_server,
-        "create_object_storage_from_env",
-        lambda: fake_object_storage,
+        "create_object_storage",
+        lambda _config: fake_object_storage,
     )
 
     args = parse_args()

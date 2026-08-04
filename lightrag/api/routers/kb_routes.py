@@ -12,6 +12,7 @@ from lightrag.api.job_service import JobService
 from lightrag.api.kb_deletion_service import (
     KBDeletionService,
     KBHardDeleteInProgressError,
+    KBHardDeleteUnsupportedError,
 )
 from lightrag.api.kb_service import (
     LEGACY_PROVENANCE_METADATA_KEYS,
@@ -840,6 +841,15 @@ def create_kb_routes(
                     "hard-delete" if hard else "soft-delete",
                 )
             if hard:
+                if deletion_service is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="KB hard-delete service is not configured",
+                    )
+                try:
+                    deletion_service.assert_hard_delete_supported()
+                except KBHardDeleteUnsupportedError as exc:
+                    raise HTTPException(status_code=503, detail=str(exc)) from exc
                 # Idempotent hard delete: if the KB is already soft-deleted,
                 # skip the (now failing) soft-delete step and run the destructive
                 # clear directly. Without this, a hard delete that fails midway
@@ -850,11 +860,6 @@ def create_kb_routes(
                     record = await kb_service.delete(
                         kb_id,
                         expected_generation=authorized_record.generation,
-                    )
-                if deletion_service is None:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="KB hard-delete service is not configured",
                     )
                 if _hard_delete_worker_enabled(request):
                     job = await deletion_service.enqueue_hard_delete(

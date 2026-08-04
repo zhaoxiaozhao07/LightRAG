@@ -171,9 +171,12 @@ async def test_parse_worker_drops_body_and_sets_summary_length(tmp_path):
 
         # The doc was handed off to q_analyze exactly once.
         assert ctx.q_analyze.qsize() == 1
-        enq_doc_id, enq_status_doc, enq_parsed = ctx.q_analyze.get_nowait()
+        enq_doc_id, enq_status_doc, enq_parsed, enq_session = (
+            ctx.q_analyze.get_nowait()
+        )
 
         assert enq_doc_id == doc_id
+        assert enq_session is None
         # The heavy body must be gone from the queue payload.
         assert "content" not in enq_parsed
         # Light metadata still rides along.

@@ -1157,3 +1157,91 @@ LightRAG采用异步文档索引机制，便于前端监控和查询文档处理
 * 内容摘要和元数据
 * 处理失败时的错误信息
 * 创建和更新时间戳
+
+## 对象权威制品存储（Phase 3）
+
+LightRAG 内置了无状态、可水平扩展的制品存储模式：**S3/MinIO 为权威**，持有源字节与生成产物字节；本地文件系统仅作 operation-scoped scratch，**永不**作为持久权威。PostgreSQL 持有生命周期 metadata（jobs、attempt/generation fence、当前指针、cleanup manifest、迁移/协调 checkpoint 与审计）。本节概述该模式、能力闸门、迁移/协调 CLI 与健康可观测性；完整运维细节见 [生产级后端备份恢复 Runbook](./生产级后端备份恢复Runbook.md)。
+
+### 启用对象模式
+
+设置 `LIGHTRAG_ARTIFACT_STORAGE_MODE=object`。对象模式在启动时由 `validate_artifact_storage_configuration` 强制下列前置条件：
+
+- `LIGHTRAG_KB_METADATA_BACKEND=postgres`；
+- `LIGHTRAG_OBJECT_STORAGE` ∈ {`s3`, `minio`} 且可达；
+- `LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true`；
+- `LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES=true`（legacy/global 变更路由在对象模式下永久禁用）；
+- 存在 canonical `INPUT_DIR` 且支持 POSIX `fcntl` 锁、可写 scratch。
+
+### 能力闸门（当前对象模式启动即被拒绝）
+
+即便上述前置条件全部满足，**生产对象模式当前仍被代码能力常量关闭**：
+
+```python
+# lightrag/api/config.py
+OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED = False
+```
+
+这是**代码能力，不是配置**——任何环境变量都无法翻转它。当它为 `False` 时，只要 `LIGHTRAG_ARTIFACT_STORAGE_MODE=object`，`validate_artifact_storage_server_admission(...)` 就会在启动时抛错，服务直接拒绝以对象模式启动。该常量刻意保持 `False`，直到 Phase 3 Gate 3 通过并由代码审翻转为 `True`；翻转之后，对象模式的 destructive 路由还会额外读取 per-KB 白名单 `LIGHTRAG_OBJECT_ROUTE_POLICY`（见 Runbook 第 11 节）。
+
+### 迁移与孤儿协调 CLI
+
+两个离线 CLI（在 `pyproject.toml` 注册）用于准备和对账对象存储内容。两者都复用冻结的 Phase 3.1-A 维护运行基础设施（`planned → uploaded → applied → verified`），dry-run-first、apply 必须显式 `--plan-id ... --yes`、支持 `--resume`，且**永不直接删除对象**——所有删除都经 `ArtifactCleanupService` 的 verified-absence 流程。
+
+| CLI | 入口 | 用途 |
+| --- | ---- | ---- |
+| `lightrag-migrate-artifacts-to-object` | `lightrag.tools.migrate_artifacts_to_object:main` | 把已存在的本地（legacy）制品目录迁移到对象存储，可选地改写文档 `source_object_uri` 指针。显式 `LABEL=/absolute/root` 根、no-follow + lstat/O_NOFOLLOW/fstat 安全读、在线变更 guard、redacted 审计。 |
+| `lightrag-reconcile-orphans` | `lightrag.tools.reconcile_orphans:main` | 扫描 bucket 前缀并对每个对象分类（`eligible / referenced / retained / malformed / unknown_owner / too_new`）。apply 只对 `eligible` 条目入队 `orphan_reconcile` cleanup manifest，永不直接删除。 |
+
+简要用法：
+
+```bash
+# 1) dry-run plan（无副作用；落库一份可审计的计划）
+lightrag-migrate-artifacts-to-object \
+  --working-dir ./rag_storage --bucket lightrag-kb --prefix kb \
+  legacyA=/srv/rag/legacy-a
+lightrag-reconcile-orphans \
+  --working-dir ./rag_storage --bucket lightrag-kb
+
+# 2) apply（需要第 1 步返回的 plan id + 显式 --yes）
+lightrag-migrate-artifacts-to-object \
+  --working-dir ./rag_storage --bucket lightrag-kb --prefix kb \
+  --plan-id mig-plan-<suffix> --yes \
+  legacyA=/srv/rag/legacy-a
+lightrag-reconcile-orphans \
+  --working-dir ./rag_storage --bucket lightrag-kb \
+  --plan-id or-plan-<suffix> --apply --yes
+
+# 3) 中断/租约过期后 resume
+lightrag-reconcile-orphans \
+  --working-dir ./rag_storage --bucket lightrag-kb \
+  --plan-id or-plan-<suffix> --apply --yes --resume
+```
+
+CLI 通过 `LIGHTRAG_OBJECT_STORAGE_*` 环境变量（或 CLI 覆盖参数）读取 S3/MinIO 配置，并通过 `LIGHTRAG_KB_METADATA_BACKEND`（或 `--metadata-backend sqlite|postgres`）选择 metadata 后端。完整选项、安全约束与 apply 后核对见 Runbook 第 9–10 节。
+
+### 健康可观测性（`artifact_lifecycle` 块）
+
+`GET /health` 暴露一个加性的 `artifact_lifecycle` 兄弟块（Phase 3.3，fix-16），由 `_build_artifact_lifecycle_health_block(...)` 构建。它报告有界索引化聚合与一个缓存的 HeadBucket readiness 探针——**永不列举 bucket 内容、永不下载对象**，每个探针在超时/异常时坍缩为 `"not_reported"`（`object_store_ready` 坍缩为 `false`），保证 `/health` 延迟有界。关键字段：
+
+```json
+{
+  "artifact_lifecycle": {
+    "mode": "local | object",
+    "backend": "none | disabled | s3",
+    "capability_admitted": { "implemented": false, "admission_gate_allows_object_mode": false },
+    "object_store_ready": false,
+    "manifests": { "total": 0, "due_pending": 0, "expired_leases": 0, "cleanup_deadline_overdue": 0, "oldest_due_at": null, "...": "..." },
+    "maintenance_runs": 0,
+    "migration_blockers": 0,
+    "unresolved_commit_unknown": 0,
+    "recovery_cursor_stale": 0
+  }
+}
+```
+
+- `mode` / `backend`：当前制品存储模式与稳定、非敏感的后端标签。
+- `capability_admitted.implemented`：镜像 `OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED`（当前为 `false`）。
+- `object_store_ready`：缓存的单次 `head_bucket` 探针（S3 上约 30s TTL；本地模式恒 `false`）。
+- `unresolved_commit_unknown > 0` 表示存在 `error_code=metadata_commit_outcome_unknown` 的 job；系统永不自动恢复——运维处置流程见 Runbook 第 13 节。
+
+legacy `artifact_cleanup` 块（`{enabled, worker_running, pending_count}`）保留不变，向后兼容。完整字段语义、告警指引与运维手册见 [Runbook](./生产级后端备份恢复Runbook.md) 第 12 节。

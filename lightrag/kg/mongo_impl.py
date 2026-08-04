@@ -2,11 +2,13 @@ import os
 import re
 import json
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 import numpy as np
 import configparser
 import asyncio
 
+from collections.abc import Mapping
 from typing import Any, Union, final
 
 from ..base import (
@@ -21,6 +23,11 @@ from ..utils import logger, compute_mdhash_id, _cooperative_yield, merge_source_
 from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 from ..constants import GRAPH_FIELD_SEP, DEFAULT_QUERY_PRIORITY
 from .._version import __version__
+from ..artifact_runtime import (
+    PipelineAttemptCommitOutcomeUnknownError,
+    PipelineAttemptRowKind,
+    extract_pipeline_attempt_token,
+)
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
 
 import pipmaster as pm
@@ -36,6 +43,9 @@ from pymongo.operations import SearchIndexModel  # type: ignore
 from pymongo.driver_info import DriverInfo  # type: ignore
 from pymongo.errors import (  # type: ignore
     PyMongoError,
+    ConnectionFailure,
+    ExecutionTimeout,
+    WriteConcernError,
     DuplicateKeyError,
     BulkWriteError,
 )
@@ -67,6 +77,96 @@ _DUPLICATE_KEY_CODE = 11000
 # watching a large migration see liveness (mirrors the OpenSearch canonical-id
 # migration's progress cadence).
 _EDGE_MIGRATION_PROGRESS_INTERVAL = 50_000
+
+_PIPELINE_ATTEMPT_TOKEN_FIELDS = {
+    "full_docs": "artifact_binding.claim_token",
+    "doc_status": "metadata.pipeline_attempt_token",
+}
+
+
+async def _compare_and_commit_pipeline_attempt(
+    collection: AsyncCollection,
+    key: str,
+    payload: Mapping[str, Any],
+    *,
+    expected_attempt_token: str,
+    row_kind: PipelineAttemptRowKind,
+) -> bool:
+    """Atomically replace one pipeline row when its attempt token still matches.
+
+    The collection is already bound to the storage instance's effective
+    workspace and namespace. ``_id`` plus the nested token therefore completes
+    the row identity/fence in a single acknowledged MongoDB replacement.
+
+    A transport failure can happen after the server applied the replacement but
+    before the acknowledgement reached this process. Reconcile that ambiguity
+    with one exact read-back: the exact replacement proves success, a different
+    (or missing) token proves this attempt no longer owns the row, and the same
+    token with different data remains ambiguous and raises the core unknown-
+    outcome error chained from the original Mongo transport failure.
+    """
+
+    if not isinstance(key, str) or not key:
+        raise ValueError("Pipeline attempt commit key must be a non-empty string")
+    try:
+        token_field = _PIPELINE_ATTEMPT_TOKEN_FIELDS[row_kind]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported pipeline row kind: {row_kind!r}") from exc
+    if not isinstance(expected_attempt_token, str) or not expected_attempt_token:
+        raise ValueError("expected_attempt_token must be a non-empty string")
+    if not isinstance(payload, Mapping):
+        raise TypeError("Pipeline attempt CAS payload must be a mapping")
+
+    replacement = deepcopy(dict(payload))
+    if "_id" in replacement and replacement["_id"] != key:
+        raise ValueError("Pipeline CAS payload _id does not match key")
+    replacement["_id"] = key
+    if (
+        extract_pipeline_attempt_token(replacement, row_kind=row_kind)
+        != expected_attempt_token
+    ):
+        raise ValueError(
+            "Pipeline CAS payload must preserve the expected attempt token"
+        )
+
+    atomic_filter = {
+        "_id": key,
+        token_field: expected_attempt_token,
+    }
+
+    try:
+        result = await collection.replace_one(
+            atomic_filter,
+            replacement,
+            upsert=False,
+        )
+        # Accessing matched_count also enforces PyMongo's acknowledged-result
+        # contract; configured Mongo collections use acknowledged writes.
+        return result.matched_count == 1
+    except (ConnectionFailure, ExecutionTimeout, WriteConcernError) as write_error:
+        try:
+            current = await collection.find_one({"_id": key})
+        except asyncio.CancelledError:
+            raise
+        except Exception as read_error:
+            raise PipelineAttemptCommitOutcomeUnknownError(
+                key,
+                row_kind=row_kind,
+                reason=type(write_error).__name__,
+            ) from read_error
+
+        if current == replacement:
+            return True
+        if (
+            extract_pipeline_attempt_token(current, row_kind=row_kind)
+            != expected_attempt_token
+        ):
+            return False
+        raise PipelineAttemptCommitOutcomeUnknownError(
+            key,
+            row_kind=row_kind,
+            reason=type(write_error).__name__,
+        ) from write_error
 
 
 def _canonical_edge_endpoints(
@@ -390,6 +490,22 @@ class MongoKVStorage(BaseKVStorage):
             doc.setdefault("update_time", 0)
         return doc
 
+    async def compare_and_commit_pipeline_attempt(
+        self,
+        key: str,
+        payload: Mapping[str, Any],
+        *,
+        expected_attempt_token: str,
+        row_kind: PipelineAttemptRowKind,
+    ) -> bool:
+        return await _compare_and_commit_pipeline_attempt(
+            self._data,
+            key,
+            payload,
+            expected_attempt_token=expected_attempt_token,
+            row_kind=row_kind,
+        )
+
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
         cursor = self._data.find({"_id": {"$in": ids}})
         docs = await cursor.to_list(length=None)
@@ -629,6 +745,22 @@ class MongoDocStatusStorage(DocStatusStorage):
 
     async def get_by_id(self, id: str) -> Union[dict[str, Any], None]:
         return await self._data.find_one({"_id": id})
+
+    async def compare_and_commit_pipeline_attempt(
+        self,
+        key: str,
+        payload: Mapping[str, Any],
+        *,
+        expected_attempt_token: str,
+        row_kind: PipelineAttemptRowKind,
+    ) -> bool:
+        return await _compare_and_commit_pipeline_attempt(
+            self._data,
+            key,
+            payload,
+            expected_attempt_token=expected_attempt_token,
+            row_kind=row_kind,
+        )
 
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
         cursor = self._data.find({"_id": {"$in": ids}})

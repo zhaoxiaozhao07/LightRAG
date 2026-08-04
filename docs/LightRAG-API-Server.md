@@ -1155,3 +1155,91 @@ This endpoint provides comprehensive status information including:
 * Content summary and metadata
 * Error messages if processing failed
 * Timestamps for creation and updates
+
+## Object-Authoritative Artifact Storage (Phase 3)
+
+LightRAG ships a stateless, horizontally-scalable artifact storage mode in which **S3/MinIO is the authority** for source bytes and generated artifacts, while the local filesystem is used only as operation-scoped scratch. PostgreSQL holds the lifecycle metadata (jobs, attempt/generation fence, current pointer, cleanup manifest, migration/reconciliation checkpoints, audit). This section summarizes the mode, its capability gate, the migration/reconciliation CLIs, and health observability. For full operational detail, see [Production Backup & Recovery Runbook](./生产级后端备份恢复Runbook.md).
+
+### Enabling object mode
+
+Set `LIGHTRAG_ARTIFACT_STORAGE_MODE=object`. Object mode has hard prerequisites enforced at startup by `validate_artifact_storage_configuration`:
+
+- `LIGHTRAG_KB_METADATA_BACKEND=postgres`;
+- `LIGHTRAG_OBJECT_STORAGE` ∈ {`s3`, `minio`} and reachable;
+- `LIGHTRAG_ENTERPRISE_AUTH_ENABLED=true`;
+- `LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES=true` (legacy/global mutation routes are permanently disabled in object mode);
+- a canonical `INPUT_DIR` that supports POSIX `fcntl` locking and writable scratch.
+
+### Capability gate (object mode rejects at startup today)
+
+Even when all prerequisites are met, **production object mode is currently disabled** by a code-level capability constant:
+
+```python
+# lightrag/api/config.py
+OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED = False
+```
+
+This is a *code capability, not configuration* — it cannot be flipped by any environment variable. While it is `False`, `validate_artifact_storage_server_admission(...)` raises at startup whenever `LIGHTRAG_ARTIFACT_STORAGE_MODE=object`, so the server refuses to start in object mode. The constant is intentionally `False` until Phase 3 Gate 3 passes and a code review flips it to `True`; after the flip, destructive object-mode routes additionally consult the per-KB allowlist `LIGHTRAG_OBJECT_ROUTE_POLICY` (see the Runbook, section 11).
+
+### Migration & orphan reconciliation CLIs
+
+Two offline CLIs (registered in `pyproject.toml`) prepare and reconcile object-storage contents. Both reuse the frozen Phase 3.1-A maintenance-run infrastructure (`planned → uploaded → applied → verified`), are dry-run-first, require explicit `--plan-id ... --yes` to apply, support `--resume`, and never delete objects directly — every deletion is funneled through the `ArtifactCleanupService` verified-absence flow.
+
+| CLI | Entrypoint | Purpose |
+| --- | ---------- | ------- |
+| `lightrag-migrate-artifacts-to-object` | `lightrag.tools.migrate_artifacts_to_object:main` | Migrate existing local (legacy) artifact directories into object storage, optionally rewriting document `source_object_uri` pointers. Explicit `LABEL=/absolute/root` roots, no-follow + lstat/O_NOFOLLOW/fstat safe reads, online-mutation guard, redacted audit. |
+| `lightrag-reconcile-orphans` | `lightrag.tools.reconcile_orphans:main` | Scan a bucket prefix and classify every object (`eligible / referenced / retained / malformed / unknown_owner / too_new`). Apply only enqueues `orphan_reconcile` cleanup manifests for `eligible` entries; never deletes directly. |
+
+Brief usage:
+
+```bash
+# 1) dry-run plan (no side effects; creates an auditable plan row)
+lightrag-migrate-artifacts-to-object \
+  --working-dir ./rag_storage --bucket lightrag-kb --prefix kb \
+  legacyA=/srv/rag/legacy-a
+lightrag-reconcile-orphans \
+  --working-dir ./rag_storage --bucket lightrag-kb
+
+# 2) apply (requires the plan id from step 1 + explicit --yes)
+lightrag-migrate-artifacts-to-object \
+  --working-dir ./rag_storage --bucket lightrag-kb --prefix kb \
+  --plan-id mig-plan-<suffix> --yes \
+  legacyA=/srv/rag/legacy-a
+lightrag-reconcile-orphans \
+  --working-dir ./rag_storage --bucket lightrag-kb \
+  --plan-id or-plan-<suffix> --apply --yes
+
+# 3) resume after an interrupt/lease expiry
+lightrag-reconcile-orphans \
+  --working-dir ./rag_storage --bucket lightrag-kb \
+  --plan-id or-plan-<suffix> --apply --yes --resume
+```
+
+The CLI reads S3/MinIO configuration from the `LIGHTRAG_OBJECT_STORAGE_*` environment variables (or CLI overrides) and selects the metadata backend via `LIGHTRAG_KB_METADATA_BACKEND` (or `--metadata-backend sqlite|postgres`). Full options, safety constraints, and post-apply verification are documented in the Runbook, sections 9–10.
+
+### Health observability (`artifact_lifecycle` block)
+
+`GET /health` exposes an additive `artifact_lifecycle` sibling block (Phase 3.3, fix-16) built by `_build_artifact_lifecycle_health_block(...)`. It reports bounded, indexed aggregates plus a cached HeadBucket readiness probe — **it never lists bucket contents or downloads objects**, and every probe collapses to `"not_reported"` (or `false` for `object_store_ready`) on timeout/error so `/health` latency stays bounded. Key fields:
+
+```json
+{
+  "artifact_lifecycle": {
+    "mode": "local | object",
+    "backend": "none | disabled | s3",
+    "capability_admitted": { "implemented": false, "admission_gate_allows_object_mode": false },
+    "object_store_ready": false,
+    "manifests": { "total": 0, "due_pending": 0, "expired_leases": 0, "cleanup_deadline_overdue": 0, "oldest_due_at": null, "...": "..." },
+    "maintenance_runs": 0,
+    "migration_blockers": 0,
+    "unresolved_commit_unknown": 0,
+    "recovery_cursor_stale": 0
+  }
+}
+```
+
+- `mode` / `backend` reflect the artifact storage mode and a stable, non-sensitive backend label.
+- `capability_admitted.implemented` mirrors `OBJECT_AUTHORITATIVE_LIFECYCLE_IMPLEMENTED` (currently `false`).
+- `object_store_ready` is a cached single `head_bucket` probe (~30s TTL on S3; `false` in local mode).
+- `unresolved_commit_unknown > 0` means a job has `error_code=metadata_commit_outcome_unknown`; the system never auto-resolves it — see the Runbook, section 13, for the operator recovery procedure.
+
+The legacy `artifact_cleanup` block (`{enabled, worker_running, pending_count}`) is preserved unchanged for backward compatibility. Full field semantics, alerting guidance, and operator runbooks are in the [Runbook](./生产级后端备份恢复Runbook.md), section 12.

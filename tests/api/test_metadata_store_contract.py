@@ -28,6 +28,7 @@ throwaway DB on the same server, e.g.::
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import sqlite3
@@ -74,9 +75,8 @@ from lightrag.api.metadata_store import (
 
 pytestmark = pytest.mark.offline
 
-_POSTGRES_DSN = (
-    os.getenv("LIGHTRAG_KB_POSTGRES_TEST_DSN")
-    or os.getenv("POSTGRES_TEST_DSN")
+_POSTGRES_DSN = os.getenv("LIGHTRAG_KB_POSTGRES_TEST_DSN") or os.getenv(
+    "POSTGRES_TEST_DSN"
 )
 
 
@@ -128,7 +128,9 @@ def _unique_kb(store) -> str:
     return kb_id
 
 
-def _doc(kb_id: str, doc_id: str, *, source_key: str | None = None, status: str = "uploaded") -> DocumentRecord:
+def _doc(
+    kb_id: str, doc_id: str, *, source_key: str | None = None, status: str = "uploaded"
+) -> DocumentRecord:
     now = utc_now_iso()
     metadata: dict = {}
     if source_key is not None:
@@ -264,7 +266,9 @@ def _enterprise_api_key(kb_id: str) -> EnterpriseAPIKeyRecord:
     )
 
 
-def _enterprise_invitation(*, expires_at: str | None = None) -> EnterpriseInvitationRecord:
+def _enterprise_invitation(
+    *, expires_at: str | None = None
+) -> EnterpriseInvitationRecord:
     now = utc_now_iso()
     return EnterpriseInvitationRecord(
         id=f"inv_{uuid.uuid4().hex[:10]}",
@@ -315,7 +319,9 @@ async def test_enterprise_metadata_contract(store):
         "registration_enabled", "true", updated_by=user.id
     )
     assert await store.get_enterprise_system_setting("registration_enabled") == "true"
-    assert await store.get_enterprise_system_setting("missing", "fallback") == "fallback"
+    assert (
+        await store.get_enterprise_system_setting("missing", "fallback") == "fallback"
+    )
 
     assert await store.get_enterprise_user_kb_query_settings(user.id, kb_id) is None
     first_settings = await store.upsert_enterprise_user_kb_query_settings(
@@ -328,9 +334,7 @@ async def test_enterprise_metadata_contract(store):
         )
     )
     assert first_settings.user_prompt == "answer in Chinese"
-    fetched_settings = await store.get_enterprise_user_kb_query_settings(
-        user.id, kb_id
-    )
+    fetched_settings = await store.get_enterprise_user_kb_query_settings(user.id, kb_id)
     assert fetched_settings is not None
     assert fetched_settings.user_prompt == "answer in Chinese"
     updated_settings = await store.upsert_enterprise_user_kb_query_settings(
@@ -410,11 +414,11 @@ async def test_enterprise_metadata_contract(store):
     # Filter by actor + target returns both events for this test.
     by_actor = await store.list_audit_events(actor_user_id=user.id, target_id=kb_id)
     assert {e.id for e in by_actor} == {event.id, other.id}
-    assert all(
-        e.actor_user_id == user.id and e.target_id == kb_id for e in by_actor
-    )
+    assert all(e.actor_user_id == user.id and e.target_id == kb_id for e in by_actor)
     # Pagination over the (newest-first) matches.
-    first = await store.list_audit_events(limit=1, actor_user_id=user.id, target_id=kb_id)
+    first = await store.list_audit_events(
+        limit=1, actor_user_id=user.id, target_id=kb_id
+    )
     second = await store.list_audit_events(
         limit=1, offset=1, actor_user_id=user.id, target_id=kb_id
     )
@@ -525,9 +529,7 @@ async def test_audit_service_resolves_omitted_tenant_once_and_preserves_null(
             moved = True
             assert event.actor_tenant_id == tenant_a
             current = await store.get_enterprise_user_by_id(actor.id)
-            current_membership = await store.get_tenant_membership(
-                tenant_a, actor.id
-            )
+            current_membership = await store.get_tenant_membership(tenant_a, actor.id)
             assert current is not None
             assert current_membership is not None
             moved_at = utc_now_iso()
@@ -712,12 +714,8 @@ async def test_tenant_user_kb_override_and_membership_cleanup_contract(store):
     )
     assert denied.effect == "deny" and denied.role is None
     assert denied.created_at == allowed.created_at
-    assert await store.reset_tenant_user_kb_override(
-        tenant_a, kb_id, saved.id
-    ) is True
-    assert await store.reset_tenant_user_kb_override(
-        tenant_a, kb_id, saved.id
-    ) is False
+    assert await store.reset_tenant_user_kb_override(tenant_a, kb_id, saved.id) is True
+    assert await store.reset_tenant_user_kb_override(tenant_a, kb_id, saved.id) is False
 
     await store.upsert_tenant_user_kb_override(allowed)
     user_b = EnterpriseUserRecord(
@@ -751,9 +749,7 @@ async def test_tenant_user_kb_override_and_membership_cleanup_contract(store):
     assert await store.list_user_tenant_kb_overrides(saved.id) == []
 
 
-async def test_override_target_snapshot_cas_blocks_all_stale_writes(
-    store, tmp_path
-):
+async def test_override_target_snapshot_cas_blocks_all_stale_writes(store, tmp_path):
     """A second store cannot use a stale route-admission target snapshot."""
 
     if isinstance(store, SQLiteMetadataStore):
@@ -778,11 +774,12 @@ async def test_override_target_snapshot_cas_blocks_all_stale_writes(
                 initial_user = EnterpriseUserRecord(
                     **{**raw.to_dict(), "tenant_id": tenant_a}
                 )
-                saved, saved_membership = (
-                    await store.upsert_enterprise_user_with_membership(
-                        initial_user,
-                        _membership(raw.id, tenant_a),
-                    )
+                (
+                    saved,
+                    saved_membership,
+                ) = await store.upsert_enterprise_user_with_membership(
+                    initial_user,
+                    _membership(raw.id, tenant_a),
                 )
                 created_user_ids.append(saved.id)
                 assert saved_membership is not None
@@ -846,9 +843,7 @@ async def test_override_target_snapshot_cas_blocks_all_stale_writes(
                             "token_version": current_user.token_version + 1,
                         }
                     await peer.upsert_enterprise_user(
-                        EnterpriseUserRecord(
-                            **{**current_user.to_dict(), **changes}
-                        ),
+                        EnterpriseUserRecord(**{**current_user.to_dict(), **changes}),
                         **_user_cas(current_user),
                     )
 
@@ -883,10 +878,7 @@ async def test_override_target_snapshot_cas_blocks_all_stale_writes(
                             saved.id,
                             **target_cas,
                         )
-                assert (
-                    conflict.value.entity_type
-                    == "tenant_user_kb_override_target"
-                )
+                assert conflict.value.entity_type == "tenant_user_kb_override_target"
 
                 current_override = await store.get_tenant_user_kb_override(
                     tenant_a, kb_id, saved.id
@@ -1167,18 +1159,14 @@ async def test_chat_project_and_session_contract(store):
     assert stranger_msgs == []
 
     assert (
-        await store.delete_chat_message(
-            stranger.id, project.id, s1.id, messages[0].id
-        )
+        await store.delete_chat_message(stranger.id, project.id, s1.id, messages[0].id)
         is False
     )
     assert (
         await store.delete_chat_message(owner.id, project.id, s1.id, messages[0].id)
         is True
     )
-    _, total_after_delete = await store.list_chat_messages(
-        owner.id, project.id, s1.id
-    )
+    _, total_after_delete = await store.list_chat_messages(owner.id, project.id, s1.id)
     assert total_after_delete == 2
 
     assert await store.delete_chat_session(owner.id, project.id, s2.id) == (True, 0)
@@ -1201,9 +1189,7 @@ async def test_chat_project_and_session_contract(store):
     assert await store.delete_enterprise_user(owner.id) is True
     assert await store.get_chat_project(owner.id, second.id) is None
     assert await store.get_chat_session(owner.id, second.id, s3.id) is None
-    _, user_cascade_total = await store.list_chat_messages(
-        owner.id, second.id, s3.id
-    )
+    _, user_cascade_total = await store.list_chat_messages(owner.id, second.id, s3.id)
     assert user_cascade_total == 0
 
 
@@ -1282,8 +1268,7 @@ async def test_chat_memory_episode_contract(store):
     await store.record_chat_memory_episode(_episode("ep-2", 3, 3))
     assert await store.get_chat_memory_watermark(owner.id, project.id, session.id) == 3
     assert all(
-        item.session_id != session.id
-        for item in await store.list_chat_memory_backlog()
+        item.session_id != session.id for item in await store.list_chat_memory_backlog()
     )
 
     covering = await store.find_chat_memory_episodes_covering(
@@ -1460,13 +1445,15 @@ async def test_enterprise_tenant_membership_and_kb_acl_contract(store):
     )
     assert alice_membership.role == "tenant_admin"
     assert bob_membership.role == "tenant_member"
-    assert [item.user_id for item in await store.list_tenant_memberships(tenant_id)] == [
+    assert [
+        item.user_id for item in await store.list_tenant_memberships(tenant_id)
+    ] == [
         alice.id,
         bob.id,
     ]
-    assert [item.tenant_id for item in await store.list_user_tenant_memberships(alice.id)] == [
-        tenant_id
-    ]
+    assert [
+        item.tenant_id for item in await store.list_user_tenant_memberships(alice.id)
+    ] == [tenant_id]
     fetched_membership = await store.get_tenant_membership(tenant_id, alice.id)
     assert fetched_membership is not None
     assert fetched_membership.role == "tenant_admin"
@@ -1623,6 +1610,49 @@ async def test_count_active_jobs_by_principal_and_tenant(store):
     assert await store.count_active_jobs_for_tenant("t_none") == 0
 
 
+async def test_count_active_jobs_globally_is_unscoped_across_kbs(store) -> None:
+    """``count_active_jobs_globally`` aggregates across ALL KBs (no kb_id scope).
+
+    Regression coverage for B-1: the migration online-mutation guard relies on
+    a cross-KB aggregate. The older per-KB ``list_jobs`` could never observe a
+    job seeded under a DIFFERENT ``kb_id``, so the guard silently passed. This
+    contract verifies both backends expose the method AND that jobs in multiple
+    KBs with mixed statuses all roll up to the unscoped count.
+    """
+    # The method exists on both backends (parity contract).
+    assert hasattr(store, "count_active_jobs_globally")
+    assert callable(store.count_active_jobs_globally)
+
+    # Defensive: a malformed query would silently under-count and defeat the
+    # guard, so invalid input must raise rather than be coerced.
+    with pytest.raises(ValueError):
+        await store.count_active_jobs_globally([])
+    with pytest.raises(ValueError):
+        await store.count_active_jobs_globally(["running", 1])  # type: ignore[list-item]
+
+    kb_a = _unique_kb(store)
+    kb_b = _unique_kb(store)
+    # Two active jobs in KB-A, one active in KB-B, one terminal in KB-A.
+    # The aggregate must observe ALL active jobs regardless of kb_id.
+    await store.create_job(_job(kb_a, f"job_{uuid.uuid4().hex[:10]}", status="queued"))
+    await store.create_job(_job(kb_a, f"job_{uuid.uuid4().hex[:10]}", status="running"))
+    await store.create_job(
+        _job(kb_b, f"job_{uuid.uuid4().hex[:10]}", status="cancelling")
+    )
+    await store.create_job(
+        _job(kb_a, f"job_{uuid.uuid4().hex[:10]}", status="succeeded")
+    )
+
+    mutation_statuses = ["queued", "running", "retrying", "cancelling"]
+    # Cross-KB: 2 (KB-A) + 1 (KB-B) == 3. The ``succeeded`` job is excluded.
+    assert await store.count_active_jobs_globally(mutation_statuses) == 3
+    # A narrower status set rolls up correctly too.
+    assert await store.count_active_jobs_globally(["running"]) == 1
+    assert await store.count_active_jobs_globally(["queued", "running"]) == 2
+    # A status that matches no row returns 0 (not an error).
+    assert await store.count_active_jobs_globally(["nonexistent_status"]) == 0
+
+
 async def test_create_documents_and_job_then_read_back(store):
     kb_id = _unique_kb(store)
     doc = _doc(kb_id, "doc_a")
@@ -1640,10 +1670,57 @@ async def test_create_documents_and_job_then_read_back(store):
     assert fetched_job.job_type == "parse"
 
 
+async def test_document_lifecycle_read_includes_logical_delete_until_purge(store):
+    kb_id = _unique_kb(store)
+    document_id = "doc_lifecycle"
+    assert await store.get_document_lifecycle(kb_id, "doc_unknown") is None
+
+    documents, _job_record, created = await store.create_documents_and_job(
+        [_doc(kb_id, document_id)],
+        _job(kb_id, "job_lifecycle", document_id=document_id),
+    )
+    assert created is True
+    live = await store.get_document_lifecycle(kb_id, document_id)
+    assert live == documents[0]
+    assert live.status == "uploaded"
+    assert live.deleted_at is None
+
+    deleted = await store.complete_document_delete(
+        kb_id, document_id, metadata_patch={"delete_contract": "logical"}
+    )
+    tombstone = await store.get_document_lifecycle(kb_id, document_id)
+    assert tombstone == deleted
+    assert tombstone.status == "deleted"
+    assert tombstone.deleted_at is not None
+    assert tombstone.metadata["delete_contract"] == "logical"
+    with pytest.raises(MetadataRecordNotFoundError):
+        await store.get_document(kb_id, document_id)
+
+    await store.purge_kb_metadata(kb_id)
+    assert await store.get_document_lifecycle(kb_id, document_id) is None
+
+
+def test_sqlite_postgres_cleanup_safety_api_signatures_match():
+    from lightrag.api.postgres_metadata_store import PostgresMetadataStore
+
+    for method_name in (
+        "get_document_lifecycle",
+        "list_artifact_cleanup_manifests",
+        "count_artifact_cleanup_manifests",
+        "delete_artifact_recovery_cursor",
+    ):
+        assert inspect.signature(
+            getattr(SQLiteMetadataStore, method_name)
+        ) == inspect.signature(getattr(PostgresMetadataStore, method_name))
+
+
 async def test_list_documents_status_and_source_name_filter(store):
     kb_id = _unique_kb(store)
     await store.create_documents_and_job(
-        [_doc(kb_id, "doc_a", status="parsed"), _doc(kb_id, "doc_b", status="uploaded")],
+        [
+            _doc(kb_id, "doc_a", status="parsed"),
+            _doc(kb_id, "doc_b", status="uploaded"),
+        ],
         _job(kb_id, "job_list", document_id=None),
     )
     parsed, total_parsed = await store.list_documents(kb_id, status="parsed")
@@ -1678,13 +1755,19 @@ async def test_idempotency_key_reuse_and_conflict(store):
 
 async def test_job_transition_and_invalid_transition(store):
     kb_id = _unique_kb(store)
-    await store.create_documents_and_job([_doc(kb_id, "doc_a")], _job(kb_id, "job_t", document_id="doc_a"))
+    await store.create_documents_and_job(
+        [_doc(kb_id, "doc_a")], _job(kb_id, "job_t", document_id="doc_a")
+    )
 
-    running = await store.transition_job(kb_id, "job_t", status="running", stage="parsing", progress=0.5)
+    running = await store.transition_job(
+        kb_id, "job_t", status="running", stage="parsing", progress=0.5
+    )
     assert running.status == "running"
     assert running.stage == "parsing"
 
-    done = await store.transition_job(kb_id, "job_t", status="succeeded", progress=1.0, result={"ok": True})
+    done = await store.transition_job(
+        kb_id, "job_t", status="succeeded", progress=1.0, result={"ok": True}
+    )
     assert done.status == "succeeded"
     assert done.result == {"ok": True}
 
@@ -1752,7 +1835,9 @@ async def test_retry_resets_job_and_enforces_max_retries(store):
     await store.transition_job(kb_id, "job_retry", status="running")
     await store.transition_job(kb_id, "job_retry", status="failed", error_code="boom")
 
-    retried = await store.reset_job_for_retry(kb_id, "job_retry", new_idempotency_key=None)
+    retried = await store.reset_job_for_retry(
+        kb_id, "job_retry", new_idempotency_key=None
+    )
     assert retried.status == "queued"
     assert retried.retry_count == 1
     assert retried.error_code is None
@@ -1935,7 +2020,9 @@ async def test_complete_parse_persists_artifacts_and_replaces_on_retry(store):
     await store.create_documents_and_job(
         [_doc(kb_id, "doc_a")], _job(kb_id, "job_p", document_id="doc_a")
     )
-    await store.mark_document_parsing(kb_id, "doc_a", metadata_patch={"current_parse_job_id": "job_p"})
+    await store.mark_document_parsing(
+        kb_id, "doc_a", metadata_patch={"current_parse_job_id": "job_p"}
+    )
 
     def _artifact(artifact_type: str, suffix: str) -> ArtifactRecord:
         return ArtifactRecord(
@@ -1957,7 +2044,10 @@ async def test_complete_parse_persists_artifacts_and_replaces_on_retry(store):
         parser_hash="sha256:parser",
         lightrag_doc_id="doc-lr-1",
         metadata_patch={"parsed": True},
-        artifacts=[_artifact("original", "a.pdf"), _artifact("blocks", "a.blocks.jsonl")],
+        artifacts=[
+            _artifact("original", "a.pdf"),
+            _artifact("blocks", "a.blocks.jsonl"),
+        ],
     )
     assert doc.status == "parsed"
     assert doc.parser_hash == "sha256:parser"
@@ -1966,7 +2056,9 @@ async def test_complete_parse_persists_artifacts_and_replaces_on_retry(store):
     assert {a.artifact_type for a in listed} == {"original", "blocks"}
 
     # Re-parse replaces artifacts wholesale (no stale residue).
-    await store.mark_document_parsing(kb_id, "doc_a", metadata_patch={"current_parse_job_id": "job_p"})
+    await store.mark_document_parsing(
+        kb_id, "doc_a", metadata_patch={"current_parse_job_id": "job_p"}
+    )
     _doc2, _arts2 = await store.complete_document_parse(
         kb_id,
         "doc_a",
@@ -2058,16 +2150,17 @@ async def test_kb_lifecycle_generation_and_tombstone_contract(store):
     assert activated.deleted_at is None
     # Registering the same active generation is idempotent and does not rewrite
     # its activation timestamp.
-    assert await store.register_kb_generation(
-        kb_id, old_generation, activated_at="must-not-replace-activated-at"
-    ) == activated
+    assert (
+        await store.register_kb_generation(
+            kb_id, old_generation, activated_at="must-not-replace-activated-at"
+        )
+        == activated
+    )
     with pytest.raises(KBLifecycleConflictError):
         await store.activate_kb_generation(kb_id, new_generation)
 
     await store.upsert_kb_acl(direct_acl, expected_generation=old_generation)
-    await store.upsert_tenant_kb_acl(
-        tenant_acl, expected_generation=old_generation
-    )
+    await store.upsert_tenant_kb_acl(tenant_acl, expected_generation=old_generation)
     await store.upsert_tenant_user_kb_override(
         override, expected_generation=old_generation
     )
@@ -2108,9 +2201,7 @@ async def test_kb_lifecycle_generation_and_tombstone_contract(store):
     with pytest.raises(KBLifecycleConflictError):
         await store.upsert_kb_acl(direct_acl)
     with pytest.raises(KBLifecycleConflictError):
-        await store.upsert_tenant_kb_acl(
-            tenant_acl, expected_generation=old_generation
-        )
+        await store.upsert_tenant_kb_acl(tenant_acl, expected_generation=old_generation)
     with pytest.raises(KBLifecycleConflictError):
         await store.upsert_tenant_user_kb_override(
             override, expected_generation=old_generation
@@ -2140,9 +2231,7 @@ async def test_kb_lifecycle_generation_and_tombstone_contract(store):
         await store.create_enterprise_api_key(_enterprise_api_key(kb_id))
 
     await store.upsert_kb_acl(direct_acl, expected_generation=new_generation)
-    await store.upsert_tenant_kb_acl(
-        tenant_acl, expected_generation=new_generation
-    )
+    await store.upsert_tenant_kb_acl(tenant_acl, expected_generation=new_generation)
     await store.upsert_tenant_user_kb_override(
         override, expected_generation=new_generation
     )
@@ -2152,9 +2241,9 @@ async def test_kb_lifecycle_generation_and_tombstone_contract(store):
     )
     assert await store.get_kb_acl_role(kb_id, user.id) == "kb_editor"
     assert await store.get_tenant_kb_acl_role(tenant_id, kb_id) == "kb_admin"
-    assert await store.get_tenant_user_kb_override(
-        tenant_id, kb_id, user.id
-    ) == override
+    assert (
+        await store.get_tenant_user_kb_override(tenant_id, kb_id, user.id) == override
+    )
     assert (await store.get_enterprise_api_key_by_id(new_key.id)) is not None
     assert await store.assert_kb_generation(kb_id, new_generation) == reactivated
 
@@ -2259,9 +2348,7 @@ async def test_kb_deletion_fence_strict_purge_and_completion_contract(store):
     # state/job binding remains so restore/create stay blocked and the same job
     # can retry safely.
     with pytest.raises(RuntimeError, match="injected cleanup failure"):
-        async with store.kb_deletion_guard(
-            kb_id, generation, clear_job_id
-        ) as deleting:
+        async with store.kb_deletion_guard(kb_id, generation, clear_job_id) as deleting:
             assert deleting.state == "deleting"
             assert deleting.delete_job_id == clear_job_id
             raise RuntimeError("injected cleanup failure")
@@ -2283,17 +2370,13 @@ async def test_kb_deletion_fence_strict_purge_and_completion_contract(store):
         ):
             pass
     with pytest.raises(KBLifecycleConflictError):
-        async with store.kb_deletion_guard(
-            kb_id, "old-generation", clear_job_id
-        ):
+        async with store.kb_deletion_guard(kb_id, "old-generation", clear_job_id):
             pass
 
     # The strict purge is generation/job bound. A stale generation cannot
     # remove any current metadata, and the successful purge retains only the
     # clear job needed for final status/audit updates.
-    async with store.kb_deletion_guard(
-        kb_id, generation, clear_job_id
-    ) as retry:
+    async with store.kb_deletion_guard(kb_id, generation, clear_job_id) as retry:
         assert retry.state == "deleting"
         with pytest.raises(KBLifecycleConflictError):
             await store.purge_kb_metadata(
@@ -2326,15 +2409,12 @@ async def test_kb_deletion_fence_strict_purge_and_completion_contract(store):
         still_deleting = await store.get_kb_lifecycle(kb_id)
         assert still_deleting is not None and still_deleting.state == "deleting"
 
-    completed = await store.complete_kb_deletion(
-        kb_id, generation, clear_job_id
-    )
+    completed = await store.complete_kb_deletion(kb_id, generation, clear_job_id)
     assert completed.state == "deleted"
     assert completed.deleted_at is not None
     assert completed.delete_job_id == clear_job_id
     assert (
-        await store.complete_kb_deletion(kb_id, generation, clear_job_id)
-        == completed
+        await store.complete_kb_deletion(kb_id, generation, clear_job_id) == completed
     )
     # Exact deleted retries may acquire the fence for tail-only idempotent work;
     # callers inspect the returned state and must not destroy storage again.
@@ -2378,9 +2458,7 @@ async def test_kb_operation_guards_allow_business_calls_with_single_pool(store):
         assert (await store.get_document(kb_id, document_id)).id == document_id
         assert (await store.get_job(kb_id, delete_job_id)).id == delete_job_id
 
-    async with store.kb_deletion_guard(
-        kb_id, generation, delete_job_id
-    ) as deleting:
+    async with store.kb_deletion_guard(kb_id, generation, delete_job_id) as deleting:
         assert deleting.state == "deleting"
         assert (await store.get_kb_lifecycle(kb_id)).state == "deleting"
         updated = await store.update_job_payload_patch(
@@ -2417,9 +2495,7 @@ async def test_sqlite_kb_operation_fence_waits_and_rejects_new_writers(tmp_path)
     release_exclusive = asyncio.Event()
 
     async def hold_exclusive() -> None:
-        async with deletion_store.kb_deletion_guard(
-            kb_id, generation, delete_job_id
-        ):
+        async with deletion_store.kb_deletion_guard(kb_id, generation, delete_job_id):
             exclusive_entered.set()
             await release_exclusive.wait()
 
@@ -2630,7 +2706,8 @@ async def test_purge_kb_metadata_removes_everything(store):
 async def test_recover_orphan_jobs_marks_running_failed(store):
     kb_id = _unique_kb(store)
     await store.create_documents_and_job(
-        [_doc(kb_id, "doc_a")], _job(kb_id, "job_orphan", job_type="parse", document_id="doc_a")
+        [_doc(kb_id, "doc_a")],
+        _job(kb_id, "job_orphan", job_type="parse", document_id="doc_a"),
     )
     await store.transition_job(kb_id, "job_orphan", status="running")
     recovered = await store.recover_orphan_jobs()
@@ -2723,9 +2800,7 @@ async def test_recovery_respects_cross_store_job_owner_contract(store):
         recovered = await peer.recover_orphan_jobs(grace_seconds=0)
         assert [job.id for job in recovered] == [job_id]
         assert (await store.get_job(kb_id, job_id)).status == "failed"
-        assert (await store.get_document(kb_id, document_id)).status == (
-            "parse_failed"
-        )
+        assert (await store.get_document(kb_id, document_id)).status == ("parse_failed")
     finally:
         await peer.close()
 
@@ -2866,7 +2941,9 @@ def test_postgres_legacy_json_defaults():
     legacy_user = _enterprise_user("pg-legacy")
     legacy_data = legacy_user.to_dict()
     legacy_data.pop("can_download_files")
-    assert _enterprise_user_from_row({"data_json": legacy_data}).can_download_files is True
+    assert (
+        _enterprise_user_from_row({"data_json": legacy_data}).can_download_files is True
+    )
     assert (
         _enterprise_user_from_row(
             {"data_json": {**legacy_data, "can_download_files": False}}
@@ -3457,9 +3534,7 @@ async def test_sqlite_two_store_scoped_user_and_membership_cas(tmp_path):
             f"scoped_revoke_{uuid.uuid4().hex[:8]}", "tenant-a"
         )
         assert revoke_membership is not None
-        promoted_revoke = _membership(
-            revoke_user.id, "tenant-a", role="tenant_admin"
-        )
+        promoted_revoke = _membership(revoke_user.id, "tenant-a", role="tenant_admin")
         promoted_revoke.updated_at = "2099-01-01T00:00:08+00:00"
         await store_b.upsert_tenant_membership(promoted_revoke)
         stale_revoke = EnterpriseUserRecord(
@@ -3545,12 +3620,9 @@ async def test_sqlite_membership_write_failure_rolls_back_user_and_override(tmp_
 
     current = await store.get_enterprise_user_by_id(initial.id)
     assert current == initial
-    assert await store.list_user_tenant_memberships(initial.id) == [
-        original_membership
-    ]
+    assert await store.list_user_tenant_memberships(initial.id) == [original_membership]
     assert (
-        await store.get_tenant_user_kb_override(tenant_a, kb_id, initial.id)
-        == override
+        await store.get_tenant_user_kb_override(tenant_a, kb_id, initial.id) == override
     )
     assert await store.get_tenant_membership(tenant_b, initial.id) is None
     await store.close()
@@ -3649,9 +3721,7 @@ async def test_sqlite_purge_serializes_with_delayed_old_generation_grant(
             updated_at=utc_now_iso(),
         )
 
-        monkeypatch.setattr(
-            metadata_store_module, "_loads_json_object", blocking_loads
-        )
+        monkeypatch.setattr(metadata_store_module, "_loads_json_object", blocking_loads)
         armed = True
         purge_task = asyncio.create_task(
             asyncio.to_thread(
@@ -3664,9 +3734,7 @@ async def test_sqlite_purge_serializes_with_delayed_old_generation_grant(
         grant_task = asyncio.create_task(
             asyncio.to_thread(
                 lambda: asyncio.run(
-                    grant_store.upsert_kb_acl(
-                        grant, expected_generation=generation
-                    )
+                    grant_store.upsert_kb_acl(grant, expected_generation=generation)
                 )
             )
         )
@@ -3694,6 +3762,7 @@ async def test_postgres_schema_migrations_are_idempotent_contract():
             self.schema_versions: set[int] = set()
             self.chat_memory_v2_complete = False
             self.chat_memory_v3_complete = False
+            self.artifact_lifecycle_v6_complete = False
 
         async def execute(self, statement: str, *_args):
             self.statements.append(statement)
@@ -3703,10 +3772,14 @@ async def test_postgres_schema_migrations_are_idempotent_contract():
                 self.schema_versions.add(2)
             if "VALUES (3, clock_timestamp()::text)" in statement:
                 self.schema_versions.add(3)
+            if "VALUES (6, clock_timestamp()::text)" in statement:
+                self.schema_versions.add(6)
             if "uq_enterprise_chat_memory_episode_generation_batch" in statement:
                 self.chat_memory_v2_complete = True
             if "ADD COLUMN IF NOT EXISTS snapshot_digest TEXT" in statement:
                 self.chat_memory_v3_complete = True
+            if "idx_kb_artifact_maintenance_item_uri_digest" in statement:
+                self.artifact_lifecycle_v6_complete = True
             return "OK"
 
         async def fetch(self, statement: str, *_args):
@@ -3714,6 +3787,79 @@ async def test_postgres_schema_migrations_are_idempotent_contract():
             if "SELECT version FROM kb_metadata_schema" in statement:
                 return [
                     {"version": version} for version in sorted(self.schema_versions)
+                ]
+            if (
+                "information_schema.columns" in statement
+                and "kb_artifact_maintenance_runs" in statement
+            ):
+                return (
+                    [{"column_name": "metadata_backend", "is_nullable": "NO"}]
+                    if self.artifact_lifecycle_v6_complete
+                    else []
+                )
+            if (
+                "information_schema.columns" in statement
+                and "kb_artifact_maintenance_items" in statement
+            ):
+                if not self.artifact_lifecycle_v6_complete:
+                    return []
+                return [
+                    {
+                        "column_name": column_name,
+                        "is_nullable": (
+                            "NO"
+                            if column_name in {"logical_group_id", "relative_object_id"}
+                            else "YES"
+                        ),
+                    }
+                    for column_name in (
+                        "kb_id",
+                        "kb_generation",
+                        "workspace",
+                        "document_id",
+                        "artifact_id",
+                        "logical_group_id",
+                        "relative_object_id",
+                        "root_label",
+                        "expected_checksum",
+                        "expected_size_bytes",
+                        "target_uri_authority",
+                        "target_uri_digest",
+                    )
+                ]
+            if "FROM pg_constraint" in statement and "maintenance" in statement:
+                if not self.artifact_lifecycle_v6_complete:
+                    return []
+                return [
+                    {"conname": constraint}
+                    for constraint in (
+                        "kb_artifact_maintenance_run_backend_v6_check",
+                        "kb_artifact_maintenance_item_relative_v6_check",
+                        "kb_artifact_maintenance_item_root_v6_check",
+                        "kb_artifact_maintenance_item_authority_v6_check",
+                        "kb_artifact_maintenance_item_digest_v6_check",
+                        "kb_artifact_maintenance_item_terminal_v6_check",
+                        "kb_artifact_maintenance_item_error_v6_check",
+                    )
+                ]
+            if "FROM pg_indexes" in statement and "maintenance" in statement:
+                if not self.artifact_lifecycle_v6_complete:
+                    return []
+                return [
+                    {"indexname": index}
+                    for index in (
+                        "uq_kb_artifact_maintenance_run_lease_token",
+                        "idx_kb_artifact_maintenance_run_claim",
+                        "idx_kb_artifact_maintenance_run_parent",
+                        "idx_kb_artifact_maintenance_run_backend",
+                        "idx_kb_artifact_maintenance_item_run_state",
+                        "idx_kb_artifact_maintenance_item_subject",
+                        "idx_kb_artifact_maintenance_item_kb",
+                        "idx_kb_artifact_maintenance_item_document",
+                        "idx_kb_artifact_maintenance_item_artifact",
+                        "idx_kb_artifact_maintenance_item_group",
+                        "idx_kb_artifact_maintenance_item_uri_digest",
+                    )
                 ]
             return []
 
@@ -3743,13 +3889,15 @@ async def test_postgres_schema_migrations_are_idempotent_contract():
     assert sql.count("ADD COLUMN IF NOT EXISTS actor_tenant_id") == 2
     assert sql.count("ADD COLUMN IF NOT EXISTS delete_job_id") == 2
     assert sql.count("ADD COLUMN IF NOT EXISTS append_batch_id TEXT") == 2
-    assert sql.count("DROP INDEX IF EXISTS uq_enterprise_chat_memory_episodes_event") == 1
+    assert (
+        sql.count("DROP INDEX IF EXISTS uq_enterprise_chat_memory_episodes_event") == 1
+    )
     assert sql.count("ADD COLUMN IF NOT EXISTS snapshot_digest TEXT") == 2
     assert "VALUES (3, clock_timestamp()::text)" in sql
-    assert (
-        sql.count("enterprise_chat_messages_admission_v2_check")
-        >= 1
-    )
+    assert "VALUES (6, clock_timestamp()::text)" in sql
+    assert sql.count("ADD COLUMN IF NOT EXISTS metadata_backend TEXT") == 1
+    assert "idx_kb_artifact_maintenance_item_uri_digest" in sql
+    assert sql.count("enterprise_chat_messages_admission_v2_check") >= 1
 
 
 async def test_postgres_chat_memory_claim_sql_contract(monkeypatch):
@@ -3873,7 +4021,10 @@ async def test_postgres_lifecycle_uses_advisory_and_row_locks_sql_contract():
         if "FROM enterprise_kb_lifecycle" in statement and "FOR UPDATE" in statement
     ]
     assert len(lock_indexes) == len(row_lock_indexes) == 5
-    assert all(lock_index < row_index for lock_index, row_index in zip(lock_indexes, row_lock_indexes))
+    assert all(
+        lock_index < row_index
+        for lock_index, row_index in zip(lock_indexes, row_lock_indexes)
+    )
     sql = "\n".join(conn.statements)
     assert "state = 'active'" in sql and "delete_job_id IS NULL" in sql
     assert "state = 'deleting'" in sql and "delete_job_id = $3" in sql
@@ -4105,20 +4256,14 @@ async def test_postgres_job_and_kb_guards_share_one_operation_session(monkeypatc
         async with store.job_execution_guard("job-pg-nested") as owned:
             assert owned is True
             async with store.kb_write_guard("kb-pg-nested", "gen-pg-nested"):
-                async with store.kb_write_guard(
-                    "kb-pg-nested", "gen-pg-nested"
-                ):
+                async with store.kb_write_guard("kb-pg-nested", "gen-pg-nested"):
                     pass
 
                 async def child_reentry():
-                    async with store.kb_write_guard(
-                        "kb-pg-nested", "gen-pg-nested"
-                    ):
+                    async with store.kb_write_guard("kb-pg-nested", "gen-pg-nested"):
                         pass
 
-                await asyncio.wait_for(
-                    asyncio.create_task(child_reentry()), timeout=1
-                )
+                await asyncio.wait_for(asyncio.create_task(child_reentry()), timeout=1)
                 async with store.kb_write_guard(
                     "kb-pg-nested-other", "gen-pg-nested-other"
                 ):
@@ -4142,8 +4287,7 @@ async def test_postgres_job_and_kb_guards_share_one_operation_session(monkeypatc
     )
     assert (
         sum(
-            "pg_advisory_unlock_shared" in statement
-            for statement in same_kb_statements
+            "pg_advisory_unlock_shared" in statement for statement in same_kb_statements
         )
         == 1
     )
@@ -4281,7 +4425,9 @@ async def test_postgres_operation_guards_unlock_and_release_on_error_and_cancel(
     assert "pg_advisory_lock(hashtextextended($1, 1263295562))" in statements[0]
     assert "pg_advisory_unlock(hashtextextended($1, 1263295562))" in statements[1]
     assert "pg_advisory_lock_shared(hashtextextended($1, 1263295562))" in statements[2]
-    assert "pg_advisory_unlock_shared(hashtextextended($1, 1263295562))" in statements[3]
+    assert (
+        "pg_advisory_unlock_shared(hashtextextended($1, 1263295562))" in statements[3]
+    )
 
 
 async def test_postgres_operation_guards_preserve_shared_exclusive_order(
@@ -4423,13 +4569,9 @@ async def test_postgres_operation_guards_preserve_shared_exclusive_order(
             exclusive_entered.set()
             await release_exclusive.wait()
 
-    shared_a = asyncio.create_task(
-        shared("shared-a", shared_a_entered, release_shared)
-    )
+    shared_a = asyncio.create_task(shared("shared-a", shared_a_entered, release_shared))
     await asyncio.wait_for(shared_a_entered.wait(), timeout=2)
-    shared_b = asyncio.create_task(
-        shared("shared-b", shared_b_entered, release_shared)
-    )
+    shared_b = asyncio.create_task(shared("shared-b", shared_b_entered, release_shared))
     await asyncio.wait_for(shared_b_entered.wait(), timeout=2)
 
     exclusive_task = asyncio.create_task(exclusive())
@@ -4584,14 +4726,19 @@ async def _enroll(
     EnterprisePersonEnrollmentGrantRecord,
 ]:
     person = person or _person()
-    grant = _person_grant(
-        account_id, token_hash=token_hash, expires_at=expires_at
+    grant = _person_grant(account_id, token_hash=token_hash, expires_at=expires_at)
+    await store.create_person_enrollment_grant_atomic(
+        grant, actor_user_id=actor_user_id
     )
-    await store.create_person_enrollment_grant_atomic(grant, actor_user_id=actor_user_id)
     credential = _person_credential(person.id)
     link = _person_link(person.id, account_id, status="active")
     session = _person_session(person.id, account_id, person_epoch=person.auth_epoch)
-    saved_person, saved_cred, saved_link, saved_session = await store.enroll_person_atomic(
+    (
+        saved_person,
+        saved_cred,
+        saved_link,
+        saved_session,
+    ) = await store.enroll_person_atomic(
         grant_token_hash=grant.token_hash,
         person=person,
         credential=credential,
@@ -4603,7 +4750,9 @@ async def _enroll(
 
 
 async def test_person_crud_and_credential_uniqueness(store):
-    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
 
     saved_person, saved_cred, saved_link, saved_session, grant = await _enroll(
         store, account_id=account.id
@@ -4652,7 +4801,9 @@ async def test_person_crud_and_credential_uniqueness(store):
 
 
 async def test_person_credential_unique_constraint(store):
-    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
     saved_person, _, _, _, _ = await _enroll(store, account_id=account.id)
 
     # A second active password credential for the same person must fail the
@@ -4717,7 +4868,9 @@ async def test_person_credential_unique_constraint(store):
 
 
 async def test_enrollment_grant_partial_unique_index(store):
-    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
     grant1 = _person_grant(account.id)
     await store.create_person_enrollment_grant_atomic(grant1, actor_user_id="usr_admin")
 
@@ -4739,7 +4892,9 @@ async def test_enrollment_grant_partial_unique_index(store):
 
 
 async def test_consume_enrollment_grant_atomic_is_single_use(store):
-    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
     grant = _person_grant(account.id)
     await store.create_person_enrollment_grant_atomic(grant, actor_user_id="usr_admin")
 
@@ -4758,7 +4913,9 @@ async def test_consume_enrollment_grant_atomic_is_single_use(store):
 
     # Expired grant is rejected.
     expired = _person_grant(account.id, expires_at="2000-01-01T00:00:00+00:00")
-    await store.create_person_enrollment_grant_atomic(expired, actor_user_id="usr_admin")
+    await store.create_person_enrollment_grant_atomic(
+        expired, actor_user_id="usr_admin"
+    )
     with pytest.raises(MetadataConflictError):
         await store.consume_enrollment_grant_atomic(
             expired.token_hash, person_id=person.id
@@ -4766,7 +4923,9 @@ async def test_consume_enrollment_grant_atomic_is_single_use(store):
 
 
 async def test_person_link_state_transitions(store):
-    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
     person, _, _, _, _ = await _enroll(store, account_id=account.id)
 
     # Add a second account and propose a pending link to it.
@@ -4807,7 +4966,9 @@ async def test_person_link_state_transitions(store):
 
 
 async def test_person_account_active_link_partial_unique_index(store):
-    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
     # Person 1 binds account as an active link.
     person_a, _, _, _, _ = await _enroll(store, account_id=account.id)
 
@@ -4857,9 +5018,7 @@ async def test_person_session_epoch_advances_on_switch(store):
     # create a fresh session on account_a for the switch test.
     refreshed = await store.get_person_by_id(person.id)
     assert refreshed is not None
-    fresh = _person_session(
-        person.id, account_a.id, person_epoch=refreshed.auth_epoch
-    )
+    fresh = _person_session(person.id, account_a.id, person_epoch=refreshed.auth_epoch)
     created = await store.create_person_session_atomic(
         fresh, expected_person_epoch=refreshed.auth_epoch, actor_user_id=account_a.id
     )
@@ -4898,7 +5057,9 @@ async def test_person_session_epoch_advances_on_switch(store):
 
 
 async def test_enroll_person_atomic_rollback_on_link_conflict(store):
-    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
     # First enrollment binds account as active link.
     await _enroll(store, account_id=account.id)
 
@@ -4906,7 +5067,9 @@ async def test_enroll_person_atomic_rollback_on_link_conflict(store):
     # no orphan person/credential should remain.
     person_b = _person()
     grant_b = _person_grant(account.id)
-    await store.create_person_enrollment_grant_atomic(grant_b, actor_user_id="usr_admin")
+    await store.create_person_enrollment_grant_atomic(
+        grant_b, actor_user_id="usr_admin"
+    )
     with pytest.raises(MetadataConflictError):
         await store.enroll_person_atomic(
             grant_token_hash=grant_b.token_hash,
@@ -4927,7 +5090,9 @@ async def test_enroll_person_atomic_rollback_on_link_conflict(store):
 
 
 async def test_revoke_person_session_and_logout_all(store):
-    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
     person, _, _, session_a, _ = await _enroll(store, account_id=account.id)
     # Create a second session on the same account.
     refreshed = await store.get_person_by_id(person.id)
@@ -4956,7 +5121,9 @@ async def test_revoke_person_session_and_logout_all(store):
 
 
 async def test_rotate_credential_revokes_sessions(store):
-    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
     person, cred, _, _, _ = await _enroll(store, account_id=account.id)
     refreshed = await store.get_person_by_id(person.id)
 
@@ -4978,7 +5145,9 @@ async def test_rotate_credential_revokes_sessions(store):
 
 
 async def test_disable_and_enable_person(store):
-    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
     person, _, _, _, _ = await _enroll(store, account_id=account.id)
     refreshed = await store.get_person_by_id(person.id)
 
@@ -4998,7 +5167,9 @@ async def test_disable_and_enable_person(store):
 
 
 async def test_account_delete_revokes_person_sessions_and_links(store):
-    account = await store.upsert_enterprise_user(_enterprise_user(f"acct_{uuid.uuid4().hex[:10]}"))
+    account = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
     person, _, _, session, _ = await _enroll(store, account_id=account.id)
 
     # The person has an active link + active session pointing at `account`.
@@ -5122,9 +5293,7 @@ async def test_person_identity_events_are_platform_level(store):
     # session on account then switch to account_b.
     refreshed = await store.get_person_by_id(person.id)
     assert refreshed is not None
-    fresh = _person_session(
-        person.id, account.id, person_epoch=refreshed.auth_epoch
-    )
+    fresh = _person_session(person.id, account.id, person_epoch=refreshed.auth_epoch)
     created = await store.create_person_session_atomic(
         fresh, expected_person_epoch=refreshed.auth_epoch, actor_user_id=account.id
     )
@@ -5136,9 +5305,7 @@ async def test_person_identity_events_are_platform_level(store):
     )
 
     # logout-all (writes person_sessions_logout_all).
-    await store.revoke_all_person_sessions_atomic(
-        person.id, actor_user_id=account.id
-    )
+    await store.revoke_all_person_sessions_atomic(person.id, actor_user_id=account.id)
 
     # Grant lifecycle: create + revoke a fresh grant. The target account must
     # exist for the partial-unique index semantics.
@@ -5154,9 +5321,7 @@ async def test_person_identity_events_are_platform_level(store):
     )
 
     # disable then enable person (writes person_disabled / person_enabled).
-    await store.disable_person_atomic(
-        person_id=person.id, actor_user_id=account.id
-    )
+    await store.disable_person_atomic(person_id=person.id, actor_user_id=account.id)
     await store.enable_person_atomic(person_id=person.id, actor_user_id=account.id)
 
     # Collect every person_* event type the contract defines.
@@ -5376,7 +5541,6 @@ async def test_propose_re_propose_after_revoke_reuses_row(store):
     assert refreshed_person.auth_epoch == pre.auth_epoch
 
 
-
 async def test_person_credential_failure_counter_is_atomic(store):
     """Failure counting increments in SQL so concurrent failures never lose a
     count; the lock trips exactly once at the threshold and audit rows land in
@@ -5497,9 +5661,7 @@ async def test_concurrent_switch_and_logout_all_leave_no_live_session(store):
     )
     refreshed = await store.get_person_by_id(person.id)
     assert refreshed is not None
-    fresh = _person_session(
-        person.id, account_a.id, person_epoch=refreshed.auth_epoch
-    )
+    fresh = _person_session(person.id, account_a.id, person_epoch=refreshed.auth_epoch)
     created = await store.create_person_session_atomic(
         fresh, expected_person_epoch=refreshed.auth_epoch
     )
@@ -5585,9 +5747,7 @@ async def test_person_kb_share_materializes_and_revokes_acl(store):
     kb_id = f"kb_{uuid.uuid4().hex[:10]}"
 
     share = _person_kb_share(kb_id, person.id, account_a.id, account_b.id)
-    saved = await store.create_person_kb_share_atomic(
-        share, actor_user_id=account_a.id
-    )
+    saved = await store.create_person_kb_share_atomic(share, actor_user_id=account_a.id)
     assert saved.status == "active"
     assert await store.get_kb_acl_role(kb_id, account_b.id) == "kb_editor"
 

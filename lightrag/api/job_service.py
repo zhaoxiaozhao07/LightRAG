@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from lightrag.api.enterprise_auth import (
@@ -325,15 +326,23 @@ class JobService:
         lightrag_doc_id: str,
         parser_engine: str,
         process_options: str,
-        source_uri: str,
         source_hash: str,
+        source_name: str | None = None,
+        source_object_uri: str | None = None,
+        raw_object_refs: Sequence[dict[str, Any]] | None = None,
+        source_uri: str | None = None,
         force_reparse: bool = False,
         auto_index: bool = False,
         idempotency_key: str | None = None,
     ) -> JobRecord:
+        resolved_source_name = source_name or (
+            Path(source_uri).name if source_uri else None
+        )
         payload = {
             "document_id": document_id,
-            "source_uri": source_uri,
+            "source_name": resolved_source_name,
+            "source_object_uri": source_object_uri,
+            "raw_object_refs": list(raw_object_refs or ()),
             "source_hash": source_hash,
             "parser_engine": parser_engine,
             "process_options": process_options,
@@ -389,15 +398,23 @@ class JobService:
         lightrag_doc_id: str,
         parser_engine: str,
         process_options: str,
-        source_uri: str,
         source_hash: str,
+        source_name: str | None = None,
+        source_object_uri: str | None = None,
+        raw_object_refs: Sequence[dict[str, Any]] | None = None,
+        source_uri: str | None = None,
         force_reparse: bool = False,
         auto_index: bool = False,
         idempotency_key: str | None = None,
     ) -> tuple[JobRecord, bool]:
+        resolved_source_name = source_name or (
+            Path(source_uri).name if source_uri else None
+        )
         payload = {
             "document_id": document_id,
-            "source_uri": source_uri,
+            "source_name": resolved_source_name,
+            "source_object_uri": source_object_uri,
+            "raw_object_refs": list(raw_object_refs or ()),
             "source_hash": source_hash,
             "parser_engine": parser_engine,
             "process_options": process_options,
@@ -771,24 +788,26 @@ class JobService:
         index_hash: str,
         source_hash: str,
         lightrag_doc_id: str,
-        sidecar_uri: str | None,
-        blocks_path: str | None,
-        process_options: str,
+        sidecar_artifact_id: str | None = None,
+        blocks_artifact_id: str | None = None,
+        sidecar_uri: str | None = None,
+        blocks_path: str | None = None,
+        process_options: str | None = None,
         force_rechunk: bool = False,
         force_extract: bool = False,
         force_embedding: bool = False,
         job_type: str = "build_kg",
         idempotency_key: str | None = None,
     ) -> tuple[JobRecord, bool]:
+        del sidecar_uri, blocks_path, process_options
         payload = {
             "document_id": document_id,
             "parser_hash": parser_hash,
             "index_hash": index_hash,
             "source_hash": source_hash,
             "lightrag_doc_id": lightrag_doc_id,
-            "sidecar_uri": sidecar_uri,
-            "blocks_path": blocks_path,
-            "process_options": process_options,
+            "sidecar_artifact_id": sidecar_artifact_id,
+            "blocks_artifact_id": blocks_artifact_id,
             "force_rechunk": force_rechunk,
             "force_extract": force_extract,
             "force_embedding": force_embedding,
@@ -887,6 +906,11 @@ class JobService:
             "delete_llm_cache": delete_llm_cache,
             "delete_graph_orphans": delete_graph_orphans,
             "strategy": strategy,
+            # Per-document COW attempt-token map ({document_id: token}).
+            # Populated by route/worker after the B1 state machine claims or
+            # rotates a token; reused on durable worker resume via Store A
+            # claim idempotency. Each document's token is independent.
+            "attempt_tokens": {},
         }
         payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
         return await self.create_job_once(
@@ -919,6 +943,7 @@ class JobService:
         process_options: str | None = None,
         force_reparse: bool = False,
         idempotency_key: str | None = None,
+        staging_object_uri: str | None = None,
     ) -> tuple[JobRecord, bool]:
         fingerprint_payload = {
             "document_id": document_id,
@@ -939,7 +964,18 @@ class JobService:
         payload = {
             **fingerprint_payload,
             "previous_lightrag_doc_id": previous_lightrag_doc_id,
+            # Per-document COW attempt-token map ({document_id: token}).
+            # Populated by route/worker after the B1 state machine claims or
+            # rotates a token; reused on durable worker resume via Store A
+            # claim idempotancy.
+            "attempt_tokens": {},
         }
+        if staging_object_uri is not None:
+            # Phase 3.2 object-backed staging: the immutable candidate object
+            # URI that carries the replacement bytes across request-process
+            # death and moved-root worker resume. Metadata-only — never a local
+            # path. May also be patched in after staging by the route.
+            payload["staging_object_uri"] = staging_object_uri
         payload["idempotency_fingerprint"] = _idempotency_fingerprint(
             fingerprint_payload
         )
@@ -973,6 +1009,11 @@ class JobService:
             "delete_llm_cache": delete_llm_cache,
             "delete_graph_orphans": delete_graph_orphans,
             "strategy": strategy,
+            # Per-document COW attempt-token map ({document_id: token}).
+            # Each document in the batch gets its own independent token;
+            # partial failures use per-document tokens with the existing
+            # partial_* transition shapes.
+            "attempt_tokens": {},
         }
         payload["idempotency_fingerprint"] = _idempotency_fingerprint(payload)
         return await self.create_job_once(

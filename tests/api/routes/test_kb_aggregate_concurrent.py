@@ -38,7 +38,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from lightrag.api.document_lifecycle_service import DocumentLifecycleService
-from lightrag.api.index_build_service import IndexBuildPlan, IndexBuildService
+from lightrag.api.index_build_service import (
+    BuildArtifactReference,
+    IndexBuildExecution,
+    IndexBuildPlan,
+    IndexBuildService,
+)
 from lightrag.api.job_service import JobService
 from lightrag.api.kb_service import KnowledgeBaseService
 from lightrag.api.lightrag_registry import LightRAGInstanceRegistry, LightRAGLike
@@ -559,8 +564,18 @@ def _document_record(doc_id: str, lr_id: str) -> DocumentRecord:
 def _plan(doc_id: str, lr_id: str) -> IndexBuildPlan:
     return IndexBuildPlan(
         document=_document_record(doc_id, lr_id),
-        sidecar_uri="file:///sidecar/",
-        blocks_path=None,
+        sidecar_artifact=BuildArtifactReference(
+            id=f"artifact-{doc_id}",
+            artifact_type="sidecar",
+            checksum=None,
+            size_bytes=None,
+            object_uri=None,
+            object_prefix_uri=None,
+            compatibility_locator="file:///sidecar/",
+        ),
+        blocks_artifact=None,
+        expected_current_sidecar_artifact_id=None,
+        expected_current_blocks_artifact_id=None,
         parser_hash="sha256:parser",
         index_hash="sha256:index",
         process_options="iF",
@@ -568,6 +583,27 @@ def _plan(doc_id: str, lr_id: str) -> IndexBuildPlan:
         force_extract=False,
         force_embedding=False,
     )
+
+
+def _execution(plan: IndexBuildPlan) -> IndexBuildExecution:
+    return IndexBuildExecution(
+        lease=None,
+        runtime_sidecar_dir=Path("/sidecar"),
+        runtime_sidecar_uri="file:///sidecar/",
+        runtime_blocks_path=Path("/sidecar/paper.blocks.jsonl"),
+        canonical_sidecar_locator=Path("/sidecar"),
+        canonical_blocks_locator=Path("/sidecar/paper.blocks.jsonl"),
+        expected_current_sidecar_artifact_id=None,
+        expected_current_blocks_artifact_id=None,
+        initial_sidecar_checksum="sha256:sidecar",
+        initial_blocks_checksum="sha256:blocks",
+    )
+
+
+def _executions(plans: list[IndexBuildPlan]) -> dict[str, IndexBuildExecution]:
+    return {
+        plan.document.id: _execution(plan) for plan in plans if not plan.skipped
+    }
 
 
 def _service_with_fast_poll() -> IndexBuildService:
@@ -587,7 +623,9 @@ async def test_run_build_batch_waits_out_concurrent_drain(tmp_path):
     rag = ConcurrentFakeRAG("kb_unit", drain_mode="owner", owner_delay=0.05)
     plans = [_plan(f"doc_{i}", f"doc-{i}") for i in range(3)]
 
-    results = await svc.run_build_batch(rag, plans, job_id="job_x")
+    results = await svc.run_build_batch(
+        rag, plans, _executions(plans), job_id="job_x"
+    )
 
     assert set(results) == {"doc_0", "doc_1", "doc_2"}
     for doc_id, run_result in results.items():
@@ -606,7 +644,9 @@ async def test_run_build_batch_classifies_mid_drain_cancel(tmp_path):
     rag = ConcurrentFakeRAG("kb_unit", drain_mode="cancel")
     plans = [_plan("doc_0", "doc-0")]
 
-    results = await svc.run_build_batch(rag, plans, job_id="job_x")
+    results = await svc.run_build_batch(
+        rag, plans, _executions(plans), job_id="job_x"
+    )
 
     assert results["doc_0"].get("cancelled") is True
     assert "error_code" not in results["doc_0"]
@@ -623,7 +663,10 @@ async def test_run_build_batch_skips_skipped_plans(tmp_path):
     skipped.skipped = True
     skipped.skip_reason = "index_hash_match"
 
-    results = await svc.run_build_batch(rag, [runnable, skipped], job_id="job_x")
+    plans = [runnable, skipped]
+    results = await svc.run_build_batch(
+        rag, plans, _executions(plans), job_id="job_x"
+    )
 
     assert results["doc_1"]["skipped"] is True
     assert results["doc_0"]["chunks_count"] == 4
