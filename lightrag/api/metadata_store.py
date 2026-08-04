@@ -2190,6 +2190,9 @@ class EnterprisePersonRecord:
     metadata: dict[str, Any]
     created_at: str
     updated_at: str
+    # Optional human-memorable natural key (工号). Unique among non-null
+    # values; when set, login accepts it in place of the opaque person id.
+    person_number: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "EnterprisePersonRecord":
@@ -2200,6 +2203,9 @@ class EnterprisePersonRecord:
             metadata=_loads_json_object(row["metadata_json"]),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+            person_number=(
+                row["person_number"] if "person_number" in row.keys() else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -2256,6 +2262,9 @@ class EnterprisePersonEnrollmentGrantRecord:
     created_at: str
     updated_at: str
     consumed_at: str | None
+    # Optional 工号 to stamp onto the person created at enroll time. The
+    # persons unique index is the final arbiter when the grant is consumed.
+    person_number: str | None = None
 
     @classmethod
     def from_row(
@@ -2272,6 +2281,9 @@ class EnterprisePersonEnrollmentGrantRecord:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
             consumed_at=row["consumed_at"],
+            person_number=(
+                row["person_number"] if "person_number" in row.keys() else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -10369,6 +10381,74 @@ class SQLiteMetadataStore:
             ).fetchone()
         return EnterprisePersonRecord.from_row(row) if row is not None else None
 
+    async def get_person_by_number(
+        self, person_number: str
+    ) -> EnterprisePersonRecord | None:
+        await self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM enterprise_persons WHERE person_number = ?",
+                (person_number,),
+            ).fetchone()
+        return EnterprisePersonRecord.from_row(row) if row is not None else None
+
+    async def set_person_number_atomic(
+        self,
+        *,
+        person_id: str,
+        person_number: str | None,
+        actor_user_id: str | None = None,
+    ) -> EnterprisePersonRecord:
+        """Bind (or clear, with ``None``) the person's 工号.
+
+        The partial unique index arbitrates concurrent binds of the same
+        number; a collision surfaces as ``MetadataConflictError`` with
+        entity_type ``person_number_unique``. Writes a ``person_number_set``
+        audit row in the same transaction.
+        """
+
+        await self._ensure_initialized()
+
+        def write(conn: sqlite3.Connection) -> EnterprisePersonRecord:
+            now = utc_now_iso()
+            try:
+                cursor = conn.execute(
+                    "UPDATE enterprise_persons "
+                    "SET person_number = ?, updated_at = ? WHERE id = ?",
+                    (person_number, now, person_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise MetadataConflictError(
+                    "person_number_unique",
+                    person_number or "",
+                    expected={"person_number": "unused"},
+                    current={"error": str(exc)},
+                ) from exc
+            if not cursor.rowcount:
+                raise MetadataRecordNotFoundError(
+                    f"Person '{person_id}' not found"
+                )
+            _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_number_set",
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person",
+                    target_id=person_id,
+                    metadata={"person_number": person_number},
+                    created_at=now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM enterprise_persons WHERE id = ?", (person_id,)
+            ).fetchone()
+            assert row is not None
+            return EnterprisePersonRecord.from_row(row)
+
+        return await self._write(write)
+
     async def list_persons(
         self, *, status: str | None = None
     ) -> list[EnterprisePersonRecord]:
@@ -10721,8 +10801,8 @@ class SQLiteMetadataStore:
                     INSERT INTO enterprise_person_enrollment_grants (
                         id, account_id, token_hash, status, created_by,
                         consumed_by_person, expires_at, created_at, updated_at,
-                        consumed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        consumed_at, person_number
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         grant.id,
@@ -10735,6 +10815,7 @@ class SQLiteMetadataStore:
                         grant.created_at,
                         grant.updated_at,
                         grant.consumed_at,
+                        grant.person_number,
                     ),
                 )
             except sqlite3.IntegrityError as exc:
@@ -10963,21 +11044,34 @@ class SQLiteMetadataStore:
                 """,
                 (person.id, now, now, grant_rec.id),
             )
-            conn.execute(
-                """
-                INSERT INTO enterprise_persons (
-                    id, status, auth_epoch, metadata_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    person.id,
-                    person.status,
-                    person.auth_epoch,
-                    _dumps_json(person.metadata),
-                    person.created_at,
-                    person.updated_at,
-                ),
-            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO enterprise_persons (
+                        id, status, auth_epoch, metadata_json, created_at,
+                        updated_at, person_number
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        person.id,
+                        person.status,
+                        person.auth_epoch,
+                        _dumps_json(person.metadata),
+                        person.created_at,
+                        person.updated_at,
+                        person.person_number,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                # 工号 already bound to another person; the transaction rolls
+                # back so the grant stays consumable after the conflict is
+                # resolved.
+                raise MetadataConflictError(
+                    "person_number_unique",
+                    person.person_number or "",
+                    expected={"person_number": "unused"},
+                    current={"error": str(exc)},
+                ) from exc
             conn.execute(
                 """
                 INSERT INTO enterprise_person_credentials (
@@ -14586,6 +14680,7 @@ class SQLiteMetadataStore:
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                person_number TEXT,
                 CHECK (status IN ('active', 'disabled'))
             );
 
@@ -14624,6 +14719,7 @@ class SQLiteMetadataStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 consumed_at TEXT,
+                person_number TEXT,
                 CHECK (status IN ('active', 'consumed', 'revoked', 'expired'))
             );
 
@@ -14750,6 +14846,10 @@ class SQLiteMetadataStore:
             "enterprise_person_login_sessions": {
                 "account_token_version": "INTEGER NOT NULL DEFAULT 0",
             },
+            # person_number (工号): nullable natural key for person login;
+            # grants carry an optional 工号 stamped onto the person at enroll.
+            "enterprise_persons": {"person_number": "TEXT"},
+            "enterprise_person_enrollment_grants": {"person_number": "TEXT"},
             "enterprise_chat_sessions": {
                 "context_rounds": "INTEGER NOT NULL DEFAULT 1",
             },
@@ -14795,6 +14895,15 @@ class SQLiteMetadataStore:
             for column, ddl in columns.items():
                 if column not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+        # Unique among non-null 工号 values. Built here (not in the DDL
+        # script) so pre-existing databases gain the column via the ALTER
+        # above before the index is created.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_enterprise_persons_person_number "
+            "ON enterprise_persons (person_number) "
+            "WHERE person_number IS NOT NULL"
+        )
 
         # Legacy rows used config_fingerprint for both extraction/runtime and
         # physical graph-store identity. Preserve that recoverability while new

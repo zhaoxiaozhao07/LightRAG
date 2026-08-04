@@ -572,6 +572,18 @@ class EnterpriseMetadataStore(Protocol):
         self, person_id: str
     ) -> EnterprisePersonRecord | None: ...
 
+    async def get_person_by_number(
+        self, person_number: str
+    ) -> EnterprisePersonRecord | None: ...
+
+    async def set_person_number_atomic(
+        self,
+        *,
+        person_id: str,
+        person_number: str | None,
+        actor_user_id: str | None = None,
+    ) -> EnterprisePersonRecord: ...
+
     async def list_persons(
         self, *, status: str | None = None
     ) -> list[EnterprisePersonRecord]: ...

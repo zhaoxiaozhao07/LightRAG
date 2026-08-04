@@ -77,7 +77,9 @@ class PersonEnrollRequest(BaseModel):
 
 
 class PersonLoginRequest(BaseModel):
-    person_id: str = Field(..., min_length=1)
+    # Exactly one of person_id / person_number identifies the person.
+    person_id: str | None = Field(None, min_length=1)
+    person_number: str | None = Field(None, min_length=1)
     person_password: str = Field(..., min_length=1)
     account_id: str | None = None
 
@@ -122,6 +124,7 @@ class EnrollmentGrantSummary(BaseModel):
     expired: bool
     created_by: str | None = None
     consumed_by_person: str | None = None
+    person_number: str | None = None
     expires_at: str
     created_at: str
     updated_at: str
@@ -143,6 +146,8 @@ class CreateEnrollmentGrantRequest(BaseModel):
     account_id: str = Field(..., min_length=1)
     ttl_seconds: int = 900
     reason: str | None = None
+    # Optional 工号 stamped onto the person created at enroll time.
+    person_number: str | None = None
 
 
 class EnrollmentGrantResponse(BaseModel):
@@ -150,6 +155,17 @@ class EnrollmentGrantResponse(BaseModel):
     grant_token: str
     account_id: str
     expires_at: str
+    person_number: str | None = None
+
+
+class PersonUpdateRequest(BaseModel):
+    """PATCH /admin/persons/{person_id} body; null/empty clears the 工号."""
+
+    person_number: str | None = None
+
+
+class PersonSummaryResponse(BaseModel):
+    person: dict[str, Any]
 
 
 class ProposeLinkRequest(BaseModel):
@@ -312,6 +328,7 @@ def create_person_routes(
             person_id=body.person_id,
             person_password=body.person_password,
             account_id=body.account_id,
+            person_number=body.person_number,
         )
         return _token_response(request, result)
 
@@ -490,12 +507,14 @@ def create_person_routes(
             account_id=body.account_id,
             created_by=principal.user_id,
             ttl_seconds=body.ttl_seconds,
+            person_number=body.person_number,
         )
         return EnrollmentGrantResponse(
             grant_id=result["grant_id"],
             grant_token=result["grant_token"],
             account_id=result["account_id"],
             expires_at=result["expires_at"],
+            person_number=result.get("person_number"),
         )
 
     @router.delete(
@@ -507,6 +526,25 @@ def create_person_routes(
         _require_interactive_super_admin(request)
         service = _person_service(request)
         return await service.revoke_enrollment_grant(grant_id=grant_id)
+
+    @router.patch(
+        "/admin/persons/{person_id}",
+        response_model=PersonSummaryResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def update_person(
+        request: Request, person_id: str, body: PersonUpdateRequest
+    ):
+        """Bind/rebind/clear the person's 工号 (补录 for existing persons)."""
+
+        _require_person_enabled()
+        principal = _require_interactive_super_admin(request)
+        service = _person_service(request)
+        return await service.set_person_number(
+            person_id=person_id,
+            person_number=body.person_number,
+            actor_user_id=principal.user_id,
+        )
 
     @router.post(
         "/admin/persons/{person_id}/accounts/{account_id}",

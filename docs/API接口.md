@@ -2243,7 +2243,7 @@ GRAPHITI_TELEMETRY_ENABLED=false             # 内网部署关闭 graphiti 匿�
 
 核心概念：
 
-- `person` 是自然人身份（`enterprise_persons.id`，形如 `per_<hex>`），一个 person 可关联多个 `enterprise_users` 账号；一个账号在任一时刻最多一个 active person link（部分唯一索引裁决）。
+- `person` 是自然人身份（`enterprise_persons.id`，形如 `per_<hex>`），一个 person 可关联多个 `enterprise_users` 账号；一个账号在任一时刻最多一个 active person link（部分唯一索引裁决）。person 可绑定唯一**工号**（`person_number`，签发 grant 时指定或事后 `PATCH /admin/persons/{person_id}` 补录），绑定后 `person_id` 与工号均可登录。
 - **person credential（严格 bcrypt）是跨账号切换的信任根**；账号 `password_hash` 只服务 legacy `/login`，**不能**跨账号。
 - 首次建立自然人身份：super admin 线下核验后签发一次性 enrollment grant（绑定精确 `account_id`）→ 用户凭 grant + 自设自然人密码 enroll。
 - 新部门账号：super admin 创建 `pending` link → person 本人用自然人密码 confirm 才变 `active`；admin 不能直接产生 active link。
@@ -2306,7 +2306,7 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
 | `POST` | `/auth/person/enroll` | 公开（grant） | 用一次性 enrollment grant 建立自然人身份，建立首个 active link 并签发首 token，`201` |
-| `POST` | `/auth/person/login` | 公开（person 密码） | 用 person 凭据登录并选择一个 active link 账号 |
+| `POST` | `/auth/person/login` | 公开（person 密码） | 用 person 凭据登录；`person_id` 或工号 `person_number` 二选一，`account_id` 可选（多账号自动落地最近使用） |
 | `GET` | `/auth/person/accounts` | session-control | 列出当前 person 可切换的账号 |
 | `POST` | `/auth/person/switch` | session-control | 在 active link 集合内切换账号，签发新 token |
 | `POST` | `/auth/person/logout` | session-control | 撤销当前 person session |
@@ -2315,6 +2315,7 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
 | `GET` | `/auth/person/links` | session-control | 列出本人全部 link（pending/active/revoked，含账号摘要），`?status=` 过滤 |
 | `POST` | `/auth/person/links/{account_id}:confirm` | session-control + person 密码 | person 本人确认激活 pending link |
 | `GET` | `/admin/persons` | super admin | 自然人列表（每个 person 附带全部状态的 link），`?status=` 过滤 |
+| `PATCH` | `/admin/persons/{person_id}` | super admin | 绑定/改绑/清除 person 的工号（`person_number`，唯一；null/空串清除） |
 | `POST` | `/admin/persons/enrollment-grants` | super admin | 签发一次性 enrollment grant，`201` |
 | `GET` | `/admin/persons/enrollment-grants` | super admin | 已签发 grant 列表（永不回显 token/hash），`?account_id=&status=` 过滤 |
 | `DELETE` | `/admin/persons/enrollment-grants/{grant_id}` | super admin | 撤销未消费的 grant |
@@ -2342,21 +2343,22 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
   "access_token": "<v2 person token>",
   "token_type": "bearer",
   "expires_in": 3600,
-  "person": {"id": "per_...", "status": "active", "auth_epoch": 1, "metadata": {...}, "created_at": "...", "updated_at": "..."},
+  "person": {"id": "per_...", "status": "active", "auth_epoch": 1, "metadata": {...}, "person_number": "E-1001", "created_at": "...", "updated_at": "..."},
   "active_account": {"account_id": "usr_dept_a", "username": "alice_finance", "status": "active", "system_role": "user", "tenant_id": "tenant_finance"},
   "session": {"id": "psess_...", "person_id": "per_...", "active_account_id": "usr_dept_a", "status": "active", "person_epoch": 1, "session_epoch": 1, "absolute_expires_at": "...", "created_at": "...", "last_seen_at": null, "revoked_at": null, "account_token_version": 3}
 }
 ```
 
-主要错误：`400 person_password_weak`（空/首尾空白/过短/超 1024 UTF-8 字节）、`400 cannot_bind_super_admin`、`401 invalid_grant`（grant 不存在/已消费/已撤销/已过期，**统一返回不区分**）、`403 account_not_active`、`409 account_already_linked`（目标账号已有 active person link）、`429 too_many_attempts`（同一客户端地址无效 grant 尝试达 `LIGHTRAG_PERSON_ENROLL_MAX_ATTEMPTS`，带 `Retry-After`）。
+主要错误：`400 person_password_weak`（空/首尾空白/过短/超 1024 UTF-8 字节）、`400 cannot_bind_super_admin`、`401 invalid_grant`（grant 不存在/已消费/已撤销/已过期，**统一返回不区分**）、`403 account_not_active`、`409 account_already_linked`（目标账号已有 active person link）、`409 person_number_conflict`（grant 携带的工号已被其他 person 绑定；事务回滚，grant 保持可消费）、`429 too_many_attempts`（同一客户端地址无效 grant 尝试达 `LIGHTRAG_PERSON_ENROLL_MAX_ATTEMPTS`，带 `Retry-After`）。
 
 > `expires_in` 为 token 的**实际**剩余有效期：取 `LIGHTRAG_PERSON_ACCESS_TOKEN_TTL` 与 session 绝对过期剩余时间的较小值（与签发时对 `exp` 的 min() 截断一致），临近 session 到期时会小于配置的 TTL。enroll/login/switch 响应同此语义。
 
-**`POST /auth/person/login`** —— 用 person 凭据登录。`account_id` 在只有一个 active link 时可省略；多个 active link 时必须显式提供。服务端只按精确 `person_id + account_id` 查找，不接受 email/姓名/用户名推断。
+**`POST /auth/person/login`** —— 用 person 凭据登录。身份标识 `person_id` 与 `person_number`（工号，见 10.6.6 的绑定方式）**二选一**：绑定过工号的 person 两者皆可登录；两个都传或都不传返回 `400 validation_error`。查找是**精确唯一键**匹配（person_id 或唯一工号），不接受 email/姓名/用户名推断。`account_id` 可选：省略时单账号直接登录，多账号自动落地**最近使用**的可用账号（取最新 session 的 `active_account_id`，跳过已禁用/升为 super admin 的候选，兜底最早绑定账号），登录后可 `GET /auth/person/accounts` + `switch` 换账号。
 
 ```json
-// 请求
+// 请求（person_id 与 person_number 二选一；account_id 可选）
 {"person_id": "per_...", "person_password": "自然人密码", "account_id": "usr_dept_a"}
+{"person_number": "E-1001", "person_password": "自然人密码"}
 ```
 
 ```json
@@ -2365,7 +2367,7 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
  "person": {...}, "active_account": {...}, "session": {...}}
 ```
 
-主要错误：`401 invalid_person_credentials`（person/密码/credential 不匹配，**统一返回**；不存在 person 执行 dummy bcrypt 平滑时序）、`403 person_disabled`、`403 account_not_active`、`404 account_not_linked`（无 active link 或指定账号非 active link）、`409 account_selection_required`（多个 active link 未提供 `account_id`）、`429 too_many_attempts`（带 `Retry-After`，连续失败达 `LIGHTRAG_PERSON_LOGIN_MAX_ATTEMPTS` 锁定 900s）。
+主要错误：`400 validation_error`（标识不是恰好一个）、`401 invalid_person_credentials`（person/工号/密码/credential 不匹配，**统一返回**；不存在 person 执行 dummy bcrypt 平滑时序）、`403 person_disabled`、`403 account_not_active`、`404 account_not_linked`（无 active link 或指定账号非 active link）、`429 too_many_attempts`（带 `Retry-After`，连续失败达 `LIGHTRAG_PERSON_LOGIN_MAX_ATTEMPTS` 锁定 900s）。多账号未传 `account_id` 不再返回 `409 account_selection_required`（已改为自动选择）。
 
 #### 10.6.5 session-control 端点
 
@@ -2447,23 +2449,23 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
 ```json
 // 200 响应
 {"persons": [
-   {"id": "per_...", "status": "active", "auth_epoch": 3, "metadata": {"created_via": "enrollment"}, "created_at": "...", "updated_at": "...",
+   {"id": "per_...", "status": "active", "auth_epoch": 3, "metadata": {"created_via": "enrollment"}, "person_number": "E-1001", "created_at": "...", "updated_at": "...",
     "links": [{"id": "plink_...", "account_id": "usr_dept_a", "status": "active", "...": "..."},
               {"id": "plink_...", "account_id": "usr_dept_b", "status": "pending", "...": "..."}]}
  ],
  "total": 1}
 ```
 
-**`POST /admin/persons/enrollment-grants`** —— 签发一次性 grant，绑定精确 `account_id`。明文 grant token 仅返回一次，服务端只存 SHA-256 hash。`ttl_seconds` 下限 60s。
+**`POST /admin/persons/enrollment-grants`** —— 签发一次性 grant，绑定精确 `account_id`。明文 grant token 仅返回一次，服务端只存 SHA-256 hash。`ttl_seconds` 下限 60s。可选 `person_number`（工号）：enroll 消费该 grant 时落到新建 person 上；签发时对已绑定工号做 fail-fast 查重（`409 person_number_conflict`），最终裁决仍是 enroll 时的唯一索引。
 
 ```json
 // 请求
-{"account_id": "usr_dept_a", "ttl_seconds": 900, "reason": "线下核验后建立自然人身份"}
+{"account_id": "usr_dept_a", "ttl_seconds": 900, "person_number": "E-1001", "reason": "线下核验后建立自然人身份"}
 // 201 响应
-{"grant_id": "pgrant_...", "grant_token": "<一次性明文，仅此一次>", "account_id": "usr_dept_a", "expires_at": "2026-07-30T12:15:00Z"}
+{"grant_id": "pgrant_...", "grant_token": "<一次性明文，仅此一次>", "account_id": "usr_dept_a", "expires_at": "2026-07-30T12:15:00Z", "person_number": "E-1001"}
 ```
 
-主要错误：`400 cannot_bind_super_admin`、`404 account_not_found`、`409 active_grant_exists`（该账号已有未消费 active grant）。
+主要错误：`400 cannot_bind_super_admin`、`404 account_not_found`、`409 active_grant_exists`（该账号已有未消费 active grant）、`409 person_number_conflict`（工号已被其他 person 绑定）。
 
 **`GET /admin/persons/enrollment-grants`** —— 已签发 grant 列表。响应**永不**包含明文 token 或 `token_hash`（明文仅在签发时返回一次）。`expired` 为时间判定：`expires_at` 已过即 `true`——`status=active` 且 `expired=true` 的 grant 已不可再消费。可选 `?account_id=` 与 `?status=active|consumed|revoked` 过滤，status 非法值返回 `400 validation_error`。按 `created_at` 倒序（新→旧）。
 
@@ -2471,11 +2473,22 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
 // 200 响应
 {"grants": [
    {"grant_id": "pgrant_...", "account_id": "usr_dept_a", "status": "consumed", "expired": false,
-    "created_by": "usr_admin", "consumed_by_person": "per_...", "expires_at": "...",
+    "created_by": "usr_admin", "consumed_by_person": "per_...", "person_number": "E-1001", "expires_at": "...",
     "created_at": "...", "updated_at": "...", "consumed_at": "..."}
  ],
  "total": 1}
 ```
+
+**`PATCH /admin/persons/{person_id}`** —— 绑定/改绑/清除 person 的工号（存量 person 补录入口）。`person_number` 全局唯一（部分唯一索引，仅约束非空值）；`null` 或空串清除绑定。绑定后 `person_id` 与工号**均可**登录；清除后仅 `person_id` 可登录。同事务写 `person_number_set` 审计。
+
+```json
+// 请求
+{"person_number": "E-1001"}   // 或 {"person_number": null} 清除
+// 200 响应
+{"person": {"id": "per_...", "status": "active", "auth_epoch": 3, "metadata": {...}, "person_number": "E-1001", "created_at": "...", "updated_at": "..."}}
+```
+
+主要错误：`400 validation_error`（工号超长，>64 字符）、`404 person_not_found`、`409 person_number_conflict`（工号已被其他 person 绑定）。
 
 **`DELETE /admin/persons/enrollment-grants/{grant_id}`** —— 撤销未消费 grant。
 
@@ -2540,7 +2553,7 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
 | 403 | `person_disabled` | person 已停用 |
 | 403 | `account_not_active` | 目标账号未 active（enroll/login/switch） |
 | 404 | `person_not_found` / `account_not_found` / `account_not_linked` / `grant_not_found` / `link_not_found` | 资源不存在或无有效关联（tenant admin 提议跨租户目标时也返回 `account_not_found`） |
-| 409 | `account_already_linked` / `account_selection_required` / `session_epoch_conflict` / `active_grant_exists` / `link_state_conflict` | 并发、重复（含对已 active 的 pair 重复提议）或需明确选择 |
+| 409 | `account_already_linked` / `session_epoch_conflict` / `active_grant_exists` / `link_state_conflict` / `person_number_conflict` | 并发、重复（含对已 active 的 pair 重复提议）或工号已被其他 person 绑定；多账号登录未传 `account_id` 已改为自动选择，不再返回 `account_selection_required` |
 | 429 | `too_many_attempts` | 自然人密码失败达阈值（login/confirm-link/change-password 共用计数）或 enroll 触发地址限流，带 `Retry-After` |
 | 503 | `person_auth_unavailable` | 路由已挂载但运行时 flag 关闭（防御性兜底） |
 

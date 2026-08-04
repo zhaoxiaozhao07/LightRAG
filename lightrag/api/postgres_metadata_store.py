@@ -565,7 +565,12 @@ def _person_from_row(row: Any) -> EnterprisePersonRecord:
             data[key] = int(value)
         else:
             data[key] = str(value)
+    # Nullable projection column is authoritative over any stale data_json.
+    if "person_number" in projection_keys:
+        number = row["person_number"]
+        data["person_number"] = str(number) if number is not None else None
     data.setdefault("metadata", {})
+    data.setdefault("person_number", None)
     return EnterprisePersonRecord(**data)
 
 
@@ -588,6 +593,10 @@ def _person_credential_from_row(row: Any) -> EnterprisePersonCredentialRecord:
 def _person_enrollment_grant_from_row(
     row: Any,
 ) -> EnterprisePersonEnrollmentGrantRecord:
+    try:
+        keys = set(row.keys())
+    except (AttributeError, TypeError):
+        keys = set(row) if isinstance(row, dict) else set()
     return EnterprisePersonEnrollmentGrantRecord(
         id=str(row["id"]),
         account_id=str(row["account_id"]),
@@ -599,6 +608,7 @@ def _person_enrollment_grant_from_row(
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
         consumed_at=row["consumed_at"],
+        person_number=row["person_number"] if "person_number" in keys else None,
     )
 
 
@@ -8354,18 +8364,90 @@ class PostgresMetadataStore:
         await self._ensure_initialized()
         async with self._pool_or_raise().acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, status, auth_epoch, created_at, updated_at, data_json "
+                "SELECT id, status, auth_epoch, created_at, updated_at, person_number, data_json "
                 "FROM enterprise_persons WHERE id = $1",
                 person_id,
             )
         return _person_from_row(row) if row is not None else None
+
+    async def get_person_by_number(
+        self, person_number: str
+    ) -> EnterprisePersonRecord | None:
+        await self._ensure_initialized()
+        async with self._pool_or_raise().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, status, auth_epoch, created_at, updated_at, person_number, data_json "
+                "FROM enterprise_persons WHERE person_number = $1",
+                person_number,
+            )
+        return _person_from_row(row) if row is not None else None
+
+    async def set_person_number_atomic(
+        self,
+        *,
+        person_id: str,
+        person_number: str | None,
+        actor_user_id: str | None = None,
+    ) -> EnterprisePersonRecord:
+        """Bind (or clear, with ``None``) the person's 工号.
+
+        Mirrors the SQLite semantics: the partial unique index arbitrates
+        concurrent binds (``MetadataConflictError`` with entity_type
+        ``person_number_unique``), and a ``person_number_set`` audit row lands
+        in the same transaction.
+        """
+
+        await self._ensure_initialized()
+
+        async def write(conn: Any) -> EnterprisePersonRecord:
+            now = utc_now_iso()
+            try:
+                row = await conn.fetchrow(
+                    "UPDATE enterprise_persons "
+                    "SET person_number = $2, updated_at = $3 WHERE id = $1 "
+                    "RETURNING id, status, auth_epoch, created_at, updated_at, "
+                    "person_number, data_json",
+                    person_id,
+                    person_number,
+                    now,
+                )
+            except Exception as exc:
+                asyncpg = _load_asyncpg()
+                if isinstance(exc, asyncpg.UniqueViolationError):
+                    raise MetadataConflictError(
+                        "person_number_unique",
+                        person_number or "",
+                        expected={"person_number": "unused"},
+                        current={"error": str(exc)},
+                    ) from exc
+                raise
+            if row is None:
+                raise MetadataRecordNotFoundError(
+                    f"Person '{person_id}' not found"
+                )
+            await _insert_audit_event(
+                conn,
+                AuditEventRecord(
+                    id=_new_audit_id(),
+                    event_type="person_number_set",
+                    actor_user_id=actor_user_id,
+                    actor_tenant_id=None,
+                    target_type="person",
+                    target_id=person_id,
+                    metadata={"person_number": person_number},
+                    created_at=now,
+                ),
+            )
+            return _person_from_row(row)
+
+        return await self._write(write)
 
     async def list_persons(
         self, *, status: str | None = None
     ) -> list[EnterprisePersonRecord]:
         await self._ensure_initialized()
         sql = (
-            "SELECT id, status, auth_epoch, created_at, updated_at, data_json "
+            "SELECT id, status, auth_epoch, created_at, updated_at, person_number, data_json "
             "FROM enterprise_persons"
         )
         params: list[Any] = []
@@ -8691,8 +8773,8 @@ class PostgresMetadataStore:
                     INSERT INTO enterprise_person_enrollment_grants (
                         id, account_id, token_hash, status, created_by,
                         consumed_by_person, expires_at, created_at, updated_at,
-                        consumed_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        consumed_at, person_number
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                     """,
                     grant.id,
                     grant.account_id,
@@ -8704,6 +8786,7 @@ class PostgresMetadataStore:
                     grant.created_at,
                     grant.updated_at,
                     grant.consumed_at,
+                    grant.person_number,
                 )
             except Exception as exc:
                 asyncpg = _load_asyncpg()
@@ -8930,19 +9013,35 @@ class PostgresMetadataStore:
                 now,
                 now,
             )
-            await conn.execute(
-                """
-                INSERT INTO enterprise_persons (
-                    id, status, auth_epoch, created_at, updated_at, data_json
-                ) VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-                """,
-                person.id,
-                person.status,
-                person.auth_epoch,
-                person.created_at,
-                person.updated_at,
-                _record_json(person),
-            )
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO enterprise_persons (
+                        id, status, auth_epoch, created_at, updated_at,
+                        person_number, data_json
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                    """,
+                    person.id,
+                    person.status,
+                    person.auth_epoch,
+                    person.created_at,
+                    person.updated_at,
+                    person.person_number,
+                    _record_json(person),
+                )
+            except Exception as exc:
+                asyncpg = _load_asyncpg()
+                if isinstance(exc, asyncpg.UniqueViolationError):
+                    # 工号 already bound to another person; the transaction
+                    # rolls back so the grant stays consumable after the
+                    # conflict is resolved.
+                    raise MetadataConflictError(
+                        "person_number_unique",
+                        person.person_number or "",
+                        expected={"person_number": "unused"},
+                        current={"error": str(exc)},
+                    ) from exc
+                raise
             await conn.execute(
                 """
                 INSERT INTO enterprise_person_credentials (
@@ -9043,7 +9142,7 @@ class PostgresMetadataStore:
                 ),
             )
             prow = await conn.fetchrow(
-                "SELECT id, status, auth_epoch, created_at, updated_at, data_json "
+                "SELECT id, status, auth_epoch, created_at, updated_at, person_number, data_json "
                 "FROM enterprise_persons WHERE id = $1",
                 person.id,
             )
@@ -9082,7 +9181,7 @@ class PostgresMetadataStore:
         async def write(conn: Any) -> EnterprisePersonLoginSessionRecord:
             now = session.created_at
             prow = await conn.fetchrow(
-                "SELECT id, status, auth_epoch, created_at, updated_at, data_json "
+                "SELECT id, status, auth_epoch, created_at, updated_at, person_number, data_json "
                 "FROM enterprise_persons WHERE id = $1 FOR UPDATE",
                 session.person_id,
             )
@@ -9279,7 +9378,7 @@ class PostgresMetadataStore:
         ) -> tuple[EnterprisePersonRecord, EnterprisePersonCredentialRecord]:
             now = new_credential.updated_at
             prow = await conn.fetchrow(
-                "SELECT id, status, auth_epoch, created_at, updated_at, data_json "
+                "SELECT id, status, auth_epoch, created_at, updated_at, person_number, data_json "
                 "FROM enterprise_persons WHERE id = $1 FOR UPDATE",
                 person_id,
             )
@@ -9356,7 +9455,7 @@ class PostgresMetadataStore:
                 ),
             )
             prow = await conn.fetchrow(
-                "SELECT id, status, auth_epoch, created_at, updated_at, data_json "
+                "SELECT id, status, auth_epoch, created_at, updated_at, person_number, data_json "
                 "FROM enterprise_persons WHERE id = $1",
                 person_id,
             )
@@ -9385,7 +9484,7 @@ class PostgresMetadataStore:
         async def write(conn: Any) -> EnterprisePersonRecord:
             now = disabled_at or utc_now_iso()
             prow = await conn.fetchrow(
-                "SELECT id, status, auth_epoch, created_at, updated_at, data_json "
+                "SELECT id, status, auth_epoch, created_at, updated_at, person_number, data_json "
                 "FROM enterprise_persons WHERE id = $1 FOR UPDATE",
                 person_id,
             )
@@ -9428,7 +9527,7 @@ class PostgresMetadataStore:
                 ),
             )
             row = await conn.fetchrow(
-                "SELECT id, status, auth_epoch, created_at, updated_at, data_json "
+                "SELECT id, status, auth_epoch, created_at, updated_at, person_number, data_json "
                 "FROM enterprise_persons WHERE id = $1",
                 person_id,
             )
@@ -9449,7 +9548,7 @@ class PostgresMetadataStore:
         async def write(conn: Any) -> EnterprisePersonRecord:
             now = enabled_at or utc_now_iso()
             prow = await conn.fetchrow(
-                "SELECT id, status, auth_epoch, created_at, updated_at, data_json "
+                "SELECT id, status, auth_epoch, created_at, updated_at, person_number, data_json "
                 "FROM enterprise_persons WHERE id = $1 FOR UPDATE",
                 person_id,
             )
@@ -9477,7 +9576,7 @@ class PostgresMetadataStore:
                 ),
             )
             row = await conn.fetchrow(
-                "SELECT id, status, auth_epoch, created_at, updated_at, data_json "
+                "SELECT id, status, auth_epoch, created_at, updated_at, person_number, data_json "
                 "FROM enterprise_persons WHERE id = $1",
                 person_id,
             )
@@ -9590,7 +9689,7 @@ class PostgresMetadataStore:
         ) -> tuple[EnterprisePersonRecord, EnterprisePersonAccountLinkRecord]:
             now = confirmed_at or utc_now_iso()
             prow = await conn.fetchrow(
-                "SELECT id, status, auth_epoch, created_at, updated_at, data_json "
+                "SELECT id, status, auth_epoch, created_at, updated_at, person_number, data_json "
                 "FROM enterprise_persons WHERE id = $1 FOR UPDATE",
                 person_id,
             )
@@ -9692,7 +9791,7 @@ class PostgresMetadataStore:
                 ),
             )
             prow = await conn.fetchrow(
-                "SELECT id, status, auth_epoch, created_at, updated_at, data_json "
+                "SELECT id, status, auth_epoch, created_at, updated_at, person_number, data_json "
                 "FROM enterprise_persons WHERE id = $1",
                 person_id,
             )
@@ -9860,7 +9959,7 @@ class PostgresMetadataStore:
         async def write(conn: Any) -> tuple[EnterprisePersonRecord, int]:
             now = revoked_at or utc_now_iso()
             prow = await conn.fetchrow(
-                "SELECT id, status, auth_epoch, created_at, updated_at, data_json "
+                "SELECT id, status, auth_epoch, created_at, updated_at, person_number, data_json "
                 "FROM enterprise_persons WHERE id = $1 FOR UPDATE",
                 person_id,
             )
@@ -9903,7 +10002,7 @@ class PostgresMetadataStore:
                 ),
             )
             row = await conn.fetchrow(
-                "SELECT id, status, auth_epoch, created_at, updated_at, data_json "
+                "SELECT id, status, auth_epoch, created_at, updated_at, person_number, data_json "
                 "FROM enterprise_persons WHERE id = $1",
                 person_id,
             )
@@ -12574,6 +12673,7 @@ class PostgresMetadataStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 data_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                person_number TEXT,
                 CHECK (status IN ('active', 'disabled'))
             );
             CREATE INDEX IF NOT EXISTS idx_enterprise_persons_status
@@ -12610,6 +12710,7 @@ class PostgresMetadataStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 consumed_at TEXT,
+                person_number TEXT,
                 CHECK (status IN ('active', 'consumed', 'revoked', 'expired'))
             );
             CREATE UNIQUE INDEX IF NOT EXISTS uq_person_enrollment_grant_active
@@ -12705,6 +12806,28 @@ class PostgresMetadataStore:
             """
             ALTER TABLE enterprise_person_login_sessions
             ADD COLUMN IF NOT EXISTS account_token_version INTEGER NOT NULL DEFAULT 0
+            """
+        )
+        # person_number (工号): nullable natural key for person login; the
+        # unique partial index is created after the ALTERs so pre-existing
+        # databases gain the column first.
+        await conn.execute(
+            """
+            ALTER TABLE enterprise_persons
+            ADD COLUMN IF NOT EXISTS person_number TEXT
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE enterprise_person_enrollment_grants
+            ADD COLUMN IF NOT EXISTS person_number TEXT
+            """
+        )
+        await conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_enterprise_persons_person_number
+                ON enterprise_persons (person_number)
+                WHERE person_number IS NOT NULL
             """
         )
         chat_memory_v2_complete = await self._chat_memory_schema_v2_complete(conn)

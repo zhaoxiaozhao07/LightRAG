@@ -5492,6 +5492,91 @@ async def test_person_and_grant_listing_methods(store):
     assert [g.id for g in revoked_c] == [grant_c1.id]
 
 
+async def test_person_number_bind_lookup_and_conflict(store):
+    """person_number (工号) round-trips on both backends: enroll stamps it,
+    ``get_person_by_number`` resolves it, the partial unique index rejects a
+    second bind (leaving the losing enroll's grant consumable), and
+    ``set_person_number_atomic`` binds/rebinds/clears with audit."""
+
+    number_a = f"PN-{uuid.uuid4().hex[:10]}"
+    account_a = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    person_template = _person()
+    person_template.person_number = number_a
+    person_a, _, _, _, _ = await _enroll(
+        store, account_id=account_a.id, person=person_template
+    )
+
+    fetched = await store.get_person_by_number(number_a)
+    assert fetched is not None
+    assert fetched.id == person_a.id
+    assert fetched.person_number == number_a
+    by_id = await store.get_person_by_id(person_a.id)
+    assert by_id is not None and by_id.person_number == number_a
+
+    # A second enroll with the same 工号 loses to the unique index; the
+    # transaction rolls back so its grant is NOT consumed.
+    account_b = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    clash_template = _person()
+    clash_template.person_number = number_a
+    clash_grant = _person_grant(account_b.id)
+    await store.create_person_enrollment_grant_atomic(
+        clash_grant, actor_user_id="usr_admin"
+    )
+    with pytest.raises(MetadataConflictError) as excinfo:
+        await store.enroll_person_atomic(
+            grant_token_hash=clash_grant.token_hash,
+            person=clash_template,
+            credential=_person_credential(clash_template.id),
+            link=_person_link(clash_template.id, account_b.id, status="active"),
+            session=_person_session(clash_template.id, account_b.id),
+            actor_user_id="usr_admin",
+        )
+    assert excinfo.value.entity_type == "person_number_unique"
+    surviving_grant = await store.get_person_enrollment_grant(clash_grant.id)
+    assert surviving_grant is not None
+    assert surviving_grant.status == "active"
+
+    # set_person_number_atomic: bind a fresh number to a second person, then
+    # rebinding the taken number conflicts, clearing frees it up. (A fresh
+    # account: account_b still holds the active clash grant above.)
+    account_c = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    person_b, _, _, _, _ = await _enroll(store, account_id=account_c.id)
+    number_b = f"PN-{uuid.uuid4().hex[:10]}"
+    updated = await store.set_person_number_atomic(
+        person_id=person_b.id, person_number=number_b, actor_user_id="usr_admin"
+    )
+    assert updated.person_number == number_b
+    with pytest.raises(MetadataConflictError):
+        await store.set_person_number_atomic(
+            person_id=person_b.id, person_number=number_a
+        )
+    cleared = await store.set_person_number_atomic(
+        person_id=person_b.id, person_number=None
+    )
+    assert cleared.person_number is None
+    assert await store.get_person_by_number(number_b) is None
+    # The freed number can now move to the other person.
+    moved = await store.set_person_number_atomic(
+        person_id=person_a.id, person_number=number_b
+    )
+    assert moved.person_number == number_b
+    with pytest.raises(MetadataRecordNotFoundError):
+        await store.set_person_number_atomic(
+            person_id="per_missing", person_number=f"PN-{uuid.uuid4().hex[:10]}"
+        )
+
+    events = await store.list_audit_events(
+        event_type="person_number_set", limit=20
+    )
+    assert any(e.target_id == person_b.id for e in events)
+
+
 async def test_person_schema_reinitialize_is_idempotent(store):
     """Repeated initialize() runs (fresh start, restart, extra worker) must
     converge without duplicate-table/index errors and leave the person tables

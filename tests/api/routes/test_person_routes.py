@@ -1482,3 +1482,311 @@ def test_admin_list_persons(monkeypatch, tmp_path):
     # Non-super-admin is rejected; person tokens (non-interactive-legacy) too.
     alice_headers = {"Authorization": f"Bearer {_legacy_token(user_service, alice)}"}
     assert client.get("/admin/persons", headers=alice_headers).status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# 工号 (person_number) login + admin binding
+# ---------------------------------------------------------------------------
+
+
+def test_person_number_enroll_and_login(monkeypatch, tmp_path):
+    """A grant may pin a 工号; the enrolled person can then log in with either
+    the opaque person_id or the 工号. Duplicate numbers are rejected at grant
+    creation (fail-fast) and at enroll (unique index), leaving the losing
+    grant consumable."""
+
+    (
+        client,
+        user_service,
+        person_service,
+        metadata_store,
+        admin,
+        alice,
+        bob,
+    ) = _build_client(monkeypatch, tmp_path)
+
+    grant = client.post(
+        "/admin/persons/enrollment-grants",
+        json={"account_id": alice.id, "person_number": "E-1001"},
+        headers=_admin_headers(user_service, admin),
+    )
+    assert grant.status_code == 201, grant.text
+    assert grant.json()["person_number"] == "E-1001"
+
+    enrolled = client.post(
+        "/auth/person/enroll",
+        json={
+            "grant_token": grant.json()["grant_token"],
+            "person_password": "RightPass-1",
+        },
+    )
+    assert enrolled.status_code == 201, enrolled.text
+    person = enrolled.json()["person"]
+    assert person["person_number"] == "E-1001"
+    person_id = person["id"]
+
+    # Login by 工号.
+    by_number = client.post(
+        "/auth/person/login",
+        json={"person_number": "E-1001", "person_password": "RightPass-1"},
+    )
+    assert by_number.status_code == 200, by_number.text
+    assert by_number.json()["active_account"]["account_id"] == alice.id
+
+    # Login by person_id still works.
+    by_id = client.post(
+        "/auth/person/login",
+        json={"person_id": person_id, "person_password": "RightPass-1"},
+    )
+    assert by_id.status_code == 200, by_id.text
+
+    # Exactly one identifier: both -> 400, neither -> 400.
+    both = client.post(
+        "/auth/person/login",
+        json={
+            "person_id": person_id,
+            "person_number": "E-1001",
+            "person_password": "RightPass-1",
+        },
+    )
+    assert both.status_code == 400
+    neither = client.post(
+        "/auth/person/login", json={"person_password": "RightPass-1"}
+    )
+    assert neither.status_code == 400
+
+    # Unknown 工号 is indistinguishable from a bad password (unified 401).
+    unknown = client.post(
+        "/auth/person/login",
+        json={"person_number": "E-9999", "person_password": "RightPass-1"},
+    )
+    assert unknown.status_code == 401
+    assert unknown.json()["detail"]["error_code"] == "invalid_person_credentials"
+
+    # Fail-fast: a new grant reusing a bound 工号 is rejected at creation.
+    dup = client.post(
+        "/admin/persons/enrollment-grants",
+        json={"account_id": bob.id, "person_number": "E-1001"},
+        headers=_admin_headers(user_service, admin),
+    )
+    assert dup.status_code == 409
+    assert dup.json()["detail"]["error_code"] == "person_number_conflict"
+
+
+def test_person_number_enroll_conflict_keeps_grant_consumable(monkeypatch, tmp_path):
+    """Two grants issued with the same (still unbound) 工号: the first enroll
+    wins the unique index; the second gets 409 person_number_conflict and its
+    grant stays active for re-use after the conflict is resolved."""
+
+    (
+        client,
+        user_service,
+        person_service,
+        metadata_store,
+        admin,
+        alice,
+        bob,
+    ) = _build_client(monkeypatch, tmp_path)
+
+    grant_a = client.post(
+        "/admin/persons/enrollment-grants",
+        json={"account_id": alice.id, "person_number": "E-2002"},
+        headers=_admin_headers(user_service, admin),
+    ).json()
+    # The number is not bound yet, so the fail-fast check lets this through.
+    grant_b = client.post(
+        "/admin/persons/enrollment-grants",
+        json={"account_id": bob.id, "person_number": "E-2002"},
+        headers=_admin_headers(user_service, admin),
+    )
+    assert grant_b.status_code == 201, grant_b.text
+
+    first = client.post(
+        "/auth/person/enroll",
+        json={
+            "grant_token": grant_a["grant_token"],
+            "person_password": "RightPass-1",
+        },
+    )
+    assert first.status_code == 201, first.text
+
+    second = client.post(
+        "/auth/person/enroll",
+        json={
+            "grant_token": grant_b.json()["grant_token"],
+            "person_password": "RightPass-1",
+        },
+    )
+    assert second.status_code == 409, second.text
+    assert second.json()["detail"]["error_code"] == "person_number_conflict"
+
+    # The losing grant is still active (transaction rolled back).
+    listing = client.get(
+        f"/admin/persons/enrollment-grants?account_id={bob.id}",
+        headers=_admin_headers(user_service, admin),
+    )
+    assert listing.json()["grants"][0]["status"] == "active"
+    assert listing.json()["grants"][0]["person_number"] == "E-2002"
+
+
+def test_admin_patch_person_number(monkeypatch, tmp_path):
+    """PATCH /admin/persons/{person_id} 补录/rebinds/clears the 工号."""
+
+    (
+        client,
+        user_service,
+        person_service,
+        metadata_store,
+        admin,
+        alice,
+        bob,
+    ) = _build_client(monkeypatch, tmp_path)
+
+    person_a, _ = _enroll_person_token(client, user_service, admin, alice)
+    person_b, _ = _enroll_person_token(client, user_service, admin, bob)
+
+    # 补录 a number for an existing person.
+    patched = client.patch(
+        f"/admin/persons/{person_a}",
+        json={"person_number": "E-3003"},
+        headers=_admin_headers(user_service, admin),
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["person"]["person_number"] == "E-3003"
+
+    login = client.post(
+        "/auth/person/login",
+        json={"person_number": "E-3003", "person_password": "RightPass-1"},
+    )
+    assert login.status_code == 200, login.text
+    assert login.json()["person"]["id"] == person_a
+
+    # Binding the same number to another person conflicts.
+    conflict = client.patch(
+        f"/admin/persons/{person_b}",
+        json={"person_number": "E-3003"},
+        headers=_admin_headers(user_service, admin),
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["error_code"] == "person_number_conflict"
+
+    # The listing surfaces the binding.
+    persons = client.get(
+        "/admin/persons", headers=_admin_headers(user_service, admin)
+    ).json()["persons"]
+    numbers = {p["id"]: p["person_number"] for p in persons}
+    assert numbers[person_a] == "E-3003"
+    assert numbers[person_b] is None
+
+    # Clearing (null) removes 工号 login; person_id keeps working.
+    cleared = client.patch(
+        f"/admin/persons/{person_a}",
+        json={"person_number": None},
+        headers=_admin_headers(user_service, admin),
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["person"]["person_number"] is None
+    assert (
+        client.post(
+            "/auth/person/login",
+            json={"person_number": "E-3003", "person_password": "RightPass-1"},
+        ).status_code
+        == 401
+    )
+    assert (
+        client.post(
+            "/auth/person/login",
+            json={"person_id": person_a, "person_password": "RightPass-1"},
+        ).status_code
+        == 200
+    )
+
+    # Unknown person -> 404; non-super-admin -> 403.
+    missing = client.patch(
+        "/admin/persons/per_missing",
+        json={"person_number": "E-4004"},
+        headers=_admin_headers(user_service, admin),
+    )
+    assert missing.status_code == 404
+    alice_headers = {"Authorization": f"Bearer {_legacy_token(user_service, alice)}"}
+    assert (
+        client.patch(
+            f"/admin/persons/{person_a}",
+            json={"person_number": "E-5005"},
+            headers=alice_headers,
+        ).status_code
+        == 403
+    )
+
+
+def test_login_auto_selects_most_recent_account(monkeypatch, tmp_path):
+    """Multi-link login without account_id lands on the most recently used
+    account instead of the former 409 account_selection_required."""
+
+    (
+        client,
+        user_service,
+        person_service,
+        metadata_store,
+        admin,
+        alice,
+        bob,
+    ) = _build_client(monkeypatch, tmp_path)
+
+    person_id, token = _enroll_person_token(client, user_service, admin, alice)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    propose = client.post(
+        f"/admin/persons/{person_id}/accounts/{bob.id}",
+        json={"reason": "second dept"},
+        headers=_admin_headers(user_service, admin),
+    )
+    assert propose.status_code == 201, propose.text
+    confirm = client.post(
+        f"/auth/person/links/{bob.id}:confirm",
+        json={"person_password": "RightPass-1"},
+        headers=headers,
+    )
+    assert confirm.status_code == 200, confirm.text
+
+    # Most recent session points at bob (explicit login), then logout.
+    login_b = client.post(
+        "/auth/person/login",
+        json={
+            "person_id": person_id,
+            "person_password": "RightPass-1",
+            "account_id": bob.id,
+        },
+    )
+    assert login_b.status_code == 200, login_b.text
+    client.post(
+        "/auth/person/logout",
+        headers={"Authorization": f"Bearer {login_b.json()['access_token']}"},
+    )
+
+    # No account_id: auto-select the last-used account (bob), no 409.
+    auto = client.post(
+        "/auth/person/login",
+        json={"person_id": person_id, "person_password": "RightPass-1"},
+    )
+    assert auto.status_code == 200, auto.text
+    assert auto.json()["active_account"]["account_id"] == bob.id
+
+    # Switch to alice inside this session, log out, and the next auto login
+    # follows the switch.
+    switch = client.post(
+        "/auth/person/switch",
+        json={"account_id": alice.id},
+        headers={"Authorization": f"Bearer {auto.json()['access_token']}"},
+    )
+    assert switch.status_code == 200, switch.text
+    client.post(
+        "/auth/person/logout",
+        headers={"Authorization": f"Bearer {switch.json()['access_token']}"},
+    )
+    auto2 = client.post(
+        "/auth/person/login",
+        json={"person_id": person_id, "person_password": "RightPass-1"},
+    )
+    assert auto2.status_code == 200, auto2.text
+    assert auto2.json()["active_account"]["account_id"] == alice.id

@@ -482,6 +482,9 @@ class PersonService:
             metadata={"created_via": "enrollment"},
             created_at=now,
             updated_at=now,
+            # 工号 pinned on the grant at issue time; the persons unique
+            # index is the final arbiter at consume time.
+            person_number=grant.person_number,
         )
         credential = EnterprisePersonCredentialRecord(
             id=f"pcred_{secrets.token_hex(12)}",
@@ -534,13 +537,23 @@ class PersonService:
                 )
             )
         except MetadataConflictError as exc:
-            # Map the two distinct conflict shapes to stable codes.
+            # Map the distinct conflict shapes to stable codes.
             if exc.entity_type == "person_account_link_active":
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail={
                         "error_code": "account_already_linked",
                         "message": "Account is already linked to a person",
+                    },
+                ) from exc
+            if exc.entity_type == "person_number_unique":
+                # The grant itself is valid (and stays consumable after the
+                # rollback), so this is not an invalid-grant rate signal.
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error_code": "person_number_conflict",
+                        "message": "person_number is already bound to another person",
                     },
                 ) from exc
             if self._enroll_tracker is not None and rate_key:
@@ -562,6 +575,26 @@ class PersonService:
         }
 
     # -- login -------------------------------------------------------------
+
+    _PERSON_NUMBER_MAX_LENGTH = 64
+
+    def _normalize_person_number(self, person_number: str | None) -> str | None:
+        """Strip the 工号; empty/whitespace-only collapses to ``None``."""
+
+        if person_number is None:
+            return None
+        value = person_number.strip()
+        if not value:
+            return None
+        if len(value) > self._PERSON_NUMBER_MAX_LENGTH:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error_code": "validation_error",
+                    "message": "person_number is too long",
+                },
+            )
+        return value
 
     def _ensure_credential_not_locked(
         self, credential: EnterprisePersonCredentialRecord
@@ -624,12 +657,67 @@ class PersonService:
     ) -> None:
         await self._store.reset_person_credential_failures_atomic(credential.id)
 
+    async def _pick_default_link(
+        self,
+        person_id: str,
+        active_links: list[EnterprisePersonAccountLinkRecord],
+    ) -> EnterprisePersonAccountLinkRecord:
+        """Choose the login landing account when ``account_id`` is omitted.
+
+        Preference order: the account of the most recent login session (its
+        ``active_account_id`` reflects the last switch), then the remaining
+        active links in bind order. Ineligible candidates (account missing,
+        inactive, or promoted to super_admin) are skipped; if none is
+        eligible the first candidate is returned so the shared eligibility
+        checks in ``login`` produce the proper 403.
+        """
+
+        by_account = {link.account_id: link for link in active_links}
+        ordered: list[EnterprisePersonAccountLinkRecord] = []
+        sessions = await self._store.list_person_login_sessions(person_id)
+        for session in sessions:  # newest first
+            link = by_account.get(session.active_account_id or "")
+            if link is not None and link not in ordered:
+                ordered.append(link)
+        for link in active_links:  # bound_at ascending fallback
+            if link not in ordered:
+                ordered.append(link)
+        for link in ordered:
+            account = await self._store.get_enterprise_user_by_id(link.account_id)
+            if (
+                account is not None
+                and account.status == USER_STATUS_ACTIVE
+                and account.system_role != SYSTEM_ROLE_SUPER_ADMIN
+            ):
+                return link
+        return ordered[0]
+
     async def login(
-        self, *, person_id: str, person_password: str, account_id: str | None = None
+        self,
+        *,
+        person_id: str | None = None,
+        person_password: str,
+        account_id: str | None = None,
+        person_number: str | None = None,
     ) -> dict[str, Any]:
-        person = await self._store.get_person_by_id(person_id)
+        # Exactly one person identifier: the opaque person_id or the bound
+        # 工号. Rejecting both-or-neither happens before any lookup so the
+        # 400 cannot become an existence oracle.
+        person_number = self._normalize_person_number(person_number)
+        if bool(person_id) == bool(person_number):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error_code": "validation_error",
+                    "message": "Provide exactly one of person_id or person_number",
+                },
+            )
+        if person_id:
+            person = await self._store.get_person_by_id(person_id)
+        else:
+            person = await self._store.get_person_by_number(person_number or "")
         credential = (
-            await self._store.get_person_credential(person_id)
+            await self._store.get_person_credential(person.id)
             if person is not None
             else None
         )
@@ -662,17 +750,16 @@ class PersonService:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"error_code": "account_not_linked", "message": "No linked account"},
             )
-        # Resolve target account.
+        # Resolve target account. When omitted, land on the most recently
+        # used eligible account (multi-link persons no longer get a 409; the
+        # session can switch afterwards at no extra credential cost).
         if account_id is None:
-            if len(active_links) > 1:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail={
-                        "error_code": "account_selection_required",
-                        "message": "account_id is required",
-                    },
+            if len(active_links) == 1:
+                target_link = active_links[0]
+            else:
+                target_link = await self._pick_default_link(
+                    person.id, active_links
                 )
-            target_link = active_links[0]
         else:
             target_link = next(
                 (lnk for lnk in active_links if lnk.account_id == account_id), None
@@ -882,7 +969,12 @@ class PersonService:
     # -- enrollment grants -------------------------------------------------
 
     async def create_enrollment_grant(
-        self, *, account_id: str, created_by: str, ttl_seconds: int = 900
+        self,
+        *,
+        account_id: str,
+        created_by: str,
+        ttl_seconds: int = 900,
+        person_number: str | None = None,
     ) -> dict[str, Any]:
         account = await self._store.get_enterprise_user_by_id(account_id)
         if account is None:
@@ -898,6 +990,19 @@ class PersonService:
                     "message": "Cannot bind a super admin account",
                 },
             )
+        person_number = self._normalize_person_number(person_number)
+        if person_number is not None:
+            # Fail-fast duplicate check; the persons unique index at enroll
+            # time remains the concurrency arbiter.
+            existing = await self._store.get_person_by_number(person_number)
+            if existing is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error_code": "person_number_conflict",
+                        "message": "person_number is already bound to another person",
+                    },
+                )
         plain_token = secrets.token_urlsafe(32)
         token_hash = hashlib.sha256(plain_token.encode("utf-8")).hexdigest()
         now = datetime.now(timezone.utc)
@@ -912,6 +1017,7 @@ class PersonService:
             created_at=now.isoformat(),
             updated_at=now.isoformat(),
             consumed_at=None,
+            person_number=person_number,
         )
         try:
             saved = await self._store.create_person_enrollment_grant_atomic(
@@ -931,6 +1037,7 @@ class PersonService:
             "grant_token": plain_token,
             "account_id": saved.account_id,
             "expires_at": saved.expires_at,
+            "person_number": saved.person_number,
         }
 
     async def revoke_enrollment_grant(self, *, grant_id: str) -> dict[str, Any]:
@@ -978,6 +1085,7 @@ class PersonService:
                 "expired": grant.expires_at <= now,
                 "created_by": grant.created_by,
                 "consumed_by_person": grant.consumed_by_person,
+                "person_number": grant.person_number,
                 "expires_at": grant.expires_at,
                 "created_at": grant.created_at,
                 "updated_at": grant.updated_at,
@@ -1225,6 +1333,42 @@ class PersonService:
     # -- person enable/disable --------------------------------------------
 
     _PERSON_STATUSES = frozenset({"active", "disabled"})
+
+    async def set_person_number(
+        self,
+        *,
+        person_id: str,
+        person_number: str | None,
+        actor_user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Bind or clear the person's 工号 (super-admin 补录/修改).
+
+        ``None``/empty clears the binding; after a bind both the person_id
+        and the 工号 log in. Duplicate numbers map to 409
+        ``person_number_conflict``.
+        """
+
+        normalized = self._normalize_person_number(person_number)
+        try:
+            person = await self._store.set_person_number_atomic(
+                person_id=person_id,
+                person_number=normalized,
+                actor_user_id=actor_user_id,
+            )
+        except MetadataConflictError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error_code": "person_number_conflict",
+                    "message": "person_number is already bound to another person",
+                },
+            ) from exc
+        except MetadataRecordNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error_code": "person_not_found", "message": "Person not found"},
+            ) from exc
+        return {"person": person.to_dict()}
 
     async def list_persons(
         self, *, status_filter: str | None = None
