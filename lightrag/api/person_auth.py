@@ -942,6 +942,51 @@ class PersonService:
             )
         return {"status": "revoked", "grant_id": grant_id, "current_status": result.status}
 
+    _GRANT_STATUSES = frozenset({"active", "consumed", "revoked"})
+
+    async def list_enrollment_grants(
+        self,
+        *,
+        account_id: str | None = None,
+        status_filter: str | None = None,
+    ) -> dict[str, Any]:
+        """List issued enrollment grants for the super-admin surface.
+
+        The stored ``token_hash`` is never exposed — even the hash stays
+        server-side (the plaintext token is returned exactly once at create
+        time). ``expired`` reports whether ``expires_at`` has passed; an
+        ``active`` grant with ``expired=true`` can no longer be consumed.
+        """
+
+        if status_filter is not None and status_filter not in self._GRANT_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error_code": "validation_error",
+                    "message": "status must be one of active/consumed/revoked",
+                },
+            )
+        grants = await self._store.list_person_enrollment_grants(
+            account_id=account_id, status=status_filter
+        )
+        now = utc_now_iso()
+        items = [
+            {
+                "grant_id": grant.id,
+                "account_id": grant.account_id,
+                "status": grant.status,
+                "expired": grant.expires_at <= now,
+                "created_by": grant.created_by,
+                "consumed_by_person": grant.consumed_by_person,
+                "expires_at": grant.expires_at,
+                "created_at": grant.created_at,
+                "updated_at": grant.updated_at,
+                "consumed_at": grant.consumed_at,
+            }
+            for grant in grants
+        ]
+        return {"grants": items, "total": len(items)}
+
     # -- link management ---------------------------------------------------
 
     async def authorize_link_proposal(
@@ -1053,6 +1098,46 @@ class PersonService:
             ) from exc
         return {"link": saved.to_dict()}
 
+    _LINK_STATUSES = frozenset({"pending", "active", "revoked"})
+
+    async def list_links(
+        self, *, person_id: str, status_filter: str | None = None
+    ) -> dict[str, Any]:
+        """List the person's own account links in every state.
+
+        Unlike :meth:`list_accounts` (active links only, the switchable set)
+        this surfaces ``pending`` links awaiting the person's confirmation and
+        ``revoked`` history. Each entry carries the non-secret account summary
+        so the person can tell which account a pending link points at; the
+        summary is ``None`` when the account row no longer exists.
+        """
+
+        if status_filter is not None and status_filter not in self._LINK_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error_code": "validation_error",
+                    "message": "status must be one of pending/active/revoked",
+                },
+            )
+        links = await self._store.list_person_account_links(
+            person_id, only_active=False
+        )
+        if status_filter is not None:
+            links = [link for link in links if link.status == status_filter]
+        items = []
+        for link in links:
+            account = await self._store.get_enterprise_user_by_id(link.account_id)
+            items.append(
+                {
+                    "link": link.to_dict(),
+                    "account": _account_summary(account)
+                    if account is not None
+                    else None,
+                }
+            )
+        return {"person_id": person_id, "links": items, "total": len(items)}
+
     async def confirm_link(
         self, *, person_id: str, account_id: str, person_password: str
     ) -> dict[str, Any]:
@@ -1138,6 +1223,32 @@ class PersonService:
         }
 
     # -- person enable/disable --------------------------------------------
+
+    _PERSON_STATUSES = frozenset({"active", "disabled"})
+
+    async def list_persons(
+        self, *, status_filter: str | None = None
+    ) -> dict[str, Any]:
+        """List natural persons with their account links (super-admin view)."""
+
+        if status_filter is not None and status_filter not in self._PERSON_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error_code": "validation_error",
+                    "message": "status must be one of active/disabled",
+                },
+            )
+        persons = await self._store.list_persons(status=status_filter)
+        items = []
+        for person in persons:
+            links = await self._store.list_person_account_links(
+                person.id, only_active=False
+            )
+            entry = person.to_dict()
+            entry["links"] = [link.to_dict() for link in links]
+            items.append(entry)
+        return {"persons": items, "total": len(items)}
 
     async def disable_person(self, *, person_id: str, reason: str | None = None) -> dict[str, Any]:
         try:

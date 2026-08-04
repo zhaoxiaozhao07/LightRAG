@@ -1195,3 +1195,290 @@ def test_person_kb_share_rejections(monkeypatch, tmp_path):
         headers=alice_headers,
     )
     assert resp.status_code == 400, resp.text
+
+
+# ---------------------------------------------------------------------------
+# listing endpoints: person links / admin grants / admin persons
+# ---------------------------------------------------------------------------
+
+
+def test_person_links_listing_shows_pending(monkeypatch, tmp_path):
+    """GET /auth/person/links surfaces every link with its status — most
+    importantly pending links awaiting the person's confirmation — with the
+    non-secret account summary attached."""
+
+    (
+        client,
+        user_service,
+        person_service,
+        metadata_store,
+        admin,
+        alice,
+        bob,
+    ) = _build_client(monkeypatch, tmp_path)
+
+    person_id, access_token = _enroll_person_token(client, user_service, admin, alice)
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    # No token -> 401.
+    assert client.get("/auth/person/links").status_code == 401
+
+    # Only the enrollment link exists initially.
+    initial = client.get("/auth/person/links", headers=headers)
+    assert initial.status_code == 200, initial.text
+    assert initial.json()["total"] == 1
+    assert initial.json()["links"][0]["link"]["status"] == "active"
+    assert initial.json()["links"][0]["account"]["account_id"] == alice.id
+
+    # Admin proposes a pending link to bob.
+    propose = client.post(
+        f"/admin/persons/{person_id}/accounts/{bob.id}",
+        json={"reason": "second dept"},
+        headers=_admin_headers(user_service, admin),
+    )
+    assert propose.status_code == 201, propose.text
+
+    listing = client.get("/auth/person/links", headers=headers)
+    assert listing.status_code == 200, listing.text
+    body = listing.json()
+    assert body["person_id"] == person_id
+    assert body["total"] == 2
+    by_account = {item["link"]["account_id"]: item for item in body["links"]}
+    assert by_account[alice.id]["link"]["status"] == "active"
+    assert by_account[bob.id]["link"]["status"] == "pending"
+    assert by_account[bob.id]["link"]["confirmed_by_person_at"] is None
+    assert by_account[bob.id]["account"]["username"] == "bob"
+
+    # status filter narrows to the pending link only.
+    pending = client.get("/auth/person/links?status=pending", headers=headers)
+    assert pending.status_code == 200, pending.text
+    assert pending.json()["total"] == 1
+    assert pending.json()["links"][0]["link"]["account_id"] == bob.id
+
+    # Unknown status value is a validation error.
+    bad = client.get("/auth/person/links?status=bogus", headers=headers)
+    assert bad.status_code == 400
+    assert bad.json()["detail"]["error_code"] == "validation_error"
+
+    # Confirm the pending link, re-login (confirm revokes sessions), and the
+    # listing now shows both links active.
+    confirm = client.post(
+        f"/auth/person/links/{bob.id}:confirm",
+        json={"person_password": "RightPass-1"},
+        headers=headers,
+    )
+    assert confirm.status_code == 200, confirm.text
+    relogin = client.post(
+        "/auth/person/login",
+        json={
+            "person_id": person_id,
+            "person_password": "RightPass-1",
+            "account_id": alice.id,
+        },
+    ).json()
+    headers = {"Authorization": f"Bearer {relogin['access_token']}"}
+    after = client.get("/auth/person/links", headers=headers)
+    assert after.status_code == 200, after.text
+    statuses = {
+        item["link"]["account_id"]: item["link"]["status"]
+        for item in after.json()["links"]
+    }
+    assert statuses == {alice.id: "active", bob.id: "active"}
+    assert client.get(
+        "/auth/person/links?status=pending", headers=headers
+    ).json()["total"] == 0
+
+
+def test_admin_list_enrollment_grants(monkeypatch, tmp_path):
+    """GET /admin/persons/enrollment-grants lists issued grants with status,
+    consumption and expiry info while never echoing the token or its hash."""
+
+    (
+        client,
+        user_service,
+        person_service,
+        metadata_store,
+        admin,
+        alice,
+        bob,
+    ) = _build_client(monkeypatch, tmp_path)
+
+    # alice's grant gets consumed by enroll; bob's stays active.
+    person_id, _token = _enroll_person_token(client, user_service, admin, alice)
+    bob_grant = client.post(
+        "/admin/persons/enrollment-grants",
+        json={"account_id": bob.id},
+        headers=_admin_headers(user_service, admin),
+    ).json()
+
+    listing = client.get(
+        "/admin/persons/enrollment-grants",
+        headers=_admin_headers(user_service, admin),
+    )
+    assert listing.status_code == 200, listing.text
+    body = listing.json()
+    assert body["total"] == 2
+    for entry in body["grants"]:
+        assert "token_hash" not in entry
+        assert "grant_token" not in entry
+        assert entry["expired"] is False
+
+    by_account = {entry["account_id"]: entry for entry in body["grants"]}
+    assert by_account[alice.id]["status"] == "consumed"
+    assert by_account[alice.id]["consumed_by_person"] == person_id
+    assert by_account[alice.id]["consumed_at"] is not None
+    assert by_account[bob.id]["status"] == "active"
+    assert by_account[bob.id]["grant_id"] == bob_grant["grant_id"]
+    assert by_account[bob.id]["created_by"] == admin.id
+
+    # account_id filter.
+    only_bob = client.get(
+        f"/admin/persons/enrollment-grants?account_id={bob.id}",
+        headers=_admin_headers(user_service, admin),
+    )
+    assert only_bob.status_code == 200
+    assert [g["account_id"] for g in only_bob.json()["grants"]] == [bob.id]
+
+    # status filter follows the revoke transition.
+    revoke = client.delete(
+        f"/admin/persons/enrollment-grants/{bob_grant['grant_id']}",
+        headers=_admin_headers(user_service, admin),
+    )
+    assert revoke.status_code == 200
+    active_left = client.get(
+        "/admin/persons/enrollment-grants?status=active",
+        headers=_admin_headers(user_service, admin),
+    )
+    assert active_left.status_code == 200
+    assert active_left.json()["total"] == 0
+    revoked = client.get(
+        "/admin/persons/enrollment-grants?status=revoked",
+        headers=_admin_headers(user_service, admin),
+    )
+    assert [g["grant_id"] for g in revoked.json()["grants"]] == [
+        bob_grant["grant_id"]
+    ]
+
+    # A stale-but-active grant reads expired=true (inserted directly with a
+    # past expires_at; the API clamps ttl_seconds to >=60 so this state only
+    # arises with the passage of time).
+    from lightrag.api.metadata_store import EnterprisePersonEnrollmentGrantRecord
+    import uuid as _uuid
+
+    async def _seed_expired():
+        carol = await user_service.create_user(
+            username="carol", password="carol-pass"
+        )
+        now = "2000-01-01T00:00:00+00:00"
+        await metadata_store.create_person_enrollment_grant_atomic(
+            EnterprisePersonEnrollmentGrantRecord(
+                id=f"pgrant_{_uuid.uuid4().hex[:12]}",
+                account_id=carol.id,
+                token_hash=f"sha256:{_uuid.uuid4().hex}",
+                status="active",
+                created_by=admin.id,
+                consumed_by_person=None,
+                expires_at="2000-01-02T00:00:00+00:00",
+                created_at=now,
+                updated_at=now,
+                consumed_at=None,
+            ),
+            actor_user_id=admin.id,
+        )
+        return carol
+
+    carol = asyncio.run(_seed_expired())
+    stale = client.get(
+        f"/admin/persons/enrollment-grants?account_id={carol.id}",
+        headers=_admin_headers(user_service, admin),
+    )
+    assert stale.status_code == 200
+    assert stale.json()["grants"][0]["status"] == "active"
+    assert stale.json()["grants"][0]["expired"] is True
+
+    # Unknown status value is a validation error.
+    bad = client.get(
+        "/admin/persons/enrollment-grants?status=bogus",
+        headers=_admin_headers(user_service, admin),
+    )
+    assert bad.status_code == 400
+
+    # Non-super-admin is rejected.
+    alice_headers = {"Authorization": f"Bearer {_legacy_token(user_service, alice)}"}
+    assert (
+        client.get("/admin/persons/enrollment-grants", headers=alice_headers)
+        .status_code
+        == 403
+    )
+
+
+def test_admin_list_persons(monkeypatch, tmp_path):
+    """GET /admin/persons lists natural persons with all their links."""
+
+    (
+        client,
+        user_service,
+        person_service,
+        metadata_store,
+        admin,
+        alice,
+        bob,
+    ) = _build_client(monkeypatch, tmp_path)
+
+    person_a, _ = _enroll_person_token(client, user_service, admin, alice)
+    person_b, _ = _enroll_person_token(client, user_service, admin, bob)
+
+    # A pending link on person_a shows up in its links array.
+    carol = asyncio.run(
+        user_service.create_user(username="carol", password="carol-pass")
+    )
+    propose = client.post(
+        f"/admin/persons/{person_a}/accounts/{carol.id}",
+        json={"reason": "pending link visible in listing"},
+        headers=_admin_headers(user_service, admin),
+    )
+    assert propose.status_code == 201, propose.text
+
+    listing = client.get(
+        "/admin/persons", headers=_admin_headers(user_service, admin)
+    )
+    assert listing.status_code == 200, listing.text
+    body = listing.json()
+    assert body["total"] == 2
+    by_id = {entry["id"]: entry for entry in body["persons"]}
+    assert set(by_id) == {person_a, person_b}
+    a_links = {
+        link["account_id"]: link["status"] for link in by_id[person_a]["links"]
+    }
+    assert a_links == {alice.id: "active", carol.id: "pending"}
+    b_links = {
+        link["account_id"]: link["status"] for link in by_id[person_b]["links"]
+    }
+    assert b_links == {bob.id: "active"}
+
+    # status filter after disabling person_b.
+    disable = client.post(
+        f"/admin/persons/{person_b}:disable",
+        headers=_admin_headers(user_service, admin),
+    )
+    assert disable.status_code == 200
+    disabled = client.get(
+        "/admin/persons?status=disabled",
+        headers=_admin_headers(user_service, admin),
+    )
+    assert [p["id"] for p in disabled.json()["persons"]] == [person_b]
+    active = client.get(
+        "/admin/persons?status=active",
+        headers=_admin_headers(user_service, admin),
+    )
+    assert [p["id"] for p in active.json()["persons"]] == [person_a]
+
+    # Unknown status value is a validation error.
+    bad = client.get(
+        "/admin/persons?status=bogus", headers=_admin_headers(user_service, admin)
+    )
+    assert bad.status_code == 400
+
+    # Non-super-admin is rejected; person tokens (non-interactive-legacy) too.
+    alice_headers = {"Authorization": f"Bearer {_legacy_token(user_service, alice)}"}
+    assert client.get("/admin/persons", headers=alice_headers).status_code == 403

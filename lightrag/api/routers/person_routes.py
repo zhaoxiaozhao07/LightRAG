@@ -6,9 +6,9 @@ person self-service and super-admin management endpoints defined in
 
 Two dependency classes, kept strictly separate (doc 5.10):
 
-* **session-control endpoints** (accounts/switch/logout/logout-all/change-
-  password/confirm-link) use ``require_person_session_control`` and the v2
-  person access JWT. They deliberately do NOT go through ``combined_auth`` —
+* **session-control endpoints** (accounts/links/switch/logout/logout-all/
+  change-password/confirm-link) use ``require_person_session_control`` and the
+  v2 person access JWT. They deliberately do NOT go through ``combined_auth`` —
   combined_auth would re-process the v2 token and the two paths must not
   duplicate each other.
 * **super-admin management endpoints** go through ``combined_auth`` (legacy
@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from lightrag.api.enterprise_auth import (
@@ -97,6 +97,46 @@ class PersonConfirmLinkRequest(BaseModel):
 
 class PersonLinkSummary(BaseModel):
     link: dict[str, Any]
+
+
+class PersonLinkEntry(BaseModel):
+    """One link of the person plus the non-secret account projection."""
+
+    link: dict[str, Any]
+    # None when the linked account row no longer exists.
+    account: PersonAccountSummary | None = None
+
+
+class PersonLinksResponse(BaseModel):
+    person_id: str
+    links: list[PersonLinkEntry]
+    total: int
+
+
+class EnrollmentGrantSummary(BaseModel):
+    """Issued-grant projection; the token (and its hash) is never echoed."""
+
+    grant_id: str
+    account_id: str
+    status: str
+    expired: bool
+    created_by: str | None = None
+    consumed_by_person: str | None = None
+    expires_at: str
+    created_at: str
+    updated_at: str
+    consumed_at: str | None = None
+
+
+class EnrollmentGrantListResponse(BaseModel):
+    grants: list[EnrollmentGrantSummary]
+    total: int
+
+
+class PersonListResponse(BaseModel):
+    # Each entry is the person record plus a ``links`` array (all statuses).
+    persons: list[dict[str, Any]]
+    total: int
 
 
 class CreateEnrollmentGrantRequest(BaseModel):
@@ -345,6 +385,29 @@ def create_person_routes(
             new_password=body.new_person_password,
         )
 
+    @router.get("/auth/person/links", response_model=PersonLinksResponse)
+    async def person_links(
+        request: Request,
+        status_filter: str | None = Query(
+            None,
+            alias="status",
+            description="Filter by link status: pending/active/revoked",
+        ),
+        session: PersonSessionContext = Depends(require_person_session_control),
+    ):
+        """List all of the person's links (pending/active/revoked).
+
+        Session-control path like accounts/confirm-link: usable even while the
+        current account is disabled, so the person can always inspect which
+        pending links await their confirmation.
+        """
+
+        _require_person_enabled()
+        service = _person_service(request)
+        return await service.list_links(
+            person_id=session.person.id, status_filter=status_filter
+        )
+
     @router.post(
         "/auth/person/links/{account_id}:confirm", response_model=PersonLinkSummary
     )
@@ -365,6 +428,51 @@ def create_person_routes(
     # ------------------------------------------------------------------
     # Super-admin management endpoints (combined_auth + interactive super admin)
     # ------------------------------------------------------------------
+
+    @router.get(
+        "/admin/persons",
+        response_model=PersonListResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def list_persons(
+        request: Request,
+        status_filter: str | None = Query(
+            None,
+            alias="status",
+            description="Filter by person status: active/disabled",
+        ),
+    ):
+        """List natural persons with their account links (all statuses)."""
+
+        _require_person_enabled()
+        _require_interactive_super_admin(request)
+        service = _person_service(request)
+        return await service.list_persons(status_filter=status_filter)
+
+    @router.get(
+        "/admin/persons/enrollment-grants",
+        response_model=EnrollmentGrantListResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def list_enrollment_grants(
+        request: Request,
+        account_id: str | None = Query(
+            None, description="Filter by target account id"
+        ),
+        status_filter: str | None = Query(
+            None,
+            alias="status",
+            description="Filter by grant status: active/consumed/revoked",
+        ),
+    ):
+        """List issued enrollment grants (token/hash never included)."""
+
+        _require_person_enabled()
+        _require_interactive_super_admin(request)
+        service = _person_service(request)
+        return await service.list_enrollment_grants(
+            account_id=account_id, status_filter=status_filter
+        )
 
     @router.post(
         "/admin/persons/enrollment-grants",

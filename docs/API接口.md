@@ -2296,7 +2296,7 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
 
 **两类 person 校验依赖**（实现于 `lightrag/api/person_auth.py`）：
 
-- **session-control**（`require_person_session_control`）：服务 `accounts/switch/logout/logout-all/change-password/confirm-link`。校验 v2 签名/kid/typ/iss/aud、person active、session active/未过期、`person_epoch`/`session_epoch` 一致。**不**要求当前账号 active、**不**比较账号 `token_version`、**不**校验 link/membership，也不构建账号 `Principal`——因此当前账号被 disable/reset 后仍可 list/switch/logout。运行时把 person/session 信息放入 `request.state.person_session`，**不**写入 `Principal.metadata`。
+- **session-control**（`require_person_session_control`）：服务 `accounts/links/switch/logout/logout-all/change-password/confirm-link`。校验 v2 签名/kid/typ/iss/aud、person active、session active/未过期、`person_epoch`/`session_epoch` 一致。**不**要求当前账号 active、**不**比较账号 `token_version`、**不**校验 link/membership，也不构建账号 `Principal`——因此当前账号被 disable/reset 后仍可 list/switch/logout。运行时把 person/session 信息放入 `request.state.person_session`，**不**写入 `Principal.metadata`。
 - **account-access**（`person_account_access_validate`，经 `combined_auth` 调用）：服务所有现有业务 API。在 session-control 基础上**额外**校验：账号 active、账号非 `super_admin`（升权后的账号对 person token 立即不可达）、账号 `token_version` 与 session 快照一致、`(person_id, user_id)` active link 存在、`session.active_account_id == token.user_id`，随后按现有逻辑构建普通账号 `Principal`（`auth_method="person_jwt"`）。**交互式等价**：所有按"交互式用户"把关的业务面（chat、chat memory、个人查询设置、个人 agent prompt、`PATCH /auth/me`、`POST /auth/logout` 等）通过 `INTERACTIVE_AUTH_METHODS = {"jwt", "person_jwt"}` 同时接受两种 token——person token 在业务 API 上的行为与该账号自己的 legacy 登录 JWT 完全一致。
 
 #### 10.6.3 端点总览（19 个）
@@ -2312,8 +2312,11 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
 | `POST` | `/auth/person/logout` | session-control | 撤销当前 person session |
 | `POST` | `/auth/person/logout-all` | session-control | 撤销该 person 全部 session |
 | `POST` | `/auth/person/change-password` | session-control | 轮换自然人密码（撤销全部 session） |
+| `GET` | `/auth/person/links` | session-control | 列出本人全部 link（pending/active/revoked，含账号摘要），`?status=` 过滤 |
 | `POST` | `/auth/person/links/{account_id}:confirm` | session-control + person 密码 | person 本人确认激活 pending link |
+| `GET` | `/admin/persons` | super admin | 自然人列表（每个 person 附带全部状态的 link），`?status=` 过滤 |
 | `POST` | `/admin/persons/enrollment-grants` | super admin | 签发一次性 enrollment grant，`201` |
+| `GET` | `/admin/persons/enrollment-grants` | super admin | 已签发 grant 列表（永不回显 token/hash），`?account_id=&status=` 过滤 |
 | `DELETE` | `/admin/persons/enrollment-grants/{grant_id}` | super admin | 撤销未消费的 grant |
 | `POST` | `/admin/persons/{person_id}/accounts/{account_id}` | super admin **或目标所属租户的 tenant admin** | 提议 pending link，`201`（权限矩阵见 10.6.6） |
 | `DELETE` | `/admin/persons/{person_id}/accounts/{account_id}` | super admin | 解绑 link |
@@ -2411,6 +2414,19 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
 
 主要错误：`401 invalid_current_password`、`400 person_password_weak`、`404 person_not_found`。
 
+**`GET /auth/person/links`** —— 列出本人**全部** link 及状态。与 `GET /auth/person/accounts`（仅 active、可切换集合）不同，本端点包含 `pending`（等待本人 confirm）与 `revoked`（历史）；每项附带非秘密账号摘要，便于确认 pending link 指向哪个账号（账号行已被删除时 `account` 为 `null`）。走 session-control：当前账号被 disable/reset 后仍可查看。可选 `?status=pending|active|revoked` 过滤，非法值返回 `400 validation_error`。
+
+```json
+// 200 响应
+{"person_id": "per_...",
+ "links": [
+   {"link": {"id": "plink_...", "person_id": "per_...", "account_id": "usr_dept_a", "status": "active", "bound_by": "...", "bound_at": "...", "confirmed_by_person_at": "...", "revoked_by": null, "revoked_at": null, "reason": null, "created_at": "...", "updated_at": "..."},
+    "account": {"account_id": "usr_dept_a", "username": "alice", "status": "active", "system_role": "user", "tenant_id": "tenant-fin"}},
+   {"link": {"...": "status=pending，confirmed_by_person_at=null"}, "account": {"...": "..."}}
+ ],
+ "total": 2}
+```
+
 **`POST /auth/person/links/{account_id}:confirm`** —— person 本人确认激活 super admin 提议的 pending link。二次确认：v2 token + 当前自然人密码。原子事务内 pending→active（由 active 部分唯一索引裁决并发）、递增 `auth_epoch`、撤销该 person 全部旧 session（激活后必须重新 login 才能使用新账号）。
 
 ```json
@@ -2426,6 +2442,18 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
 
 > 以下端点走 `combined_auth`（交互式 JWT），API key / service key 返回 `403 interactive_jwt_required`。除"提议 pending link"外均要求 active `super_admin`（非 super admin 返回 `403 super_admin_required`）。tenant_admin **无权**裁决跨 tenant 自然人身份：grant 签发、解绑、person 停用/启用始终仅限 super admin。
 
+**`GET /admin/persons`** —— 自然人列表。每个 person 条目为 person 记录加 `links` 数组（**全部**状态：pending/active/revoked），可直接看到每个自然人当前绑定与待确认的账号。可选 `?status=active|disabled` 过滤，非法值返回 `400 validation_error`。
+
+```json
+// 200 响应
+{"persons": [
+   {"id": "per_...", "status": "active", "auth_epoch": 3, "metadata": {"created_via": "enrollment"}, "created_at": "...", "updated_at": "...",
+    "links": [{"id": "plink_...", "account_id": "usr_dept_a", "status": "active", "...": "..."},
+              {"id": "plink_...", "account_id": "usr_dept_b", "status": "pending", "...": "..."}]}
+ ],
+ "total": 1}
+```
+
 **`POST /admin/persons/enrollment-grants`** —— 签发一次性 grant，绑定精确 `account_id`。明文 grant token 仅返回一次，服务端只存 SHA-256 hash。`ttl_seconds` 下限 60s。
 
 ```json
@@ -2436,6 +2464,18 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
 ```
 
 主要错误：`400 cannot_bind_super_admin`、`404 account_not_found`、`409 active_grant_exists`（该账号已有未消费 active grant）。
+
+**`GET /admin/persons/enrollment-grants`** —— 已签发 grant 列表。响应**永不**包含明文 token 或 `token_hash`（明文仅在签发时返回一次）。`expired` 为时间判定：`expires_at` 已过即 `true`——`status=active` 且 `expired=true` 的 grant 已不可再消费。可选 `?account_id=` 与 `?status=active|consumed|revoked` 过滤，status 非法值返回 `400 validation_error`。按 `created_at` 倒序（新→旧）。
+
+```json
+// 200 响应
+{"grants": [
+   {"grant_id": "pgrant_...", "account_id": "usr_dept_a", "status": "consumed", "expired": false,
+    "created_by": "usr_admin", "consumed_by_person": "per_...", "expires_at": "...",
+    "created_at": "...", "updated_at": "...", "consumed_at": "..."}
+ ],
+ "total": 1}
+```
 
 **`DELETE /admin/persons/enrollment-grants/{grant_id}`** —— 撤销未消费 grant。
 
@@ -2486,7 +2526,7 @@ LIGHTRAG_PERSON_ENROLL_LOCKOUT_SECONDS=900
 
 | HTTP | `error_code` | 使用场景 |
 |---:|---|---|
-| 400 | `person_password_weak` / `cannot_bind_super_admin` | 密码策略不满足；绑定目标为 super admin 账号 |
+| 400 | `person_password_weak` / `cannot_bind_super_admin` / `validation_error` | 密码策略不满足；绑定目标为 super admin 账号；列表端点 `status` 过滤值非法 |
 | 401 | `authentication_required` | session-control 端点缺少 Bearer token |
 | 401 | `invalid_grant` | enroll：grant 不存在/已消费/已撤销/已过期（统一） |
 | 401 | `invalid_person_credentials` | login：person/密码/credential 不匹配（统一） |

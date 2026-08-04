@@ -8360,6 +8360,23 @@ class PostgresMetadataStore:
             )
         return _person_from_row(row) if row is not None else None
 
+    async def list_persons(
+        self, *, status: str | None = None
+    ) -> list[EnterprisePersonRecord]:
+        await self._ensure_initialized()
+        sql = (
+            "SELECT id, status, auth_epoch, created_at, updated_at, data_json "
+            "FROM enterprise_persons"
+        )
+        params: list[Any] = []
+        if status is not None:
+            sql += " WHERE status = $1"
+            params.append(status)
+        sql += " ORDER BY created_at ASC, id ASC"
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        return [_person_from_row(row) for row in rows]
+
     async def list_person_account_links(
         self, person_id: str, *, only_active: bool = False
     ) -> list[EnterprisePersonAccountLinkRecord]:
@@ -8580,6 +8597,29 @@ class PostgresMetadataStore:
         return (
             _person_enrollment_grant_from_row(row) if row is not None else None
         )
+
+    async def list_person_enrollment_grants(
+        self,
+        *,
+        account_id: str | None = None,
+        status: str | None = None,
+    ) -> list[EnterprisePersonEnrollmentGrantRecord]:
+        await self._ensure_initialized()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if account_id is not None:
+            params.append(account_id)
+            clauses.append(f"account_id = ${len(params)}")
+        if status is not None:
+            params.append(status)
+            clauses.append(f"status = ${len(params)}")
+        sql = "SELECT * FROM enterprise_person_enrollment_grants"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC, id DESC"
+        async with self._pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        return [_person_enrollment_grant_from_row(row) for row in rows]
 
     async def _postgres_revoke_person_sessions_locked(
         self,

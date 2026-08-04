@@ -5421,6 +5421,77 @@ async def test_person_credential_failure_counter_is_atomic(store):
     assert cleared.locked_until is None
 
 
+async def test_person_and_grant_listing_methods(store):
+    """``list_persons`` / ``list_person_enrollment_grants`` behave identically
+    on both backends. Assertions are scoped to records created in this run so
+    a persistent PG test DB with residue from earlier runs stays green."""
+
+    account_a = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    account_b = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    person_a, _, _, _, grant_a = await _enroll(store, account_id=account_a.id)
+    person_b, _, _, _, grant_b = await _enroll(store, account_id=account_b.id)
+
+    # Unfiltered listing contains both fresh persons; the status filter
+    # partitions them once one is disabled.
+    all_ids = {p.id for p in await store.list_persons()}
+    assert {person_a.id, person_b.id} <= all_ids
+    await store.disable_person_atomic(
+        person_id=person_a.id, actor_user_id=None, reason="listing-test"
+    )
+    disabled_ids = {p.id for p in await store.list_persons(status="disabled")}
+    active_ids = {p.id for p in await store.list_persons(status="active")}
+    assert person_a.id in disabled_ids
+    assert person_a.id not in active_ids
+    assert person_b.id in active_ids
+
+    # Grant listing: account filter isolates this run's rows; enroll consumed
+    # both grants, so status filters split consumed vs active accordingly.
+    grants_a = await store.list_person_enrollment_grants(account_id=account_a.id)
+    assert [g.id for g in grants_a] == [grant_a.id]
+    assert grants_a[0].status == "consumed"
+    assert grants_a[0].consumed_by_person == person_a.id
+    consumed_a = await store.list_person_enrollment_grants(
+        account_id=account_a.id, status="consumed"
+    )
+    assert [g.id for g in consumed_a] == [grant_a.id]
+    assert (
+        await store.list_person_enrollment_grants(
+            account_id=account_a.id, status="active"
+        )
+        == []
+    )
+
+    # A second (still active) grant for the same account after revoking the
+    # consumed one is impossible; use a fresh account for the active case and
+    # verify newest-first ordering with a revoked + newer active pair.
+    account_c = await store.upsert_enterprise_user(
+        _enterprise_user(f"acct_{uuid.uuid4().hex[:10]}")
+    )
+    grant_c1 = _person_grant(account_c.id)
+    await store.create_person_enrollment_grant_atomic(
+        grant_c1, actor_user_id="usr_admin"
+    )
+    await store.revoke_person_enrollment_grant_atomic(grant_c1.id)
+    grant_c2 = _person_grant(account_c.id)
+    await store.create_person_enrollment_grant_atomic(
+        grant_c2, actor_user_id="usr_admin"
+    )
+    listed_c = await store.list_person_enrollment_grants(account_id=account_c.id)
+    assert [g.id for g in listed_c] == [grant_c2.id, grant_c1.id]
+    active_c = await store.list_person_enrollment_grants(
+        account_id=account_c.id, status="active"
+    )
+    assert [g.id for g in active_c] == [grant_c2.id]
+    revoked_c = await store.list_person_enrollment_grants(
+        account_id=account_c.id, status="revoked"
+    )
+    assert [g.id for g in revoked_c] == [grant_c1.id]
+
+
 async def test_person_schema_reinitialize_is_idempotent(store):
     """Repeated initialize() runs (fresh start, restart, extra worker) must
     converge without duplicate-table/index errors and leave the person tables

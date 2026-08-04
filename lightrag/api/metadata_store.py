@@ -10369,6 +10369,20 @@ class SQLiteMetadataStore:
             ).fetchone()
         return EnterprisePersonRecord.from_row(row) if row is not None else None
 
+    async def list_persons(
+        self, *, status: str | None = None
+    ) -> list[EnterprisePersonRecord]:
+        await self._ensure_initialized()
+        sql = "SELECT * FROM enterprise_persons"
+        params: tuple[Any, ...] = ()
+        if status is not None:
+            sql += " WHERE status = ?"
+            params = (status,)
+        sql += " ORDER BY created_at ASC, id ASC"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [EnterprisePersonRecord.from_row(row) for row in rows]
+
     async def list_person_account_links(
         self, person_id: str, *, only_active: bool = False
     ) -> list[EnterprisePersonAccountLinkRecord]:
@@ -10611,6 +10625,31 @@ class SQLiteMetadataStore:
             if row is not None
             else None
         )
+
+    async def list_person_enrollment_grants(
+        self,
+        *,
+        account_id: str | None = None,
+        status: str | None = None,
+    ) -> list[EnterprisePersonEnrollmentGrantRecord]:
+        await self._ensure_initialized()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if account_id is not None:
+            clauses.append("account_id = ?")
+            params.append(account_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        sql = "SELECT * FROM enterprise_person_enrollment_grants"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC, id DESC"
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [
+            EnterprisePersonEnrollmentGrantRecord.from_row(row) for row in rows
+        ]
 
     def _sqlite_revoke_person_sessions_locked(
         self,

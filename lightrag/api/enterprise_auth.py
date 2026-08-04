@@ -572,6 +572,10 @@ class EnterpriseMetadataStore(Protocol):
         self, person_id: str
     ) -> EnterprisePersonRecord | None: ...
 
+    async def list_persons(
+        self, *, status: str | None = None
+    ) -> list[EnterprisePersonRecord]: ...
+
     async def list_person_account_links(
         self, person_id: str, *, only_active: bool = False
     ) -> list[EnterprisePersonAccountLinkRecord]: ...
@@ -619,6 +623,13 @@ class EnterpriseMetadataStore(Protocol):
     async def get_person_enrollment_grant(
         self, grant_id: str
     ) -> EnterprisePersonEnrollmentGrantRecord | None: ...
+
+    async def list_person_enrollment_grants(
+        self,
+        *,
+        account_id: str | None = None,
+        status: str | None = None,
+    ) -> list[EnterprisePersonEnrollmentGrantRecord]: ...
 
     async def create_person_enrollment_grant_atomic(
         self,
