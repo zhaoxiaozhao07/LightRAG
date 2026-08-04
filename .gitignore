@@ -14,6 +14,9 @@ venv/
 # Enviroment Variable Files
 .env
 .env.backup.*
+# Branch-specific env templates (tracked for reproducible deployments)
+!.env.main
+!.env.phase3-stateless-artifact-storage
 
 # Generated Docker Compose files (output of setup wizard)
 docker-compose.*.yml
