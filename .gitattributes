@@ -1,2 +1,35 @@
 lightrag/api/webui/** binary
 lightrag/api/webui/** linguist-generated
+
+# Force LF line endings for text files to prevent CRLF merge conflicts
+* text=auto eol=lf
+
+# Python source files
+*.py text eol=lf
+*.pyi text eol=lf
+
+# Config and data files
+*.json text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.env text eol=lf
+.env* text eol=lf
+
+# Shell scripts
+*.sh text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.whl binary
+*.ttf binary
