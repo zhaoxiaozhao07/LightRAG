@@ -180,14 +180,18 @@ def test_chunking_config_accepts_int_amount_widened_to_float():
     assert cfg_json.params == {"breakpoint_threshold_amount": 95.0}
 
 
-def test_chunking_config_accepts_valid_sentence_split_regex():
-    cfg = TextChunkingConfig.model_validate(
-        {
-            "strategy": "semantic_vector",
-            "params": {"sentence_split_regex": r"(?<=[.?!])\s+"},
-        }
+def test_chunking_config_rejects_sentence_split_regex():
+    """sentence_split_regex removed due to ReDoS risk (GHSA-32jh-39m7-8x84)."""
+    with pytest.raises(ValidationError) as exc_info:
+        TextChunkingConfig.model_validate(
+            {
+                "strategy": "semantic_vector",
+                "params": {"sentence_split_regex": r"(?<=[.?!])\s+"},
+            }
+        )
+    assert "extra_forbidden" in str(exc_info.value) or "Extra inputs" in str(
+        exc_info.value
     )
-    assert cfg.params == {"sentence_split_regex": r"(?<=[.?!])\s+"}
 
 
 def test_chunking_config_drops_explicit_null():
