@@ -157,36 +157,48 @@ def is_valid_file_source(file_source: str | None) -> bool:
 
 def sanitize_filename(filename: str, input_dir: Path) -> str:
     """
-    Sanitize uploaded filename to prevent Path Traversal attacks.
+    Validate uploaded filename to prevent Path Traversal and collision attacks.
 
     Args:
         filename: The original filename from the upload
         input_dir: The target input directory
 
     Returns:
-        str: Sanitized filename that is safe to use
+        str: Validated filename that is safe to use
 
     Raises:
         HTTPException: If the filename is unsafe or invalid
+
+    Security: GHSA-2wpj-ffvv-2pq8
+        - Reject (not sanitize) filenames with path separators / backslash / ..
+        - Reject control characters, null bytes
+        - Reject filenames that would escape input_dir after normalization
     """
     # Basic validation
     if not filename or not filename.strip():
         raise HTTPException(status_code=400, detail="Filename cannot be empty")
 
-    # Remove path separators and traversal sequences
-    clean_name = filename.replace("/", "").replace("\\", "")
-    clean_name = clean_name.replace("..", "")
+    # Reject (not sanitize) dangerous patterns - preventing collision attacks
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Filename must not contain path separators or traversal sequences"
+        )
 
-    # Remove control characters and null bytes
-    clean_name = "".join(c for c in clean_name if ord(c) >= 32 and c != "\x7f")
+    # Reject control characters and null bytes
+    if any(ord(c) < 32 or c == "\x7f" for c in filename):
+        raise HTTPException(
+            status_code=400,
+            detail="Filename must not contain control characters"
+        )
 
-    # Remove leading/trailing whitespace and dots
-    clean_name = clean_name.strip().strip(".")
+    # Remove leading/trailing whitespace and dots (edge case normalization only)
+    clean_name = filename.strip().strip(".")
 
-    # Check if anything is left after sanitization
+    # Check if anything is left after edge normalization
     if not clean_name:
         raise HTTPException(
-            status_code=400, detail="Invalid filename after sanitization"
+            status_code=400, detail="Invalid filename after normalization"
         )
 
     # Verify the final path stays within the input directory
@@ -198,6 +210,35 @@ def sanitize_filename(filename: str, input_dir: Path) -> str:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
     return clean_name
+
+
+def upload_file_opener(path: Path, flags: int, mode: int = 0o666, *, dir_fd: int | None = None):
+    """
+    Safe file opener for uploads with O_EXCL to prevent TOCTOU races.
+
+    Security: GHSA-2wpj-ffvv-2pq8
+        - O_CREAT | O_EXCL: atomic create, fail if exists
+        - O_NOFOLLOW: reject symlinks
+        - dir_fd: relative open to prevent races
+
+    Args:
+        path: Target file path
+        flags: Open flags (should include O_CREAT | O_EXCL)
+        mode: File permissions
+        dir_fd: Directory fd for relative open (optional)
+
+    Returns:
+        int: File descriptor
+
+    Raises:
+        FileExistsError: If file already exists
+        IsADirectoryError: If path is a directory
+        OSError: Other open failures
+    """
+    import os
+    # Enforce security flags
+    flags = flags | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    return os.open(path, flags, mode, dir_fd=dir_fd)
 
 
 class ScanResponse(BaseModel):
@@ -3237,25 +3278,36 @@ def create_document_routes(
             chunk_size = 1024 * 1024  # 1MB chunks
             needs_cleanup = False
 
-            async with aiofiles.open(file_path, "wb") as out_file:
-                while True:
-                    # Read chunk from upload stream
-                    chunk = await file.read(chunk_size)
-                    if not chunk:
-                        break
-
-                    # Check size limit during streaming (if not checked before)
-                    if (
-                        global_args.max_upload_size is not None
-                        and global_args.max_upload_size > 0
-                    ):
-                        bytes_written += len(chunk)
-                        if bytes_written > global_args.max_upload_size:
-                            needs_cleanup = True
+            # Security: Use O_EXCL opener to prevent TOCTOU races (GHSA-2wpj-ffvv-2pq8)
+            # If file exists, fail atomically (409 already checked above, this is defense-in-depth)
+            try:
+                async with aiofiles.open(
+                    file_path, "wb", opener=lambda p, f: upload_file_opener(p, f)
+                ) as out_file:
+                    while True:
+                        # Read chunk from upload stream
+                        chunk = await file.read(chunk_size)
+                        if not chunk:
                             break
 
-                    # Write chunk to file
-                    await out_file.write(chunk)
+                        # Check size limit during streaming (if not checked before)
+                        if (
+                            global_args.max_upload_size is not None
+                            and global_args.max_upload_size > 0
+                        ):
+                            bytes_written += len(chunk)
+                            if bytes_written > global_args.max_upload_size:
+                                needs_cleanup = True
+                                break
+
+                        # Write chunk to file
+                        await out_file.write(chunk)
+            except FileExistsError:
+                # O_EXCL detected a race: file appeared between check and open
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"File '{safe_filename}' already exists (concurrent upload detected)"
+                )
 
             # Cleanup after file is closed
             if needs_cleanup:
