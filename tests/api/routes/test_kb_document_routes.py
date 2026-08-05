@@ -117,12 +117,26 @@ class FakeRAG:
         if self.should_fail or source_path.name in self.fail_source_names:
             raise RuntimeError("parser exploded")
         if engine == "legacy":
-            from lightrag.parser.legacy import parse_legacy_source_file
+            # Legacy parser now returns RAW format (plain text) instead of sidecar
+            from lightrag.parser.legacy.extractors import extract_text
+            from lightrag.constants import FULL_DOCS_FORMAT_RAW
 
-            result = parse_legacy_source_file(doc_id=doc_id, file_path=source_path)
+            content = extract_text(
+                source_path.read_bytes(),
+                source_path.suffix.lower().lstrip("."),
+                pdf_password=None,
+            )
             if content_data.get("archive_source_after_parse", True):
                 source_path.unlink()
-            return result
+            return {
+                "doc_id": doc_id,
+                "file_path": str(source_path),
+                "parse_format": FULL_DOCS_FORMAT_RAW,
+                "parse_engine": "legacy",
+                "content": content,
+                "blocks_path": "",
+                "parse_stage_skipped": False,
+            }
         parsed_dir = source_path.parent / "__parsed__" / f"{source_path.name}.parsed"
         parsed_dir.mkdir(parents=True, exist_ok=True)
         blocks_path = parsed_dir / f"{source_path.stem}.blocks.jsonl"
