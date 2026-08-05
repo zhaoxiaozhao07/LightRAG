@@ -526,6 +526,19 @@ def _docling_suffix_requires_libreoffice(suffix: str) -> bool:
     return suffix.lower().lstrip(".") in _LEGACY_OFFICE_SUFFIXES_REQUIRING_LIBREOFFICE
 
 
+def should_convert_with_libreoffice(file_path: str) -> bool:
+    """Check if a file needs LibreOffice conversion before parsing.
+
+    Returns True for .doc/.ppt/.xls files when LibreOffice conversion is enabled.
+    """
+    if not libreoffice_conversion_enabled():
+        return False
+
+    from pathlib import Path
+    suffix = Path(file_path).suffix.lower().lstrip(".")
+    return suffix in _LEGACY_OFFICE_SUFFIXES_REQUIRING_LIBREOFFICE
+
+
 def _engine_is_usable(
     engine: str,
     suffix: str,
