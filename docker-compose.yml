@@ -1,0 +1,61 @@
+# Default deployment: pull the prebuilt image from Docker Hub.
+#
+#   julienol/lightrag-api-server
+#
+#   docker compose up -d
+#
+# Override the tag without editing this file:
+#
+#   LIGHTRAG_IMAGE=julienol/lightrag-api-server:v1.5.0 docker compose up -d
+#
+# For a local source build (development), layer docker-compose.dev.yml on top:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#
+# Port 9621 is the only published port. The .env on the host is injected via
+# env_file; container-only overrides live in `environment:` below so the host
+# .env keeps working for bare-metal runs (its LIGHTRAG_RUNTIME_TARGET=host is
+# overridden to `compose` here). Never bind-mount the host .env into the
+# container.
+services:
+  lightrag:
+    image: ${LIGHTRAG_IMAGE:-julienol/lightrag-api-server:latest}
+    pull_policy: always
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 60s
+
+    env_file:
+      - .env
+    environment:
+      # Container-only overrides; these win over env_file and the image defaults.
+      LIGHTRAG_RUNTIME_TARGET: compose
+      HOST: 0.0.0.0
+      PORT: "9621"
+      WORKING_DIR: /app/rag_storage
+      INPUT_DIR: /app/inputs
+      LOG_DIR: /app/logs
+      TIKTOKEN_CACHE_DIR: /app/data/tiktoken
+      PROMPT_DIR: /app/prompts
+
+    ports:
+      - "9621:9621"
+
+    volumes:
+      - ./inputs:/app/inputs
+      - ./logs:/app/logs
+      - ./rag_storage:/app/rag_storage
+      - ./data/tiktoken:/app/data/tiktoken
+      - ./prompts:/app/prompts:ro
+
+    # Reach host services (PostgreSQL, Neo4j, Milvus, MinIO, ...) by their
+    # hostname from inside the container.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9621/health', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3

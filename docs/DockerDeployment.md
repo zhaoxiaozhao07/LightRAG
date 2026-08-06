@@ -70,15 +70,29 @@ Docker instructions work the same on all platforms with Docker Desktop installed
 The Dockerfile uses BuildKit cache mounts to significantly improve build performance:
 
 - **Automatic cache management**: BuildKit is automatically enabled via `# syntax=docker/dockerfile:1` directive
-- **Faster rebuilds**: Only downloads changed dependencies when `uv.lock` or `bun.lock` files are modified
-- **Efficient package caching**: UV and Bun package downloads are cached across builds
+- **Faster rebuilds**: Only downloads changed dependencies when `uv.lock` is modified
+- **Efficient package caching**: UV package downloads are cached across builds
 - **No manual configuration needed**: Works out of the box in Docker Compose and GitHub Actions
 
-### Start LightRAG  server:
+### Start LightRAG server
+
+The checked-in `docker-compose.yml` is cloud-first: it only references the prebuilt
+Docker Hub image (`julienol/lightrag-api-server:latest`, override with the
+`LIGHTRAG_IMAGE` variable) and does **not** contain a `build:` section, so a plain
+compose command never builds locally.
 
 ```bash
 docker compose up -d
 ```
+
+For a local source build during development, layer the explicit dev override on top:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+```
+
+`docker-compose.dev.yml` is deliberately not named `docker-compose.override.yml`, so
+Compose never auto-loads a local build in the default cloud-first flow.
 
 If you used the interactive setup, start the generated stack with:
 
@@ -105,13 +119,22 @@ make env-security-check
 That command audits the current `.env` for missing authentication, unsafe whitelist settings, weak
 JWT secrets, and other setup-level security risks without rewriting any files.
 
-LightRAG Server uses the following paths for data storage:
+LightRAG Server uses the following paths for data storage inside the container:
 
 ```
-data/
-├── rag_storage/    # RAG data persistence
-└── inputs/         # Input documents
+inputs/       # Uploaded source documents + parsed artifacts
+logs/         # lightrag.log (+ rotated backups)
+rag_storage/  # RAG graph / vector data + local metadata
+data/tiktoken # Tokenizer cache (offline deployments pre-populate this)
+prompts/      # Custom entity-type prompts (read-only mount)
 ```
+
+The container-only paths above are injected via Compose `environment` (`WORKING_DIR`,
+`INPUT_DIR`, `LOG_DIR`, `TIKTOKEN_CACHE_DIR`, `PROMPT_DIR`). The host `.env` is
+provided through `env_file:` — never bind-mount the host `.env` into the container:
+a host `.env` carries `LIGHTRAG_RUNTIME_TARGET=host`, and the server's runtime-target
+check refuses to start inside a container with that value. Compose sets
+`LIGHTRAG_RUNTIME_TARGET=compose` (plus `HOST=0.0.0.0`, `PORT=9621`) to override it.
 
 ### Optional: local vLLM embedding and reranker
 
@@ -295,11 +318,11 @@ Software packages requiring `transformers`, `torch`, or `cuda` are not preinstal
 ### For local development and testing
 
 ```bash
-# Build and run with Docker Compose (BuildKit automatically enabled)
-docker compose up --build
+# Build and run from the local Dockerfile (BuildKit automatically enabled)
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 
 # Or explicitly enable BuildKit if needed
-DOCKER_BUILDKIT=1 docker compose up --build
+DOCKER_BUILDKIT=1 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 ```
 
 **Note**: BuildKit is automatically enabled by the `# syntax=docker/dockerfile:1` directive in the Dockerfile, ensuring optimal caching performance.

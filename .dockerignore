@@ -1,0 +1,57 @@
+# Git / CI
+.git
+.github
+
+# Secrets and configuration (never bake host config or keys into an image)
+.env
+.env.*
+*.env
+env.example
+
+# Python virtual environments and caches
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+.history
+.cache
+
+# Local runtime data (host data is mounted at runtime, not baked)
+inputs
+logs
+rag_storage
+output
+data
+temp
+local_neo4jWorkDir
+neo4jWorkDir
+
+# Build / distribution artifacts
+dist
+build
+site
+
+# Source areas not needed in the image
+examples
+reproduce
+scripts
+tests
+
+# Keep only the API-server doc needed as the in-image build README
+docs/*
+!docs/LightRAG-API-Server.md
+
+# Frontend / misc
+node_modules
+.DS_Store
+.idea
+.vscode
+*.log
+*.log.*
+.python-version

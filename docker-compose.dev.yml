@@ -1,0 +1,15 @@
+# Local development override: build the image from the local Dockerfile instead
+# of pulling the Docker Hub image.
+#
+# The default docker-compose.yml deliberately has no `build:` section so a plain
+# `docker compose up -d` always pulls the cloud image. Layer this file on top to
+# build locally (does not use the auto-loaded docker-compose.override.yml name):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+services:
+  lightrag:
+    image: lightrag-api-server:dev
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: Dockerfile
