@@ -294,7 +294,7 @@ equations.json 文件的 `blockid` `heading` `surrounding` `llm_analyze_result` 
 | `format` | 固定为 `"latex"` |
 | `content` | 字符串：是**原始** LaTeX（可能包含 Unicode 运算符、外层 `\[ \]`），不包含两头的`$`分割符；模态分析阶段直接读这里 |
 | `self_ref` | 可选；解析引擎原始输出中的对象引用（如 Docling JSON Pointer `#/texts/15`，或 MinerU `content_list.json#/45`），用于溯源时回查原始解析产物 |
-| `llm_analyze_result.equation` | 字符串：是大模型输出的**规范化**后的 LaTeX公式（外层 `$ / \[ \] / equation` 环境，Unicode 转 LaTeX，不包含联投的`$`分割符），这是后续多模态 chunk 真正使用的字符串； |
+| `llm_analyze_result.equation` | 字符串：是大模型输出的**规范化**后的 LaTeX公式（外层 `$ / \[ \] / equation` 环境，Unicode 转 LaTeX，不包含联投的`$`分割符），这是后续多模态 chunk 真正使用的字符串。**回退语义**：当 LLM 返回的 JSON 缺失或留空 `equation` 字段时（典型于复杂公式下的 token 截断 / 字段名漂移），分析阶段会回退到本 item 的 `content`（原始 LaTeX）作为 `equation` 值，`status` 保持 `success`，写入 `degraded=true`，并在 `message` 中标注 "fell back to sidecar raw latex"，同时输出一条 WARNING 日志；这样单条公式的 LLM 抖动不会 fail-fast 拖垮整篇文档。回退结果不写入 analysis cache；若命中历史坏 cache 也会将该条目逐出，重跑会重新尝试获得干净的 LLM 输出。若完整原始 LaTeX 仍超过 `MAX_EXTRACT_INPUT_TOKENS`，系统保留 sidecar/正文中的原公式，但省略该公式的多模态 chunk，避免整篇构建失败。仅当同时缺失 `equation` 字段且 `content` 为空时才升格为 `failure`（实际由上游 `missing equation content` 校验先行拦截）。 |
 
 在模态分析阶段，如果`content`字段长度超过大模型的上下文长度时，表格内容会被机械地截断后在喂给模型。行内公式（与正文连续的 `<equation format="latex">…</equation>`）**不会**保存到 equations.json 文件，它仅会在 blocks 文本里以无 `id` 形式留存。这样做的目的是避免给抽取结果注入过多的噪音。
 
@@ -386,14 +386,14 @@ charspan: 内容从标定段落的m个字符开始到底n个字符结束（可�
 
 | `status` | 触发场景 | 字段说明 |
 |---|---|---|
-| `success` | 模型成功返回合法 JSON 且必需字段齐全 | 图形：`name / type / description`；表格：`name / description`；公式：`name / description / equation` |
+| `success` | 模型成功返回合法 JSON 且必需字段齐全；**含降级回退**：公式的 `equation` 字段缺失/无效但 sidecar 原始 LaTeX 可用时，回退到原始 LaTeX 继续，`status` 仍为 `success` | 图形：`name / type / description`；表格：`name / description`；公式：`name / description / equation / degraded`（回退时 `equation` 取自 sidecar `content`，`degraded=true`，`message` 标注回退原因；正常公式为 `degraded=false`） |
 | `skipped` | 期跳过多模态分析：图片格式不支持、像素 < `VLM_MIN_IMAGE_PIXEL`（默认 32px）、大于 `VLM_MAX_IMAGE_BYTES`（默认 5 MB）、未启用VLM | `message` 写跳过原因 |
-| `failure` | 必需字段缺失、JSON 修复后仍不合法、VLM/EXTRACT role 未配置而对应模态被启用、模型调用异常 | `message` 写诊断 |
+| `failure` | 必需字段（除公式 `equation` 外）缺失、JSON 修复后仍不合法、VLM/EXTRACT role 未配置而对应模态被启用、模型调用异常；公式的 `equation` 缺失**且** sidecar `content` 也为空时同样进入 `failure` | `message` 写诊断 |
 
 补充：
 
 - `analyze_time` 是 epoch 秒，每个 status 都有；
-- `message` 在 `status="success"` 时**恒为空串**，便于过滤；
-- 对已启用模态的 item，每次 `analyze_multimodal` 都会重新计算，并用本次结果覆盖已有的 `llm_analyze_result`（无论原先是 `success`、`skipped` 还是 `failure`）。这样修正 VLM/EXTRACT 配置后可以直接重试，无须手动清理旧 sidecar 结果。LLM 调用仍会走 analysis cache：如果 cache key 命中，不会再次请求 provider，语义字段通常保持一致，但 `analyze_time` 等运行时字段会被重写。只有 cache miss，例如有效 role 模型 / binding / host、prompt 输入或图片元数据变化后，保存内容才可能与上次不同。
+- `message` 在 `status="success"` 时：常规情况下为空串；**降级回退场景下不为空**，会写入 `"equation field missing or invalid in LLM response; fell back to sidecar raw latex"`，便于运维通过 `degraded=true` 或 `message != ""` 过滤出降级 item；
+- 对已启用模态的 item，每次 `analyze_multimodal` 都会重新计算，并用本次结果覆盖已有的 `llm_analyze_result`（无论原先是 `success`、`skipped` 还是 `failure`）。这样修正 VLM/EXTRACT 配置后可以直接重试，无须手动清理旧 sidecar 结果。LLM 调用仍会走 analysis cache：如果 cache key 命中，不会再次请求 provider，语义字段通常保持一致，但 `analyze_time` 等运行时字段会被重写。只有 cache miss，例如有效 role 模型 / binding / host、prompt 输入或图片元数据变化后，保存内容才可能与上次不同。**降级结果不写入 cache，命中的历史降级 cache 也会被逐出**，所以重跑时会重新尝试获得干净的 LLM 输出。
 
 图形 `type` 受 12 项枚举约束（见 [`IMAGE_TYPE_ENUM`](../lightrag/prompt_multimodal.py)：`Photo / Illustration / Screenshot / Icon / Chart / Table / Infographic / Flowchart / Chat Log / Wireframe / Texture / Other`）；模型若返回枚举外的值，会被规整成 `Other` 而不是失败。

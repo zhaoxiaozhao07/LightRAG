@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from lightrag.parser.external.mineru import is_bundle_valid
+from lightrag.parser.external.mineru import PENDING_TASK_FILENAME, is_bundle_valid
 from lightrag.parser.external.mineru.client import MinerURawClient
 
 
@@ -151,6 +151,16 @@ def fake_httpx(monkeypatch: pytest.MonkeyPatch) -> type:
 
     monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
     return fake
+
+
+def _set_monotonic_sequence(
+    monkeypatch: pytest.MonkeyPatch, values: list[float]
+) -> None:
+    import lightrag.parser.external.mineru.client as mod
+
+    iterator = iter(values)
+    final = values[-1]
+    monkeypatch.setattr(mod, "monotonic", lambda: next(iterator, final))
 
 
 def _nested_mineru_zip() -> bytes:
@@ -287,7 +297,6 @@ async def test_client_official_mode_round_trip(
     monkeypatch.setenv("MINERU_API_MODE", "official")
     monkeypatch.setenv("MINERU_API_TOKEN", "token-123")
     monkeypatch.setenv("MINERU_POLL_INTERVAL_SECONDS", "0")
-    monkeypatch.setenv("MINERU_MAX_POLLS", "5")
 
     src = tmp_path / "demo.pdf"
     src.write_bytes(b"PDFBYTES" * 200)
@@ -576,7 +585,15 @@ class _LocalNeverCompletesDispatcher(_Dispatcher):
     def get(self, url: str, **_: Any) -> _FakeResponse:
         if url == "http://127.0.0.1:8000/tasks/L-timeout":
             return _FakeResponse(
-                text=json.dumps({"task_id": "L-timeout", "status": "running"})
+                text=json.dumps(
+                    {
+                        "task_id": "L-timeout",
+                        "status": "running",
+                        "backend": "vlm-http-client",
+                        "queued_ahead": 0,
+                        "started_at": "2026-08-05T08:31:17+00:00",
+                    }
+                )
             )
         raise AssertionError(f"unexpected GET {url}")
 
@@ -590,7 +607,10 @@ async def test_client_local_polling_timeout_raises_clear_error(
     monkeypatch.setenv("MINERU_API_MODE", "local")
     monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://127.0.0.1:8000")
     monkeypatch.setenv("MINERU_POLL_INTERVAL_SECONDS", "0")
-    monkeypatch.setenv("MINERU_MAX_POLLS", "2")
+    monkeypatch.setenv("MINERU_TASK_TIMEOUT_SECONDS", "1")
+    _set_monotonic_sequence(
+        monkeypatch, [0.0, 0.0, 0.25, 0.5, 0.75, 1.0]
+    )
 
     src = tmp_path / "demo.pdf"
     src.write_bytes(b"PDFBYTES" * 200)
@@ -598,8 +618,180 @@ async def test_client_local_polling_timeout_raises_clear_error(
     raw.mkdir()
 
     _CURRENT.dispatcher = _LocalNeverCompletesDispatcher()
-    with pytest.raises(TimeoutError, match="MinerU local task polling timeout: L-timeout"):
+    with pytest.raises(TimeoutError, match="MinerU local task polling timeout: L-timeout") as excinfo:
         await MinerURawClient().download_into(raw, src)
+    # Enhanced timeout message must carry diagnostics so operators can tell
+    # "stuck in pending/running" (VLM starvation) from a non-standard
+    # failure word. The dispatcher reports status="running", so last_status
+    # must surface here alongside the poll budget.
+    msg = str(excinfo.value)
+    assert "last_status='running'" in msg
+    assert "polls=2" in msg
+    assert "timeout=1.0s" in msg
+    assert "interval=0.0s" in msg
+    assert "queued_ahead=0" in msg
+    assert "backend='vlm-http-client'" in msg
+    pending = json.loads((raw / PENDING_TASK_FILENAME).read_text(encoding="utf-8"))
+    assert pending["task_id"] == "L-timeout"
+
+
+class _LocalResumeCompletedDispatcher(_Dispatcher):
+    def post(self, url: str, **_: Any) -> _FakeResponse:
+        raise AssertionError(f"resume must not submit another task: {url}")
+
+    def get(self, url: str, **_: Any) -> _FakeResponse:
+        if url == "http://127.0.0.1:8000/tasks/L-timeout":
+            return _FakeResponse(
+                text=json.dumps({"task_id": "L-timeout", "status": "completed"})
+            )
+        if url == "http://127.0.0.1:8000/tasks/L-timeout/result":
+            return _FakeResponse(
+                content=_nested_mineru_zip(),
+                headers={"Content-Type": "application/zip"},
+            )
+        raise AssertionError(f"unexpected GET {url}")
+
+
+@pytest.mark.offline
+async def test_client_local_retry_resumes_persisted_task_without_reupload(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://127.0.0.1:8000")
+    monkeypatch.setenv("MINERU_POLL_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("MINERU_TASK_TIMEOUT_SECONDS", "1")
+
+    src = tmp_path / "demo.pdf"
+    src.write_bytes(b"PDFBYTES" * 200)
+    raw = tmp_path / "demo.mineru_raw"
+    raw.mkdir()
+
+    _CURRENT.dispatcher = _LocalNeverCompletesDispatcher()
+    _set_monotonic_sequence(
+        monkeypatch, [0.0, 0.0, 0.25, 0.5, 0.75, 1.0]
+    )
+    with pytest.raises(TimeoutError):
+        await MinerURawClient().download_into(raw, src)
+
+    _CURRENT.dispatcher = _LocalResumeCompletedDispatcher()
+    _set_monotonic_sequence(monkeypatch, [0.0, 0.0])
+    manifest = await MinerURawClient().download_into(raw, src)
+
+    assert manifest.task_id == "L-timeout"
+    assert (raw / "content_list.json").is_file()
+    assert not (raw / PENDING_TASK_FILENAME).exists()
+
+
+class _LocalExpiredTaskDispatcher(_Dispatcher):
+    def __init__(self) -> None:
+        self.submissions = 0
+
+    def post(self, url: str, **_: Any) -> _FakeResponse:
+        if url == "http://127.0.0.1:8000/tasks":
+            self.submissions += 1
+            return _FakeResponse(text=json.dumps({"task_id": "L-replacement"}))
+        raise AssertionError(f"unexpected POST {url}")
+
+    def get(self, url: str, **_: Any) -> _FakeResponse:
+        if url == "http://127.0.0.1:8000/tasks/L-timeout":
+            return _FakeResponse(status_code=404, text='{"detail":"not found"}')
+        if url == "http://127.0.0.1:8000/tasks/L-replacement":
+            return _FakeResponse(
+                text=json.dumps(
+                    {"task_id": "L-replacement", "status": "completed"}
+                )
+            )
+        if url == "http://127.0.0.1:8000/tasks/L-replacement/result":
+            return _FakeResponse(
+                content=_nested_mineru_zip(),
+                headers={"Content-Type": "application/zip"},
+            )
+        raise AssertionError(f"unexpected GET {url}")
+
+
+@pytest.mark.offline
+async def test_client_local_expired_pending_task_submits_replacement(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://127.0.0.1:8000")
+    monkeypatch.setenv("MINERU_POLL_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("MINERU_TASK_TIMEOUT_SECONDS", "1")
+
+    src = tmp_path / "demo.pdf"
+    src.write_bytes(b"PDFBYTES" * 200)
+    raw = tmp_path / "demo.mineru_raw"
+    raw.mkdir()
+
+    _CURRENT.dispatcher = _LocalNeverCompletesDispatcher()
+    _set_monotonic_sequence(
+        monkeypatch, [0.0, 0.0, 0.25, 0.5, 0.75, 1.0]
+    )
+    with pytest.raises(TimeoutError):
+        await MinerURawClient().download_into(raw, src)
+
+    dispatcher = _LocalExpiredTaskDispatcher()
+    _CURRENT.dispatcher = dispatcher
+    import lightrag.parser.external.mineru.client as client_mod
+
+    monkeypatch.setattr(client_mod, "monotonic", lambda: 0.0)
+    manifest = await MinerURawClient().download_into(raw, src)
+
+    assert dispatcher.submissions == 1
+    assert manifest.task_id == "L-replacement"
+    assert not (raw / PENDING_TASK_FILENAME).exists()
+
+
+@pytest.mark.offline
+async def test_client_local_non_standard_error_state_raises(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Self-hosted mineru-api variants sometimes surface task-level errors
+    via ``status="error"`` (or ``cancelled``/``timeout``) instead of the
+    canonical ``failed``. The client must treat these as terminal failures
+    and surface the server-side error body — not silently poll until the
+    budget is exhausted."""
+
+    class _ErrorStateDispatcher(_Dispatcher):
+        def post(self, url: str, **_: Any) -> _FakeResponse:
+            if url == "http://127.0.0.1:8000/tasks":
+                return _FakeResponse(text=json.dumps({"task_id": "L-err"}))
+            raise AssertionError(f"unexpected POST {url}")
+
+        def get(self, url: str, **_: Any) -> _FakeResponse:
+            if url == "http://127.0.0.1:8000/tasks/L-err":
+                return _FakeResponse(
+                    text=json.dumps(
+                        {
+                            "task_id": "L-err",
+                            "status": "error",
+                            "error": "vlm backend unreachable",
+                        }
+                    )
+                )
+            raise AssertionError(f"unexpected GET {url}")
+
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://127.0.0.1:8000")
+    monkeypatch.setenv("MINERU_POLL_INTERVAL_SECONDS", "0")
+
+    src = tmp_path / "demo.pdf"
+    src.write_bytes(b"PDFBYTES" * 200)
+    raw = tmp_path / "demo.mineru_raw"
+    raw.mkdir()
+
+    _CURRENT.dispatcher = _ErrorStateDispatcher()
+    # Must be a RuntimeError (terminal-failure path) carrying the server
+    # error body, NOT a TimeoutError from polling-budget exhaustion.
+    with pytest.raises(RuntimeError, match="vlm backend unreachable"):
+        await MinerURawClient().download_into(raw, src)
+    assert not (raw / PENDING_TASK_FILENAME).exists()
 
 
 class _LocalNetworkDropDispatcher(_Dispatcher):
@@ -632,6 +824,7 @@ async def test_client_local_network_interruption_propagates(
     _CURRENT.dispatcher = _LocalNetworkDropDispatcher()
     with pytest.raises(ConnectionError, match="connection reset by peer"):
         await MinerURawClient().download_into(raw, src)
+    assert (raw / PENDING_TASK_FILENAME).is_file()
 
 
 class _LocalRedirectDispatcher(_Dispatcher):
@@ -734,6 +927,12 @@ def test_client_mode_specific_endpoint_validation(
 
     monkeypatch.setenv("MINERU_API_MODE", "custom")
     with pytest.raises(ValueError, match="MINERU_API_MODE"):
+        MinerURawClient()
+
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://127.0.0.1:8000")
+    monkeypatch.setenv("MINERU_TASK_TIMEOUT_SECONDS", "0")
+    with pytest.raises(ValueError, match="MINERU_TASK_TIMEOUT_SECONDS"):
         MinerURawClient()
 
 
@@ -904,7 +1103,6 @@ async def test_client_official_polls_through_non_terminal_states(
     monkeypatch.setenv("MINERU_API_MODE", "official")
     monkeypatch.setenv("MINERU_API_TOKEN", "token-123")
     monkeypatch.setenv("MINERU_POLL_INTERVAL_SECONDS", "0")
-    monkeypatch.setenv("MINERU_MAX_POLLS", "5")
 
     src = tmp_path / "demo.pdf"
     src.write_bytes(b"PDF" * 50)

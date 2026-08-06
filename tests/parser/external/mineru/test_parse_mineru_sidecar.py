@@ -89,13 +89,13 @@ _FAKE_CONTENT_LIST = [
 ]
 
 
-def _install_fake_download(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+def _install_fake_download(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Replace :meth:`MinerURawClient.download_into` with a recorder that
     writes a synthetic bundle (content_list.json + one image + manifest).
     """
     import lightrag.parser.external.mineru.client as client_mod
 
-    counters = {"calls": 0, "upload_names": []}
+    counters = {"calls": 0, "upload_names": [], "resume_pending": []}
 
     async def _fake_download(
         self,
@@ -103,9 +103,11 @@ def _install_fake_download(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
         source_file_path: Path,
         *,
         upload_name: str | None = None,
+        resume_pending: bool = True,
     ):
         counters["calls"] += 1
         counters["upload_names"].append(upload_name)
+        counters["resume_pending"].append(resume_pending)
         raw_dir.mkdir(parents=True, exist_ok=True)
         (raw_dir / "content_list.json").write_text(
             json.dumps(_FAKE_CONTENT_LIST, ensure_ascii=False),
@@ -357,6 +359,7 @@ def test_parse_mineru_cache_hit_skips_download(
                 content_data={"force_reparse": True},
             )
             assert counters["calls"] == 2
+            assert counters["resume_pending"] == [True, False]
 
             # Env-level force-reparse remains supported.
             monkeypatch.setenv("LIGHTRAG_FORCE_REPARSE_MINERU", "true")
@@ -366,6 +369,7 @@ def test_parse_mineru_cache_hit_skips_download(
                 content_data={},
             )
             assert counters["calls"] == 3
+            assert counters["resume_pending"] == [True, False, False]
         finally:
             await rag.finalize_storages()
 

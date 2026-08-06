@@ -3226,6 +3226,7 @@ class _PipelineMixin:
         # Lazy imports keep this module import-cheap and avoid pulling httpx
         # into call paths that never touch the MinerU engine.
         from lightrag.parser.external.mineru import (
+            PENDING_TASK_FILENAME,
             MinerUIRBuilder,
             MinerURawClient,
             clear_dir_contents,
@@ -3278,7 +3279,12 @@ class _PipelineMixin:
                     raw_dir,
                 )
             raw_dir.mkdir(parents=True, exist_ok=True)
-            clear_dir_contents(raw_dir)
+            clear_dir_contents(
+                raw_dir,
+                preserve_names=(
+                    set() if force_reparse else {PENDING_TASK_FILENAME}
+                ),
+            )
             client = MinerURawClient()
             logger.info(
                 "[MinerU] Parsing %s %s (may take a few minutes)",
@@ -3289,6 +3295,7 @@ class _PipelineMixin:
                 raw_dir,
                 source_file_path,
                 upload_name=document_name,
+                resume_pending=not force_reparse,
             )
 
         ir_builder = MinerUIRBuilder()
@@ -4762,18 +4769,59 @@ class _PipelineMixin:
                     "status": "success",
                     "message": "",
                 }
+                # `degraded` marks items whose LLM output was unusable for a
+                # required modality-specific field but could be recovered
+                # from sidecar ground truth. Degraded results are NOT cached
+                # so a re-run gets another shot at a clean LLM response.
+                degraded = False
                 if kind == "equation":
                     equation_value = parsed.get("equation")
                     if (
                         not isinstance(equation_value, str)
                         or not equation_value.strip()
                     ):
-                        raise MultimodalAnalysisError(
-                            f"equation/{item_id}: missing or invalid field 'equation'"
+                        # Graceful degradation: a missing/empty `equation`
+                        # field is typically a recoverable LLM hiccup
+                        # (token truncation, field-name drift, complex
+                        # formula). Fail-fast here would cancel every other
+                        # item task in this sidecar (analyze_multimodal's
+                        # FIRST_EXCEPTION loop) and discard already-completed
+                        # sibling analyses. Instead, fall back to the
+                        # sidecar's raw latex (content_text, validated
+                        # non-empty upstream) so the document can still
+                        # build; the fallback reason is recorded in
+                        # `message` for diagnostics. Only when there is no
+                        # ground-truth latex to fall back on do we hard-fail.
+                        if not content_text.strip():
+                            raise MultimodalAnalysisError(
+                                f"equation/{item_id}: missing or invalid "
+                                f"field 'equation' and no sidecar content "
+                                f"to fall back on"
+                            )
+                        logger.warning(
+                            f"[analyze_multimodal] equation/{item_id}: "
+                            f"missing or invalid field 'equation'; falling "
+                            f"back to sidecar raw latex ({file_path})"
                         )
-                    result_obj["equation"] = equation_value.strip()
+                        result_obj["equation"] = content_text.strip()
+                        result_obj["message"] = (
+                            "equation field missing or invalid in LLM "
+                            "response; fell back to sidecar raw latex"
+                        )
+                        degraded = True
+                    else:
+                        result_obj["equation"] = equation_value.strip()
+                    result_obj["degraded"] = degraded
                 cache_id_to_attach: str | None = None
-                if fresh and analysis_cache_enabled:
+                if degraded and not fresh and self.llm_response_cache:
+                    try:
+                        await self.llm_response_cache.delete([cache_id])
+                    except Exception as cache_delete_error:
+                        logger.warning(
+                            f"[analyze_multimodal] failed to evict degraded "
+                            f"analysis cache {cache_id}: {cache_delete_error}"
+                        )
+                if fresh and analysis_cache_enabled and not degraded:
                     await save_to_cache(
                         self.llm_response_cache,
                         CacheData(
@@ -4786,7 +4834,7 @@ class _PipelineMixin:
                         ),
                     )
                     cache_id_to_attach = cache_id
-                elif not fresh:
+                elif not fresh and not degraded:
                     # Cache hit path (handle_cache already gated by flag):
                     # safe to surface the existing cache_id for cleanup.
                     cache_id_to_attach = cache_id
@@ -5176,7 +5224,13 @@ class _PipelineMixin:
                 sections.append(f"[{footnote_label}]{footnotes_joined}")
             return "\n\n".join(s for s in sections if s).strip()
 
-        max_tokens = DEFAULT_MAX_EXTRACT_INPUT_TOKENS
+        max_tokens = get_env_value(
+            "MAX_EXTRACT_INPUT_TOKENS",
+            DEFAULT_MAX_EXTRACT_INPUT_TOKENS,
+            int,
+        )
+        if max_tokens <= 0:
+            max_tokens = DEFAULT_MAX_EXTRACT_INPUT_TOKENS
         min_desc_tokens = DEFAULT_MM_CHUNK_DESCRIPTION_MIN_TOKENS
 
         for root_key, sidecar_path, kind in sidecar_defs:
@@ -5213,6 +5267,11 @@ class _PipelineMixin:
                 description = str(analysis.get("description") or "").strip()
                 equation_body = str(analysis.get("equation") or "").strip()
                 image_type = str(analysis.get("type") or "").strip()
+                degraded_equation = kind == "equation" and (
+                    analysis.get("degraded") is True
+                    or "fell back to sidecar raw latex"
+                    in str(analysis.get("message") or "").lower()
+                )
                 if not name:
                     raise MultimodalAnalysisError(
                         f"{root_key}/{item_id}: success result missing 'name'"
@@ -5258,6 +5317,15 @@ class _PipelineMixin:
                             break
                         keep = max(min_desc_tokens, keep - (tokens - max_tokens))
                     if tokens > max_tokens:
+                        if degraded_equation:
+                            logger.warning(
+                                f"[build_mm_chunks] equations/{item_id}: "
+                                f"degraded raw-latex fallback exceeds "
+                                f"{max_tokens} tokens; keeping the equation in "
+                                f"the primary text block and omitting its "
+                                f"multimodal chunk"
+                            )
+                            continue
                         raise MultimodalAnalysisError(
                             f"{root_key}/{item_id}: multimodal chunk exceeds "
                             f"{max_tokens} tokens even after truncating description "

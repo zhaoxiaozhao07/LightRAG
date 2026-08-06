@@ -98,12 +98,12 @@ python -m lightrag.parser.cli ./inputs/workspace/sample.pdf \
 
 `mineru` / `docling` 引擎在 **缓存未命中**（首次解析或 `--force-reparse`）时会调用外部服务，所需环境变量与生产入库一致：
 
-- **MinerU**：`MINERU_API_MODE`（`local` / `official`）、`MINERU_API_TOKEN`、`MINERU_LOCAL_ENDPOINT` 或 `MINERU_OFFICIAL_ENDPOINT`，可选 `MINERU_ENGINE_VERSION` / `MINERU_MODEL_VERSION` / `MINERU_POLL_INTERVAL_SECONDS` / `MINERU_MAX_POLLS`。
+- **MinerU**：`MINERU_API_MODE`（`local` / `official`）、`MINERU_API_TOKEN`、`MINERU_LOCAL_ENDPOINT` 或 `MINERU_OFFICIAL_ENDPOINT`，可选 `MINERU_ENGINE_VERSION` / `MINERU_MODEL_VERSION` / `MINERU_POLL_INTERVAL_SECONDS` / `MINERU_TASK_TIMEOUT_SECONDS`（默认 3600 秒绝对时限）。
 - **Docling**：`DOCLING_ENDPOINT`，可选 `DOCLING_ENGINE_VERSION` / `DOCLING_DO_OCR` / `DOCLING_FORCE_OCR` / `DOCLING_OCR_ENGINE` / `DOCLING_OCR_PRESET` / `DOCLING_OCR_LANG` / `DOCLING_DO_FORMULA_ENRICHMENT` / `DOCLING_POLL_INTERVAL_SECONDS` / `DOCLING_MAX_POLLS`。
 
 详见 [FileProcessingConfiguration-zh.md](./FileProcessingConfiguration-zh.md)。
 
-**缓存命中**时（raw 目录已存在且非空，且未传 `--force-reparse`）无需任何外部服务环境变量——可用于离线复现解析输出。
+**缓存命中**时（raw 目录包含有效 `_manifest.json`，且未传 `--force-reparse`）无需任何外部服务环境变量——可用于离线复现解析输出。仅存在 `_pending_task.json` 不算缓存命中；local 模式会连接 MinerU 服务续轮询同一 `task_id`。`--force-reparse` 会删除 pending 状态并创建新任务。
 
 ## 常见排障
 

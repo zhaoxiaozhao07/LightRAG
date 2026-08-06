@@ -16,7 +16,11 @@ from lightrag.parser.external.mineru.cache import (
 )
 from lightrag.parser.external.mineru.client import MinerURawClient
 from lightrag.parser.external.mineru.ir_builder import MinerUIRBuilder
-from lightrag.parser.external.mineru.manifest import Manifest, ManifestFile
+from lightrag.parser.external.mineru.manifest import (
+    PENDING_TASK_FILENAME,
+    Manifest,
+    ManifestFile,
+)
 
 __all__ = [
     "MINERU_RAW_DIR_SUFFIX",
@@ -24,6 +28,7 @@ __all__ = [
     "ManifestFile",
     "MinerUIRBuilder",
     "MinerURawClient",
+    "PENDING_TASK_FILENAME",
     "clear_dir_contents",
     "compute_size_and_hash",
     "is_bundle_valid",

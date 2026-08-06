@@ -982,3 +982,212 @@ async def test_extract_cap_below_prompt_frame_fails_item_without_llm_call(
         assert "MAX_EXTRACT_INPUT_TOKENS" in item["llm_analyze_result"]["message"]
     finally:
         await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_equation_missing_field_falls_back_without_caching_and_retries(
+    tmp_path, caplog, _propagate_lightrag_logger
+):
+    """When the EXTRACT role returns a valid JSON but the `equation` field
+    is missing/empty (a common LLM hiccup on complex formulas — token
+    truncation, field-name drift), analyze_multimodal must NOT fail-fast
+    and cancel the whole sidecar. Instead it degrades gracefully: falls
+    back to the sidecar's raw latex (`content`), keeps status="success"
+    so the equation still produces a multimodal chunk, and records the
+    fallback reason in `message` + a WARNING log.
+    """
+    extract_log: list[dict] = []
+
+    async def _extract_equation(prompt, **kwargs):
+        extract_log.append({"prompt": prompt, "kwargs": dict(kwargs)})
+        if len(extract_log) == 1:
+            # Valid JSON, but `equation` is missing: production regression.
+            return json.dumps(
+                {"name": "Euler identity", "description": "famous"}
+            )
+        return json.dumps(
+            {
+                "name": "Euler identity",
+                "description": "famous",
+                "equation": r"e^{i\pi}+1=0",
+            }
+        )
+
+    rag = _build_rag(
+        tmp_path,
+        vlm_process_enable=False,
+        extract_func=_extract_equation,
+    )
+    await rag.initialize_storages()
+    try:
+        parsed_dir = tmp_path / "parsed"
+        parsed_dir.mkdir()
+        blocks_path = parsed_dir / "doc.blocks.jsonl"
+        blocks_path.write_text(
+            json.dumps({"type": "meta", "doc_id": "doc-eq"}) + "\n",
+            encoding="utf-8",
+        )
+        raw_latex = r"\frac{a}{b} = c"
+        equations_path = parsed_dir / "doc.equations.json"
+        equations_path.write_text(
+            json.dumps(
+                {
+                    "equations": {
+                        "eq-001": {
+                            "caption": "Eq 1",
+                            "content": raw_latex,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="lightrag.pipeline"):
+            await rag.analyze_multimodal(
+                doc_id="doc-eq",
+                file_path="fixture.pdf",
+                parsed_data={"blocks_path": str(blocks_path)},
+                process_options="e",
+            )
+
+        # First pass degrades without failing the document.
+        assert len(extract_log) == 1
+        payload = json.loads(equations_path.read_text(encoding="utf-8"))
+        result = payload["equations"]["eq-001"]["llm_analyze_result"]
+        assert result["status"] == "success"
+        assert result["degraded"] is True
+        assert result["name"] == "Euler identity"
+        assert result["description"] == "famous"
+        assert result["equation"] == raw_latex
+        assert "back" in result["message"].lower()
+        assert "equation" in result["message"].lower()
+        assert payload["equations"]["eq-001"].get("llm_cache_list", []) == []
+
+        chunks = rag._build_mm_chunks_from_sidecars(
+            doc_id="doc-eq",
+            file_path="fixture.pdf",
+            blocks_path=str(blocks_path),
+            base_order_index=0,
+            process_options="e",
+        )
+        assert len(chunks) == 1
+        assert raw_latex in chunks[0]["content"]
+
+        # A degraded response must not enter the analysis cache.
+        await rag.llm_response_cache.index_done_callback()
+        cache_file = (
+            Path(rag.working_dir) / rag.workspace / "kv_store_llm_response_cache.json"
+        )
+        if cache_file.exists():
+            cache_blob = json.loads(cache_file.read_text(encoding="utf-8"))
+            assert not any(
+                key.startswith("default:analysis:") for key in cache_blob
+            )
+
+        # Second pass must call EXTRACT again and replace the fallback with a
+        # clean, cacheable equation response.
+        await rag.analyze_multimodal(
+            doc_id="doc-eq",
+            file_path="fixture.pdf",
+            parsed_data={"blocks_path": str(blocks_path)},
+            process_options="e",
+        )
+        assert len(extract_log) == 2
+        payload = json.loads(equations_path.read_text(encoding="utf-8"))
+        result = payload["equations"]["eq-001"]["llm_analyze_result"]
+        assert result["status"] == "success"
+        assert result["degraded"] is False
+        assert result["equation"] == r"e^{i\pi}+1=0"
+        assert result["message"] == ""
+
+        await rag.llm_response_cache.index_done_callback()
+        cache_blob = json.loads(cache_file.read_text(encoding="utf-8"))
+        analysis_keys = [
+            key for key in cache_blob if key.startswith("default:analysis:")
+        ]
+        assert len(analysis_keys) == 1
+        assert analysis_keys[0] in payload["equations"]["eq-001"]["llm_cache_list"]
+
+        warning_records = [
+            r
+            for r in caplog.records
+            if r.levelname == "WARNING"
+            and "[analyze_multimodal]" in r.getMessage()
+            and "eq-001" in r.getMessage()
+            and "back" in r.getMessage().lower()
+        ]
+        assert warning_records, (
+            "expected a WARNING log line announcing the equation fallback"
+        )
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_oversized_degraded_equation_omits_mm_chunk_without_failing_build(
+    tmp_path, monkeypatch, caplog, _propagate_lightrag_logger
+):
+    monkeypatch.setenv("MAX_EXTRACT_INPUT_TOKENS", "20480")
+
+    async def _extract_missing_equation(_prompt, **_kwargs):
+        return json.dumps({"name": "Huge equation", "description": "fallback"})
+
+    rag = _build_rag(
+        tmp_path,
+        vlm_process_enable=False,
+        extract_func=_extract_missing_equation,
+    )
+    await rag.initialize_storages()
+    try:
+        parsed_dir = tmp_path / "parsed"
+        parsed_dir.mkdir()
+        blocks_path = parsed_dir / "doc.blocks.jsonl"
+        blocks_path.write_text(
+            json.dumps({"type": "meta", "doc_id": "doc-huge-eq"}) + "\n",
+            encoding="utf-8",
+        )
+        raw_latex = r"\operatorname{" + ("x" * 25000) + "}"
+        equations_path = parsed_dir / "doc.equations.json"
+        equations_path.write_text(
+            json.dumps(
+                {
+                    "equations": {
+                        "eq-huge": {
+                            "caption": "Huge",
+                            "content": raw_latex,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        await rag.analyze_multimodal(
+            doc_id="doc-huge-eq",
+            file_path="fixture.pdf",
+            parsed_data={"blocks_path": str(blocks_path)},
+            process_options="e",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="lightrag.pipeline"):
+            chunks = rag._build_mm_chunks_from_sidecars(
+                doc_id="doc-huge-eq",
+                file_path="fixture.pdf",
+                blocks_path=str(blocks_path),
+                base_order_index=0,
+                process_options="e",
+            )
+
+        assert chunks == []
+        payload = json.loads(equations_path.read_text(encoding="utf-8"))
+        result = payload["equations"]["eq-huge"]["llm_analyze_result"]
+        assert result["status"] == "success"
+        assert result["degraded"] is True
+        assert result["equation"] == raw_latex
+        assert any(
+            "omitting its multimodal chunk" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        await rag.finalize_storages()

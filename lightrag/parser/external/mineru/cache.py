@@ -24,8 +24,8 @@ Validation policy (settled in design discussion; see
 9. **Other files**: size-only verification (cheap; covers most corruption
    modes for image / middle.json / layout.pdf).
 
-Any failed step ⇒ cache miss; the caller wipes the directory contents
-(preserving the directory itself) and re-runs the download.
+Any failed step ⇒ cache miss. The caller clears partial output but may preserve
+a matching local ``_pending_task.json`` so the original task can be resumed.
 """
 
 from __future__ import annotations
@@ -67,18 +67,22 @@ def raw_dir_for_parsed_dir(parsed_dir: Path) -> Path:
     return parsed_dir.parent / f"{stem}{MINERU_RAW_DIR_SUFFIX}"
 
 
-def clear_dir_contents(directory: Path) -> None:
-    """Delete everything inside ``directory`` but keep ``directory`` itself."""
+def clear_dir_contents(
+    directory: Path, *, preserve_names: set[str] | frozenset[str] = frozenset()
+) -> None:
+    """Delete directory contents while optionally preserving named entries."""
     if not directory.exists():
         return
     for entry in directory.iterdir():
+        if entry.name in preserve_names:
+            continue
         try:
             if entry.is_dir() and not entry.is_symlink():
                 _rmtree_safe(entry)
             else:
                 entry.unlink()
         except OSError:
-            # Best-effort cleanup; subsequent download will overwrite.
+            # Best-effort cleanup; a subsequent download will overwrite.
             continue
 
 

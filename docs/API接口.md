@@ -455,7 +455,7 @@ Content-Type: application/json
 行为：
 - 解析指令优先级为：请求体 `engine/process_options` > 文档 metadata 中已 snapshot 的 `parser_engine/process_options` > active config 的 `parser_config.engine/process_options` > 文件名/环境变量路由默认值。active `parser_config` 只提供默认值；请求体显式传值始终优先。
 - `engine="legacy"` 现已接入 KB 生命周期：文本/数据/代码类文件（如 `txt/md/json/xml/yaml/log/sql/py/js/ts/css/...`）直接按 UTF-8 本地抽取，轻量 Office/PDF 路径支持 `pdf/docx/pptx/xlsx` 本地抽取，不依赖 MinerU/Docling；CSV 仍可显式指定 legacy 本地抽取，但生产默认 `.env` 路由将 `csv:docling-iteP` 放在 `*:legacy-R` 前，表格结构更适合 Docling；传统 Office `doc/ppt/xls` 仍建议按 LibreOffice → Docling/MinerU 预转换链路处理。legacy 解析同样写入 LightRAG sidecar/blocks artifact，可继续走 `:build-kg` 纳入 chunk、实体关系抽取、embedding、图谱和向量管理。
-- 解析缓存命中时直接复用 artifacts：缓存有效性由 MinerU/Docling 的 `*.mineru_raw` raw bundle manifest 校验（源文件大小 + 内容 sha256 + options 签名），而非 KB 控制面的 `source_hash`/`parser_hash`（后者用于增量决策与 diff，不作为 raw bundle cache key）。`force_reparse=true` 绕过该 raw bundle cache；legacy 本地解析不依赖外部 raw bundle，会按当前 source 重新生成 sidecar/blocks。
+- 解析缓存命中时直接复用 artifacts：缓存有效性由 MinerU/Docling 的 `*.mineru_raw` raw bundle manifest 校验（源文件大小 + 内容 sha256 + options 签名），而非 KB 控制面的 `source_hash`/`parser_hash`（后者用于增量决策与 diff，不作为 raw bundle cache key）。local MinerU 提交后还会在 raw 目录原子持久化 `_pending_task.json`；parse 超时、网络中断、进程重启或 job `:retry` 时，只要源文件/endpoint/上传名/options 一致，就续轮询并下载原 `task_id`，不会重复上传；任务 404/结果过期才重新提交。`force_reparse=true` 同时绕过 raw bundle cache 和 pending-task 恢复；legacy 本地解析不依赖外部 raw bundle，会按当前 source 重新生成 sidecar/blocks。
 - 同一文档已有 `parse_queued` / `parsing` / `build_queued` / `building` / `deleting` / `replacing` 时返回 `409`，原 active job 保持不变，新建的 job 同步标记 `failed`。
 - 成功后写入 `original` / `sidecar` / `blocks` artifact，MinerU/Docling 还会写 `raw_dir`，并从 raw bundle 中记录细粒度文件 artifact：`markdown`、`content_list`、`middle_json`、`model_json`、`image`、`layout_pdf`。解析完成还会生成可缓存的安全预览 artifact（如 `preview_text`、`preview_table_json`；CSV 会生成 `preview_table_json`），metadata 标记 `preview=true`、`source_hash`、`parser_hash`、`truncated`、`preview_schema_version`，供文档级 preview manifest 选择。细粒度 artifact metadata 包含 `parse_engine`、`parser_hash`、`source`、`relative_path`。启用对象存储时，文件 artifact 额外写入 `metadata.object_uri`，目录 artifact 写入 `metadata.object_prefix_uri`；`original` artifact 复用 document 的 `metadata.source_object_uri`。
 - **`auto_index` 是 parse-only 预留 no-op**：`:parse` 始终只解析、不构建，持久化 job payload 固定 `auto_index=false`，因此 durable worker 续跑与 in-process 路径行为一致（都不构建）。要在解析后构建知识图谱请调用 `:build-kg`。
@@ -668,7 +668,7 @@ POST /kbs/{kb_id}/jobs/{job_id}:cancel
 状态转换规则：
 - `queued` → `cancelled`，`error_code=cancelled_by_user`。
 - `running` / `retrying` → `cancelling`。parse / build_kg / reindex 执行器在进入昂贵阶段（解析 / chunk-抽取-嵌入）前会检查 `cancelling` 协作式取消检查点：命中则不调用 parser/pipeline，job 转 `cancelled`，文档释放回 `parse_failed` / `build_failed`（可经 `:retry` 重跑）。
-- **parse 阶段额外支持 await 内强制中断**：进入解析后，执行器把单次长 parse await（MinerU/Docling/native）作为独立 `asyncio.Task` 运行，并并发轮询 job 状态；一旦翻转为 `cancelling` 即 `cancel()` 该任务，**无需等待解析跑完**，文档释放回 `parse_failed`（可 `:retry`）。这是安全的，因为解析幂等——重跑只是覆盖 raw bundle/sidecar。**build_kg / 向量写入阶段刻意不做 await 内强制中断**（中途打断可能留下半合并图谱/半写入向量），仍只用阶段边界协作式取消。
+- **parse 阶段额外支持 await 内强制中断**：进入解析后，执行器把单次长 parse await（MinerU/Docling/native）作为独立 `asyncio.Task` 运行，并并发轮询 job 状态；一旦翻转为 `cancelling` 即 `cancel()` 该任务，**无需等待解析跑完**，文档释放回 `parse_failed`（可 `:retry`）。这是安全的，因为解析幂等；local MinerU 已提交的 task 还会保留 `_pending_task.json`，后续 `:retry` 优先续轮询同一任务，而不是盲目覆盖或重复上传。**build_kg / 向量写入阶段刻意不做 await 内强制中断**（中途打断可能留下半合并图谱/半写入向量），仍只用阶段边界协作式取消。
 - `succeeded` / `failed` / `cancelled` 视为 no-op，原样返回当前 job。
 - `cancelling` 视为 no-op。
 
@@ -722,7 +722,7 @@ Content-Type: application/json
 - **结果顺序**：`result.items[]` 不保证与请求输入顺序一致（按完成情况聚合），但每个输入文档 / `source_key` 恰好出现一次。
 - **取消**：批量构建途中触发 `:cancel`，流水线协作式取消会把在途文档标记为 `cancelled`（而非 `build_failed`）。
 - **并发 drain 安全**：当同一 KB 上有多个聚合流并发（例如两个 disjoint `:sync`、或 `:sync` 与 `:upload` auto_parse 同时进行），构建结果读取采用对 `doc_status` 终态的轮询等待，避免把仍在其它流水线 drain 中的文档误判为失败。
-- 可调环境变量：`MAX_PARALLEL_PARSE_MINERU`（聚合 Phase 1 并发解析上限，默认随部署，生产建议按 MinerU 后端可承受并发设置）、`KB_BUILD_DRAIN_TIMEOUT_SECONDS`（构建结果等待终态超时，默认 3600s）、`KB_BUILD_DRAIN_POLL_SECONDS`（轮询间隔，默认 1.0s）。
+- 可调环境变量：`MAX_PARALLEL_PARSE_MINERU`（聚合 Phase 1 并发解析上限，local 模式不应超过 MinerU `/health` 的 `max_concurrent_requests`；单 VLM 建议从 1-2 起步）、`MINERU_POLL_INTERVAL_SECONDS`（MinerU task 状态轮询间隔，默认 2s）、`MINERU_TASK_TIMEOUT_SECONDS`（单次 MinerU task 的 monotonic 绝对等待时限，默认 3600s；超时保留 pending task 供 `:retry` 续跑）、`KB_BUILD_DRAIN_TIMEOUT_SECONDS`（构建结果等待终态超时，默认 3600s）、`KB_BUILD_DRAIN_POLL_SECONDS`（轮询间隔，默认 1.0s）。
 
 ### 5.6 等待任务终态
 

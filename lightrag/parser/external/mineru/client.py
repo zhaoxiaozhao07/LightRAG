@@ -25,17 +25,24 @@ import zipfile
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from lightrag.parser.external._common import raise_for_status_with_detail
 from lightrag.parser.external.mineru.cache import (
     MinerUParserOptions,
+    clear_dir_contents,
     compute_size_and_hash,
 )
 from lightrag.parser.external.mineru.manifest import (
+    PENDING_TASK_FILENAME,
     Manifest,
     ManifestFile,
+    PendingLocalTask,
+    delete_pending_task,
+    load_pending_task,
+    write_pending_task,
     write_manifest,
 )
 from lightrag.utils import logger
@@ -54,9 +61,23 @@ DEFAULT_MINERU_OFFICIAL_ENDPOINT = "https://mineru.net"
 VALID_MINERU_API_MODES = {"official", "local"}
 OFFICIAL_DONE_STATES = {"done"}
 OFFICIAL_FAILED_STATES = {"failed"}
-LOCAL_DONE_STATES = {"completed"}
-LOCAL_FAILED_STATES = {"failed"}
+LOCAL_DONE_STATES = {"completed", "done", "success", "succeeded"}
+# Beyond the canonical `failed`, self-hosted mineru-api variants sometimes
+# surface task-level errors via non-standard terminal states (`error`,
+# `cancelled`/`canceled`, `timeout`). Treating these as failed lets the
+# caller receive a diagnostic RuntimeError (with server-side error body)
+# instead of silently polling until the budget is exhausted.
+LOCAL_FAILED_STATES = {"failed", "error", "cancelled", "canceled", "timeout"}
+DEFAULT_MINERU_TASK_TIMEOUT_SECONDS = 3600.0
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+class _LocalTaskUnavailableError(RuntimeError):
+    """The persisted local task no longer exists or has no retained result."""
+
+
+class _LocalTaskFailedError(RuntimeError):
+    """The local MinerU service reported a terminal failure state."""
 
 
 def _get_by_path(payload: Any, path: str) -> Any:
@@ -159,7 +180,16 @@ class MinerURawClient:
             )
             self.endpoint = self.local_endpoint
         self.poll_interval = float(os.getenv("MINERU_POLL_INTERVAL_SECONDS", "2"))
-        self.max_polls = int(os.getenv("MINERU_MAX_POLLS", "180"))
+        self.task_timeout = float(
+            os.getenv(
+                "MINERU_TASK_TIMEOUT_SECONDS",
+                str(DEFAULT_MINERU_TASK_TIMEOUT_SECONDS),
+            )
+        )
+        if self.poll_interval < 0:
+            raise ValueError("MINERU_POLL_INTERVAL_SECONDS must be >= 0")
+        if self.task_timeout <= 0:
+            raise ValueError("MINERU_TASK_TIMEOUT_SECONDS must be > 0")
         self.engine_version = os.getenv("MINERU_ENGINE_VERSION", "").strip()
 
         options = MinerUParserOptions.from_env(api_mode=self.api_mode)
@@ -187,13 +217,13 @@ class MinerURawClient:
         source_file_path: Path,
         *,
         upload_name: str | None = None,
+        resume_pending: bool = True,
     ) -> Manifest:
-        """Download a fresh bundle and write the manifest.
+        """Download or resume a bundle and write the success manifest.
 
-        Pre-condition: caller cleared ``raw_dir`` contents (recommended via
-        :func:`clear_dir_contents`). This method does NOT clean the
-        directory itself — leaving that to the caller keeps cache miss
-        semantics explicit at the parse_mineru entry point.
+        A matching local ``_pending_task.json`` is resumed by default. Stale
+        partial output is cleared before a fresh submission. Set
+        ``resume_pending=False`` for an explicit force-reparse request.
 
         Returns the :class:`Manifest` describing the bundle.
         """
@@ -202,6 +232,16 @@ class MinerURawClient:
         raw_dir.mkdir(parents=True, exist_ok=True)
         resolved_upload_name = _resolve_upload_name(upload_name, source_file_path)
 
+        pending: PendingLocalTask | None = None
+        if self.api_mode == "local" and resume_pending:
+            pending = self._matching_pending_task(
+                raw_dir, source_file_path, resolved_upload_name
+            )
+        clear_dir_contents(
+            raw_dir,
+            preserve_names={PENDING_TASK_FILENAME} if pending is not None else set(),
+        )
+
         timeout = httpx.Timeout(120.0, connect=30.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
             if self.api_mode == "official":
@@ -209,14 +249,46 @@ class MinerURawClient:
                     client, source_file_path, raw_dir, resolved_upload_name
                 )
             else:
-                task_id = await self._download_local(
-                    client, source_file_path, raw_dir, resolved_upload_name
-                )
+                try:
+                    if pending is not None:
+                        logger.info(
+                            "[mineru_raw] resuming local task %s for %s",
+                            pending.task_id,
+                            resolved_upload_name,
+                        )
+                        try:
+                            task_id = await self._resume_local(
+                                client, pending.task_id, raw_dir
+                            )
+                        except _LocalTaskUnavailableError:
+                            logger.warning(
+                                "[mineru_raw] pending local task %s is no longer "
+                                "available; submitting %s again",
+                                pending.task_id,
+                                resolved_upload_name,
+                            )
+                            delete_pending_task(raw_dir)
+                            clear_dir_contents(raw_dir)
+                            task_id = await self._download_local(
+                                client,
+                                source_file_path,
+                                raw_dir,
+                                resolved_upload_name,
+                            )
+                    else:
+                        task_id = await self._download_local(
+                            client, source_file_path, raw_dir, resolved_upload_name
+                        )
+                except (_LocalTaskFailedError, _LocalTaskUnavailableError):
+                    delete_pending_task(raw_dir)
+                    raise
 
         self._normalize_raw_bundle(raw_dir, source_file_path, resolved_upload_name)
-        return self._build_and_write_manifest(
+        manifest = self._build_and_write_manifest(
             raw_dir, source_file_path, task_id, resolved_upload_name
         )
+        delete_pending_task(raw_dir)
+        return manifest
 
     # ------------------------------------------------------------------
     # Upload + poll
@@ -297,9 +369,18 @@ class MinerURawClient:
         upload_name: str,
     ) -> str:
         poll_url = f"{self.official_endpoint}/api/v4/extract-results/batch/{batch_id}"
-        for _ in range(self.max_polls):
-            await asyncio.sleep(self.poll_interval)
-            resp = await client.get(poll_url, headers=self._official_headers())
+        deadline = monotonic() + self.task_timeout
+        polls = 0
+        while True:
+            resp = await self._poll_get_before_deadline(
+                client,
+                poll_url,
+                deadline,
+                headers=self._official_headers(),
+            )
+            if resp is None:
+                break
+            polls += 1
             raise_for_status_with_detail(resp, "MinerU official batch poll")
             payload = resp.json() if resp.text else {}
             self._raise_if_official_error(payload, "MinerU official batch poll")
@@ -327,7 +408,11 @@ class MinerURawClient:
                     f"MinerU official parse failed for batch {batch_id}: {err}"
                 )
 
-        raise TimeoutError(f"MinerU official batch polling timeout: {batch_id}")
+        raise TimeoutError(
+            f"MinerU official batch polling timeout: {batch_id} "
+            f"(timeout={self.task_timeout}s, polls={polls}, "
+            f"interval={self.poll_interval}s)"
+        )
 
     def _raise_if_official_error(self, payload: Any, operation: str) -> None:
         if not isinstance(payload, dict):
@@ -388,13 +473,40 @@ class MinerURawClient:
                 f"MinerU local /tasks response missing task_id: {payload}"
             )
 
-        await self._poll_local_task(client, task_id)
-        await self._download_zip(
-            client,
-            f"{self.local_endpoint}/tasks/{task_id}/result",
+        self._write_pending_task(
             raw_dir,
+            task_id=task_id,
+            source_file_path=source_file_path,
+            upload_name=upload_name,
         )
+        await self._poll_local_task(client, task_id)
+        await self._download_local_result(client, task_id, raw_dir)
         return task_id
+
+    async def _resume_local(
+        self,
+        client: "httpx.AsyncClient",
+        task_id: str,
+        raw_dir: Path,
+    ) -> str:
+        await self._poll_local_task(client, task_id)
+        await self._download_local_result(client, task_id, raw_dir)
+        return task_id
+
+    async def _download_local_result(
+        self,
+        client: "httpx.AsyncClient",
+        task_id: str,
+        raw_dir: Path,
+    ) -> None:
+        result_url = f"{self.local_endpoint}/tasks/{task_id}/result"
+        resp = await client.get(result_url)
+        if int(getattr(resp, "status_code", 0) or 0) == 404:
+            raise _LocalTaskUnavailableError(
+                f"MinerU local result is no longer available for task {task_id}"
+            )
+        raise_for_status_with_detail(resp, "MinerU result bundle download")
+        await self._download_zip(client, result_url, raw_dir, resp=resp)
 
     async def _poll_local_task(
         self,
@@ -402,21 +514,150 @@ class MinerURawClient:
         task_id: str,
     ) -> None:
         poll_url = f"{self.local_endpoint}/tasks/{task_id}"
-        for _ in range(self.max_polls):
-            await asyncio.sleep(self.poll_interval)
-            resp = await client.get(poll_url)
+        last_status = ""
+        last_payload: Any = None
+        deadline = monotonic() + self.task_timeout
+        polls = 0
+        while True:
+            resp = await self._poll_get_before_deadline(client, poll_url, deadline)
+            if resp is None:
+                break
+            polls += 1
+            if int(getattr(resp, "status_code", 0) or 0) == 404:
+                raise _LocalTaskUnavailableError(
+                    f"MinerU local task is no longer available: {task_id}"
+                )
             raise_for_status_with_detail(resp, "MinerU local task poll")
             payload = resp.json() if resp.text else {}
-            status = str(payload.get("status") or "").lower()
+            last_payload = payload
+            status = str(payload.get("status") or "").strip().lower()
+            if status:
+                last_status = status
             if status in LOCAL_DONE_STATES:
                 return
             if status in LOCAL_FAILED_STATES:
                 err = payload.get("error") or payload.get("message") or payload
-                raise RuntimeError(
+                raise _LocalTaskFailedError(
                     f"MinerU local parse failed for task {task_id}: {err}"
                 )
 
-        raise TimeoutError(f"MinerU local task polling timeout: {task_id}")
+        # Polling budget exhausted without reaching a terminal state.
+        # Carry the last observed status + a trimmed payload summary so the
+        # caller can distinguish "task stuck in pending/running" (typical
+        # VLM backend starvation) from "server reported a non-standard
+        # failure word we don't recognize". Previously this branch only
+        # surfaced the task_id, leaving the operator with zero diagnostic
+        # signal — the root cause almost always lives in the last poll
+        # payload's progress/error fields.
+        summary = self._summarize_last_payload(last_payload)
+        raise TimeoutError(
+            f"MinerU local task polling timeout: {task_id} "
+            f"(timeout={self.task_timeout}s, polls={polls}, "
+            f"interval={self.poll_interval}s, "
+            f"last_status={last_status or 'unknown'!r}"
+            f"{', last_payload=' + summary if summary else ''})"
+        )
+
+    @staticmethod
+    def _summarize_last_payload(payload: Any) -> str:
+        """Trim a poll payload down to its diagnostic fields for the
+        timeout error message. Returns '' if nothing useful is present."""
+        if not isinstance(payload, dict):
+            return ""
+        keys = (
+            "status",
+            "state",
+            "progress",
+            "queued_ahead",
+            "backend",
+            "created_at",
+            "started_at",
+            "completed_at",
+            "error",
+            "message",
+            "msg",
+            "task_id",
+        )
+        bits = []
+        for k in keys:
+            v = payload.get(k)
+            if v in (None, "", []):
+                continue
+            s = repr(v)
+            if len(s) > 200:
+                s = s[:200] + "..."
+            bits.append(f"{k}={s}")
+        return ", ".join(bits)
+
+    async def _poll_get_before_deadline(
+        self,
+        client: "httpx.AsyncClient",
+        url: str,
+        deadline: float,
+        **kwargs: Any,
+    ) -> Any | None:
+        """Sleep, then issue one poll without crossing the absolute deadline."""
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return None
+        await asyncio.sleep(min(self.poll_interval, remaining))
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            return await asyncio.wait_for(
+                client.get(url, **kwargs),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError:
+            return None
+
+    def _matching_pending_task(
+        self,
+        raw_dir: Path,
+        source_file_path: Path,
+        upload_name: str,
+    ) -> PendingLocalTask | None:
+        pending = load_pending_task(raw_dir)
+        if pending is None:
+            return None
+        source_size, source_hash = compute_size_and_hash(source_file_path)
+        if (
+            pending.source_size_bytes != source_size
+            or pending.source_content_hash != source_hash
+            or pending.source_filename_at_parse != upload_name
+            or pending.endpoint_signature != self.local_endpoint
+            or pending.options_signature != self._options_signature()
+        ):
+            logger.info(
+                "[mineru_raw] discarding stale pending task %s for %s",
+                pending.task_id,
+                upload_name,
+            )
+            return None
+        return pending
+
+    def _write_pending_task(
+        self,
+        raw_dir: Path,
+        *,
+        task_id: str,
+        source_file_path: Path,
+        upload_name: str,
+    ) -> None:
+        source_size, source_hash = compute_size_and_hash(source_file_path)
+        write_pending_task(
+            raw_dir,
+            PendingLocalTask(
+                task_id=task_id,
+                source_content_hash=source_hash,
+                source_size_bytes=source_size,
+                source_filename_at_parse=upload_name,
+                endpoint_signature=self.local_endpoint,
+                options_signature=self._options_signature(),
+                submitted_at=datetime.now(timezone.utc).isoformat(),
+            ),
+        )
 
     async def _download_zip(
         self,
@@ -444,7 +685,11 @@ class MinerURawClient:
         self._maybe_hoist_single_subdir(raw_dir)
 
     def _maybe_hoist_single_subdir(self, raw_dir: Path) -> None:
-        entries = [p for p in raw_dir.iterdir() if p.name != "_manifest.json"]
+        entries = [
+            p
+            for p in raw_dir.iterdir()
+            if p.name not in {"_manifest.json", PENDING_TASK_FILENAME}
+        ]
         if len(entries) != 1 or not entries[0].is_dir():
             return
         sub = entries[0]
@@ -537,7 +782,7 @@ class MinerURawClient:
         for p in sorted(raw_dir.rglob("*")):
             if not p.is_file():
                 continue
-            if p.name == "_manifest.json":
+            if p.name in {"_manifest.json", PENDING_TASK_FILENAME}:
                 continue
             rel = p.relative_to(raw_dir).as_posix()
             if rel == CONTENT_LIST_FILENAME:

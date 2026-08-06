@@ -57,7 +57,7 @@ uv add <package-name>
 | Embedding | `EMBEDDING_BINDING`、`EMBEDDING_MODEL`、`EMBEDDING_BINDING_HOST`、`EMBEDDING_DIM` |
 | Rerank | `RERANK_BINDING`、`RERANK_MODEL`、`RERANK_BINDING_HOST` |
 | 存储 | `LIGHTRAG_KV_STORAGE`、`LIGHTRAG_VECTOR_STORAGE`、`LIGHTRAG_GRAPH_STORAGE`、`LIGHTRAG_DOC_STATUS_STORAGE`、如 `MILVUS_URI` |
-| MinerU | `MINERU_API_MODE`、`MINERU_LOCAL_ENDPOINT` 或 `MINERU_API_TOKEN`、可选 `MINERU_LOCAL_BACKEND` / `MINERU_VLM_URL` |
+| MinerU | `MINERU_API_MODE`、`MINERU_LOCAL_ENDPOINT` 或 `MINERU_API_TOKEN`、可选 `MINERU_LOCAL_BACKEND` / `MINERU_VLM_URL`、`MINERU_POLL_INTERVAL_SECONDS` / `MINERU_TASK_TIMEOUT_SECONDS` |
 | 文件流水线 | `LIGHTRAG_PARSER`、`VLM_PROCESS_ENABLE`、`MAX_PARALLEL_PARSE_MINERU`、`MAX_PARALLEL_INSERT` |
 
 推荐的 MinerU + 多模态 PDF 配置示例：
@@ -67,7 +67,9 @@ LIGHTRAG_PARSER=*:native-iteP,*:mineru-iteP,*:legacy-R
 VLM_PROCESS_ENABLE=true
 MINERU_API_MODE=local
 MINERU_LOCAL_ENDPOINT=http://localhost:8000
-MAX_PARALLEL_PARSE_MINERU=1
+MINERU_POLL_INTERVAL_SECONDS=2
+MINERU_TASK_TIMEOUT_SECONDS=3600
+MAX_PARALLEL_PARSE_MINERU=2
 MAX_PARALLEL_INSERT=2
 ```
 
@@ -481,7 +483,10 @@ query = httpx.post(
 
 - `MINERU_API_MODE=local` 时 `MINERU_LOCAL_ENDPOINT` 是否能访问。
 - endpoint 是否提供 `/tasks` API，而不是 OpenAI `/v1/chat/completions` 类接口。
-- `MAX_PARALLEL_PARSE_MINERU=1` 对单 GPU 更稳。
+- `MINERU_TASK_TIMEOUT_SECONDS` 默认 3600 秒；它是单任务的 monotonic 绝对等待时限。大 PDF 应按实测耗时留余量，不再使用 `MINERU_MAX_POLLS` 估算预算。
+- `MAX_PARALLEL_PARSE_MINERU` 不应超过 MinerU `/health` 返回的 `max_concurrent_requests`；单 GPU 建议从 1-2 起步。
+- local MinerU 提交成功后会在对应 `*.mineru_raw/` 写 `_pending_task.json`。如果 LightRAG 先超时但 MinerU 仍在运行，修正时限后调用 job `:retry` 会续轮询同一 `task_id`，不会重新上传；原任务 404 或结果过期时才自动创建替代任务。
+- 确认 `_pending_task.json` 中的 source hash、endpoint 和 options 与当前配置一致；`force_reparse=true` 会显式丢弃 pending 并创建新任务。
 - 查看服务端日志和 `/documents/pipeline_status.latest_message`。
 
 ### 6.5 文档 `processed` 但图谱为空

@@ -38,6 +38,8 @@ VLM_PROCESS_ENABLE=true
 VLM_LLM_MODEL=kimi-k2.6
 MINERU_API_MODE=local
 MINERU_LOCAL_ENDPOINT=http://localhost:8000
+MINERU_POLL_INTERVAL_SECONDS=2
+MINERU_TASK_TIMEOUT_SECONDS=3600
 ```
 
 > `P`分块策略是LightRAG原生的分块策略，详情请参阅[Paragraph Semantic 分块策略](ParagraphSemanticChunking-zh.md)。VLM的配资请参阅[基于角色的 LLM/VLM 配置指南](RoleSpecificLLMConfiguration-zh.md)
@@ -162,6 +164,8 @@ Local 模式（自建 mineru-api）：
 ```bash
 MINERU_API_MODE=local
 MINERU_LOCAL_ENDPOINT=http://localhost:8000
+MINERU_POLL_INTERVAL_SECONDS=2
+MINERU_TASK_TIMEOUT_SECONDS=3600
 ```
 
 Official 模式（MinerU 云端 API）：
@@ -172,7 +176,7 @@ MINERU_API_TOKEN=<your_token>
 # MINERU_OFFICIAL_ENDPOINT=https://mineru.net   # 默认值，通常无需修改
 ```
 
-其余高级开关（`MINERU_MODEL_VERSION`、`MINERU_LANGUAGE`、`MINERU_ENABLE_TABLE` / `MINERU_ENABLE_FORMULA`、`MINERU_PAGE_RANGES`、`MINERU_LOCAL_BACKEND` / `MINERU_LOCAL_PARSE_METHOD`、`MINERU_POLL_INTERVAL_SECONDS` / `MINERU_MAX_POLLS`、`MINERU_ENGINE_VERSION`、`LIGHTRAG_FORCE_REPARSE_MINERU` 等）请参考仓库根目录 `env.example` 模板的 MinerU 小节。需要特别注意 `MINERU_PAGE_RANGES` 在两种模式下语义不同：`official` 支持完整列表（如 `1-3,5,7-9`），`local` 仅支持单页（`3`）或简单范围（`1-10`），不接受逗号列表。
+`MINERU_TASK_TIMEOUT_SECONDS` 是基于 monotonic clock 的单任务绝对等待时限，默认 `3600` 秒；它替代了按轮询次数估算预算的 `MINERU_MAX_POLLS`。其余高级开关（`MINERU_MODEL_VERSION`、`MINERU_LANGUAGE`、`MINERU_ENABLE_TABLE` / `MINERU_ENABLE_FORMULA`、`MINERU_PAGE_RANGES`、`MINERU_LOCAL_BACKEND` / `MINERU_LOCAL_PARSE_METHOD`、`MINERU_ENGINE_VERSION`、`LIGHTRAG_FORCE_REPARSE_MINERU` 等）请参考仓库根目录 `env.example` 模板的 MinerU 小节。需要特别注意 `MINERU_PAGE_RANGES` 在两种模式下语义不同：`official` 支持完整列表（如 `1-3,5,7-9`），`local` 仅支持单页（`3`）或简单范围（`1-10`），不接受逗号列表。
 
 #### Docling 配置方法
 
@@ -487,7 +491,7 @@ selector → 子字典映射：F → `fixed_token`，R → `recursive_character`
 
 ### 4.3 MinerU 原始产物目录 `<base>.mineru_raw/`
 
-`mineru` 引擎在解析过程中会把 MinerU 服务返回的完整产物（`content_list.json` + 可选的 `full.md` / `middle.json` / `layout.pdf` / `images/` 等）落到 `__parsed__/<规范文件名>.mineru_raw/` 目录下，并写入 `_manifest.json` 作为完整性校验文件。
+`mineru` 引擎在解析过程中会把 MinerU 服务返回的完整产物（`content_list.json` + 可选的 `full.md` / `middle.json` / `layout.pdf` / `images/` 等）落到 `__parsed__/<规范文件名>.mineru_raw/` 目录下，并写入 `_manifest.json` 作为完整性校验文件。local 模式提交任务后会先原子写入 `_pending_task.json`；其中保存 `task_id`、源文件 hash/大小、endpoint、上传文件名和 options 签名，用于超时、网络中断或 LightRAG 重启后的同任务续轮询。
 
 设计目的：
 
@@ -495,20 +499,23 @@ selector → 子字典映射：F → `fixed_token`，R → `recursive_character`
 - **保留诊断信息**。MinerU 解析出错或者下游 sidecar 字段异常时，可以直接到 `*.mineru_raw/` 比对原始 content_list 与图片资源。
 - **支持对象溯源**。MinerU 生成的 `drawings.json` / `tables.json` / `equations.json` 会在 `self_ref` 中保存 `content_list.json#/N`，用于回查对应的 MinerU 原始对象及其 `page_idx` / `bbox` 等定位信息。
 - **上传文件名去 hint**。源文件名包含 `[mineru-...]` / `[-iet]` 等处理 hint 时，调用 MinerU API 使用去 hint 后的规范文件名，避免 MinerU 返回的 raw bundle 内部文件名携带 hint。
+- **避免超时后重复计算**。重试时只有 `_pending_task.json` 的源文件、endpoint、上传名和 options 全部匹配才会复用原 `task_id`；任务已完成则直接下载结果，仍在运行则继续轮询，服务端返回 404/结果已过期时才清理 pending 并重新提交。
 
 生命周期：
 
 | 操作 | 行为 |
 |---|---|
-| 首次解析 | 下载所有产物 → 原子写入 `_manifest.json`。 |
+| 首次解析 | 提交 local task → 原子写入 `_pending_task.json` → 在 `MINERU_TASK_TIMEOUT_SECONDS` 时限内轮询 → 下载所有产物 → 原子写入 `_manifest.json` → 删除 pending 文件。 |
 | 重复解析（cache 命中） | 不调用 MinerU 服务；不重写产物；走 adapter+Writer 重生成 sidecar（适用于 adapter 升级场景）。 |
-| 重复解析（cache miss） | 清空目录内所有文件后重新下载并写入 manifest。 |
+| 重复解析（cache miss，有匹配 pending） | 保留 `_pending_task.json`、清理其它不完整产物，续轮询同一 `task_id`；不重复上传。 |
+| 重复解析（cache miss，无匹配 pending） | 清空目录内所有文件后重新提交、下载并写入 manifest。 |
+| 显式 `force_reparse` | 删除 manifest、pending 与不完整产物，强制创建新任务。 |
 | `DELETE /documents` 且 `delete_file=True` | `*.parsed/` 与 `*.mineru_raw/` 与原始文件一并删除。 |
 | `DELETE /documents` 且 `delete_file=False` | 保留所有产物，仅删 doc_status 与 KG 数据。 |
 | `clear_documents` / `__parsed__` 整体清理 | 自然一并清除。 |
 | scan 周期 | 不主动 GC 孤儿 `*.mineru_raw/`（用户显式删除时才清，避免误删调试现场）。 |
 
-强制重新解析（绕过 cache）：设置 `LIGHTRAG_FORCE_REPARSE_MINERU=true`。
+强制重新解析（绕过 cache 且不恢复 pending task）：设置 `LIGHTRAG_FORCE_REPARSE_MINERU=true`。
 
 并发安全：LightRAG 强制要求同一 workspace 下 `canonical_basename` 唯一（上传/入队时返回 HTTP 409），加上流水线对单个文档的串行化处理，因此 `*.mineru_raw/` 不会出现并发写入冲突，无需额外锁。
 
@@ -734,9 +741,10 @@ PENDING ─►├─ q_mineru  ──► [mineru parser  × N2] ─┼─► q_a
 
 1. **解析阶段按引擎隔离**，所以混用 native/mineru/docling 时不必担心一种引擎慢拖累另一种。
 2. **mineru / docling 默认 2**：两者资源占用高，默认保持适度并发。资源紧张时可降到 1（避免 OOM / 显存竞争 / 失败重试）；如果你部署了多 GPU 或专门的解析服务器，可手动调高。
-3. **`MAX_PARALLEL_INSERT` 兼任 worker 池大小和信号量上限**：流水线创建 `Semaphore(max_parallel_insert)`，每个 process worker 在抽取入库前还要拿一次信号量。所以哪怕你把 worker 数手动改大，实际并发上限仍由这个值决定——直接调它就够了。
-4. **queue size 与背压**：`QUEUE_SIZE_INSERT=4` 这个偏小的默认值是有意为之——process 阶段慢且占内存，让 analyze 阶段在队列写满时阻塞、再反压到 parse 阶段，避免一次性把成千上万份解析结果堆在内存里。
-5. **改后生效方式**：所有参数通过 `.env`（或环境变量）传入，仅在 `LightRAG` 实例构造时读取一次；改完需要重启服务。
+3. **本地 MinerU 并发不要超过后端 `max_concurrent_requests`**：超过后任务会排队，虽然每个任务拥有独立 `MINERU_TASK_TIMEOUT_SECONDS` 预算，但会增加端到端延迟并造成 VLM 资源竞争。
+4. **`MAX_PARALLEL_INSERT` 兼任 worker 池大小和信号量上限**：流水线创建 `Semaphore(max_parallel_insert)`，每个 process worker 在抽取入库前还要拿一次信号量。所以哪怕你把 worker 数手动改大，实际并发上限仍由这个值决定——直接调它就够了。
+5. **queue size 与背压**：`QUEUE_SIZE_INSERT=4` 这个偏小的默认值是有意为之——process 阶段慢且占内存，让 analyze 阶段在队列写满时阻塞、再反压到 parse 阶段，避免一次性把成千上万份解析结果堆在内存里。
+6. **改后生效方式**：所有参数通过 `.env`（或环境变量）传入，仅在 `LightRAG` 实例构造时读取一次；改完需要重启服务。
 
 **典型调优场景：**
 

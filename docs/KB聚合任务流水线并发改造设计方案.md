@@ -612,7 +612,7 @@ QUEUE_SIZE_INSERT=4             # 当前 4，建议提到 8（更大的批量缓
 
 ### D.4 配置
 
-`.env`：`MAX_PARALLEL_PARSE_MINERU` 由 `1` 调到 **`4`**（MinerU 后端单 VLLM 部署、可承受多路 batch，已确认）。新增可选环境变量 `KB_BUILD_DRAIN_TIMEOUT_SECONDS`（默认 3600）/ `KB_BUILD_DRAIN_POLL_SECONDS`（默认 1.0）。
+初始并发改造曾把 `.env` 的 `MAX_PARALLEL_PARSE_MINERU` 由 `1` 调到 `4`。**2026-08-06 生产稳定性回调**：当前 `.env` / `.env.main` 已按单 VLM 部署下调为 **`2`**，避免超过 MinerU 后端实际并发能力后排队并放大单任务延迟；同时新增 `MINERU_TASK_TIMEOUT_SECONDS=3600`，替代 `MINERU_MAX_POLLS`。本改造原有的 `KB_BUILD_DRAIN_TIMEOUT_SECONDS`（默认 3600）/ `KB_BUILD_DRAIN_POLL_SECONDS`（默认 1.0）保持不变。
 
 ### D.5 测试
 
