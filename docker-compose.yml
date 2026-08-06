@@ -1,12 +1,12 @@
-# Default deployment: pull the prebuilt image from Docker Hub.
+# Default deployment: pull the prebuilt image from GitHub Container Registry.
 #
-#   julienol/lightrag-api-server
+#   ghcr.io/zhaoxiaozhao07/lightrag-api-server
 #
 #   docker compose up -d
 #
 # Override the tag without editing this file:
 #
-#   LIGHTRAG_IMAGE=julienol/lightrag-api-server:v1.5.0 docker compose up -d
+#   LIGHTRAG_IMAGE=ghcr.io/zhaoxiaozhao07/lightrag-api-server:v1.5.0 docker compose up -d
 #
 # For a local source build (development), layer docker-compose.dev.yml on top:
 #
@@ -19,7 +19,7 @@
 # container.
 services:
   lightrag:
-    image: ${LIGHTRAG_IMAGE:-julienol/lightrag-api-server:latest}
+    image: ${LIGHTRAG_IMAGE:-ghcr.io/zhaoxiaozhao07/lightrag-api-server:latest}
     pull_policy: always
     restart: unless-stopped
     init: true

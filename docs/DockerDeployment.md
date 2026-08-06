@@ -77,7 +77,7 @@ The Dockerfile uses BuildKit cache mounts to significantly improve build perform
 ### Start LightRAG server
 
 The checked-in `docker-compose.yml` is cloud-first: it only references the prebuilt
-Docker Hub image (`julienol/lightrag-api-server:latest`, override with the
+GitHub Container Registry image (`ghcr.io/zhaoxiaozhao07/lightrag-api-server:latest`, override with the
 `LIGHTRAG_IMAGE` variable) and does **not** contain a `build:` section, so a plain
 compose command never builds locally.
 
