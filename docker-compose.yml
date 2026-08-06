@@ -37,6 +37,10 @@ services:
       LOG_DIR: /app/logs
       TIKTOKEN_CACHE_DIR: /app/data/tiktoken
       PROMPT_DIR: /app/prompts
+      HOME: /home/lightrag
+      XDG_CACHE_HOME: /home/lightrag/.cache
+      PIP_CACHE_DIR: /home/lightrag/.cache/pip
+      TMPDIR: /tmp
 
     ports:
       - "9621:9621"

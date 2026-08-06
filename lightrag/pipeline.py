@@ -3695,8 +3695,15 @@ class _PipelineMixin:
             if candidate in seen_candidates:
                 continue
             seen_candidates.add(candidate)
-            if candidate.exists() and candidate.is_file():
-                return str(candidate)
+            try:
+                if candidate.is_file():
+                    return str(candidate)
+            except OSError as exc:
+                logger.warning(
+                    "Skipping inaccessible parser source candidate %s: %s",
+                    candidate,
+                    exc,
+                )
 
         canonical_name = normalize_document_file_path(file_path)
         if has_known_document_source(canonical_name):
@@ -3706,11 +3713,29 @@ class _PipelineMixin:
                 if root in seen_roots:
                     continue
                 seen_roots.add(root)
-                if not root.exists() or not root.is_dir():
+                try:
+                    if not root.is_dir():
+                        continue
+                    root_entries = sorted(root.iterdir(), key=lambda item: item.name)
+                except OSError as exc:
+                    logger.warning(
+                        "Skipping inaccessible parser source directory %s: %s",
+                        root,
+                        exc,
+                    )
                     continue
-                for candidate in sorted(root.iterdir(), key=lambda item: item.name):
+                for candidate in root_entries:
+                    try:
+                        is_file = candidate.is_file()
+                    except OSError as exc:
+                        logger.warning(
+                            "Skipping inaccessible parser source candidate %s: %s",
+                            candidate,
+                            exc,
+                        )
+                        continue
                     if (
-                        candidate.is_file()
+                        is_file
                         and normalize_document_file_path(candidate.name)
                         == canonical_name
                     ):

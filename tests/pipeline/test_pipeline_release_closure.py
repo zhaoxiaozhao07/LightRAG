@@ -2912,6 +2912,32 @@ def test_parser_source_resolver_prefers_exact_canonical_file(tmp_path, monkeypat
 
 
 @pytest.mark.offline
+def test_parser_source_resolver_skips_inaccessible_stale_host_path(
+    tmp_path, monkeypatch
+):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    monkeypatch.setenv("INPUT_DIR", str(input_dir))
+
+    source = input_dir / "demo.pdf"
+    source.write_bytes(b"container-copy")
+    stale_host_path = Path("/home/ubuntu/uploads/demo.pdf")
+    original_is_file = Path.is_file
+
+    def _is_file(path):
+        if path == stale_host_path:
+            raise PermissionError(13, "Permission denied", str(path.parent))
+        return original_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", _is_file)
+    rag = _new_rag(tmp_path / "work")
+
+    resolved = rag._resolve_source_file_for_parser(str(stale_host_path))
+
+    assert Path(resolved) == source
+
+
+@pytest.mark.offline
 def test_parse_mineru_to_lightrag_document(tmp_path, monkeypatch):
     """End-to-end: parse_mineru routes through MinerURawClient + sidecar
     writer and produces spec-compliant *.parsed/ + *.mineru_raw/ artifacts.

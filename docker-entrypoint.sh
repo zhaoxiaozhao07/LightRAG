@@ -14,6 +14,15 @@ set -e
 # appended flags to the server. Now that ENTRYPOINT is this script, a first arg
 # starting with "-" means the user only passed flags, so prepend the default
 # command.
+# Keep host-side HOME/cache variables from leaking through --env-file into the
+# fixed non-root container user. Libraries may otherwise try to create caches
+# under paths such as /home/ubuntu, which are not writable inside the image.
+HOME=/home/lightrag
+XDG_CACHE_HOME=/home/lightrag/.cache
+PIP_CACHE_DIR=/home/lightrag/.cache/pip
+TMPDIR=/tmp
+export HOME XDG_CACHE_HOME PIP_CACHE_DIR TMPDIR
+
 if [ "${1#-}" != "$1" ]; then
     set -- python -m lightrag.api.lightrag_server "$@"
 fi
