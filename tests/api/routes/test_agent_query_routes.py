@@ -473,7 +473,7 @@ async def test_all_steps_failed_raises_502(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_clarification_plan_short_circuits_without_retrieval(monkeypatch):
+async def test_clarification_plan_downgrades_to_fallback_retrieval(monkeypatch):
     _audit_recorder(monkeypatch)
     plan = {
         "type": "plan",
@@ -489,9 +489,13 @@ async def test_clarification_plan_short_circuits_without_retrieval(monkeypatch):
         body=AgentQueryRequest(query="如何合规推荐配方？", candidate_kb_ids=["kb1"]),
     )
 
-    assert result.status == "clarification_required"
+    # Clarification no longer short-circuits: the session degrades to a
+    # single-step retrieval and the question rides along in the result.
+    assert result.status == "success"
     assert result.clarification_question == "请补充目标场景。"
-    assert tool.calls == []
+    assert result.metadata["pending_clarification"] == "请补充目标场景。"
+    assert len(tool.calls) == 1
+    assert result.steps_summary[0]["query"] == "如何合规推荐配方？"
 
 
 @pytest.mark.asyncio

@@ -284,7 +284,16 @@ def _plan_response(*, clarification: bool = False) -> str:
                 "type": "plan",
                 "clarification_required": True,
                 "clarification_question": "Please provide the missing constraint.",
-                "steps": [],
+                "steps": [
+                    {
+                        "step_index": 1,
+                        "title": "Best-effort retrieval",
+                        "query": "Retrieve current authoritative evidence",
+                        "kb_ids": ["kb1"],
+                        "mode": "mix",
+                        "priority": "P0",
+                    }
+                ],
             }
         )
     return json.dumps(
@@ -321,8 +330,6 @@ def _staged_responses(*, clarification: bool = False) -> list[str]:
         ),
         "constraints": [],
     }
-    if clarification:
-        return [json.dumps(requirement)]
     return [
         json.dumps(requirement),
         json.dumps(
@@ -541,7 +548,7 @@ async def test_agent_memory_terminal_statuses_still_use_sensitive_final_llm(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("workflow", ["plan", "staged"])
-async def test_agent_clarification_marks_memory_not_used_without_search(
+async def test_agent_clarification_downgrades_and_memory_is_still_used(
     monkeypatch: pytest.MonkeyPatch, workflow: str
 ) -> None:
     memory_service = _MemoryService(
@@ -561,14 +568,15 @@ async def test_agent_clarification_marks_memory_not_used_without_search(
         sensitive_context=handle,
     )
 
-    assert result.status == "clarification_required"
-    assert result.metadata["memory"] is handle.info
-    assert handle.info["status"] == "not_used"
-    assert handle.info["reason"] == "clarification_required"
-    assert handle.resolve_calls == 0
-    assert memory_service.calls == []
-    assert tool.calls == []
-    assert rag.query_calls == []
+    # Clarification no longer short-circuits: retrieval and memory-scoped
+    # synthesis run, and the question rides along in the result.
+    assert result.status == "success"
+    assert result.clarification_question is not None
+    assert result.metadata["pending_clarification"] == result.clarification_question
+    assert tool.calls
+    assert rag.query_calls
+    assert rag.query_calls[0]["_sensitive"] is True
+    assert handle.resolve_calls == 1
 
 
 @pytest.mark.asyncio

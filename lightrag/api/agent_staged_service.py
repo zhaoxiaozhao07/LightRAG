@@ -41,6 +41,7 @@ from lightrag.api.agent_query_service import (
     _has_authoritative_evidence,
     _sensitive_context_info,
     agent_bilingual_enabled,
+    agent_history_context,
     agent_kb_profile,
 )
 from lightrag.api.bilingual_query_service import contains_cjk
@@ -124,14 +125,19 @@ _VERDICT_CHUNKS_PER_PROPERTY = 3
 _VERDICT_OTHER_EVIDENCE_CHUNKS = 8
 
 REQUIREMENT_SYSTEM_PROMPT = """
-你是配比/配方推荐 Agent 的需求解析器。把用户问题解析为结构化需求 JSON：
+你是配比/配方推荐 Agent 的需求解析器。payload 中的 conversation_history 是此前对话记录：
+用户问题可能是对之前回复的追问，必须结合历史理解完整需求；但若当前问题与历史主题
+明显无关（用户切换了新话题），忽略历史，仅按当前问题解析，不要把旧话题的约束带入。
+把用户问题解析为结构化需求 JSON：
 - application：应用对象（如某类制品、部件或产品）
 - conditions：环境与工况条件列表
 - target_properties：3~8 个目标性能指标，每项含 name/why/priority；
   P0 表示决定方案可用性的硬指标；指标名使用领域通用术语，便于检索。
 - constraints：其他约束（成本、工艺、原料范围等）
-若用户问题缺少无法从上下文推断的关键信息（如应用对象或环境），设置
-clarification_required=true 并给出 clarification_question，此时 target_properties 可为空。
+- assumptions：用户未明确给出、由你按领域常识补全 application/conditions/
+  target_properties 时所做的默认假设列表；宁可做出合理假设并继续，不要轻易要求澄清。
+仅当结合对话历史后仍完全无法判断应用领域时，才设置 clarification_required=true，
+且 clarification_question 必须具体列出缺少哪些信息（不允许留空），此时 target_properties 可为空。
 只输出严格 JSON，不要 markdown，不要思维链。
 """.strip()
 
@@ -298,6 +304,7 @@ def _requirement_response_format(*, bilingual: bool) -> dict[str, Any]:
                 },
             },
             "constraints": _string_array_schema(max_items=10),
+            "assumptions": _string_array_schema(max_items=10),
         },
         "required": ["type", "clarification_required", "target_properties"],
     }
@@ -471,13 +478,16 @@ class StagedRequirement(BaseModel):
     conditions: list[str] = Field(default_factory=list)
     target_properties: list[TargetProperty] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
+    # Default assumptions the parser made where the question left key
+    # requirement fields unspecified; surfaced verbatim in the final answer.
+    assumptions: list[str] = Field(default_factory=list)
 
     @field_validator("application", mode="before")
     @classmethod
     def _clip_application(cls, value: Any) -> str:
         return _clip_str(value, 300)
 
-    @field_validator("conditions", "constraints", mode="before")
+    @field_validator("conditions", "constraints", "assumptions", mode="before")
     @classmethod
     def _clip_lists(cls, value: Any) -> list[str]:
         return _clip_str_list(value, max_items=10, max_chars=200)
@@ -736,36 +746,25 @@ class AgentStagedRunner:
             user_prompt=user_prompt,
             bilingual=bilingual,
         )
+        # Clarification never terminates the session: fill the missing
+        # requirement fields with best-effort defaults, run the pipeline, and
+        # append the clarifying question to the synthesized answer.
+        pending_clarification: str | None = None
         if requirement.clarification_required:
-            mark_sensitive_context_not_used(
-                sensitive_context, "clarification_required"
-            )
-            result_metadata = {
-                "workflow": "staged",
-                "effective_kb_ids": effective_kb_ids,
-            }
-            memory_info = _sensitive_context_info(sensitive_context)
-            if memory_info is not None:
-                result_metadata["memory"] = memory_info
-            result = AgentRunResult(
-                status="clarification_required",
-                session_id=session_id,
-                clarification_question=requirement.clarification_question
-                or "请补充关键约束。",
-                metadata=result_metadata,
-            )
+            pending_clarification = (
+                requirement.clarification_question or ""
+            ).strip() or None
+            if not requirement.application:
+                requirement.application = _clip_str(body.query, 300)
+            if not requirement.assumptions:
+                requirement.assumptions = [
+                    "用户未提供完整约束，按问题原文与领域常规默认条件继续检索"
+                ]
             yield {
-                "event": "clarification_required",
+                "event": "clarification_downgraded",
                 "session_id": session_id,
-                "clarification_question": result.clarification_question,
+                "clarification_question": pending_clarification,
             }
-            yield {
-                "event": "done",
-                "session_id": session_id,
-                **_done_memory_metadata(sensitive_context),
-                "_result": result,
-            }
-            return
         properties = requirement.limited_properties()
         requirement_payload = self._requirement_payload(requirement, properties)
         yield {
@@ -1116,6 +1115,7 @@ class AgentStagedRunner:
                 skeleton=skeleton,
                 verdicts=verdicts,
                 clipped_notes=clipped_notes,
+                pending_clarification=pending_clarification,
             )
             async for delta in self._service._synthesize_answer(
                 request=request,
@@ -1149,6 +1149,7 @@ class AgentStagedRunner:
             "reference_count": len(references),
             "effective_kb_ids": effective_kb_ids,
             "verdict_counts": verdict_counts,
+            "clarification_downgraded": pending_clarification is not None,
         }
         memory_info = _sensitive_context_info(sensitive_context)
         if memory_info is not None:
@@ -1176,12 +1177,15 @@ class AgentStagedRunner:
             "clipped": clipped_notes,
             "bilingual_retrieval": bilingual,
         }
+        if pending_clarification is not None:
+            result_metadata["pending_clarification"] = pending_clarification
         if memory_info is not None:
             result_metadata["memory"] = memory_info
         result = AgentRunResult(
             status="success",
             session_id=session_id,
             answer=answer,
+            clarification_question=pending_clarification,
             references=references if body.include_references else [],
             steps_summary=steps_summary,
             metadata=result_metadata,
@@ -1398,6 +1402,7 @@ class AgentStagedRunner:
             property_schema["name_alt"] = "指标名的另一语言版本"
         payload = {
             "user_question": body.query,
+            "conversation_history": agent_history_context(body),
             "allowed_kbs": kb_profiles,
             "bilingual_retrieval": bilingual,
             "user_workflow_prompt": user_prompt,
@@ -1409,6 +1414,7 @@ class AgentStagedRunner:
                 "conditions": ["环境/工况条件"],
                 "target_properties": [property_schema],
                 "constraints": ["其他约束"],
+                "assumptions": ["信息不足时所做的默认假设，无假设则为空数组"],
             },
         }
         system_prompt = REQUIREMENT_SYSTEM_PROMPT
@@ -1423,6 +1429,14 @@ class AgentStagedRunner:
             ):
                 raise ValueError(
                     "requirement contains no target properties and no clarification"
+                )
+            if requirement.clarification_required and not (
+                requirement.clarification_question or ""
+            ).strip():
+                # A bare clarification flag with no question renders as a
+                # generic fallback message; force a retry instead.
+                raise ValueError(
+                    "clarification_required without clarification_question"
                 )
             return requirement
 
@@ -1846,6 +1860,7 @@ class AgentStagedRunner:
             "conditions": requirement.conditions,
             "target_properties": [_prop_payload(prop) for prop in properties],
             "constraints": requirement.constraints,
+            "assumptions": requirement.assumptions,
         }
 
     @staticmethod
@@ -2028,6 +2043,7 @@ class AgentStagedRunner:
         skeleton: SkeletonExtract | None,
         verdicts: list[dict[str, Any]],
         clipped_notes: list[str],
+        pending_clarification: str | None = None,
     ) -> str:
         summary = {
             "requirement": requirement_payload,
@@ -2035,8 +2051,19 @@ class AgentStagedRunner:
             "property_verdicts": verdicts,
             "clipped": clipped_notes,
         }
-        return (
+        rules = (
             f"{SYNTHESIS_EXTRA_RULES}\n"
             "结构化需求、骨架与指标裁决（引用编号已与证据对应，直接用于组织回答）：\n"
             f"{json.dumps(summary, ensure_ascii=False)}"
         )
+        if requirement_payload.get("assumptions"):
+            rules += (
+                "\n需求中的 assumptions 是因用户未给出完整约束而做的默认假设，"
+                "必须在回答开头以“默认假设”一节逐条列出，并说明推荐仅在这些假设下成立。"
+            )
+        if pending_clarification:
+            rules += (
+                "\n必须在回答末尾附上一段“如需更精准的推荐，请补充以下信息”，"
+                f"内容为：{pending_clarification}"
+            )
+        return rules

@@ -49,8 +49,10 @@
 [门禁] 鉴权 → can_use_agent_query → effective_kbs（与 plan 模式一致）
     ▼
 S0 需求解析（AGENT LLM，无检索）
-    问题 → {application 应用对象, conditions 环境/工况, target_properties 目标性能指标(P0/P1/P2, ≤8),
-            constraints 其他约束}；缺关键信息 → clarification（复用既有澄清路径）
+    问题（含截断后的 conversation_history） → {application 应用对象, conditions 环境/工况,
+            target_properties 目标性能指标(P0/P1/P2, ≤8), constraints 其他约束,
+            assumptions 默认假设}；缺关键信息 → 按领域常识补默认假设继续；
+            完全无法判断应用领域时置 clarification（降级执行，不终止会话）
     ▼
 S1 骨架召回（AGENT LLM 规划 ≤3 步 → 串行检索 → AGENT LLM 提取）
     a) 模型为每个 effective KB 标注证据角色 kb_roles（reference_formula/experimental/
@@ -152,7 +154,7 @@ S5 终答合成（QUERY LLM，复用证据包模板 + 推荐输出结构约束�
 | `skeleton_extracted` | 骨架组分（含 source_refs）、open_questions、`dropped_components` |
 | `validation_verdicts` | 指标裁决列表；补查后携带 `after_repair: true` 再发一次 |
 | `round_started` / `round_result` | 复用 plan 模式，新增 `stage` 字段；空结果重试成功时 `round_result` 带 `retried_mode` |
-| 其余 | `session_started`（metadata 增加 `workflow`）、`references`（每条含 `stage`/`evidence_role`）、`response`、`clarification_required`、`done`、`error` 复用 |
+| 其余 | `session_started`（metadata 增加 `workflow`）、`references`（每条含 `stage`/`evidence_role`）、`response`、`clarification_downgraded`（澄清降级，不终止会话）、`done`、`error` 复用 |
 
 ### 4.3 响应 metadata（staged）
 
@@ -205,7 +207,7 @@ AGENT_STAGED_MAX_KBS_PER_STEP=4
 ### 6.2 测试矩阵（tests/api/routes/test_agent_staged_workflow.py）
 
 - 全流程 happy path：事件顺序、kb_roles、骨架引用、裁决映射、references 的 stage/evidence_role、终答合成。
-- S0 澄清短路（不触发任何检索）；S0 JSON 连续失败 → 502 `agent_requirement_invalid`。
+- S0 澄清降级（继续检索并在终答附澄清问题，application 缺失时用原始问题回填）；S0 JSON 连续失败（含 clarification 无问题文本）→ 502 `agent_requirement_invalid`。
 - 骨架组分无效引用被丢弃并计数；骨架规划选越权 KB → 403 + `agent_session_failed`。
 - 裁决 fail-closed：漏答指标 → no_data；supported 无有效引用 → 降级 no_data。
 - 缺口补查：no_data 触发补查、补查后裁决更新、`after_repair` 事件。

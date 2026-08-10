@@ -59,7 +59,7 @@ LightRAG 已提供：
 | F4 | 终答与引用 | 终答可追溯至统一 **Agent 级引用编号**（含 `kb_id`、`round`、文件路径等）；法规/禁忌类结论优先于推荐类（由工作流提示词约束）。 |
 | F5 | 单库与多库 | 每轮可为单 KB 或多 KB（同一子问）；多 KB 仅在会话允许集合内且 embedding 配置一致前提下使用。 |
 | F6 | 用户指定知识库 | 请求可传 `candidate_kb_ids`（长度 1～N）。有效集合 = **授权 KB ∩ candidate_kb_ids**；若 **未传或为空**，表示候选范围为 **全部授权 KB**，由 Agent 模型在规划时自行决定使用哪些库。不得指定授权外的 `kb_id`。 |
-| F7 | 澄清 | 关键约束缺失且无法从 KB 推断时，编排 LLM 可输出 **澄清**（结构化 JSON）；**不调用检索**；客户端可携带同一会话上下文再次请求（产品可配置是否持久 `session_id`）。 |
+| F7 | 澄清降级 | 关键约束缺失且无法从 KB 或对话历史推断时，编排 LLM 输出默认假设（`assumptions`）并照常规划检索；即便置 `clarification_required`，服务端也**不终止会话**，而是降级为兜底检索 + 终答，假设列在答案开头、澄清问题附在答案末尾（`clarification_question` / `metadata.pending_clarification`）。规划 payload 携带截断后的 `conversation_history`，追问无需重复完整约束；提示词要求与历史主题明显无关的新问题忽略历史。客户端开新话题时应发送空的 `conversation_history`。 |
 | F8 | 快速路径 | 简单单库问题可缩短规划与轮次（如 1 次检索 + 证据合成），仍须会话门禁与权限校验。 |
 | F9 | 工作流提示词 | 系统内置默认 **Agent 工作流提示词**（见 §8）；支持 **按用户** 持久化自定义工作流提示词，通过企业 API 读写；执行时 **用户自定义覆盖或追加** 于默认策略（实现时二选一：覆盖默认 vs 追加，建议 **追加在系统指令之后**，并限制最大长度）。 |
 | F10 | 串行执行 | 所有检索轮次 **严格串行**；规划中的多步按顺序执行，不启用并行 retrieve。 |
@@ -194,9 +194,9 @@ KB 角色阶梯：`kb_viewer` < `kb_editor` < `kb_admin` < `kb_owner`。
     ▼
 [0] 门禁：鉴权 → can_use_agent_query → effective_kb_ids
     ▼
-[1] 规划（AGENT LLM，JSON）：子问题、每步 kb_ids、底层 mode、优先级；或 clarification
+[1] 规划（AGENT LLM，JSON）：子问题、每步 kb_ids、底层 mode、优先级；payload 含截断后的对话历史；或 clarification
         （JSON 解析失败自动重试，最多 3 次；仍失败 → 502 + agent_session_failed 审计）
-    ▼（若 clarification → 返回用户，结束本轮 HTTP）
+    ▼（若 clarification → 降级：无步骤时改为单步 mix 兜底检索继续执行，澄清问题附在终答末尾）
 [2] 检索循环（串行，最多 max_rounds；步骤按 P0→P1→P2 稳定排序后截断，保证 P0 保留）：
         for step in plan.steps:
             校验 kb_ids ⊆ effective_kb_ids，mode ∈ {local,global,hybrid,naive,mix}
@@ -228,7 +228,7 @@ KB 角色阶梯：`kb_viewer` < `kb_editor` < `kb_admin` < `kb_owner`。
 
 ### 7.4 流式输出（已实现）
 
-NDJSON 事件按执行进度 **实时输出**：`session_started`、`plan_created`（规划完成即发）、`round_started`、`round_result`（每轮检索前后）、`references`、`response`（终答增量 delta，可多条）、`clarification_required`、`done`、`error`。
+NDJSON 事件按执行进度 **实时输出**：`session_started`、`plan_created`（规划完成即发）、`round_started`、`round_result`（每轮检索前后）、`references`、`response`（终答增量 delta，可多条）、`clarification_downgraded`（澄清降级，不终止会话）、`done`、`error`。
 与现有仅 `response` 的 query stream 区分，需 WebUI 独立 parser。
 
 **证据合成语义**：每步检索结果已在检索内按该步子问题 rerank；证据板合并时 **不做二次 rerank**（避免子问题证据被总问题相关性打分整体挤掉），而是按轮次轮转交错合并，再按 `max_total_tokens` 预算截断。失败步骤与跳过的 KB 作为"已知检索缺口"注入终答约束，要求模型明确声明未覆盖内容。
@@ -274,7 +274,7 @@ NDJSON 事件按执行进度 **实时输出**：`session_started`、`plan_create
 }
 ```
 
-若需澄清：`clarification_required: true`，`steps` 为空数组，`clarification_question` 必填。
+若需澄清：`clarification_required: true`，`clarification_question` 必填（为空视为无效输出并重试）；服务端不会因此终止会话，`steps` 为空时降级为单步 mix 兜底检索。
 
 **规则**
 

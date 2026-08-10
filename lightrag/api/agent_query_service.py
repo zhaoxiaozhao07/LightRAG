@@ -103,7 +103,15 @@ DEFAULT_AGENT_WORKFLOW_PROMPT = """
 你是 LightRAG Agent 编排器。你只能在服务端提供的 allowed_kbs 中选择 kb_ids，
 并为每个检索步骤指定底层检索模式 local/global/hybrid/naive/mix 之一。禁止使用 bypass。
 你不直接回答最终问题，只输出严格 JSON。子 query 必须完整自洽，不要依赖“上文”。
-法规、禁忌、合规类子问题优先标记 P0。若用户问题缺少关键约束且无法规划检索，输出澄清。
+payload 中的 conversation_history 是此前的对话记录：用户问题可能是对之前回复的追问，
+必须结合历史理解完整意图，并把历史中的约束合并进子 query。
+若当前问题与 conversation_history 的主题明显无关（用户切换了新话题），
+忽略历史，仅按当前问题理解需求，不要把旧话题的约束带入新问题。
+法规、禁忌、合规类子问题优先标记 P0。
+信息不足时不要轻易要求澄清：基于领域常识做合理的默认假设，逐条写入 assumptions 数组，
+并照常规划检索步骤。仅当结合历史后仍完全无法判断用户的应用领域时才设置
+clarification_required=true，此时 clarification_question 必须具体列出缺少哪些信息，
+且仍应尽力给出基于假设的检索步骤。
 不要输出 markdown，不要输出 chain-of-thought。
 """.strip()
 
@@ -123,6 +131,27 @@ def agent_bilingual_enabled(body: "AgentQueryRequest") -> bool:
     deployment default only (steps span KBs, so per-KB config is not read)."""
     mode = resolve_bilingual_mode(body.bilingual, None)
     return bilingual_applies(mode, body.query, None)
+
+
+# Bounds for the conversation-history excerpt injected into planning /
+# requirement-parsing payloads: enough turns to resolve a follow-up question,
+# small enough not to crowd out KB profiles in local-model context windows.
+AGENT_HISTORY_MAX_MESSAGES = 6
+AGENT_HISTORY_MESSAGE_CHARS = 1000
+
+
+def agent_history_context(body: "AgentQueryRequest") -> list[dict[str, str]]:
+    """Tail-truncated conversation history for planner/requirement payloads,
+    so follow-up questions ("全钢TBR配方") keep the context of earlier turns."""
+    trimmed: list[dict[str, str]] = []
+    for message in (body.conversation_history or [])[-AGENT_HISTORY_MAX_MESSAGES:]:
+        role = str(message.get("role", "")).strip()
+        content = str(message.get("content", "")).strip()[
+            :AGENT_HISTORY_MESSAGE_CHARS
+        ]
+        if role and content:
+            trimmed.append({"role": role, "content": content})
+    return trimmed
 
 
 class AgentPlanStep(BaseModel):
@@ -186,7 +215,30 @@ class AgentPlan(BaseModel):
     clarification_required: bool = False
     clarification_question: str | None = None
     steps: list[AgentPlanStep] = Field(default_factory=list)
+    # Default assumptions the planner made where the question left constraints
+    # unspecified; surfaced verbatim in the synthesized answer.
+    assumptions: list[str] = Field(default_factory=list)
     notes_for_user: str | None = None
+
+    @field_validator("assumptions", mode="before")
+    @classmethod
+    def _clip_assumptions(cls, value: Any) -> list[str]:
+        if isinstance(value, str):
+            raw: list[Any] = [value]
+        elif isinstance(value, list):
+            raw = value
+        elif value is None:
+            raw = []
+        else:
+            raw = [value]
+        items: list[str] = []
+        for entry in raw:
+            text = str(entry).strip()[:300]
+            if text and text not in items:
+                items.append(text)
+            if len(items) >= 10:
+                break
+        return items
 
 
 class AgentQueryRequest(BaseModel):
@@ -276,6 +328,26 @@ class AgentRunResult:
 
 def _json_event(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
+def assumption_synthesis_rules(
+    assumptions: list[str], pending_clarification: str | None
+) -> str:
+    """Synthesis-prompt fragment surfacing planner assumptions and turning a
+    downgraded clarification into a follow-up ask appended to the answer."""
+    parts: list[str] = []
+    if assumptions:
+        parts.append(
+            "因用户未给出完整约束，本次检索基于以下默认假设，必须在回答开头以"
+            "“默认假设”一节逐条列出，并说明结论仅在这些假设下成立："
+            + "；".join(assumptions)
+        )
+    if pending_clarification:
+        parts.append(
+            "必须在回答末尾附上一段“如需更精准的结果，请补充以下信息”，"
+            f"内容为：{pending_clarification}"
+        )
+    return "\n".join(parts)
 
 
 def _sensitive_context_info(
@@ -426,6 +498,7 @@ def _agent_plan_response_format(
                 },
             },
             "notes_for_user": {"type": ["string", "null"]},
+            "assumptions": {"type": "array", "items": {"type": "string"}},
         },
         "required": ["type", "clarification_required", "steps"],
     }
@@ -580,36 +653,36 @@ class AgentQueryService:
                 effective_records=effective_records,
                 max_rounds=max_rounds,
             )
+            # Clarification never terminates the session: an under-specified
+            # question is answered on best-effort assumptions and the
+            # clarifying question is appended to the answer instead.
+            pending_clarification: str | None = None
             if plan.clarification_required:
-                mark_sensitive_context_not_used(
-                    sensitive_context, "clarification_required"
-                )
-                result_metadata = {
-                    "workflow": body.workflow,
-                    "effective_kb_ids": [record.id for record in effective_records],
-                }
-                memory_info = _sensitive_context_info(sensitive_context)
-                if memory_info is not None:
-                    result_metadata["memory"] = memory_info
-                result = AgentRunResult(
-                    status="clarification_required",
-                    session_id=session_id,
-                    clarification_question=plan.clarification_question
-                    or "请补充关键约束。",
-                    metadata=result_metadata,
-                )
+                pending_clarification = (
+                    plan.clarification_question or ""
+                ).strip() or None
+                if not plan.steps:
+                    plan = AgentPlan(
+                        type="plan",
+                        clarification_required=False,
+                        steps=[
+                            AgentPlanStep(
+                                step_index=1,
+                                title="直接检索",
+                                query=body.query,
+                                kb_ids=[record.id for record in effective_records],
+                                mode="mix",
+                                priority="P1",
+                            )
+                        ],
+                        assumptions=plan.assumptions,
+                        notes_for_user=plan.notes_for_user,
+                    )
                 yield {
-                    "event": "clarification_required",
+                    "event": "clarification_downgraded",
                     "session_id": session_id,
-                    "clarification_question": result.clarification_question,
+                    "clarification_question": pending_clarification,
                 }
-                yield {
-                    "event": "done",
-                    "session_id": session_id,
-                    **_done_memory_metadata(sensitive_context),
-                    "_result": result,
-                }
-                return
 
             steps, plan_truncated = self._validate_plan(
                 plan, effective_records, max_rounds
@@ -816,6 +889,9 @@ class AgentQueryService:
                     context_units=context_units,
                     steps_summary=steps_summary,
                     stream=stream_synthesis,
+                    extra_rules=assumption_synthesis_rules(
+                        plan.assumptions, pending_clarification
+                    ),
                     sensitive_context=sensitive_context,
                 ):
                     if delta:
@@ -832,6 +908,7 @@ class AgentQueryService:
                 "failed_round_count": len(failed_rounds),
                 "reference_count": len(references),
                 "effective_kb_ids": [record.id for record in effective_records],
+                "clarification_downgraded": pending_clarification is not None,
             }
             memory_info = _sensitive_context_info(sensitive_context)
             if memory_info is not None:
@@ -851,13 +928,17 @@ class AgentQueryService:
                 "plan_truncated": plan_truncated,
                 "bilingual_retrieval": agent_bilingual_enabled(body),
                 "notes_for_user": plan.notes_for_user,
+                "assumptions": plan.assumptions,
             }
+            if pending_clarification is not None:
+                result_metadata["pending_clarification"] = pending_clarification
             if memory_info is not None:
                 result_metadata["memory"] = memory_info
             result = AgentRunResult(
                 status="success",
                 session_id=session_id,
                 answer=answer,
+                clarification_question=pending_clarification,
                 references=references if body.include_references else [],
                 steps_summary=steps_summary,
                 metadata=result_metadata,
@@ -1086,6 +1167,7 @@ class AgentQueryService:
 
         payload = {
             "user_question": body.query,
+            "conversation_history": agent_history_context(body),
             "allowed_kbs": [
                 agent_kb_profile(record)
                 for record in effective_records
@@ -1102,6 +1184,7 @@ class AgentQueryService:
                 "type": "plan",
                 "clarification_required": False,
                 "clarification_question": None,
+                "assumptions": ["信息不足时所做的默认假设，无假设则为空数组"],
                 "steps": [step_schema],
                 "notes_for_user": "可选一句话",
             },
@@ -1111,14 +1194,23 @@ class AgentQueryService:
         if bilingual:
             system_prompt = f"{system_prompt}\n{BILINGUAL_PLAN_PROMPT_SUFFIX}"
 
-        saw_empty_plan = False
+        saw_degenerate_plan = False
 
         def _parse_plan(data: Any) -> AgentPlan:
-            nonlocal saw_empty_plan
+            nonlocal saw_degenerate_plan
             plan = AgentPlan.model_validate(data)
             if not plan.clarification_required and not plan.steps:
-                saw_empty_plan = True
+                saw_degenerate_plan = True
                 raise ValueError("plan contains no steps and no clarification")
+            if plan.clarification_required and not (
+                plan.clarification_question or ""
+            ).strip():
+                # A bare clarification flag with no question is useless to the
+                # user (it renders as a generic fallback); force a retry.
+                saw_degenerate_plan = True
+                raise ValueError(
+                    "clarification_required without clarification_question"
+                )
             return plan
 
         try:
@@ -1135,12 +1227,12 @@ class AgentQueryService:
                 ),
             )
         except LLMJsonError as exc:
-            if saw_empty_plan:
+            if saw_degenerate_plan:
                 # All attempts failed and at least one returned a syntactically
-                # valid plan with no steps — a degenerate-but-legal output some
-                # JSON-constrained models produce. Degrade to one mix-mode
-                # retrieval over the candidate KBs instead of failing the
-                # session with 502.
+                # valid but degenerate plan (no steps, or a clarification flag
+                # with no question) — outputs some JSON-constrained models
+                # produce. Degrade to one mix-mode retrieval over the candidate
+                # KBs instead of failing the session with 502.
                 logger.warning(
                     "Agent planner produced no usable plan after %d attempts; "
                     "using single-step fallback retrieval: %s",
@@ -1316,7 +1408,10 @@ class AgentQueryService:
         user_prompt = body.user_prompt or "n/a"
         agent_rules = (
             "你只能基于给定证据回答。引用必须使用 [A1]、[A2] 这样的 Agent 级引用编号。"
-            "如果证据不足或存在冲突，必须明确说明缺口或冲突；不要编造未在证据中的事实。"
+            "如果证据不足或存在冲突，必须明确说明缺口或冲突；不要编造未在证据中的事实。\n"
+            "引用规范：正文中仅以 [A1] 编号标注引用，需要指明出处时只写来源文件名；"
+            "禁止在回答中原文粘贴或整段复述证据片段（chunk）内容，禁止输出引用块/证据块，"
+            "也不要在文末自行罗列参考文献或引用列表（系统会单独返回结构化引用列表）。"
         )
         if extra_rules:
             agent_rules = f"{agent_rules}\n{extra_rules}"

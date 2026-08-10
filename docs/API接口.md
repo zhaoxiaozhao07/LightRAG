@@ -1088,7 +1088,7 @@ Content-Type: application/json
 - 只要携带 `memory`，`query` 最长为 **4096 字符**；超限在项目记忆检索前返回 `400`。
 - **授权早（authorize early）**：在 KB 检索或 Agent 规划前校验功能开关、交互式 JWT principal、项目归属与查询长度，只创建不含事实的进程内授权句柄。不存在和属于他人的项目统一 `404`，不泄露项目是否存在。
 - **检索晚（search late）**：先完成规划、KB 选择、双语预处理、检索、合并、rerank 与当前权威证据预算；只有确定将执行最终合成、选定实际 query LLM/tokenizer 并算出完整最终请求的剩余预算后，才校验 egress 并至多检索一次项目记忆。
-- **仅终答合成（final-synthesis-only）**：记忆不会进入 Agent 规划、staged 需求解析/骨架召回/指标验证、KB 选择、检索查询、关键词提取、rerank 或结构化 verdict，也不会改变召回结果。Agent 需要澄清时已完成作用域授权，但不搜索记忆；返回 `not_used/clarification_required`。
+- **仅终答合成（final-synthesis-only）**：记忆不会进入 Agent 规划、staged 需求解析/骨架召回/指标验证、KB 选择、检索查询、关键词提取、rerank 或结构化 verdict，也不会改变召回结果。
 - **必须有当前 KB 证据**：最终处理后的当前 KB 证据为空时，不搜索记忆、不调用最终 query LLM，也不能仅凭记忆作答；返回 `not_used/no_kb_evidence`。该约束同样适用于单 KB、多 KB、双语、Agent plan 和 Agent staged。
 
 以下请求没有最终合成；携带 `memory` 时会在任何项目记忆检索前直接返回 HTTP `400`，稳定错误码为 `chat_memory_requires_final_synthesis`：
@@ -1140,7 +1140,7 @@ Content-Type: application/json
 | `status="empty"` | 已搜索，但没有可用事实 |
 | `status="budget_exhausted"` | tokenizer/总容量不可用、固定安全框架放不下，或有事实但没有完整记录能同时满足 token/字符/最终请求预算；若有可用事实因预算被省略，`truncated=true` |
 | `status="unavailable"` | 仅限 typed Chat Memory backend availability 故障；fail-open，`enabled=false`、`reason="unavailable"`，主查询继续 |
-| `status="not_used"` | 已授权但不搜索；`reason` 固定为 `clarification_required` 或 `no_kb_evidence` |
+| `status="not_used"` | 已授权但不搜索；`reason` 固定为 `no_kb_evidence` |
 | `fact_count` | 项目记忆搜索匹配数（保持兼容口径），未搜索时为 `0` |
 | `injected_count` | 实际注入的完整 JSONL 记录数 |
 | `truncated` | 是否至少有一条可用事实因预算未被注入；空白/格式错误事实不算预算截断 |
@@ -1221,7 +1221,7 @@ Agent 支持两种工作流（请求体 `workflow` 字段选择）：
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/agent/query` | 非流式 Agent 问答；返回终答、Agent 级引用、步骤摘要与 metadata |
-| `POST` | `/agent/query/stream` | Agent NDJSON 事件流；事件随执行进度**实时输出**（规划完成即发 `plan_created`，每轮检索前后发 `round_started` / `round_result`，终答按增量 `response` delta 流式输出）。`plan` 工作流事件：`session_started`、`plan_created`、`round_started`、`round_result`、`references`、`response`、`clarification_required`、`done`、`error`；`staged` 工作流额外事件见 §9.3.1 |
+| `POST` | `/agent/query/stream` | Agent NDJSON 事件流；事件随执行进度**实时输出**（规划完成即发 `plan_created`，每轮检索前后发 `round_started` / `round_result`，终答按增量 `response` delta 流式输出）。`plan` 工作流事件：`session_started`、`plan_created`、`round_started`、`round_result`、`references`、`response`、`clarification_downgraded`（澄清降级，不终止会话）、`done`、`error`；`staged` 工作流额外事件见 §9.3.1 |
 
 请求体：
 
@@ -1325,17 +1325,20 @@ Agent 支持两种工作流（请求体 `workflow` 字段选择）：
 }
 ```
 
-澄清响应：
+澄清降级响应（约束不足时**不终止会话**：服务端基于默认假设完成检索与终答，假设在答案开头列出，澄清问题附在答案末尾并回填 `clarification_question` / `metadata.pending_clarification`）：
 
 ```json
 {
-  "status": "clarification_required",
+  "status": "success",
   "session_id": "agent_...",
-  "answer": "",
+  "answer": "默认假设：...\n\n推荐方案... [A1]\n\n如需更精准的结果，请补充以下信息：目标应用场景和限制条件。",
   "clarification_question": "请补充目标应用场景和限制条件。",
-  "references": [],
-  "steps_summary": [],
-  "metadata": {"effective_kb_ids": ["kb_regulation"]}
+  "references": [{"reference_id": "A1", "...": "..."}],
+  "steps_summary": [{"...": "..."}],
+  "metadata": {
+    "effective_kb_ids": ["kb_regulation"],
+    "pending_clarification": "请补充目标应用场景和限制条件。"
+  }
 }
 ```
 
@@ -1357,7 +1360,7 @@ Agent 支持两种工作流（请求体 `workflow` 字段选择）：
 面向 **按证据来源分库**（如配方库、实验数据库、论文库、应用专项库）的配比/配方推荐问题，服务端按固定阶段流水线执行，证据链锚定在知识库而非模型记忆（设计详见 `docs/AgentStagedRecommendation-zh.md`）：
 
 ```text
-S0 需求解析（结构化目标性能指标清单，缺关键信息 → clarification）
+S0 需求解析（结构化目标性能指标清单，缺关键信息 → 按默认假设继续并降级澄清，不终止会话）
 S1 骨架召回（模型标注各 KB 证据角色 kb_roles → 检索参考配方 ≤3 步 → 提取骨架组分，引用必须可校验）
 S2 要素证据（open_questions + 组分补充查询，服务端模板实例化，≤8 步且为 S3 预留预算）
 S3 指标验证（逐指标检索实验数据 → 裁决 supported/partial/unsupported/no_data，无有效引用的结论降级 no_data）
@@ -2115,6 +2118,7 @@ Content-Type: application/json
 - 项目、会话均可改名（`PATCH`）；改名会刷新 `updated_at`，因此最近操作的记录排在列表前面；`created_at` 保持不变。**追加消息也会刷新所属会话的 `updated_at`**（同一事务内），会话列表天然按"最近活跃"排序。
 - 会话创建默认名为服务器本地时间（如 `2026-07-10 16:00:05`），显式传非空白 `name` 则使用该名称；名称不要求唯一。
 - **`context_rounds`（上下文轮次）**：会话级参数，表示每次问答发送给大模型的最近对话轮数——对话轮数超过 `n` 时只发送最近 `n` 轮，`-1` 表示全部发送。创建时缺省取部署默认值 `CHAT_SESSION_DEFAULT_CONTEXT_ROUNDS`（出厂 `1`），之后可随时 `PATCH` 修改；合法取值为 `-1` 或正整数，`0`、`-2` 等返回 `400`。前端从服务端拉取消息后，按该值取最近 `n` 轮组装 `conversation_history` 再调用 query/agent 端点。
+- **新话题约定**：用户开启新话题（如点击"新会话/新话题"）时，前端应发送**空的或省略的** `conversation_history`，从源头避免旧话题的约束串扰新问题的 Agent 规划与需求解析；同一话题内的追问则必须携带历史，Agent 规划环节会消费它来补全追问缺失的上下文。
 - **消息（跨端同步）**：`role` 仅允许 `user` / `assistant`；`content` 非空且单条 ≤ 1 MB；`metadata` 为自由 dict（推荐存放该条回答的 `references`、`mode`、`kb_ids`、agent `session_id` 等，前端换设备后可原样还原引用面板），序列化 ≤ 64 KB，超限 `400`；单次批量 1..20 条，`422` 校验。消息按会话内 `seq`（服务端在写入事务中分配的连续序号）升序返回，分页用 `total/limit/offset`。消息不可编辑，只能追加或删除单条。
 - 删除会话在同一事务内级联删除其全部消息；删除项目级联删除其下全部会话与消息；删除用户（`DELETE /admin/users/{user_id}`）级联清理该用户全部项目、会话与消息。
 - 问答本身仍走 `/kbs/{kb_id}/query`、`/kbs:query`、`/agent/query` 等既有端点：前端发起提问 → 拿到回答后把一问一答（含引用 metadata）`POST` 到 `.../messages` 落库；换浏览器登录后 `GET .../messages` 即可还原完整历史。

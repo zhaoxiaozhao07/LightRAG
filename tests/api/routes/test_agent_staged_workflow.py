@@ -420,7 +420,7 @@ async def test_staged_agent_calls_request_schema_constrained_json(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_staged_clarification_short_circuits(monkeypatch):
+async def test_staged_clarification_downgrades_and_still_answers(monkeypatch):
     _audit_recorder(monkeypatch)
     rag = _FakeRAG(
         [
@@ -432,7 +432,10 @@ async def test_staged_clarification_short_circuits(monkeypatch):
                     "target_properties": [],
                 },
                 ensure_ascii=False,
-            )
+            ),
+            _skeleton_plan_json(),
+            _skeleton_extract_json(),
+            _verdicts_json([]),
         ]
     )
     tool = _QueryTool(rag)
@@ -440,11 +443,41 @@ async def test_staged_clarification_short_circuits(monkeypatch):
 
     result = await service.run(request=_request(monkeypatch), body=_staged_body())
 
-    assert result.status == "clarification_required"
+    # Clarification no longer short-circuits: the pipeline runs on default
+    # assumptions and the question rides along in the result.
+    assert result.status == "success"
     assert result.clarification_question == "请补充目标应用与环境。"
+    assert result.metadata["pending_clarification"] == "请补充目标应用与环境。"
     assert result.metadata["workflow"] == "staged"
-    assert tool.calls == []
-    assert len(rag.agent_payloads) == 1
+    # The empty application is backfilled from the raw query.
+    assert result.metadata["requirement"]["application"] == (
+        "推荐一种高寒地区使用的胎侧胶料配比"
+    )
+    assert result.metadata["requirement"]["assumptions"]
+    assert tool.calls  # retrieval did happen
+
+
+@pytest.mark.asyncio
+async def test_staged_clarification_without_question_is_retried(monkeypatch):
+    _audit_recorder(monkeypatch)
+    bare_clarification = json.dumps(
+        {
+            "type": "requirement",
+            "clarification_required": True,
+            "clarification_question": None,
+            "target_properties": [],
+        },
+        ensure_ascii=False,
+    )
+    rag = _FakeRAG([bare_clarification, bare_clarification, bare_clarification])
+    service = AgentQueryService(kb_service=_KBService(), query_tool_service=_QueryTool(rag))
+
+    with pytest.raises(HTTPException) as exc:
+        await service.run(request=_request(monkeypatch), body=_staged_body())
+
+    assert exc.value.status_code == 502
+    assert exc.value.detail["error_code"] == "agent_requirement_invalid"
+    assert len(rag.agent_payloads) == 3
 
 
 @pytest.mark.asyncio
