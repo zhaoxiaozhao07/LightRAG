@@ -57,6 +57,7 @@ from lightrag.parser.routing import (
     validate_process_options,
 )
 from lightrag.utils import compute_mdhash_id, generate_track_id, logger
+from lightrag.utils_pipeline import rebase_under_input_dir
 
 SourceType = Literal["upload", "text", "url", "import", "scan"]
 SOURCE_TYPES: tuple[SourceType, ...] = ("upload", "text", "url", "import", "scan")
@@ -1736,7 +1737,9 @@ class DocumentLifecycleService:
         return artifacts
 
     async def _ensure_source_cached(self, document: DocumentRecord) -> Path:
-        source_path = Path(document.source_uri)
+        source_path = _local_document_path(
+            self._source_root, document, document.source_uri
+        )
         if source_path.is_file():
             return source_path
         object_uri = document.metadata.get("source_object_uri")
@@ -1916,6 +1919,62 @@ def _validate_document_cleanup_paths(
             _safe_document_path(workspace_dir, document_dir, artifact.uri)
 
 
+def _document_relative_tail(uri: str) -> tuple[str, ...]:
+    """Split off the part of a recorded path that survives an INPUT_DIR move.
+
+    Everything from the last ``__parsed__`` component onward is layout the
+    parser reproduces identically on any host; anything before it is the
+    deployment-specific ``<input_dir>/<workspace>/<document_id>`` prefix. Plain
+    source files carry no ``__parsed__`` segment, so only their basename is
+    stable.
+    """
+    parts = Path(uri).parts
+    if PARSED_DIR_NAME in parts:
+        return parts[len(parts) - 1 - parts[::-1].index(PARSED_DIR_NAME) :]
+    return parts[-1:] if parts else ()
+
+
+def _local_document_path(source_root: Path, document: DocumentRecord, uri: str) -> Path:
+    """Map a recorded source/artifact path onto this deployment's source root.
+
+    URIs are stored as absolute paths captured when the document was written,
+    so they only resolve under the INPUT_DIR configured back then. After an
+    INPUT_DIR move (bare metal -> container, volume remount) the recorded path
+    points outside the current root even when the files were copied across.
+    Prefer the recorded path while it stays inside the current root, otherwise
+    re-anchor it, and fall back to the canonical
+    ``<source_root>/<workspace>/<document_id>/<tail>`` so an object-storage
+    rehydration writes somewhere this process can actually reach.
+    """
+    rebased = rebase_under_input_dir(
+        uri, anchor=(document.workspace, document.id), input_root=source_root
+    )
+    if rebased is not None:
+        return rebased
+    document_dir = (source_root / document.workspace / document.id).resolve(
+        strict=False
+    )
+    tail = _document_relative_tail(uri)
+    fallback = (document_dir.joinpath(*tail) if tail else document_dir).resolve(
+        strict=False
+    )
+    # This path is a *write* target: _ensure_source_cached hands it to
+    # ObjectStorage.download_file, which mkdirs the parent. A ``..`` in the
+    # recorded tail must therefore not be able to walk the rehydration out of
+    # the document directory -- collapse it first, then clamp.
+    if not fallback.is_relative_to(document_dir):
+        return document_dir / Path(uri).name
+    return fallback
+
+
+def _has_object_copy(artifact: ArtifactRecord) -> bool:
+    """True when the artifact's bytes also live in object storage."""
+    return any(
+        isinstance(artifact.metadata.get(key), str) and artifact.metadata[key]
+        for key in ("object_uri", "object_prefix_uri")
+    )
+
+
 def _resolve_artifact_path(
     source_root: Path, document: DocumentRecord, artifact: ArtifactRecord
 ) -> tuple[Path, bool]:
@@ -1932,7 +1991,21 @@ def _resolve_artifact_path(
         strict=False
     )
     if not artifact_path.is_relative_to(allowed_document_dir):
-        raise ValueError("Artifact path escapes document directory")
+        # Recorded under a former INPUT_DIR (deployment moved). Re-anchoring
+        # keeps the artifact reachable without a re-parse, but only when the
+        # relocated copy actually exists — or when object storage holds the
+        # bytes and the local path is merely a cache target. Anything else is
+        # still a genuine escape.
+        rebased = rebase_under_input_dir(
+            artifact.uri,
+            anchor=(document.workspace, document.id),
+            input_root=source_root,
+        )
+        if rebased is None and _has_object_copy(artifact):
+            rebased = _local_document_path(source_root, document, artifact.uri)
+        if rebased is None or not rebased.is_relative_to(allowed_document_dir):
+            raise ValueError("Artifact path escapes document directory")
+        artifact_path = rebased
     if artifact_path.exists():
         is_directory = artifact_path.is_dir()
         if not is_directory and not artifact_path.is_file():

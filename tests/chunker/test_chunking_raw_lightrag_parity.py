@@ -292,7 +292,47 @@ def test_lightrag_document_path_rejects_uri_outside_input_dir(tmp_path, monkeypa
 
 
 @pytest.mark.offline
-def test_lightrag_document_path_rejects_unsupported_uri(tmp_path, monkeypatch):
+def test_lightrag_document_path_accepts_uri_recorded_under_a_former_input_dir(
+    tmp_path, monkeypatch
+):
+    """Relocating INPUT_DIR must not strand documents parsed before the move.
+
+    ``sidecar_location`` is an absolute path captured at parse time, so a
+    bare-metal -> container migration records a root the container never has.
+    The artifacts were copied across, so the enqueue re-anchors instead of
+    rejecting -- no re-parse.
+    """
+
+    async def _run():
+        rel = Path("kb_demo") / "doc-abc" / "__parsed__" / "moved.parsed"
+        former_dir = tmp_path / "srv" / "inputs" / rel
+        former_dir.mkdir(parents=True)
+        recorded_uri = sidecar_uri_for(former_dir)
+
+        input_dir = tmp_path / "app" / "inputs"
+        (input_dir / rel).mkdir(parents=True)
+        _write_lightrag_blocks((input_dir / rel) / "moved.blocks.jsonl", ["relocated"])
+        monkeypatch.setenv("INPUT_DIR", str(input_dir))
+
+        rag = _new_rag(tmp_path / "work-moved")
+        await rag.initialize_storages()
+        try:
+            await rag.apipeline_enqueue_documents(
+                "",
+                file_paths="moved.lightrag",
+                docs_format=FULL_DOCS_FORMAT_LIGHTRAG,
+                lightrag_document_paths=recorded_uri,
+                track_id="track-moved",
+            )
+            doc_id = compute_mdhash_id("moved.lightrag", prefix="doc-")
+            full_doc = await rag.full_docs.get_by_id(doc_id)
+            assert full_doc is not None
+            assert full_doc["content"] == LIGHTRAG_DOC_CONTENT_PREFIX + "relocated"
+            assert full_doc["sidecar_location"] == sidecar_uri_for(input_dir / rel)
+        finally:
+            await rag.finalize_storages()
+
+    asyncio.run(_run())
     async def _run():
         input_dir = tmp_path / "input-unsupported"
         input_dir.mkdir(parents=True)

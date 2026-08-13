@@ -16,7 +16,7 @@ from lightrag.api.metadata_store import (
     MetadataRecordNotFoundError,
 )
 from lightrag.utils import generate_track_id, logger
-from lightrag.utils_pipeline import sidecar_uri_for
+from lightrag.utils_pipeline import rebase_under_input_dir, sidecar_uri_for
 
 # doc_status status values that mean "still being processed by the pipeline".
 # A document showing one of these has NOT reached a terminal build state yet —
@@ -620,11 +620,24 @@ class IndexBuildService:
         )
         sidecar_uri: str | None = None
         blocks_path: str | None = None
+        # Artifact URIs are absolute paths captured at parse time, so they only
+        # resolve under the INPUT_DIR that was configured back then. A KB
+        # document always lives at ``<INPUT_DIR>/<workspace>/<document_id>/``,
+        # which makes the relocation exact for a deployment that moved its
+        # INPUT_DIR (bare metal -> container, volume remount) — no re-parse.
+        anchor = (document.workspace, document.id)
+
+        def _local(uri: str | None) -> str | None:
+            if not uri:
+                return None
+            rebased = rebase_under_input_dir(uri, anchor=anchor)
+            return str(rebased) if rebased is not None else uri
+
         for artifact in artifacts:
             if artifact.artifact_type == "blocks" and not blocks_path:
-                blocks_path = artifact.uri
+                blocks_path = _local(artifact.uri)
             if artifact.artifact_type == "sidecar" and not sidecar_uri:
-                sidecar_uri = _to_sidecar_uri(artifact.uri)
+                sidecar_uri = _to_sidecar_uri(_local(artifact.uri) or artifact.uri)
         if sidecar_uri is None and blocks_path:
             sidecar_uri = _to_sidecar_uri(str(Path(blocks_path).parent))
         return sidecar_uri, blocks_path

@@ -5519,7 +5519,12 @@ def create_kb_document_routes(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            logger.error("Failed to start batch parse for KB '%s': %s", kb_id, exc)
+            logger.error(
+                "Failed to start batch parse for KB '%s': %s",
+                kb_id,
+                exc,
+                exc_info=True,
+            )
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @router.post(
@@ -5699,7 +5704,12 @@ def create_kb_document_routes(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            logger.error("Failed to start parse for KB '%s': %s", kb_id, exc)
+            # An unexpected exception here is by definition undiagnosed, and
+            # the message alone rarely says where it came from -- keep the
+            # traceback so the next unknown 500 is readable from the logs.
+            logger.error(
+                "Failed to start parse for KB '%s': %s", kb_id, exc, exc_info=True
+            )
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     async def _start_single_build_job(

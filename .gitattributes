@@ -1,2 +1,17 @@
 lightrag/api/webui/** binary
 lightrag/api/webui/** linguist-generated
+
+# Deploy-critical files must reach Linux with LF endings. A CRLF shebang makes
+# the kernel look for the interpreter "/bin/sh\r", which fails as
+# "bad interpreter: No such file or directory" -- the container then dies at
+# startup with no useful error. Scoped deliberately to the files that run on
+# Linux rather than a repo-wide `* text=auto`, which would renormalize the many
+# Python sources that are already committed with CRLF (harmless: Python 3 reads
+# CRLF source fine) and bury real changes in whitespace churn.
+*.sh              text eol=lf
+Dockerfile        text eol=lf
+Dockerfile.*      text eol=lf
+docker-entrypoint.sh text eol=lf
+docker-compose*.yml  text eol=lf
+env.example       text eol=lf
+*.env.example     text eol=lf

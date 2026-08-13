@@ -579,6 +579,181 @@ def parsed_dir() -> Path:
     return input_dir_path() / PARSED_DIR_NAME
 
 
+# ---------------------------------------------------------------------------
+# INPUT_DIR relocation (portable artifact paths)
+# ---------------------------------------------------------------------------
+#
+# Source files and parse artifacts are recorded in the metadata DB as ABSOLUTE
+# local paths — ``full_docs.sidecar_location`` (a ``file://`` URI), KB
+# ``artifacts.uri``, ``documents.source_uri``.  Those paths are only valid for
+# the INPUT_DIR that was configured when the document was parsed.  Relocating a
+# deployment (bare metal ``<repo>/inputs`` -> container ``/app/inputs``, a host
+# path change, a k8s volume remount) therefore leaves every pre-move row
+# pointing outside the current INPUT_DIR *even when the files themselves were
+# copied across*, which surfaces as "sidecar path must stay under INPUT_DIR" on
+# rebuild and as silently-missing block provenance at chunk time.
+#
+# Rebasing re-anchors such a path onto the current INPUT_DIR. It never invents
+# a location: a candidate is only accepted when it exists on disk, so a
+# genuinely missing artifact still fails loudly instead of binding to the wrong
+# document.
+
+
+def legacy_input_dir_roots() -> list[Path]:
+    """Former INPUT_DIR values declared via ``LIGHTRAG_INPUT_DIR_LEGACY_ROOTS``.
+
+    Comma- or ``os.pathsep``-separated absolute paths. Declaring them makes
+    rebasing a deterministic prefix swap rather than a filesystem search, which
+    is the recommended setup for a one-way migration.
+    """
+    raw = os.getenv("LIGHTRAG_INPUT_DIR_LEGACY_ROOTS", "").strip()
+    if not raw:
+        return []
+    roots: list[Path] = []
+    for chunk in raw.replace(os.pathsep, ",").split(","):
+        value = chunk.strip()
+        if not value:
+            continue
+        try:
+            roots.append(Path(value).resolve())
+        except OSError:
+            continue
+    return roots
+
+
+# Former INPUT_DIR roots learned at runtime. The first document that recovers by
+# tail search reveals the prefix that moved, so every later document with the
+# same prefix becomes the deterministic swap that
+# ``LIGHTRAG_INPUT_DIR_LEGACY_ROOTS`` would have configured. This keeps a
+# relocated deployment to one warning per distinct former root instead of one
+# per document, without requiring the operator to know the old path in advance.
+# In-memory only: it is an optimisation of an idempotent lookup, never a source
+# of truth, so it does not need to survive a restart.
+_discovered_legacy_roots: set[Path] = set()
+
+
+def discovered_legacy_input_dir_roots() -> tuple[Path, ...]:
+    """Former INPUT_DIR roots inferred from successful tail-match rebases."""
+    return tuple(sorted(_discovered_legacy_roots))
+
+
+def reset_discovered_legacy_input_dir_roots() -> None:
+    """Drop the learned roots (tests, and INPUT_DIR changes within a process)."""
+    _discovered_legacy_roots.clear()
+
+
+def rebase_under_input_dir(
+    path: Path | str,
+    *,
+    anchor: tuple[str, ...] | None = None,
+    input_root: Path | str | None = None,
+) -> Path | None:
+    """Re-anchor a recorded path onto the current INPUT_DIR.
+
+    Returns the path unchanged when it already lives under INPUT_DIR, a
+    relocated path when the same artifact can be found under the current
+    INPUT_DIR, or ``None`` when neither holds.
+
+    ``anchor`` names the leading components that are known-correct under the
+    current root (KB documents pass ``(workspace, document_id)``). With an
+    anchor the relocation is exact — the recorded tail from ``__parsed__``
+    onward is spliced under ``<input_dir>/<anchor>``. Without one, resolution
+    falls back to the declared legacy roots and then to the longest recorded
+    tail that exists under INPUT_DIR, starting at or before the last
+    ``__parsed__`` component so a rebase can never drop the segment that
+    identifies the document.
+
+    ``input_root`` overrides the INPUT_DIR read from the environment; callers
+    that already hold a resolved root (``DocumentLifecycleService.source_root``)
+    pass it so both agree on a single boundary.
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        return None
+
+    root = Path(input_root) if input_root is not None else input_dir_path()
+    root = root.resolve()
+    try:
+        resolved = Path(raw).resolve()
+    except OSError:
+        return None
+    if not resolved.is_absolute():
+        resolved = (root / resolved).resolve()
+    if resolved.is_relative_to(root):
+        return resolved
+
+    def _accept(candidate: Path, *, deterministic: bool) -> Path | None:
+        if not candidate.exists():
+            return None
+        # A relocation derived from the KB layout or from a declared former
+        # root is the configured, expected outcome of a migration, so it logs
+        # at info: warning-per-document would bury real problems for the whole
+        # life of the deployment, and its remediation advice is already
+        # followed. Only the tail search below is a guess worth flagging.
+        if deterministic:
+            logger.info(
+                "Rebased a path recorded under a former INPUT_DIR: "
+                f"{resolved} -> {candidate} (INPUT_DIR={root})."
+            )
+        else:
+            logger.warning(
+                "Rebased a path recorded outside the current INPUT_DIR by "
+                f"matching its trailing components: {resolved} -> {candidate} "
+                f"(INPUT_DIR={root}). Set LIGHTRAG_INPUT_DIR_LEGACY_ROOTS to "
+                "the former path(s) to make this a deterministic prefix swap, "
+                "or re-record the artifact paths."
+            )
+        return candidate
+
+    parts = resolved.parts[1:] if resolved.is_absolute() else resolved.parts
+    # Index of the last ``__parsed__`` component: everything from there on is
+    # layout that survives a move, everything before it is deployment-specific.
+    parsed_index = (
+        len(parts) - 1 - parts[::-1].index(PARSED_DIR_NAME)
+        if PARSED_DIR_NAME in parts
+        else -1
+    )
+
+    # 1. Exact splice against a caller-supplied anchor.
+    if anchor and parts:
+        tail = parts[parsed_index:] if parsed_index >= 0 else parts[-1:]
+        accepted = _accept(root.joinpath(*anchor, *tail), deterministic=True)
+        if accepted is not None:
+            return accepted
+
+    # 2. Deterministic prefix swap against a former INPUT_DIR: declared via the
+    #    env var, or learned from an earlier tail match in this process.
+    for legacy_root in [
+        *legacy_input_dir_roots(),
+        *discovered_legacy_input_dir_roots(),
+    ]:
+        if resolved.is_relative_to(legacy_root):
+            accepted = _accept(
+                root / resolved.relative_to(legacy_root), deterministic=True
+            )
+            if accepted is not None:
+                return accepted
+
+    # 3. Longest recorded tail that exists under the current INPUT_DIR. Bounded
+    #    at the last ``__parsed__`` so the tail always keeps the artifact's own
+    #    directory; paths without one only retry their final component.
+    shortest_tail_len = len(parts) - parsed_index if parsed_index >= 0 else 1
+    for tail_len in range(len(parts), shortest_tail_len - 1, -1):
+        accepted = _accept(
+            root.joinpath(*parts[len(parts) - tail_len :]), deterministic=False
+        )
+        if accepted is not None:
+            # The prefix this match replaced is, by construction, the former
+            # INPUT_DIR. Remembering it turns every subsequent document under
+            # the same prefix into branch 2 above.
+            if tail_len < len(parts):
+                _discovered_legacy_roots.add(
+                    Path(resolved.anchor).joinpath(*parts[: len(parts) - tail_len])
+                )
+            return accepted
+    return None
+
+
 def parsed_artifact_dir_for(
     file_path: str, *, parent_hint: Path | str | None = None
 ) -> Path:
@@ -666,13 +841,28 @@ def resolve_sidecar_uri(uri: str | None) -> Path | None:
     return Path(path_str)
 
 
+def resolve_sidecar_dir(uri: str | None) -> Path | None:
+    """Decode a sidecar URI into a *readable* local directory.
+
+    Same as :func:`resolve_sidecar_uri`, plus a rebase onto the current
+    INPUT_DIR for URIs recorded under a former one (see
+    :func:`rebase_under_input_dir`). Readers go through this so a relocated
+    deployment keeps resolving its pre-move sidecars; writers and containment
+    checks keep using the pure decoder.
+    """
+    decoded = resolve_sidecar_uri(uri)
+    if decoded is None or decoded.is_dir():
+        return decoded
+    return rebase_under_input_dir(decoded) or decoded
+
+
 def sidecar_blocks_path(uri: str | None) -> str | None:
     """Locate the first ``*.blocks.jsonl`` file inside a sidecar URI.
 
     Returns the absolute path as a string, or None when the URI cannot be
     resolved locally or the directory holds no blocks file.
     """
-    d = resolve_sidecar_uri(uri)
+    d = resolve_sidecar_dir(uri)
     if d is None or not d.is_dir():
         return None
     candidates = sorted(d.glob("*.blocks.jsonl"))

@@ -89,6 +89,7 @@ from lightrag.utils_pipeline import (
     doc_status_reset_metadata,
     parsed_artifact_dir_for,
     read_source_file_basename,
+    rebase_under_input_dir,
     resolve_doc_file_path,
     resolve_doc_status_parse_engine,
     resolve_sidecar_uri,
@@ -581,12 +582,25 @@ class _PipelineMixin:
                 if not p.is_absolute():
                     p = input_root / p
                 p = p.resolve()
-                try:
-                    p.relative_to(input_root)
-                except ValueError as exc:
-                    raise ValueError(
-                        "LightRAG document sidecar path must stay under INPUT_DIR"
-                    ) from exc
+                if not p.is_relative_to(input_root):
+                    # Sidecar locations are recorded as absolute paths, so a
+                    # deployment that moved INPUT_DIR (bare metal -> container,
+                    # volume remount) carries pre-move rows that point outside
+                    # the current root even though the files were copied
+                    # across.  Re-anchor onto the current INPUT_DIR before
+                    # failing so a relocated deployment needs no re-parse.
+                    rebased = rebase_under_input_dir(p)
+                    if rebased is None:
+                        raise ValueError(
+                            "LightRAG document sidecar path must stay under "
+                            f"INPUT_DIR: {p} is outside {input_root} and no "
+                            "matching artifact exists under it. If this "
+                            "deployment moved INPUT_DIR, set "
+                            "LIGHTRAG_INPUT_DIR_LEGACY_ROOTS to the former "
+                            "path(s) and make sure the parsed artifacts were "
+                            "copied across."
+                        )
+                    p = rebased
                 # The user may point at the ``*.blocks.jsonl`` file itself
                 # or at its containing ``*.parsed/`` directory.  Sidecars
                 # are addressed by directory, so step up when given a file.

@@ -17,6 +17,17 @@
 # .env keeps working for bare-metal runs (its LIGHTRAG_RUNTIME_TARGET=host is
 # overridden to `compose` here). Never bind-mount the host .env into the
 # container.
+#
+# .env authoring rule: keep comments on their own line. `KEY=value  # note` is
+# parsed inconsistently across dotenv implementations, and a leaked comment is
+# silent -- `LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES=true  # ...` evaluates to
+# False (re-enabling the legacy global routes) and every int knob falls back to
+# its default.
+#
+# Deployment-specific keys that only matter here (read from .env, no override
+# below so they stay per-host):
+#   LIGHTRAG_INPUT_DIR_LEGACY_ROOTS  former INPUT_DIR path(s) after a move
+#   LIGHTRAG_BIND_ADDRESS            host interface to publish 9621 on
 services:
   lightrag:
     image: ${LIGHTRAG_IMAGE:-ghcr.io/zhaoxiaozhao07/lightrag-api-server:latest}
@@ -43,9 +54,18 @@ services:
       TMPDIR: /tmp
 
     ports:
-      - "9621:9621"
+      # Docker publishes ports through its own iptables chain, which is
+      # traversed BEFORE ufw/firewalld rules -- `ufw deny 9621` does not block a
+      # published container port. Binding to a specific interface is what
+      # actually limits exposure. Set LIGHTRAG_BIND_ADDRESS in .env to the LAN
+      # address (or 127.0.0.1 when a reverse proxy fronts the service); the
+      # default keeps the previous listen-on-everything behaviour.
+      - "${LIGHTRAG_BIND_ADDRESS:-0.0.0.0}:9621:9621"
 
     volumes:
+      # All five source dirs must exist on the host before `up`. Docker silently
+      # creates a missing bind source as an empty root-owned directory, which
+      # for ./prompts means the custom entity-type prompts vanish without error.
       - ./inputs:/app/inputs
       - ./logs:/app/logs
       - ./rag_storage:/app/rag_storage
@@ -56,6 +76,16 @@ services:
     # hostname from inside the container.
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+    # The pipeline logs verbosely and `restart: unless-stopped` keeps the same
+    # container alive for weeks, so the default unbounded json-file driver will
+    # eventually fill the disk. (LOG_DIR only rotates the app's own lightrag.log;
+    # stdout/stderr captured by Docker is separate.)
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
 
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9621/health', timeout=4)"]

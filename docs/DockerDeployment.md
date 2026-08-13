@@ -136,6 +136,52 @@ a host `.env` carries `LIGHTRAG_RUNTIME_TARGET=host`, and the server's runtime-t
 check refuses to start inside a container with that value. Compose sets
 `LIGHTRAG_RUNTIME_TARGET=compose` (plus `HOST=0.0.0.0`, `PORT=9621`) to override it.
 
+Two `.env` rules matter specifically under `env_file:`:
+
+- **Keep comments on their own line.** `KEY=value  # note` is parsed
+  inconsistently across dotenv implementations, and a leaked comment fails
+  silently rather than loudly: `LIGHTRAG_ENTERPRISE_DISABLE_GLOBAL_ROUTES=true  # ...`
+  evaluates to `False` (re-enabling the legacy global routes), and every int knob
+  (`MAX_UPLOAD_SIZE`, `CHUNK_P_SIZE`, `MAX_PARALLEL_PARSE_*`, ...) silently falls
+  back to its default. A `.env` that worked bare-metal — python-dotenv always
+  strips inline comments — can therefore behave differently once mounted through
+  Compose.
+- **`ufw` does not protect a published port.** Docker publishes ports through its
+  own iptables chain, which is traversed before ufw/firewalld rules, so
+  `ufw deny 9621` leaves the service reachable. Set `LIGHTRAG_BIND_ADDRESS` in
+  `.env` to the LAN address (or `127.0.0.1` behind a reverse proxy) to actually
+  limit exposure; unset keeps the previous listen-on-all-interfaces behaviour.
+
+### Migrating an existing bare-metal deployment into Docker
+
+`INPUT_DIR` is not just a drop folder: it is the root of `__parsed__/`, where the
+parser writes each document's sidecar (`*.blocks.jsonl`, the per-modality JSON, and
+the extracted image assets). The database stores the merged text plus a **pointer**
+to that sidecar — never the sidecar bytes — and the pointer is an absolute path
+captured at parse time.
+
+A bare-metal server running with `INPUT_DIR=./inputs` therefore records paths like
+`/home/ubuntu/LightRAG-API-Server/inputs/<workspace>/<doc_id>/__parsed__/…`. Inside
+the container `INPUT_DIR` is `/app/inputs`, so those recorded paths fall outside the
+current root even after you copy `inputs/` across. Rebuilding such a document used to
+fail with `LightRAG document sidecar path must stay under INPUT_DIR`, while documents
+uploaded after the move worked normally — which is why the error looks intermittent.
+
+Copy `inputs/` into the new deployment (keeping the `<workspace>/<document_id>/`
+layout intact) and declare the old root so the recovery is a deterministic prefix
+swap:
+
+```yaml
+environment:
+  LIGHTRAG_INPUT_DIR_LEGACY_ROOTS: /home/ubuntu/LightRAG-API-Server/inputs
+```
+
+Nothing needs re-parsing. Without the variable the server still recovers by locating
+each artifact's tail under the current `INPUT_DIR`, logging a `Rebased a path
+recorded outside the current INPUT_DIR` warning per document; declaring the root
+removes the search and the warnings. A document whose artifacts were genuinely not
+copied still fails loudly instead of binding to the wrong sidecar.
+
 ### Optional: local vLLM embedding and reranker
 
 To run embedding and/or reranking locally with vLLM, run `make env-base` and answer `yes` when prompted to run the embedding model and rerank service locally via Docker.

@@ -189,3 +189,20 @@ def run_integration_tests(request):
 
     # Fall back to environment variable
     return os.getenv("LIGHTRAG_RUN_INTEGRATION", "false").lower() == "true"
+
+
+@pytest.fixture(autouse=True)
+def _reset_discovered_legacy_input_dir_roots():
+    """Keep the learned former-INPUT_DIR cache from leaking across tests.
+
+    ``rebase_under_input_dir`` remembers the prefix replaced by a successful
+    tail match so a relocated deployment warns once rather than once per
+    document. That cache is process-global, and tests build their roots under
+    per-test ``tmp_path`` directories, so without a reset one test's learned
+    root can silently satisfy another's rebase and mask a regression.
+    """
+    from lightrag.utils_pipeline import reset_discovered_legacy_input_dir_roots
+
+    reset_discovered_legacy_input_dir_roots()
+    yield
+    reset_discovered_legacy_input_dir_roots()
