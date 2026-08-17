@@ -115,6 +115,37 @@ clarification_required=true，此时 clarification_question 必须具体列出�
 不要输出 markdown，不要输出 chain-of-thought。
 """.strip()
 
+AGENT_GROUNDED_SYNTHESIS_PROMPT = """---Role---
+
+You are an expert AI assistant synthesizing an answer from evidence supplied by the system.
+
+---Goal---
+
+Answer the user's query accurately and comprehensively using ONLY the provided Evidence Content.
+
+---Instructions---
+
+1. Grounding:
+  - Use only facts explicitly supported by the Evidence Content. Your own knowledge may only connect those facts into fluent prose.
+  - If the evidence is insufficient, missing, or conflicting, state the gap or conflict honestly instead of guessing.
+
+2. Source handling:
+  - Evidence links have already been validated internally by the system.
+  - In the answer body, DO NOT output source identifiers, evidence or chunk numbers, `reference_id` values, citation markers, or any references, sources, or evidence list. The API returns source metadata separately in structured `references`.
+  - Do not quote or reproduce evidence chunks in full.
+
+3. Formatting & Language:
+  - The response MUST be in the same language as the user query.
+  - The response MUST use Markdown for clear structure.
+  - The response should be presented in {response_type}.
+
+4. Additional Instructions: {user_prompt}
+
+---Evidence Content---
+
+{content_data}
+"""
+
 # Appended to planner system prompts when bilingual retrieval is on: the
 # planner then emits an alternate-language query + keywords per step so the
 # executor can retrieve both language halves of a mixed zh/en corpus.
@@ -1382,6 +1413,7 @@ class AgentQueryService:
         steps_summary: list[dict[str, Any]],
         stream: bool,
         extra_rules: str = "",
+        emit_reference_ids: bool = True,
         sensitive_context: SensitiveContext | None = None,
     ) -> AsyncIterator[str]:
         rag = synth_result.rag
@@ -1396,23 +1428,37 @@ class AgentQueryService:
             param.response_type = body.response_type
         if body.max_total_tokens:
             param.max_total_tokens = body.max_total_tokens
-        reference_list_str = "\n".join(
-            f"[{ref['reference_id']}] {ref['file_path']} (kb_id={ref['kb_id']}, round={ref['round']})"
-            for ref in references
-        )
-        chunks_str = "\n".join(json.dumps(unit, ensure_ascii=False) for unit in context_units)
-        content_data = PROMPTS["naive_query_context"].format(
-            text_chunks_str=chunks_str,
-            reference_list_str=reference_list_str,
-        )
         user_prompt = body.user_prompt or "n/a"
-        agent_rules = (
-            "你只能基于给定证据回答。引用必须使用 [A1]、[A2] 这样的 Agent 级引用编号。"
-            "如果证据不足或存在冲突，必须明确说明缺口或冲突；不要编造未在证据中的事实。\n"
-            "引用规范：正文中仅以 [A1] 编号标注引用，需要指明出处时只写来源文件名；"
-            "禁止在回答中原文粘贴或整段复述证据片段（chunk）内容，禁止输出引用块/证据块，"
-            "也不要在文末自行罗列参考文献或引用列表（系统会单独返回结构化引用列表）。"
-        )
+        if emit_reference_ids:
+            reference_list_str = "\n".join(
+                f"[{ref['reference_id']}] {ref['file_path']} (kb_id={ref['kb_id']}, round={ref['round']})"
+                for ref in references
+            )
+            chunks_str = "\n".join(
+                json.dumps(unit, ensure_ascii=False) for unit in context_units
+            )
+            content_data = PROMPTS["naive_query_context"].format(
+                text_chunks_str=chunks_str,
+                reference_list_str=reference_list_str,
+            )
+            agent_rules = (
+                "你只能基于给定证据回答。引用必须使用 [A1]、[A2] 这样的 Agent 级引用编号。"
+                "如果证据不足或存在冲突，必须明确说明缺口或冲突；不要编造未在证据中的事实。\n"
+                "引用规范：正文中仅以 [A1] 编号标注引用，需要指明出处时只写来源文件名；"
+                "禁止在回答中原文粘贴或整段复述证据片段（chunk）内容，禁止输出引用块/证据块，"
+                "也不要在文末自行罗列参考文献或引用列表（系统会单独返回结构化引用列表）。"
+            )
+        else:
+            content_data = "\n\n---\n\n".join(
+                unit["content"] for unit in context_units if unit.get("content")
+            )
+            agent_rules = (
+                "你只能基于给定证据回答；证据不足或存在冲突时，必须明确说明缺口或冲突，"
+                "不要编造未在证据中的事实。\n"
+                "证据链接已由服务端在内部校验。回答正文不得输出任何来源标识、证据编号、"
+                "分块编号、reference_id 字段或引用标记，也不得生成参考文献、来源或证据列表；"
+                "系统会单独返回结构化 references 元数据。禁止原文粘贴或整段复述证据片段内容。"
+            )
         if extra_rules:
             agent_rules = f"{agent_rules}\n{extra_rules}"
         gap_notes = self._evidence_gap_notes(steps_summary)
@@ -1431,7 +1477,12 @@ class AgentQueryService:
                 effective_content_data = (
                     f"{effective_content_data}\n\n{payload.context_data}"
                 )
-            return PROMPTS["naive_rag_response"].format(
+            synthesis_prompt = (
+                PROMPTS["naive_rag_response"]
+                if emit_reference_ids
+                else AGENT_GROUNDED_SYNTHESIS_PROMPT
+            )
+            return synthesis_prompt.format(
                 response_type=param.response_type or "Multiple Paragraphs",
                 user_prompt=effective_instructions,
                 content_data=effective_content_data,

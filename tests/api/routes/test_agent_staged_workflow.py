@@ -78,7 +78,7 @@ class _FakeRAG:
                         yield delta
 
                 return _gen()
-            return "推荐配比 [A1]"
+            return "推荐配比"
 
         return {
             "role_llm_funcs": {"agent": agent_func, "query": query_func},
@@ -284,7 +284,7 @@ def test_workflow_defaults_to_plan_mode():
 @pytest.mark.asyncio
 async def test_staged_happy_path_stream_event_sequence(monkeypatch):
     _audit_recorder(monkeypatch)
-    rag = _FakeRAG(_happy_path_responses(), answer_deltas=["配比", "表 [A1]"])
+    rag = _FakeRAG(_happy_path_responses(), answer_deltas=["配比", "表"])
     service = AgentQueryService(kb_service=_KBService(), query_tool_service=_QueryTool(rag))
 
     events = []
@@ -334,10 +334,13 @@ async def test_staged_happy_path_stream_event_sequence(monkeypatch):
     verdict_event = events[18]
     assert verdict_event["after_repair"] is False
     assert {v["verdict"] for v in verdict_event["verdicts"]} == {"supported"}
-    reference_ids = [ref["reference_id"] for ref in events[19]["references"]]
+    returned_references = events[19]["references"]
+    reference_ids = [ref["reference_id"] for ref in returned_references]
     assert reference_ids == ["A1", "A2", "A3", "A4", "A5"]
-    assert events[19]["references"][0]["stage"] == "skeleton"
-    assert events[19]["references"][0]["evidence_role"] == "reference_formula"
+    assert returned_references[0]["stage"] == "skeleton"
+    assert returned_references[0]["evidence_role"] == "reference_formula"
+    assert returned_references[0]["file_path"] == "doc.md"
+    assert returned_references[0]["kb_id"] == "kb_formula"
 
 
 @pytest.mark.asyncio
@@ -353,7 +356,7 @@ async def test_staged_happy_path_result_metadata_and_verdict_payload(monkeypatch
     result = await service.run(request=_request(monkeypatch), body=_staged_body())
 
     assert result.status == "success"
-    assert result.answer == "推荐配比 [A1]"
+    assert result.answer == "推荐配比"
     metadata = result.metadata
     assert metadata["workflow"] == "staged"
     assert metadata["requirement"]["application"] == "胎侧胶料"
@@ -363,6 +366,7 @@ async def test_staged_happy_path_result_metadata_and_verdict_payload(monkeypatch
         "supported",
         "supported",
     ]
+    assert metadata["property_verdicts"][0]["evidence_refs"] == ["A4"]
     assert metadata["kb_roles"]["kb_exp"] == "experimental"
     # Verdict prompt maps each property to the chunks of its own round.
     verdict_payload = rag.agent_payloads[3]
@@ -371,8 +375,22 @@ async def test_staged_happy_path_result_metadata_and_verdict_payload(monkeypatch
     }
     assert by_property["低温屈挠性"]["chunks"][0]["reference_id"] == "A4"
     assert by_property["耐臭氧老化"]["chunks"][0]["reference_id"] == "A5"
-    # Structured summary is injected into the synthesis system prompt.
-    assert "property_verdicts" in rag.query_prompts[0]
+    # The final synthesis model sees grounded content and sanitized summaries,
+    # while internal IDs remain available to earlier extraction/verdict stages.
+    synthesis_prompt = rag.query_prompts[0]
+    assert "property_verdicts" in synthesis_prompt
+    assert "不得输出任何来源标识" in synthesis_prompt
+    assert "不设置引用编号列" in synthesis_prompt
+    assert "依据引用编号" not in synthesis_prompt
+    assert "source_refs" not in synthesis_prompt
+    assert "evidence_refs" not in synthesis_prompt
+    assert '"reference_id"' not in synthesis_prompt
+    assert "A1" not in synthesis_prompt
+    assert "A4" not in synthesis_prompt
+    assert "Reference Document List" not in synthesis_prompt
+    assert "Generate a **References** section" not in synthesis_prompt
+    assert "### References" not in synthesis_prompt
+    assert "证据内容 1" in synthesis_prompt
     assert len(tool.calls) == 5
 
 
@@ -603,7 +621,7 @@ async def test_staged_gap_repair_updates_verdicts(monkeypatch):
             ]
         ),
     ]
-    rag = _FakeRAG(responses, answer_deltas=["答案 [A5]"])
+    rag = _FakeRAG(responses, answer_deltas=["答案"])
     tool = _QueryTool(rag)
     service = AgentQueryService(kb_service=_KBService(), query_tool_service=tool)
 

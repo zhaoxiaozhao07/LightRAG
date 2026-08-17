@@ -75,12 +75,13 @@ S4 缺口补查（条件触发，至多一轮，AGENT LLM 规划 ≤4 步）
     触发条件：存在 no_data/unsupported 指标，或存在空结果步骤，且预算未用尽；
     补查步可换库、换 mode、改写查询；执行后仅对缺口指标重新裁决并合并
     ▼
-S5 终答合成（QUERY LLM，复用证据包模板 + 推荐输出结构约束）
-    输出结构强制：① 推荐配比表（组分/配比含单位/作用/引用编号，数值只能来自证据）
-                  ② 目标性能指标逐项核对（结论 + 引用）
+S5 终答合成（QUERY LLM，使用专用无编号证据合成模板 + 推荐输出结构约束）
+    输出结构强制：① 推荐配比表（组分/配比含单位/作用，不含引用编号列；数值只能来自证据）
+                  ② 目标性能指标逐项核对（指标 + 结论 + 简短证据说明，不含引用编号列）
                   ③ 未覆盖点与风险（no_data/unsupported 指标、被裁剪的检索、建议补做的验证实验）
     ▼
-返回 answer、references（含 stage/evidence_role）、steps_summary、metadata（含指标裁决、预算用量、裁剪记录）
+返回 answer（正文不显示证据/分块引用编号）、references（结构化单独返回，含 reference_id、
+stage/evidence_role、file_path/kb_id 等）、steps_summary、metadata（含指标裁决、预算用量、裁剪记录）
 ```
 
 ### 2.1 示例走查（“推荐一种在高寒地区使用的胎侧胶料配比”）
@@ -99,9 +100,9 @@ S5 终答合成（QUERY LLM，复用证据包模板 + 推荐输出结构约束�
 ### 3.1 证据板与 A 编号先行
 
 - 阶段化会话维护统一证据板：chunk 检回即去重（kb_id+chunk_id，退化为内容哈希）并**立刻分配稳定 A 编号**；后续所有提取/裁决调用引用 A 编号。
-- 每条证据带 `stage`（skeleton/factor_evidence/validation/gap_repair）与 `evidence_role`（reference_formula/mechanism/validation/repair）标签，终答引用可按角色核对证据链。
+- 每条证据带 `stage`（skeleton/factor_evidence/validation/gap_repair）与 `evidence_role`（reference_formula/mechanism/validation/repair）标签；这些内部链接用于服务端核对证据链，最终回答正文不显示 A 编号。
 - 终答上下文按 token 预算截断时 **被引用的证据优先保留**（骨架 source_refs + 裁决 evidence_refs 排在最前），落选的只可能是未被任何结构化结论引用的证据。
-- 与 plan 模式的差别：A 编号在检回时分配且不重排，最终引用列表编号可能不连续（编号是 ID 不是序号）。
+- 与 plan 模式的差别：A 编号在检回时分配且不重排（编号是 ID 不是序号），仅用于内部骨架/裁决记账和结构化 `references`；终答模型只看到证据正文，不看到这些编号。
 
 ### 3.2 提取幻觉防线（fail-closed 引用校验）
 
@@ -230,3 +231,4 @@ AGENT_STAGED_MAX_KBS_PER_STEP=4
 |------|------|------|
 | 1.0 | 2026-07-02 | 初稿：阶段化配比推荐工作流设计 + 首期实现范围 |
 | 1.1 | 2026-07-03 | 明确知识库名称/数量无关（角色动态标注 + 逐级回退）；新增每步 KB 数上限 `AGENT_STAGED_MAX_KBS_PER_STEP`（按 agent_priority 择优，裁剪上报） |
+| 1.2 | 2026-08-17 | staged 终答正文不再输出证据编号；来源改由结构化 `references` 单独返回 |

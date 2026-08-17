@@ -183,9 +183,9 @@ mode（local/global/hybrid/naive/mix 之一）。没有值得补查的内容时 
 
 SYNTHESIS_EXTRA_RULES = """
 本次回答是配比/配方推荐，输出必须包含以下结构：
-1) 推荐配比表：每个组分一行，含组分、推荐配比（保留证据中的数值与单位）、作用、依据引用编号；
+1) 推荐配比表：每个组分一行，仅含组分、推荐配比（保留证据中的数值与单位）和作用，不设置引用编号列；
    配比数值只能来自证据（参考配方或实验数据），禁止凭空给出数值。
-2) 目标性能指标核对：逐项列出指标、证据结论（支持/部分支持/不支持/无数据）与引用编号。
+2) 目标性能指标核对：逐项列出指标、证据结论（支持/部分支持/不支持/无数据）和简短证据说明，不设置引用编号列。
 3) 未覆盖点与风险：明确列出无数据或证据不利的指标、未完成的检索，以及采纳建议前需补充的验证实验。
 """.strip()
 
@@ -1126,6 +1126,7 @@ class AgentStagedRunner:
                 steps_summary=steps_summary,
                 stream=stream_synthesis,
                 extra_rules=extra_rules,
+                emit_reference_ids=False,
                 sensitive_context=sensitive_context,
             ):
                 if delta:
@@ -2045,15 +2046,24 @@ class AgentStagedRunner:
         clipped_notes: list[str],
         pending_clarification: str | None = None,
     ) -> str:
+        skeleton_components = [
+            {key: value for key, value in component.items() if key != "source_refs"}
+            for component in AgentStagedRunner._component_payload(skeleton)
+        ]
+        property_verdicts = [
+            {key: value for key, value in verdict.items() if key != "evidence_refs"}
+            for verdict in verdicts
+        ]
         summary = {
             "requirement": requirement_payload,
-            "skeleton_components": AgentStagedRunner._component_payload(skeleton),
-            "property_verdicts": verdicts,
+            "skeleton_components": skeleton_components,
+            "property_verdicts": property_verdicts,
             "clipped": clipped_notes,
         }
         rules = (
             f"{SYNTHESIS_EXTRA_RULES}\n"
-            "结构化需求、骨架与指标裁决（引用编号已与证据对应，直接用于组织回答）：\n"
+            "结构化需求、骨架与指标裁决（证据链接已由服务端在内部校验；"
+            "回答中不得出现任何证据编号或引用编号）：\n"
             f"{json.dumps(summary, ensure_ascii=False)}"
         )
         if requirement_payload.get("assumptions"):
