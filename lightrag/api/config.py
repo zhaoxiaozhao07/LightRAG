@@ -1024,6 +1024,9 @@ def parse_args() -> argparse.Namespace:
     args.enterprise_tenant_max_concurrent_jobs = get_env_value(
         "LIGHTRAG_ENTERPRISE_TENANT_MAX_CONCURRENT_JOBS", 0, int
     )
+    args.multi_kb_query_max_kbs = get_env_value(
+        "MULTI_KB_QUERY_MAX_KBS", -1, int
+    )
     args.agent_query_enabled = get_env_value(
         "LIGHTRAG_AGENT_QUERY_ENABLED", False, bool
     )

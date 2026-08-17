@@ -1249,7 +1249,8 @@ def test_multi_kb_query_empty_results(tmp_path):
     assert body["metadata"]["merged_chunk_count"] == 0
 
 
-def test_multi_kb_query_cap_enforced(tmp_path):
+def test_multi_kb_query_cap_enforced_at_http_validation(tmp_path, monkeypatch):
+    monkeypatch.setattr(_kb_query_routes, "multi_kb_query_max_kbs", lambda: 10)
     client, _ = _build_multi_kb_client(tmp_path)
     resp = client.post(
         "/kbs:query",
@@ -1257,6 +1258,49 @@ def test_multi_kb_query_cap_enforced(tmp_path):
         headers=_HEADERS,
     )
     assert resp.status_code == 422
+    assert "MULTI_KB_QUERY_MAX_KBS allows at most 10" in resp.text
+
+
+def test_multi_kb_query_unlimited_accepts_more_than_ten_unique_ids(monkeypatch):
+    monkeypatch.setattr(_kb_query_routes, "multi_kb_query_max_kbs", lambda: -1)
+    kb_ids = [f"kb_{i}" for i in range(11)]
+
+    request = _kb_query_routes.MultiKBQueryRequest(
+        kb_ids=kb_ids,
+        query="more than ten knowledge bases",
+    )
+
+    assert request.kb_ids == kb_ids
+
+
+def test_multi_kb_query_deduplicates_before_configured_cap(monkeypatch):
+    monkeypatch.setattr(_kb_query_routes, "multi_kb_query_max_kbs", lambda: 2)
+
+    request = _kb_query_routes.MultiKBQueryRequest(
+        kb_ids=[" kb_a ", "kb_a", " kb_b"],
+        query="deduplicate knowledge bases",
+    )
+
+    assert request.kb_ids == ["kb_a", "kb_b"]
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [(-1, -1), (3, 3), (0, -1), (-2, -1), ("invalid", -1)],
+)
+def test_multi_kb_query_max_kbs_accessor_normalizes_invalid_values(
+    monkeypatch, configured, expected
+):
+    from lightrag.api import config as api_config
+    from lightrag.api.enterprise_auth import multi_kb_query_max_kbs
+
+    monkeypatch.setattr(
+        api_config,
+        "global_args",
+        SimpleNamespace(multi_kb_query_max_kbs=configured),
+    )
+
+    assert multi_kb_query_max_kbs() == expected
 
 
 def test_multi_kb_query_short_query_rejected(tmp_path):

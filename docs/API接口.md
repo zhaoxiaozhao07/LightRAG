@@ -1018,7 +1018,7 @@ Content-Type: application/json
 约束与行为：
 
 - **前提**：所有目标 KB 共用同一套本地模型服务（LLM/VLM/embedding/rerank）；KB 隔离不变（按 KB 扇出，仅在检索层合并，不合并 workspace）。检索对所有 KB 使用请求体中的**同一套查询参数**，不叠加各 KB 的 active `query_config`。
-- `kb_ids` 必填，1..10 个；超限 422。`mode` 支持 `local/global/hybrid/naive/mix`，**`bypass` 返回 400**（无检索可合并）。
+- `kb_ids` 必填且至少 1 个；去除首尾空白并按唯一 KB ID 去重后，默认不限制数量。环境变量 `MULTI_KB_QUERY_MAX_KBS` 可设为正整数以配置硬上限（默认 `-1` 表示不限），超过已配置上限返回 422。`mode` 支持 `local/global/hybrid/naive/mix`，**`bypass` 返回 400**（无检索可合并）。
 - **合并排序**：对合并后的 chunk 池用共享 reranker 统一重排（基于文本，与 embedding 无关），再按 `chunk_top_k` 与 token 预算截断。`metadata.reranked` 标识是否重排。
 - **引用**：合并后统一重新编号 `reference_id`（跨库冲突自动消解），每条引用标注来源 `kb_id`；`include_chunk_content=true` 时附 chunk 文本。
 - **合成所用 LLM/tokenizer/reranker** 为共享部署服务；`metadata.synthesis_kb_id` 仅作溯源标识。

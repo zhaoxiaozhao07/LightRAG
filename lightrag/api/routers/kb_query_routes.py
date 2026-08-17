@@ -50,6 +50,7 @@ from lightrag.api.enterprise_auth import (
     enterprise_auth_enabled,
     get_enterprise_authorization_service,
     get_request_principal,
+    multi_kb_query_max_kbs,
 )
 from lightrag.api.chat_memory_routing import (
     ChatMemoryScope,
@@ -704,9 +705,6 @@ async def _resolve_doc_id_scope(
     ]
 
 
-_MAX_MULTI_KB = 10
-
-
 class MultiKBQueryRequest(BaseModel):
     """Query several knowledge bases at once and synthesize one answer.
 
@@ -715,7 +713,7 @@ class MultiKBQueryRequest(BaseModel):
     through its own instance and results are merged at the retrieval layer.
     """
 
-    kb_ids: List[str] = Field(min_length=1, max_length=_MAX_MULTI_KB)
+    kb_ids: List[str] = Field(min_length=1)
     query: str = Field(min_length=3)
     mode: QueryMode = Field(default="mix")
     response_type: Optional[str] = Field(default=None, min_length=1)
@@ -765,6 +763,12 @@ class MultiKBQueryRequest(BaseModel):
                 result.append(kb_id)
         if not result:
             raise ValueError("kb_ids must contain at least one knowledge base id")
+        max_kbs = multi_kb_query_max_kbs()
+        if max_kbs > 0 and len(result) > max_kbs:
+            raise ValueError(
+                f"kb_ids contains {len(result)} unique knowledge base ids; "
+                f"MULTI_KB_QUERY_MAX_KBS allows at most {max_kbs}"
+            )
         return result
 
     @field_validator("conversation_history", mode="after")

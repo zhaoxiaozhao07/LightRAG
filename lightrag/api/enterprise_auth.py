@@ -1004,6 +1004,15 @@ def agent_query_enabled() -> bool:
     return bool(getattr(_global_args(), "agent_query_enabled", False))
 
 
+def multi_kb_query_max_kbs() -> int:
+    """Return the basic multi-KB query cap; ``-1`` means unlimited."""
+    try:
+        value = int(getattr(_global_args(), "multi_kb_query_max_kbs", -1))
+    except (TypeError, ValueError):
+        return -1
+    return value if value == -1 or value > 0 else -1
+
+
 def agent_max_rounds() -> int:
     return max(1, int(getattr(_global_args(), "agent_max_rounds", 5) or 5))
 
@@ -4976,6 +4985,7 @@ def _global_args() -> Any:
         enterprise_legacy_api_key_superadmin=_env_bool(
             "LIGHTRAG_ENTERPRISE_LEGACY_API_KEY_SUPERADMIN", False
         ),
+        multi_kb_query_max_kbs=_env_int("MULTI_KB_QUERY_MAX_KBS", -1),
         agent_query_enabled=_env_bool("LIGHTRAG_AGENT_QUERY_ENABLED", False),
         agent_max_rounds=_env_int("AGENT_MAX_ROUNDS", 5),
         agent_staged_max_retrievals=_env_int("AGENT_STAGED_MAX_RETRIEVALS", 24),
